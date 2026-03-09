@@ -1,0 +1,2469 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from mcd_agent.config import AgentConfig, check_profile_drift_with_mcc, load_config, recover_config_from_mcc
+from mcd_agent.backup import backup_lock_active, backup_run, backup_status
+from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
+from mcd_agent.db import MauticDB
+from mcd_agent.executor import render_mautic_command
+from mcd_agent.inventory import InstanceInventory, ensure_seeded
+from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.runtime_overrides import (
+    apply_remote_overrides,
+    consume_poll_trigger,
+    fetch_runtime_overrides,
+    local_runtime_overrides,
+    overrides_fingerprint,
+    push_runtime_overrides,
+)
+from mcd_agent.service_profiles import service_profiles_apply_once
+from mcd_agent.self_update import maybe_auto_update
+from mcd_agent.signals import collect_signals
+from mcd_agent.state_push import (
+    MCCStatePusher,
+    clear_pending_profile_event,
+    log_push_result,
+    prune_sent_profile_events,
+    queue_profile_event,
+    read_pending_profile_event,
+    should_poll_alert,
+)
+
+_CMD_SEP = "\x1f"
+_M4_CAMPAIGN_DELETED_CLAUSE_RE = re.compile(r"\s+AND\s*\(?\s*c\.deleted\s+IS\s+NULL\s*\)?", re.IGNORECASE)
+_SEGMENT_STALE_PRIORITY_SEC = 24 * 3600
+
+
+def _backup_done_for_local_date(config: AgentConfig, local_dt: datetime) -> bool:
+    today = local_dt.strftime("%Y-%m-%d")
+    try:
+        st = backup_status(config)
+    except Exception:
+        return False
+
+    if str(st.get("last_status") or "").strip().lower() != "ok":
+        return False
+
+    # Preferred source of truth for daily success.
+    last_success_at = str(st.get("last_success_at") or "").strip()
+    if last_success_at:
+        try:
+            ts = datetime.fromisoformat(last_success_at.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts.astimezone().date() == local_dt.date():
+                return True
+        except Exception:
+            pass
+
+    # Backward-compatible fallback: final path suffix contains date.
+    last_path = str(st.get("last_backup_path") or "").strip().rstrip("/")
+    return bool(last_path) and last_path.endswith(f"/{today}")
+
+
+def _backup_attempted_for_local_date(config: AgentConfig, local_dt: datetime) -> bool:
+    today = local_dt.strftime("%Y-%m-%d")
+    try:
+        st = backup_status(config)
+    except Exception:
+        return False
+
+    # A finished run (ok/failed) for today counts as "attempted" so dispatch
+    # can resume after backup completion.
+    last_run_at = str(st.get("last_run_at") or "").strip()
+    if last_run_at:
+        try:
+            ts = datetime.fromisoformat(last_run_at.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts.astimezone().date() == local_dt.date():
+                return True
+        except Exception:
+            pass
+
+    # Fallback for older states where only success path/timestamp may exist.
+    if str(st.get("last_status") or "").strip().lower() != "ok":
+        return False
+    last_path = str(st.get("last_backup_path") or "").strip().rstrip("/")
+    if last_path.endswith(f"/{today}"):
+        return True
+    last_success_at = str(st.get("last_success_at") or "").strip()
+    if not last_success_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(last_success_at.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone().date() == local_dt.date()
+    except Exception:
+        return False
+
+
+def _backup_dispatch_pause_state(
+    config: AgentConfig,
+    *,
+    backup_running: bool,
+    now_local: datetime | None = None,
+) -> tuple[bool, str]:
+    if not config.backup_enabled:
+        return False, ""
+    if backup_running:
+        return True, "backup_running"
+    if not config.backup_schedule_enabled:
+        return False, ""
+
+    pre_pause_sec = max(0, int(config.backup_schedule_pre_pause_sec))
+    if pre_pause_sec <= 0:
+        return False, ""
+
+    quiet_hour = max(0, min(23, int(config.backup_schedule_quiet_hour)))
+    quiet_window_min = max(1, min(180, int(config.backup_schedule_quiet_window_min)))
+    dt_local = now_local if now_local is not None else datetime.now()
+    start_today = dt_local.replace(hour=quiet_hour, minute=0, second=0, microsecond=0)
+    done_today = _backup_attempted_for_local_date(config, dt_local)
+    in_window = start_today <= dt_local < (start_today + timedelta(minutes=quiet_window_min))
+
+    # If today's backup is still pending and we are already in backup slot,
+    # block new task launches until backup run starts/finishes.
+    if in_window and not done_today:
+        return True, "backup_window_pending"
+
+    if dt_local < start_today:
+        next_start = start_today
+    else:
+        next_start = start_today + timedelta(days=1)
+
+    sec_to_next = int((next_start - dt_local).total_seconds())
+    if 0 < sec_to_next <= pre_pause_sec:
+        return True, f"pre_backup_window_{sec_to_next}s"
+    return False, ""
+
+
+@dataclass
+class RunningTask:
+    row_id: int
+    root: str
+    task_key: str
+    task_type: str
+    entity_id: int | None
+    command_str: str
+    timeout_sec: int
+    attempts: int
+    started_at: float
+    pid: int
+    manual_request_id: int | None = None
+
+
+def _load_id_file(path: str | None) -> set[int]:
+    out: set[int] = set()
+    if not path:
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    out.add(int(line))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        logging.warning("ID file not found: %s", path)
+    return out
+
+
+def _extract_int(row: dict[str, object], key: str) -> int | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _segment_weights(
+    ids: list[int],
+    weight_rows: list[dict[str, object]],
+    whitelist: set[int],
+    now_ts: int,
+) -> dict[int, float]:
+    by_id: dict[int, dict[str, object]] = {}
+    for row in weight_rows:
+        rid = _extract_int(row, "id")
+        if rid is not None:
+            by_id[rid] = row
+
+    weights: dict[int, float] = {}
+    for sid in ids:
+        row = by_id.get(sid, {})
+        created_ts = _extract_int(row, "created_ts")
+        modified_ts = _extract_int(row, "modified_ts")
+        built_ts = _extract_int(row, "built_ts")
+        recent_activity = _extract_int(row, "recent_activity")
+        w = 0.0
+        if created_ts is not None:
+            created_age_h = max(0.0, (now_ts - created_ts) / 3600.0)
+            w += max(0.0, 400.0 - created_age_h)
+        if built_ts is None:
+            w += 80.0
+        else:
+            staleness_h = max(0.0, (now_ts - built_ts) / 3600.0)
+            w += min(40.0, staleness_h)
+
+        if modified_ts is not None and (built_ts is None or modified_ts > built_ts):
+            w += 120.0
+        if recent_activity is not None and recent_activity > 0:
+            w += min(600.0, float(recent_activity) * 2.0)
+
+        if sid in whitelist:
+            w += 1000.0
+
+        weights[sid] = w
+    return weights
+
+
+def _campaign_weights(
+    ids: list[int],
+    weight_rows: list[dict[str, object]],
+    whitelist: set[int],
+    now_ts: int,
+) -> dict[int, float]:
+    by_id: dict[int, dict[str, object]] = {}
+    for row in weight_rows:
+        rid = _extract_int(row, "id")
+        if rid is not None:
+            by_id[rid] = row
+
+    out: dict[int, float] = {}
+    for cid in ids:
+        row = by_id.get(cid, {})
+        publish_ts = _extract_int(row, "publish_ts")
+        pending_cnt = _extract_int(row, "pending_cnt")
+        recent_activity = _extract_int(row, "recent_activity")
+        if publish_ts is None:
+            w = 0.0
+        else:
+            age_h = max(0.0, (now_ts - publish_ts) / 3600.0)
+            w = max(0.0, 500.0 - (age_h * 2.0))
+        if pending_cnt is not None and pending_cnt > 0:
+            w += min(800.0, float(pending_cnt) * 0.5)
+        if recent_activity is not None and recent_activity > 0:
+            w += min(600.0, float(recent_activity) * 2.0)
+        if cid in whitelist:
+            w += 1000.0
+        out[cid] = w
+    return out
+
+
+def _latest_campaign_ids(weight_rows: list[dict[str, object]], count: int) -> list[int]:
+    if count <= 0:
+        return []
+    pairs: list[tuple[int, int]] = []
+    for row in weight_rows:
+        rid = _extract_int(row, "id")
+        publish_ts = _extract_int(row, "publish_ts")
+        if rid is None or publish_ts is None:
+            continue
+        pairs.append((rid, publish_ts))
+    pairs.sort(key=lambda x: (-x[1], -x[0]))
+    return [rid for rid, _ in pairs[:count]]
+
+
+def _split_segment_circles(
+    ids: list[int],
+    weights: dict[int, float],
+    whitelist: set[int],
+    threshold: float,
+    priority_size: int,
+    stale_priority_ids: set[int] | None = None,
+) -> tuple[list[int], list[int]]:
+    uniq = list(dict.fromkeys(ids))
+    stale_set = set(stale_priority_ids or set())
+    priority_set: set[int] = set(whitelist)
+    if stale_priority_ids:
+        priority_set.update(stale_priority_ids)
+    ranked = sorted(uniq, key=lambda x: (-weights.get(x, 0.0), x))
+    for sid in ranked[: max(0, priority_size)]:
+        priority_set.add(sid)
+    for sid in uniq:
+        if weights.get(sid, 0.0) >= threshold:
+            priority_set.add(sid)
+
+    def _prio_key(sid: int) -> tuple[int, int, float, int]:
+        # Priority order inside ring:
+        # 1) whitelist (forced),
+        # 2) stale (>24h or never built),
+        # 3) computed weight,
+        # 4) id for deterministic tie-break.
+        return (
+            0 if sid in whitelist else 1,
+            0 if sid in stale_set else 1,
+            -weights.get(sid, 0.0),
+            sid,
+        )
+
+    priority = sorted([x for x in uniq if x in priority_set], key=_prio_key)
+    regular = sorted([x for x in uniq if x not in priority_set], key=lambda x: (-weights.get(x, 0.0), x))
+    return priority, regular
+
+
+def _stale_segment_priority_ids(
+    ids: list[int],
+    weight_rows: list[dict[str, object]],
+    now_ts: int,
+    stale_sec: int = _SEGMENT_STALE_PRIORITY_SEC,
+) -> set[int]:
+    uniq = list(dict.fromkeys(ids))
+    by_id_built_ts: dict[int, int | None] = {}
+    for row in weight_rows:
+        rid = _extract_int(row, "id")
+        if rid is None:
+            continue
+        by_id_built_ts[rid] = _extract_int(row, "built_ts")
+
+    out: set[int] = set()
+    limit_sec = max(60, int(stale_sec))
+    for sid in uniq:
+        built_ts = by_id_built_ts.get(sid)
+        # Never built / unknown built date => treat as stale.
+        if built_ts is None:
+            out.add(sid)
+            continue
+        if now_ts - built_ts >= limit_sec:
+            out.add(sid)
+    return out
+
+
+def _split_campaign_circles(
+    ids: list[int],
+    weights: dict[int, float],
+    whitelist: set[int],
+    priority_size: int,
+    latest_priority_ids: list[int],
+) -> tuple[list[int], list[int]]:
+    uniq = list(dict.fromkeys(ids))
+    latest_set = set(latest_priority_ids)
+    wl_sorted = sorted([x for x in uniq if x in whitelist], key=lambda x: (-weights.get(x, 0.0), x))
+    latest_sorted = sorted([x for x in uniq if x in latest_set and x not in whitelist], key=lambda x: (-weights.get(x, 0.0), x))
+    non_wl = sorted([x for x in uniq if x not in whitelist], key=lambda x: (-weights.get(x, 0.0), x))
+
+    forced = wl_sorted + latest_sorted
+    forced_set = set(forced)
+    need = max(0, priority_size - len(forced))
+    picked_non_wl = [x for x in non_wl if x not in forced_set][:need]
+    priority_set = set(forced + picked_non_wl)
+
+    priority = [x for x in (forced + picked_non_wl) if x in uniq]
+    regular = [x for x in non_wl if x not in priority_set]
+    return priority, regular
+
+
+def _needs_weight_recalc(ids: list[int], cached: dict[int, float]) -> bool:
+    if not cached:
+        return True
+    return set(ids) != set(cached.keys())
+
+
+def _reconcile_ring(old_ring: deque[int] | None, ordered_ids: list[int]) -> deque[int]:
+    if old_ring is None or not old_ring:
+        return deque(ordered_ids)
+    old = list(old_ring)
+    new_set = set(ordered_ids)
+    keep = [x for x in old if x in new_set]
+    keep_set = set(keep)
+    tail = [x for x in ordered_ids if x not in keep_set]
+    return deque(keep + tail)
+
+
+def _mark_ring_entity_executed(ring: deque[int], entity_id: int | None) -> None:
+    if entity_id is None or not ring:
+        return
+    try:
+        ring.remove(int(entity_id))
+        ring.append(int(entity_id))
+    except ValueError:
+        return
+
+
+def _partition_complete(ids: list[int], p1: list[int], p2: list[int]) -> bool:
+    base = set(ids)
+    return base == (set(p1) | set(p2))
+
+
+def _campaign_sql_for_major(query_template: str, mautic_major: int | None) -> str:
+    if mautic_major != 4:
+        return query_template
+    # Mautic 4 schemas may not have campaigns.deleted; strip this predicate safely.
+    patched = _M4_CAMPAIGN_DELETED_CLAUSE_RE.sub("", query_template)
+    if patched == query_template:
+        return query_template
+    return re.sub(r"\s{2,}", " ", patched).strip()
+
+
+def _fill_from_ring(
+    *,
+    ring: deque[int],
+    ring_limit: int,
+    total_limit: int,
+    root: str,
+    task_type: str,
+    running: dict[str, RunningTask],
+    ring_entities: set[int] | None,
+    config: AgentConfig,
+    store: TaskStore,
+    popens: dict[str, subprocess.Popen[bytes]],
+    build_args,
+) -> None:
+    if not ring or ring_limit <= 0 or total_limit <= 0:
+        return
+    scans = len(ring)
+    while _running_count_for_entities(running, root, task_type, ring_entities) < ring_limit and scans > 0:
+        eid = ring[0]
+        scans -= 1
+        if _is_running(running, root, task_type, eid):
+            ring.rotate(-1)
+            continue
+        args = build_args(eid)
+        launched = _submit_if_slot(
+            config=config,
+            store=store,
+            running=running,
+            root=root,
+            task_type=task_type,
+            entity_id=eid,
+            args=args,
+            timeout_sec=config.command_timeout_sec,
+            max_parallel_for_type=max(1, total_limit),
+            popens=popens,
+        )
+        if launched:
+            ring.rotate(-1)
+        else:
+            break
+
+
+def _compute_throttle_active(samples: deque[tuple[float, int]], threshold: int, window_min: int) -> bool:
+    if not samples:
+        return False
+    now = time.time()
+    window_sec = max(60, window_min * 60)
+    while samples and now - samples[0][0] > window_sec:
+        samples.popleft()
+    if not samples:
+        return False
+    if now - samples[0][0] < window_sec:
+        return False
+    return min(v for _, v in samples) >= threshold
+
+
+class TaskStore:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              root TEXT NOT NULL,
+              task_key TEXT NOT NULL,
+              task_type TEXT NOT NULL,
+              entity_id INTEGER,
+              command_str TEXT NOT NULL,
+              pid INTEGER NOT NULL,
+              timeout_sec INTEGER NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 1,
+              manual_request_id INTEGER,
+              state TEXT NOT NULL,
+              note TEXT,
+              started_at REAL NOT NULL,
+              finished_at REAL,
+              rc INTEGER
+            )
+            """
+        )
+        self._ensure_column("tasks", "manual_request_id", "ALTER TABLE tasks ADD COLUMN manual_request_id INTEGER")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_running ON tasks(state, root, task_type)")
+        self.conn.execute("DROP INDEX IF EXISTS idx_tasks_task_key_running")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weight_cache (
+              kind TEXT NOT NULL,
+              root TEXT NOT NULL,
+              entity_id INTEGER NOT NULL,
+              weight REAL NOT NULL,
+              computed_at REAL NOT NULL,
+              PRIMARY KEY(kind, root, entity_id)
+            )
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_weight_cache_lookup ON weight_cache(kind, root, computed_at)")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_sync (
+              key TEXT PRIMARY KEY,
+              payload_json TEXT NOT NULL,
+              updated_at REAL NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              root TEXT NOT NULL,
+              task_type TEXT NOT NULL,
+              entity_id INTEGER,
+              command_str TEXT NOT NULL,
+              timeout_sec INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              note TEXT,
+              task_key TEXT,
+              requested_at REAL NOT NULL,
+              launched_at REAL,
+              finished_at REAL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manual_requests_pending ON manual_requests(status, root, requested_at)"
+        )
+        self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        cur = self.conn.execute(f"PRAGMA table_info({table})")
+        cols = {str(r["name"]) for r in cur.fetchall()}
+        if column not in cols:
+            self.conn.execute(ddl)
+
+    def mark_old_running_lost(self) -> None:
+        now = time.time()
+        self.conn.execute(
+            "UPDATE tasks SET state='lost', note='daemon_restart', finished_at=? WHERE state='running'",
+            (now,),
+        )
+        self.conn.commit()
+
+    def add_running(self, task: RunningTask) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO tasks(
+              root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                task.root,
+                task.task_key,
+                task.task_type,
+                task.entity_id,
+                task.command_str,
+                task.pid,
+                task.timeout_sec,
+                task.attempts,
+                task.manual_request_id,
+                "running",
+                task.started_at,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish(self, row_id: int, state: str, rc: int | None, note: str | None) -> None:
+        self.conn.execute(
+            "UPDATE tasks SET state=?, rc=?, note=?, finished_at=? WHERE id=?",
+            (state, rc, note, time.time(), row_id),
+        )
+        self.conn.commit()
+
+    def running_rows(self) -> list[sqlite3.Row]:
+        cur = self.conn.execute("SELECT * FROM tasks WHERE state='running'")
+        return cur.fetchall()
+
+    def get_weights(self, kind: str, root: str, max_age_sec: int) -> dict[int, float]:
+        min_ts = time.time() - max(1, max_age_sec)
+        cur = self.conn.execute(
+            "SELECT entity_id, weight FROM weight_cache WHERE kind=? AND root=? AND computed_at>=?",
+            (kind, root, min_ts),
+        )
+        out: dict[int, float] = {}
+        for row in cur.fetchall():
+            out[int(row["entity_id"])] = float(row["weight"])
+        return out
+
+    def put_weights(self, kind: str, root: str, weights: dict[int, float]) -> None:
+        now = time.time()
+        self.conn.execute("DELETE FROM weight_cache WHERE kind=? AND root=?", (kind, root))
+        self.conn.executemany(
+            "INSERT INTO weight_cache(kind, root, entity_id, weight, computed_at) VALUES(?,?,?,?,?)",
+            [(kind, root, int(eid), float(w), now) for eid, w in weights.items()],
+        )
+        self.conn.commit()
+
+    def compact_tasks(
+        self,
+        *,
+        now_ts: float,
+        keep_days: int,
+        max_rows: int,
+        run_vacuum: bool,
+    ) -> tuple[int, int, bool]:
+        """Compact historical task rows (non-running only).
+
+        Returns: (deleted_rows, remaining_non_running_rows, vacuum_done)
+        """
+        deleted_rows = 0
+        keep_days = max(0, int(keep_days))
+        max_rows = max(0, int(max_rows))
+
+        if keep_days > 0:
+            cutoff = float(now_ts) - (float(keep_days) * 86400.0)
+            cur = self.conn.execute(
+                "DELETE FROM tasks WHERE state!='running' AND COALESCE(finished_at, started_at) < ?",
+                (cutoff,),
+            )
+            deleted_rows += int(cur.rowcount or 0)
+
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks WHERE state!='running'").fetchone()
+        non_running = int(row["cnt"] if row else 0)
+        if max_rows > 0 and non_running > max_rows:
+            overflow = non_running - max_rows
+            cur = self.conn.execute(
+                """
+                DELETE FROM tasks
+                WHERE id IN (
+                  SELECT id
+                  FROM tasks
+                  WHERE state!='running'
+                  ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                  LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
+            deleted_rows += int(cur.rowcount or 0)
+            row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks WHERE state!='running'").fetchone()
+            non_running = int(row["cnt"] if row else 0)
+
+        self.conn.commit()
+
+        vacuum_done = False
+        if run_vacuum and deleted_rows > 0:
+            self.conn.execute("VACUUM")
+            vacuum_done = True
+
+        return deleted_rows, non_running, vacuum_done
+
+    def put_runtime_sync(self, key: str, payload: dict[str, object]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_sync(key, payload_json, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
+            """,
+            (str(key), json.dumps(payload, ensure_ascii=False), time.time()),
+        )
+        self.conn.commit()
+
+    def enqueue_manual_request(
+        self,
+        *,
+        root: str,
+        task_type: str,
+        entity_id: int | None,
+        command_str: str,
+        timeout_sec: int,
+    ) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO manual_requests(
+              root, task_type, entity_id, command_str, timeout_sec, status, requested_at
+            ) VALUES(?,?,?,?,?,'pending',?)
+            """,
+            (
+                str(root),
+                str(task_type),
+                entity_id,
+                str(command_str),
+                int(timeout_sec),
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending_manual_requests(self, root: str, limit: int = 32) -> list[sqlite3.Row]:
+        cur = self.conn.execute(
+            """
+            SELECT *
+            FROM manual_requests
+            WHERE status='pending' AND root=?
+            ORDER BY requested_at ASC, id ASC
+            LIMIT ?
+            """,
+            (str(root), max(1, int(limit))),
+        )
+        return cur.fetchall()
+
+    def get_manual_request_status(self, req_id: int) -> str | None:
+        row = self.conn.execute("SELECT status FROM manual_requests WHERE id=?", (int(req_id),)).fetchone()
+        if not row:
+            return None
+        return str(row["status"])
+
+    def cancel_manual_request(self, req_id: int, note: str = "fallback_direct_exec") -> bool:
+        cur = self.conn.execute(
+            """
+            UPDATE manual_requests
+            SET status='cancelled', note=?, finished_at=?
+            WHERE id=? AND status='pending'
+            """,
+            (str(note), time.time(), int(req_id)),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0) > 0
+
+    def mark_manual_request_launched(self, req_id: int, task_key: str) -> None:
+        self.conn.execute(
+            """
+            UPDATE manual_requests
+            SET status='launched', task_key=?, launched_at=?, note=NULL
+            WHERE id=? AND status='pending'
+            """,
+            (str(task_key), time.time(), int(req_id)),
+        )
+        self.conn.commit()
+
+    def finish_manual_request(self, req_id: int, status: str, note: str | None = None) -> None:
+        self.conn.execute(
+            """
+            UPDATE manual_requests
+            SET status=?, note=?, finished_at=?
+            WHERE id=? AND status IN ('pending','launched')
+            """,
+            (str(status), note, time.time(), int(req_id)),
+        )
+        self.conn.commit()
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_cmdline_args(pid: int) -> list[str]:
+    if pid <= 0:
+        return []
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except Exception:
+        return []
+    if not raw:
+        return []
+    args: list[str] = []
+    for chunk in raw.split(b"\x00"):
+        if not chunk:
+            continue
+        try:
+            args.append(chunk.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+    return args
+
+
+def _task_signature_tokens(command_str: str) -> list[str]:
+    args = [x for x in str(command_str or "").split(_CMD_SEP) if x]
+    signature = [x for x in args if x.startswith("mautic:") or x.endswith("/bin/console") or x == "bin/console"]
+    if signature:
+        return signature
+    # Fallback for unexpected/custom templates: use short tail.
+    return args[-2:] if len(args) >= 2 else args
+
+
+def _cmdline_has_token(cmdline_args: list[str], token: str) -> bool:
+    if token in cmdline_args:
+        return True
+    if "/" in token:
+        token_base = os.path.basename(token.rstrip("/"))
+        if not token_base:
+            return False
+        for arg in cmdline_args:
+            if os.path.basename(str(arg).rstrip("/")) == token_base:
+                return True
+    return False
+
+
+def _pid_matches_task_command(pid: int, command_str: str) -> bool:
+    cmdline_args = _pid_cmdline_args(pid)
+    if not cmdline_args:
+        return False
+    signature = _task_signature_tokens(command_str)
+    if not signature:
+        return False
+    return all(_cmdline_has_token(cmdline_args, tok) for tok in signature)
+
+
+def _kill_pid(pid: int, grace_sec: int) -> None:
+    if not _is_pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + max(0, grace_sec)
+    while time.time() < deadline:
+        if not _is_pid_alive(pid):
+            return
+        time.sleep(0.5)
+    if _is_pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            return
+
+
+def _spawn_command(*, root: str, args: list[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        args,
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _task_key(root: str, task_type: str, entity_id: int | None) -> str:
+    eid = "-" if entity_id is None else str(entity_id)
+    return f"{root}|{task_type}|{eid}"
+
+
+def _running_count(running: dict[str, RunningTask], root: str, task_type_prefix: str) -> int:
+    return sum(1 for t in running.values() if t.root == root and t.task_type.startswith(task_type_prefix))
+
+
+def _running_campaign_total(running: dict[str, RunningTask], root: str) -> int:
+    return sum(
+        1
+        for t in running.values()
+        if t.root == root and t.task_type in {"campaign_update", "campaign_trigger", "campaign_rebuild"}
+    )
+
+
+def _running_count_for_entities(
+    running: dict[str, RunningTask],
+    root: str,
+    task_type: str,
+    entity_ids: set[int] | None,
+) -> int:
+    if entity_ids is None:
+        return _running_count(running, root, task_type)
+    return sum(
+        1
+        for t in running.values()
+        if t.root == root and t.task_type == task_type and t.entity_id is not None and t.entity_id in entity_ids
+    )
+
+
+def _is_running(running: dict[str, RunningTask], root: str, task_type: str, entity_id: int | None) -> bool:
+    for t in running.values():
+        if t.root == root and t.task_type == task_type and t.entity_id == entity_id:
+            return True
+    return False
+
+
+def _submit_if_slot(
+    *,
+    config: AgentConfig,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    root: str,
+    task_type: str,
+    entity_id: int | None,
+    args: list[str],
+    timeout_sec: int,
+    max_parallel_for_type: int,
+    popens: dict[str, subprocess.Popen[bytes]] | None = None,
+    ignore_limit: bool = False,
+    manual_request_id: int | None = None,
+) -> bool:
+    key = _task_key(root, task_type, entity_id)
+    if key in running:
+        return False
+    if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
+        return False
+
+    proc = _spawn_command(root=root, args=args)
+    task = RunningTask(
+        row_id=0,
+        root=root,
+        task_key=key,
+        task_type=task_type,
+        entity_id=entity_id,
+        command_str=_CMD_SEP.join(args),
+        timeout_sec=timeout_sec,
+        attempts=1,
+        started_at=time.time(),
+        pid=proc.pid,
+        manual_request_id=manual_request_id,
+    )
+    task.row_id = store.add_running(task)
+    running[key] = task
+    if popens is not None:
+        popens[key] = proc
+    logging.info("[%s] spawned %s pid=%s entity=%s", root, task_type, task.pid, entity_id)
+    return True
+
+
+def _respawn_task(
+    *,
+    config: AgentConfig,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+    task: RunningTask,
+) -> bool:
+    if task.attempts >= max(1, config.task_retry_max):
+        return False
+    try:
+        args = task.command_str.split(_CMD_SEP)
+        proc = _spawn_command(root=task.root, args=args)
+    except Exception as e:  # pragma: no cover - defensive
+        logging.warning("[%s] respawn failed %s: %s", task.root, task.task_type, e)
+        return False
+
+    next_task = RunningTask(
+        row_id=0,
+        root=task.root,
+        task_key=task.task_key,
+        task_type=task.task_type,
+        entity_id=task.entity_id,
+        command_str=task.command_str,
+        timeout_sec=task.timeout_sec,
+        attempts=task.attempts + 1,
+        started_at=time.time(),
+        pid=proc.pid,
+        manual_request_id=task.manual_request_id,
+    )
+    next_task.row_id = store.add_running(next_task)
+    running[next_task.task_key] = next_task
+    popens[next_task.task_key] = proc
+    logging.warning(
+        "[%s] retry %s entity=%s attempt=%s pid=%s",
+        task.root,
+        task.task_type,
+        task.entity_id,
+        next_task.attempts,
+        next_task.pid,
+    )
+    return True
+
+
+def _monitor_running(
+    *,
+    config: AgentConfig,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+) -> None:
+    now = time.time()
+    for key, task in list(running.items()):
+        proc = popens.get(key)
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None:
+                state = "done" if rc == 0 else "failed"
+                note = None if rc == 0 else "non_zero_exit"
+                store.finish(task.row_id, state=state, rc=rc, note=note)
+                running.pop(key, None)
+                popens.pop(key, None)
+                respawned = False
+                if rc != 0:
+                    logging.warning("[%s] %s entity=%s failed rc=%s", task.root, task.task_type, task.entity_id, rc)
+                    if config.task_retry_max > 1:
+                        if config.task_retry_delay_sec > 0:
+                            time.sleep(config.task_retry_delay_sec)
+                        respawned = _respawn_task(config=config, store=store, running=running, popens=popens, task=task)
+                if task.manual_request_id is not None and not respawned:
+                    store.finish_manual_request(task.manual_request_id, state, note)
+                continue
+
+        alive = _is_pid_alive(task.pid)
+        if alive and proc is None and not _pid_matches_task_command(task.pid, task.command_str):
+            store.finish(task.row_id, state="lost", rc=None, note="pid_cmd_mismatch")
+            running.pop(key, None)
+            popens.pop(key, None)
+            if task.manual_request_id is not None:
+                store.finish_manual_request(task.manual_request_id, "lost", "pid_cmd_mismatch")
+            logging.warning(
+                "[%s] %s entity=%s pid=%s command-mismatch detected, marking lost",
+                task.root,
+                task.task_type,
+                task.entity_id,
+                task.pid,
+            )
+            continue
+
+        elapsed = now - task.started_at
+        timeout_threshold: int | None = None
+        if task.timeout_sec > 0 and config.worker_watchdog_sec > 0:
+            timeout_threshold = min(task.timeout_sec, config.worker_watchdog_sec)
+        elif task.timeout_sec > 0:
+            timeout_threshold = task.timeout_sec
+        elif config.worker_watchdog_sec > 0:
+            timeout_threshold = config.worker_watchdog_sec
+
+        if alive and (timeout_threshold is None or elapsed <= timeout_threshold):
+            continue
+
+        if alive and timeout_threshold is not None and elapsed > timeout_threshold:
+            _kill_pid(task.pid, config.segment_kill_grace_sec)
+            store.finish(task.row_id, state="timeout", rc=None, note="killed_by_timeout")
+            running.pop(key, None)
+            popens.pop(key, None)
+            logging.warning("[%s] %s entity=%s timeout=%ss", task.root, task.task_type, task.entity_id, int(timeout_threshold))
+            allow_restart = (config.worker_stuck_policy or "skip").lower() == "restart"
+            restart_cap = max(0, config.worker_stuck_restart_limit)
+            respawned = False
+            if allow_restart and task.attempts <= restart_cap:
+                if config.task_retry_delay_sec > 0:
+                    time.sleep(config.task_retry_delay_sec)
+                respawned = _respawn_task(config=config, store=store, running=running, popens=popens, task=task)
+            if task.manual_request_id is not None and not respawned:
+                store.finish_manual_request(task.manual_request_id, "timeout", "killed_by_timeout")
+            continue
+
+        if not alive:
+            store.finish(task.row_id, state="lost", rc=None, note="pid_not_alive")
+            running.pop(key, None)
+            popens.pop(key, None)
+            if task.manual_request_id is not None:
+                store.finish_manual_request(task.manual_request_id, "lost", "pid_not_alive")
+            logging.warning("[%s] %s entity=%s pid_lost=%s", task.root, task.task_type, task.entity_id, task.pid)
+
+
+def _load_orphans_from_store(store: TaskStore) -> dict[str, RunningTask]:
+    out: dict[str, RunningTask] = {}
+    for row in store.running_rows():
+        t = RunningTask(
+            row_id=int(row["id"]),
+            root=str(row["root"]),
+            task_key=str(row["task_key"]),
+            task_type=str(row["task_type"]),
+            entity_id=int(row["entity_id"]) if row["entity_id"] is not None else None,
+            command_str=str(row["command_str"]),
+            timeout_sec=int(row["timeout_sec"]),
+            attempts=int(row["attempts"]),
+            started_at=float(row["started_at"]),
+            pid=int(row["pid"]),
+            manual_request_id=int(row["manual_request_id"]) if row["manual_request_id"] is not None else None,
+        )
+        out[t.task_key] = t
+    return out
+
+
+def _dispatch_manual_requests_for_root(
+    *,
+    config: AgentConfig,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+    root: str,
+    seg_prio_ring: deque[int],
+    seg_reg_ring: deque[int],
+    trg_prio_ring: deque[int],
+    trg_reg_ring: deque[int],
+    reb_prio_ring: deque[int],
+    reb_reg_ring: deque[int],
+) -> None:
+    pending = store.pending_manual_requests(root, limit=64)
+    if not pending:
+        return
+    for row in pending:
+        req_id = int(row["id"])
+        task_type = str(row["task_type"] or "").strip()
+        entity_id = int(row["entity_id"]) if row["entity_id"] is not None else None
+        raw_cmd = str(row["command_str"] or "").strip()
+        timeout_sec = int(row["timeout_sec"] or config.command_timeout_sec)
+        if not task_type or not raw_cmd:
+            store.finish_manual_request(req_id, "failed", "invalid_request_payload")
+            continue
+        args = raw_cmd.split(_CMD_SEP)
+        if not args:
+            store.finish_manual_request(req_id, "failed", "empty_command")
+            continue
+
+        launched = _submit_if_slot(
+            config=config,
+            store=store,
+            running=running,
+            root=root,
+            task_type=task_type,
+            entity_id=entity_id,
+            args=args,
+            timeout_sec=timeout_sec,
+            max_parallel_for_type=1,
+            popens=popens,
+            ignore_limit=True,
+            manual_request_id=req_id,
+        )
+        if not launched:
+            store.finish_manual_request(req_id, "skipped", "already_running")
+            continue
+
+        task_key = _task_key(root, task_type, entity_id)
+        store.mark_manual_request_launched(req_id, task_key)
+
+        if task_type == "segment":
+            _mark_ring_entity_executed(seg_prio_ring, entity_id)
+            _mark_ring_entity_executed(seg_reg_ring, entity_id)
+        elif task_type == "campaign_trigger":
+            _mark_ring_entity_executed(trg_prio_ring, entity_id)
+            _mark_ring_entity_executed(trg_reg_ring, entity_id)
+        elif task_type == "campaign_rebuild":
+            _mark_ring_entity_executed(reb_prio_ring, entity_id)
+            _mark_ring_entity_executed(reb_reg_ring, entity_id)
+
+        logging.info(
+            "[%s] manual request launched id=%s task=%s entity=%s",
+            root,
+            req_id,
+            task_type,
+            entity_id,
+        )
+
+
+def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
+    logging.info("MCD loop started")
+    base_config = config
+
+    segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
+    campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
+    if config.disable_whitelist:
+        segment_whitelist = set()
+        campaign_whitelist = set()
+
+    store = TaskStore(config.state_db_path)
+    store.put_runtime_sync("local_runtime", local_runtime_overrides(config))
+    inventory = InstanceInventory(config.state_db_path)
+    seeded = ensure_seeded(inventory, config)
+    logging.info("Instance inventory loaded: %s", seeded)
+    try:
+        rows, source = fetch_custom_manifest(config, use_cache_on_error=True)
+        logging.info("Custom scripts manifest loaded: source=%s count=%s", source, len(rows))
+    except Exception as e:
+        logging.warning("Custom scripts manifest prefetch failed: %s", e)
+
+    running = _load_orphans_from_store(store)
+    for key, task in list(running.items()):
+        if _is_pid_alive(task.pid) and _pid_matches_task_command(task.pid, task.command_str):
+            logging.info("[%s] adopted running task after restart: %s entity=%s pid=%s", task.root, task.task_type, task.entity_id, task.pid)
+            continue
+        note = "daemon_restart_pid_cmd_mismatch" if _is_pid_alive(task.pid) else "daemon_restart_pid_not_alive"
+        store.finish(task.row_id, state="lost", rc=None, note=note)
+        running.pop(key, None)
+    popens: dict[str, subprocess.Popen[bytes]] = {}
+
+    installs = inventory.list_instances()
+    segment_prio_rings: dict[str, deque[int]] = {}
+    segment_reg_rings: dict[str, deque[int]] = {}
+    campaign_trigger_prio_rings: dict[str, deque[int]] = {}
+    campaign_trigger_reg_rings: dict[str, deque[int]] = {}
+    campaign_rebuild_prio_rings: dict[str, deque[int]] = {}
+    campaign_rebuild_reg_rings: dict[str, deque[int]] = {}
+    segment_prio_sets: dict[str, set[int]] = {}
+    segment_reg_sets: dict[str, set[int]] = {}
+    campaign_prio_sets: dict[str, set[int]] = {}
+    campaign_reg_sets: dict[str, set[int]] = {}
+    campaign_round_robin: dict[str, int] = {}
+    campaign_chain_pending_trigger: dict[str, int] = {}
+    segment_resume_rings: dict[str, deque[int]] = {}
+    queue_samples: dict[str, deque[tuple[float, int]]] = {}
+    throttled: dict[str, bool] = {}
+    last_import_poll_ts: dict[str, float] = {}
+    import_pending_cache: dict[str, int] = {}
+    last_cleanup_ts: dict[str, float] = {}
+    last_cache_clear_ts: dict[str, float] = {}
+    last_cache_warm_ts: dict[str, float] = {}
+    last_tasks_compact_ts = 0.0
+    last_outbound_events_prune_ts = 0.0
+    last_custom_cache_cleanup_ts = 0.0
+    jobs_last_run: dict[tuple[str, str], float] = {}
+    last_backup_schedule_ts = 0.0
+    last_backup_schedule_day = ""
+    backup_thread: threading.Thread | None = None
+    backup_dispatch_pause_active = False
+    next_plan_refresh_at = 0.0
+    next_update_check_at = 0.0
+    update_deferred_by_backup = False
+    next_service_profile_apply_at = 0.0
+    next_runtime_overrides_poll_at = 0.0
+    next_profile_guard_at = 0.0
+    last_runtime_overrides_fp = ""
+    last_runtime_overrides_error = ""
+    last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
+    pusher = MCCStatePusher(config)
+
+    while True:
+        _monitor_running(config=config, store=store, running=running, popens=popens)
+        now = time.time()
+
+        local_runtime = local_runtime_overrides(config)
+        local_fp = overrides_fingerprint(local_runtime)
+        if local_fp != last_local_runtime_fp:
+            store.put_runtime_sync("local_runtime", local_runtime)
+            last_local_runtime_fp = local_fp
+            if config.mcc_url and config.mcc_token:
+                pushed = push_runtime_overrides(config, local_runtime, merge=False)
+                p_status = str(pushed.get("status", "")).strip().lower()
+                if p_status == "ok":
+                    logging.info(
+                        "runtime-overrides local change pushed to MCC (keys=%s)",
+                        ",".join(sorted(local_runtime.keys())) if local_runtime else "-",
+                    )
+                elif p_status != "disabled":
+                    logging.warning("runtime-overrides local push failed: %s", pushed.get("reason", "unknown"))
+
+        if consume_poll_trigger(config):
+            next_runtime_overrides_poll_at = 0.0
+            logging.info("runtime-overrides poll trigger consumed: immediate MCC sync requested")
+
+        if config.mcc_url and config.mcc_token and now >= next_runtime_overrides_poll_at:
+            ro = fetch_runtime_overrides(config)
+            status = str(ro.get("status", "")).strip().lower()
+            poll_interval = max(15, min(300, int(config.mcc_push_interval_sec or config.poll_interval_sec or 60)))
+            if status == "ok":
+                overrides_raw = ro.get("runtime_overrides")
+                overrides = overrides_raw if isinstance(overrides_raw, dict) else {}
+                store.put_runtime_sync("mcc_runtime", overrides)
+                fp = overrides_fingerprint(overrides)
+                if fp != last_runtime_overrides_fp:
+                    applied = apply_remote_overrides(base_config, overrides)
+                    next_cfg = applied["config"]
+                    applied_keys = list(applied.get("applied_keys", []))
+                    unsupported_keys = list(applied.get("unsupported_keys", []))
+                    blocked_keys = list(applied.get("blocked_keys", []))
+                    if unsupported_keys:
+                        logging.warning(
+                            "runtime-overrides ignored unsupported keys: %s",
+                            ",".join(str(x) for x in unsupported_keys),
+                        )
+                    if blocked_keys:
+                        logging.warning(
+                            "runtime-overrides ignored blocked keys (restart/static-only): %s",
+                            ",".join(str(x) for x in blocked_keys),
+                        )
+                    if next_cfg != config:
+                        old_profile = (config.profile_name or "").strip().lower()
+                        config = next_cfg
+                        pusher.cfg = config
+                        next_plan_refresh_at = 0.0
+                        next_update_check_at = 0.0
+                        next_service_profile_apply_at = 0.0
+                        segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
+                        campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
+                        if config.disable_whitelist:
+                            segment_whitelist = set()
+                            campaign_whitelist = set()
+                        new_profile = (config.profile_name or "").strip().lower()
+                        logging.info(
+                            "runtime-overrides applied from MCC: keys=%s profile=%s->%s",
+                            ",".join(applied_keys) if applied_keys else "-",
+                            old_profile or "-",
+                            new_profile or "-",
+                        )
+                    else:
+                        logging.info(
+                            "runtime-overrides synced from MCC: no effective change (keys=%s)",
+                            ",".join(applied_keys) if applied_keys else "-",
+                        )
+                    last_runtime_overrides_fp = fp
+                    store.put_runtime_sync(
+                        "active_runtime",
+                        {
+                            "profile": (config.profile_name or "").strip().lower(),
+                            "applied_keys": applied_keys,
+                            "blocked_keys": blocked_keys,
+                            "unsupported_keys": unsupported_keys,
+                        },
+                    )
+                last_runtime_overrides_error = ""
+                next_runtime_overrides_poll_at = now + poll_interval
+            elif status == "disabled":
+                last_runtime_overrides_error = ""
+                next_runtime_overrides_poll_at = now + poll_interval
+            else:
+                reason = str(ro.get("reason", "unknown")).strip() or "unknown"
+                if reason != last_runtime_overrides_error:
+                    logging.warning("runtime-overrides fetch failed: %s", reason)
+                last_runtime_overrides_error = reason
+                next_runtime_overrides_poll_at = now + max(30, poll_interval)
+
+        if config.tasks_compact_enabled:
+            quiet_hour = max(0, min(23, int(config.tasks_compact_quiet_hour)))
+            quiet_window_min = max(1, min(180, int(config.tasks_compact_quiet_window_min)))
+            interval_sec = max(300, int(config.tasks_compact_interval_sec))
+            dt = datetime.now()
+            in_quiet = dt.hour == quiet_hour and dt.minute < quiet_window_min
+            if in_quiet and (last_tasks_compact_ts == 0.0 or now - last_tasks_compact_ts >= interval_sec):
+                can_vacuum = bool(config.tasks_compact_vacuum and not running)
+                try:
+                    deleted, remaining, vacuum_done = store.compact_tasks(
+                        now_ts=now,
+                        keep_days=config.tasks_history_keep_days,
+                        max_rows=config.tasks_history_max_rows,
+                        run_vacuum=can_vacuum,
+                    )
+                    if deleted > 0 or vacuum_done:
+                        logging.info(
+                            "tasks compaction: deleted=%s remaining_non_running=%s vacuum=%s",
+                            deleted,
+                            remaining,
+                            "on" if vacuum_done else "off",
+                        )
+                    elif config.tasks_compact_vacuum and running:
+                        logging.info("tasks compaction: vacuum postponed (running tasks=%s)", len(running))
+                except Exception as e:
+                    logging.warning("tasks compaction failed: %s", e)
+                last_tasks_compact_ts = now
+
+        # Keep outbound profile-event queue bounded; old delivered events do
+        # not have operational value after retention window.
+        quiet_hour = max(0, min(23, int(config.tasks_compact_quiet_hour)))
+        quiet_window_min = max(1, min(180, int(config.tasks_compact_quiet_window_min)))
+        interval_sec = max(300, int(config.tasks_compact_interval_sec))
+        dt = datetime.now()
+        in_quiet = dt.hour == quiet_hour and dt.minute < quiet_window_min
+        if in_quiet and (
+            last_outbound_events_prune_ts == 0.0
+            or now - last_outbound_events_prune_ts >= interval_sec
+        ):
+            try:
+                removed = prune_sent_profile_events(
+                    config,
+                    keep_days=max(1, int(config.outbound_events_sent_keep_days)),
+                )
+                if removed > 0:
+                    logging.info("outbound events prune: removed=%s", removed)
+            except Exception as e:
+                logging.warning("outbound events prune failed: %s", e)
+            last_outbound_events_prune_ts = now
+
+        if config.custom_cache_cleanup_enabled:
+            quiet_hour = max(0, min(23, int(config.custom_cache_cleanup_quiet_hour)))
+            quiet_window_min = max(1, min(180, int(config.custom_cache_cleanup_quiet_window_min)))
+            interval_sec = max(300, int(config.custom_cache_cleanup_interval_sec))
+            dt = datetime.now()
+            in_quiet = dt.hour == quiet_hour and dt.minute < quiet_window_min
+            if in_quiet and (
+                last_custom_cache_cleanup_ts == 0.0
+                or now - last_custom_cache_cleanup_ts >= interval_sec
+            ):
+                try:
+                    stats = cleanup_custom_cache(config, known_keys=cached_custom_manifest_keys(config))
+                    if int(stats.get("logs_removed", 0) or 0) > 0 or int(stats.get("downloads_removed", 0) or 0) > 0:
+                        logging.info(
+                            "custom cache cleanup: logs_removed=%s downloads_removed=%s errors=%s",
+                            int(stats.get("logs_removed", 0) or 0),
+                            int(stats.get("downloads_removed", 0) or 0),
+                            int(stats.get("errors", 0) or 0),
+                        )
+                except Exception as e:
+                    logging.warning("custom cache cleanup failed: %s", e)
+                last_custom_cache_cleanup_ts = now
+
+        if now >= next_update_check_at:
+            update_backup_locked = False
+            if config.backup_enabled:
+                try:
+                    update_backup_locked = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(config)
+                except Exception as e:
+                    logging.warning("auto-update backup lock check failed: %s", e)
+                    update_backup_locked = False
+
+            if update_backup_locked:
+                if not update_deferred_by_backup:
+                    logging.info("auto-update deferred: backup lock active; retry on next cycle")
+                update_deferred_by_backup = True
+                next_update_check_at = now + max(5, int(config.poll_interval_sec or 10))
+            else:
+                if update_deferred_by_backup:
+                    logging.info("auto-update defer cleared: backup lock released")
+                update_deferred_by_backup = False
+                try:
+                    note, wait_sec = maybe_auto_update(config)
+                    if note:
+                        logging.info("%s", note)
+                    next_update_check_at = now + max(60, int(wait_sec or config.mcd_update_check_interval_sec))
+                except Exception as e:
+                    logging.warning("auto-update check failed: %s", e)
+                    next_update_check_at = now + max(120, int(config.mcd_update_check_interval_sec))
+
+        if (
+            config.service_profiles_enabled
+            and config.service_profiles_auto_apply
+            and now >= next_service_profile_apply_at
+        ):
+            try:
+                components = [c.strip().lower() for c in (config.service_profiles_components or []) if str(c).strip()]
+                if not components:
+                    components = ["php_fpm", "mysql"]
+                for comp in components:
+                    if comp not in {"php_fpm", "php-fpm", "mysql", "apt"}:
+                        continue
+                    res = service_profiles_apply_once(config, component=comp, dry_run=False)
+                    status = str(res.get("status", "")).strip().lower()
+                    if status == "ok":
+                        applied = res.get("apply")
+                        if isinstance(applied, dict):
+                            logging.info("service-profile %s apply: %s", comp, applied.get("status", "ok"))
+                    elif status == "skipped":
+                        logging.info("service-profile %s skipped: %s", comp, res.get("reason", "-"))
+                    else:
+                        logging.warning("service-profile %s apply failed: %s", comp, res.get("reason", "unknown"))
+                next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
+            except Exception as e:
+                logging.warning("service-profile auto-apply failed: %s", e)
+                next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
+
+        if config.backup_enabled and config.backup_schedule_enabled:
+            quiet_hour = max(0, min(23, int(config.backup_schedule_quiet_hour)))
+            quiet_window_min = max(1, min(180, int(config.backup_schedule_quiet_window_min)))
+            interval_sec = max(300, int(config.backup_schedule_interval_sec))
+            dt_local = datetime.now()
+            in_quiet = dt_local.hour == quiet_hour and dt_local.minute < quiet_window_min
+            if in_quiet and (last_backup_schedule_ts == 0.0 or now - last_backup_schedule_ts >= interval_sec):
+                run_day = dt_local.strftime("%Y-%m-%d")
+                if run_day == last_backup_schedule_day:
+                    # Already executed (or skipped by completed state) for current daily slot.
+                    pass
+                elif backup_thread is not None and backup_thread.is_alive():
+                    logging.info("backup schedule: previous run still active, skip this slot")
+                elif _backup_done_for_local_date(config, dt_local):
+                    logging.info("backup schedule: successful backup for %s already exists, skip", run_day)
+                    last_backup_schedule_day = run_day
+                    last_backup_schedule_ts = now
+                else:
+                    def _backup_worker() -> None:
+                        try:
+                            res = backup_run(config, None)
+                            if res.ok:
+                                logging.info("backup schedule: %s", res.message)
+                            else:
+                                logging.warning("backup schedule failed: %s", res.message)
+                        except Exception as e:
+                            logging.warning("backup schedule failed: %s", e)
+                    backup_thread = threading.Thread(target=_backup_worker, name="mcd-backup", daemon=True)
+                    backup_thread.start()
+                    last_backup_schedule_ts = now
+                    last_backup_schedule_day = run_day
+
+        if pusher.enabled() and should_poll_alert(now, pusher.last_alert_poll_ts, config.mcc_push_alert_poll_interval_sec):
+            try:
+                signals_payload = collect_signals(window_min=config.mcc_push_alert_window_min)
+                pusher.set_signals(signals_payload, now)
+            except Exception as e:
+                logging.warning("signals collect failed: %s", e)
+            pusher.last_alert_poll_ts = now
+
+        if now >= next_plan_refresh_at:
+            installs = inventory.list_instances()
+            logging.info("Instance inventory count: %d", len(installs))
+            now_utc = datetime.now(timezone.utc)
+            now_ts = int(now_utc.timestamp())
+            for inst in installs:
+                # Mautic 6 core hotfix: ReloadHelper may pass null metadata to
+                # PluginUpdateEvent (strict array in M6), which breaks
+                # plugin install/reload. Keep this check idempotent and always
+                # active so version upgrades that overwrite the file are
+                # auto-patched again on next planning cycle.
+                try:
+                    patch_gate = should_apply_m6_plugin_update_metadata_patch(
+                        inst,
+                        policy=config.mautic6_core_patch_policy,
+                        version_min=config.mautic6_core_patch_version_min,
+                        version_max=config.mautic6_core_patch_version_max,
+                        apply_if_version_unknown=bool(config.mautic6_core_patch_apply_if_version_unknown),
+                    )
+                    if bool(patch_gate.get("apply", False)):
+                        patch_res = ensure_m6_plugin_update_metadata_patch(inst)
+                        p_status = str(patch_res.get("status", "")).strip().lower()
+                        if p_status == "patched":
+                            logging.info("[%s] mautic6 core patch applied: %s", inst.root, patch_res.get("path", "-"))
+                        elif p_status == "error":
+                            logging.warning("[%s] mautic6 core patch error: %s", inst.root, patch_res.get("reason", "unknown"))
+                    else:
+                        reason = str(patch_gate.get("reason", "")).strip()
+                        version = str(patch_gate.get("version", "")).strip() or "-"
+                        if reason not in {"policy_off", "not_mautic_6"}:
+                            logging.info("[%s] mautic6 core patch skipped: reason=%s version=%s", inst.root, reason or "n/a", version)
+                except Exception as e:
+                    logging.warning("[%s] mautic6 core patch check failed: %s", inst.root, e)
+
+                if not inst.db:
+                    continue
+                root = inst.root
+                db = MauticDB(inst.db)
+                inst_now = now_utc
+                if inst.mautic_timezone:
+                    try:
+                        inst_now = now_utc.astimezone(ZoneInfo(inst.mautic_timezone))
+                    except Exception:
+                        logging.warning("[%s] invalid mautic timezone in local.php: %s", root, inst.mautic_timezone)
+                sql_ctx = {
+                    "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                    "now_local": inst_now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "window_start_local_24h": (inst_now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+                segment_ids: list[int] | None = None
+                campaign_ids: list[int] | None = None
+                try:
+                    segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
+                except Exception as e:
+                    logging.warning("[%s] segment query failed: %s", root, e)
+
+                try:
+                    campaigns_due_sql = _campaign_sql_for_major(config.sql_campaigns_due, inst.mautic_major)
+                    campaign_ids = db.fetch_ids(campaigns_due_sql, limit=5000, context=sql_ctx)
+                except Exception as e:
+                    logging.warning("[%s] campaign query failed: %s", root, e)
+                if campaign_ids is not None and (config.profile_name or "").strip().lower() == "tiny":
+                    # Tiny mode: newest published campaigns first.
+                    campaign_ids = sorted(list(dict.fromkeys(campaign_ids)), reverse=True)
+
+                if segment_ids is not None:
+                    segment_weight_rows: list[dict[str, object]] = []
+                    try:
+                        segment_weight_rows = db.fetch_rows(config.sql_segment_weights, limit=5000, context=sql_ctx)
+                    except Exception as e:
+                        logging.warning("[%s] segment weight query failed: %s", root, e)
+                        segment_weight_rows = []
+
+                    seg_w = store.get_weights("segment", root, config.weights_recalc_interval_sec)
+                    if _needs_weight_recalc(segment_ids, seg_w):
+                        seg_w = _segment_weights(segment_ids, segment_weight_rows, segment_whitelist, now_ts)
+                        store.put_weights("segment", root, seg_w)
+                    stale_seg_ids = _stale_segment_priority_ids(
+                        segment_ids,
+                        segment_weight_rows,
+                        now_ts,
+                        stale_sec=_SEGMENT_STALE_PRIORITY_SEC,
+                    )
+
+                    seg_prio, seg_reg = _split_segment_circles(
+                        segment_ids,
+                        seg_w,
+                        segment_whitelist,
+                        config.segment_priority_weight_threshold,
+                        config.segment_priority_size,
+                        stale_priority_ids=stale_seg_ids,
+                    )
+                    if config.ring_mode == "single":
+                        seg_prio, seg_reg = [], list(dict.fromkeys(segment_ids))
+                    if not _partition_complete(segment_ids, seg_prio, seg_reg):
+                        logging.warning("[%s] invalid segment partition, forcing single ring", root)
+                        seg_prio, seg_reg = [], sorted(list(dict.fromkeys(segment_ids)))
+                    segment_prio_rings[root] = _reconcile_ring(segment_prio_rings.get(root), seg_prio)
+                    segment_reg_rings[root] = _reconcile_ring(segment_reg_rings.get(root), seg_reg)
+                    segment_prio_sets[root] = set(seg_prio)
+                    segment_reg_sets[root] = set(seg_reg)
+                else:
+                    logging.warning("[%s] segment planning skipped: preserving previous segment rings", root)
+
+                if campaign_ids is not None:
+                    camp_w = store.get_weights("campaign", root, config.weights_recalc_interval_sec)
+                    campaign_weight_rows: list[dict[str, object]] = []
+                    if _needs_weight_recalc(campaign_ids, camp_w):
+                        try:
+                            campaign_weights_sql = _campaign_sql_for_major(config.sql_campaign_weights, inst.mautic_major)
+                            campaign_weight_rows = db.fetch_rows(campaign_weights_sql, limit=5000, context=sql_ctx)
+                        except Exception as e:
+                            logging.warning("[%s] campaign weight query failed: %s", root, e)
+                            campaign_weight_rows = []
+                        camp_w = _campaign_weights(campaign_ids, campaign_weight_rows, campaign_whitelist, now_ts)
+                        store.put_weights("campaign", root, camp_w)
+                    else:
+                        try:
+                            campaign_weights_sql = _campaign_sql_for_major(config.sql_campaign_weights, inst.mautic_major)
+                            campaign_weight_rows = db.fetch_rows(campaign_weights_sql, limit=5000, context=sql_ctx)
+                        except Exception as e:
+                            logging.warning("[%s] campaign weight query failed: %s", root, e)
+                            campaign_weight_rows = []
+
+                    camp_prio, camp_reg = _split_campaign_circles(
+                        campaign_ids,
+                        camp_w,
+                        campaign_whitelist,
+                        config.campaign_priority_size,
+                        _latest_campaign_ids(campaign_weight_rows, config.campaign_latest_priority_count),
+                    )
+                    if config.ring_mode == "single":
+                        camp_prio, camp_reg = [], list(dict.fromkeys(campaign_ids))
+                    if not _partition_complete(campaign_ids, camp_prio, camp_reg):
+                        logging.warning("[%s] invalid campaign partition, forcing single ring", root)
+                        camp_prio, camp_reg = [], sorted(list(dict.fromkeys(campaign_ids)))
+                    campaign_trigger_prio_rings[root] = _reconcile_ring(campaign_trigger_prio_rings.get(root), camp_prio)
+                    campaign_trigger_reg_rings[root] = _reconcile_ring(campaign_trigger_reg_rings.get(root), camp_reg)
+                    campaign_rebuild_prio_rings[root] = _reconcile_ring(campaign_rebuild_prio_rings.get(root), camp_prio)
+                    campaign_rebuild_reg_rings[root] = _reconcile_ring(campaign_rebuild_reg_rings.get(root), camp_reg)
+                    campaign_prio_sets[root] = set(camp_prio)
+                    campaign_reg_sets[root] = set(camp_reg)
+                else:
+                    logging.warning("[%s] campaign planning skipped: preserving previous campaign rings", root)
+
+                # Use freshly planned rings/sets in the same tick.
+                # Without rebinding, dispatch operates on previous-cycle objects
+                # (captured before reconcile), which can skew 3+1 behavior.
+                seg_prio_ring = segment_prio_rings.setdefault(root, deque())
+                seg_reg_ring = segment_reg_rings.setdefault(root, deque())
+                trg_prio_ring = campaign_trigger_prio_rings.setdefault(root, deque())
+                trg_reg_ring = campaign_trigger_reg_rings.setdefault(root, deque())
+                reb_prio_ring = campaign_rebuild_prio_rings.setdefault(root, deque())
+                reb_reg_ring = campaign_rebuild_reg_rings.setdefault(root, deque())
+                seg_prio_set = segment_prio_sets.setdefault(root, set(seg_prio_ring))
+                seg_reg_set = segment_reg_sets.setdefault(root, set(seg_reg_ring))
+                camp_prio_set = campaign_prio_sets.setdefault(root, set(trg_prio_ring) | set(reb_prio_ring))
+                camp_reg_set = campaign_reg_sets.setdefault(root, set(trg_reg_ring) | set(reb_reg_ring))
+
+                q_samples = queue_samples.setdefault(root, deque())
+                if config.disable_throttle:
+                    throttled[root] = False
+                else:
+                    try:
+                        queue_count = db.fetch_count(config.sql_mail_queue_count, context=sql_ctx)
+                    except Exception as e:
+                        logging.warning("[%s] mail queue query failed: %s", root, e)
+                        queue_count = 0
+                    q_samples.append((now, queue_count))
+                    throttled[root] = _compute_throttle_active(
+                        q_samples,
+                        threshold=config.queue_throttle_threshold,
+                        window_min=config.queue_throttle_window_min,
+                    )
+
+                if now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
+                    try:
+                        import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
+                    except Exception as e:
+                        logging.warning("[%s] import query failed: %s", root, e)
+                        import_pending_cache[root] = 0
+                    last_import_poll_ts[root] = now
+
+            next_plan_refresh_at = now + max(1, config.poll_interval_sec)
+
+        if pusher.enabled():
+            pending_profile_event = read_pending_profile_event(config)
+            payload = pusher.build_payload(
+                installs=installs,
+                profile_name=config.profile_name,
+                now_ts=now,
+                profile_event=pending_profile_event,
+            )
+            payload_no_ts = dict(payload)
+            payload_no_ts.pop("sent_at_utc", None)
+            do_push, _changed = pusher.should_push(now, payload_no_ts)
+            if pending_profile_event:
+                do_push = True
+            if do_push:
+                ok, msg = pusher.send(payload)
+                log_push_result(ok, msg)
+                if ok:
+                    pusher.mark_pushed(now, payload_no_ts)
+                if pending_profile_event:
+                    clear_pending_profile_event(
+                        config,
+                        event_id=str(pending_profile_event.get("event_id", "")).strip() or None,
+                        delivered=bool(ok),
+                        error=None if ok else str(msg),
+                    )
+
+        if config.mcc_url and config.mcc_token and now >= next_profile_guard_at:
+            guard_interval = max(60, int(config.mcc_push_interval_sec or config.poll_interval_sec or 300))
+            try:
+                drift = check_profile_drift_with_mcc(
+                    config.config_file_path,
+                    current_profile=(config.profile_name or ""),
+                    current_config_sha=(config.config_sha256 or ""),
+                )
+                if str(drift.get("status", "")).strip().lower() == "drift":
+                    old_profile = (config.profile_name or "").strip().lower() or None
+                    desired_profile = str(drift.get("desired_profile", "")).strip().lower() or None
+                    ok, note = recover_config_from_mcc(
+                        config.config_file_path,
+                        reason=(
+                            "profile_drift"
+                            f" local={old_profile or '-'} desired={desired_profile or '-'}"
+                            f" source={str(drift.get('config_source', '-') or '-')}"
+                        ),
+                    )
+                    if ok:
+                        logging.error(
+                            "profile drift detected and repaired from MCC desired config: local=%s desired=%s (%s)",
+                            old_profile or "-",
+                            desired_profile or "-",
+                            note,
+                        )
+                        config = load_config(config.config_file_path, allow_recover_from_mcc=False)
+                        base_config = config
+                        pusher.cfg = config
+                        next_plan_refresh_at = 0.0
+                        next_update_check_at = 0.0
+                        next_service_profile_apply_at = 0.0
+                        next_runtime_overrides_poll_at = 0.0
+                        segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
+                        campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
+                        if config.disable_whitelist:
+                            segment_whitelist = set()
+                            campaign_whitelist = set()
+                        try:
+                            queue_profile_event(
+                                config,
+                                source="auto_recover",
+                                initiated_by_user=False,
+                                old_profile=old_profile,
+                                new_profile=(config.profile_name or "").strip().lower() or desired_profile,
+                                reason="auto_recover_profile_drift",
+                                details={
+                                    "desired_profile": desired_profile,
+                                    "mcc_config_source": str(drift.get("config_source", "")).strip() or None,
+                                },
+                            )
+                        except Exception as e:
+                            logging.warning("profile-drift repair event enqueue failed: %s", e)
+                    else:
+                        logging.error(
+                            "profile drift detected but MCC repair failed: local=%s desired=%s err=%s",
+                            old_profile or "-",
+                            desired_profile or "-",
+                            note,
+                        )
+            except Exception as e:
+                logging.warning("profile guard check failed: %s", e)
+            next_profile_guard_at = now + guard_interval
+
+        if (config.profile_name or "").strip().lower() == "passive":
+            logging.info("Passive profile active: planning-only mode (no task dispatch)")
+            if single_cycle:
+                return
+            time.sleep(max(0.1, float(config.dispatch_interval_sec)))
+            continue
+
+        backup_running = False
+        if config.backup_enabled:
+            try:
+                backup_running = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(config)
+            except Exception as e:
+                logging.warning("backup lock check failed: %s", e)
+                backup_running = False
+        backup_dispatch_pause, backup_pause_reason = _backup_dispatch_pause_state(
+            config,
+            backup_running=backup_running,
+        )
+        if backup_dispatch_pause != backup_dispatch_pause_active:
+            if backup_dispatch_pause:
+                logging.info(
+                    "backup guard active (%s): new task dispatch paused for all task types (running tasks continue)",
+                    backup_pause_reason or "unknown",
+                )
+            else:
+                logging.info("backup guard released: task dispatch resumed")
+            backup_dispatch_pause_active = backup_dispatch_pause
+
+        for inst in installs:
+            if not inst.db:
+                logging.warning("[%s] skip install without db config", inst.root)
+                continue
+
+            root = inst.root
+            db = MauticDB(inst.db)
+            seg_prio_ring = segment_prio_rings.setdefault(root, deque())
+            seg_reg_ring = segment_reg_rings.setdefault(root, deque())
+            trg_prio_ring = campaign_trigger_prio_rings.setdefault(root, deque())
+            trg_reg_ring = campaign_trigger_reg_rings.setdefault(root, deque())
+            reb_prio_ring = campaign_rebuild_prio_rings.setdefault(root, deque())
+            reb_reg_ring = campaign_rebuild_reg_rings.setdefault(root, deque())
+            seg_prio_set = segment_prio_sets.setdefault(root, set())
+            seg_reg_set = segment_reg_sets.setdefault(root, set())
+            camp_prio_set = campaign_prio_sets.setdefault(root, set())
+            camp_reg_set = campaign_reg_sets.setdefault(root, set())
+
+            _dispatch_manual_requests_for_root(
+                config=config,
+                store=store,
+                running=running,
+                popens=popens,
+                root=root,
+                seg_prio_ring=seg_prio_ring,
+                seg_reg_ring=seg_reg_ring,
+                trg_prio_ring=trg_prio_ring,
+                trg_reg_ring=trg_reg_ring,
+                reb_prio_ring=reb_prio_ring,
+                reb_reg_ring=reb_reg_ring,
+            )
+
+            if backup_dispatch_pause:
+                continue
+
+            if config.segment_mode == "classic_loop":
+                args = render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_segment_full_update_template,
+                    batch_limit=config.segment_batch_limit,
+                )
+                _submit_if_slot(
+                    config=config,
+                    store=store,
+                    running=running,
+                    root=root,
+                    task_type="segment",
+                    entity_id=None,
+                    args=args,
+                    timeout_sec=config.command_timeout_sec,
+                    max_parallel_for_type=1,
+                    popens=popens,
+                )
+            else:
+                if throttled.get(root, False):
+                    if config.segment_throttle_whitelist_only:
+                        seg_prio_limit = max(0, config.segment_throttle_whitelist_parallel)
+                        seg_reg_limit = 0
+                    else:
+                        seg_prio_limit = max(0, config.segment_priority_parallel_throttled)
+                        seg_reg_limit = max(0, config.segment_regular_parallel_throttled)
+                else:
+                    seg_prio_limit = max(0, config.segment_priority_parallel_idle)
+                    seg_reg_limit = max(0, config.segment_regular_parallel_idle)
+                seg_total_limit = seg_prio_limit + seg_reg_limit
+                seg_resume_ring = segment_resume_rings.setdefault(root, deque())
+
+                if throttled.get(root, False) and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
+                    for key, task in list(running.items()):
+                        if task.root != root or task.task_type != "segment":
+                            continue
+                        if task.entity_id is None or task.entity_id in segment_whitelist:
+                            continue
+                        _kill_pid(task.pid, config.segment_kill_grace_sec)
+                        store.finish(task.row_id, state="timeout", rc=None, note="throttle_kill")
+                        running.pop(key, None)
+                        popens.pop(key, None)
+                        if task.entity_id not in seg_resume_ring:
+                            seg_resume_ring.appendleft(task.entity_id)
+
+                if not throttled.get(root, False) and seg_resume_ring:
+                    _fill_from_ring(
+                        ring=seg_resume_ring,
+                        ring_limit=seg_total_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=None,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                    )
+
+                if throttled.get(root, False) and config.segment_throttle_whitelist_only:
+                    wl_ids = list(dict.fromkeys([x for x in list(seg_prio_ring) + list(seg_reg_ring) if x in segment_whitelist]))
+                    seg_wl_ring = deque(wl_ids)
+                    _fill_from_ring(
+                        ring=seg_wl_ring,
+                        ring_limit=seg_prio_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=segment_whitelist,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                    )
+                    seg_cur_total = _running_count(running, root, "segment")
+                    if seg_cur_total >= seg_total_limit:
+                        pass
+                    else:
+                        # No non-whitelist launches while throttle is active.
+                        pass
+                else:
+                    _fill_from_ring(
+                        ring=seg_prio_ring,
+                        ring_limit=seg_prio_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=seg_prio_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                    )
+                    _fill_from_ring(
+                        ring=seg_reg_ring,
+                        ring_limit=seg_reg_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=seg_reg_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                    )
+                    seg_cur_total = _running_count(running, root, "segment")
+                    if seg_cur_total < seg_total_limit:
+                        spill = seg_total_limit - seg_cur_total
+                        if seg_reg_ring:
+                            _fill_from_ring(
+                                ring=seg_reg_ring,
+                                ring_limit=spill,
+                                total_limit=seg_total_limit,
+                                root=root,
+                                task_type="segment",
+                                running=running,
+                                ring_entities=seg_reg_set,
+                                config=config,
+                                store=store,
+                                popens=popens,
+                                build_args=lambda sid: render_mautic_command(
+                                    php_bin=config.php_bin,
+                                    run_as_user=config.mautic_run_as_user,
+                                    root=root,
+                                    template=config.cmd_segment_update_template,
+                                    id=sid,
+                                    batch_limit=config.segment_batch_limit,
+                                ),
+                            )
+                        elif seg_prio_ring and spill > 0:
+                            # If regular ring is empty, keep total segment concurrency at target
+                            # by temporarily borrowing regular slot(s) for priority ring.
+                            _fill_from_ring(
+                                ring=seg_prio_ring,
+                                ring_limit=seg_prio_limit + spill,
+                                total_limit=seg_total_limit,
+                                root=root,
+                                task_type="segment",
+                                running=running,
+                                ring_entities=seg_prio_set,
+                                config=config,
+                                store=store,
+                                popens=popens,
+                                build_args=lambda sid: render_mautic_command(
+                                    php_bin=config.php_bin,
+                                    run_as_user=config.mautic_run_as_user,
+                                    root=root,
+                                    template=config.cmd_segment_update_template,
+                                    id=sid,
+                                    batch_limit=config.segment_batch_limit,
+                                ),
+                            )
+
+            # `mautic:campaigns:update` is treated as synonym of
+            # `mautic:campaigns:rebuild` and is not scheduled separately.
+            # This avoids duplicate campaign pre-processing passes.
+            if (config.profile_name or "").strip().lower() == "tiny":
+                if _running_campaign_total(running, root) == 0:
+                    active_campaigns = set(trg_reg_ring) | set(trg_prio_ring) | set(reb_reg_ring) | set(reb_prio_ring)
+                    pending_trigger_id = campaign_chain_pending_trigger.get(root)
+                    if pending_trigger_id is not None and pending_trigger_id not in active_campaigns:
+                        pending_trigger_id = None
+                        campaign_chain_pending_trigger.pop(root, None)
+
+                    if pending_trigger_id is not None:
+                        _submit_if_slot(
+                            config=config,
+                            store=store,
+                            running=running,
+                            root=root,
+                            task_type="campaign_trigger",
+                            entity_id=pending_trigger_id,
+                            args=render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_campaign_trigger_template,
+                                id=pending_trigger_id,
+                                campaign_limit=config.campaign_limit,
+                                batch_limit=config.campaign_batch_limit,
+                            ),
+                            timeout_sec=config.command_timeout_sec,
+                            max_parallel_for_type=1,
+                            popens=popens,
+                        )
+                        if _is_running(running, root, "campaign_trigger", pending_trigger_id):
+                            campaign_chain_pending_trigger.pop(root, None)
+                    else:
+                        if trg_reg_ring:
+                            next_campaign_id = trg_reg_ring[0]
+                            trg_reg_ring.rotate(-1)
+                        else:
+                            next_campaign_id = None
+                        if next_campaign_id is not None:
+                            _submit_if_slot(
+                                config=config,
+                                store=store,
+                                running=running,
+                                root=root,
+                                task_type="campaign_rebuild",
+                                entity_id=next_campaign_id,
+                                args=render_mautic_command(
+                                    php_bin=config.php_bin,
+                                    run_as_user=config.mautic_run_as_user,
+                                    root=root,
+                                    template=config.cmd_campaign_rebuild_template,
+                                    id=next_campaign_id,
+                                ),
+                                timeout_sec=config.command_timeout_sec,
+                                max_parallel_for_type=1,
+                                popens=popens,
+                            )
+                            if _is_running(running, root, "campaign_rebuild", next_campaign_id):
+                                campaign_chain_pending_trigger[root] = next_campaign_id
+            # Tiny mode has a single campaign worker with rebuild->trigger chain per id.
+            # Import polling must stay independent from campaign slot occupancy.
+            if (config.profile_name or "").strip().lower() == "tiny":
+                if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+                    args = render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=config.cmd_import_template,
+                        import_limit=config.import_limit,
+                    )
+                    _submit_if_slot(
+                        config=config,
+                        store=store,
+                        running=running,
+                        root=root,
+                        task_type="import",
+                        entity_id=None,
+                        args=args,
+                        timeout_sec=config.command_timeout_sec,
+                        max_parallel_for_type=1,
+                        popens=popens,
+                    )
+                # Skip generic multi-ring campaign scheduler.
+                continue
+
+            shared_campaign_cap = max(0, config.campaign_total_parallel)
+            rr = campaign_round_robin.get(root, 0)
+            prefer_rebuild = (
+                shared_campaign_cap > 0
+                and config.enable_campaign_rebuild
+                and (rr % 2 == 1)
+            )
+            trg_prio_limit = max(0, config.campaign_trigger_priority_parallel)
+            trg_reg_limit = max(0, config.campaign_trigger_regular_parallel)
+            trg_total_limit = trg_prio_limit + trg_reg_limit
+            if shared_campaign_cap > 0:
+                rem = max(0, shared_campaign_cap - _running_campaign_total(running, root))
+                if prefer_rebuild:
+                    rem = 0
+                trg_total_limit = min(trg_total_limit, rem)
+                trg_prio_limit = min(trg_prio_limit, trg_total_limit)
+                trg_reg_limit = min(trg_reg_limit, max(0, trg_total_limit - trg_prio_limit))
+            _fill_from_ring(
+                ring=trg_prio_ring,
+                ring_limit=trg_prio_limit,
+                total_limit=trg_total_limit,
+                root=root,
+                task_type="campaign_trigger",
+                running=running,
+                ring_entities=camp_prio_set,
+                config=config,
+                store=store,
+                popens=popens,
+                build_args=lambda cid: render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_campaign_trigger_template,
+                    id=cid,
+                    campaign_limit=config.campaign_limit,
+                    batch_limit=config.campaign_batch_limit,
+                ),
+            )
+            _fill_from_ring(
+                ring=trg_reg_ring,
+                ring_limit=trg_reg_limit,
+                total_limit=trg_total_limit,
+                root=root,
+                task_type="campaign_trigger",
+                running=running,
+                ring_entities=camp_reg_set,
+                config=config,
+                store=store,
+                popens=popens,
+                build_args=lambda cid: render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_campaign_trigger_template,
+                    id=cid,
+                    campaign_limit=config.campaign_limit,
+                    batch_limit=config.campaign_batch_limit,
+                ),
+            )
+            trg_cur_total = _running_count(running, root, "campaign_trigger")
+            if trg_cur_total < trg_total_limit:
+                spill = trg_total_limit - trg_cur_total
+                if trg_reg_ring:
+                    _fill_from_ring(
+                        ring=trg_reg_ring,
+                        ring_limit=spill,
+                        total_limit=trg_total_limit,
+                        root=root,
+                        task_type="campaign_trigger",
+                        running=running,
+                        ring_entities=camp_reg_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda cid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_campaign_trigger_template,
+                            id=cid,
+                            campaign_limit=config.campaign_limit,
+                            batch_limit=config.campaign_batch_limit,
+                        ),
+                    )
+                elif trg_prio_ring:
+                    _fill_from_ring(
+                        ring=trg_prio_ring,
+                        ring_limit=spill,
+                        total_limit=trg_total_limit,
+                        root=root,
+                        task_type="campaign_trigger",
+                        running=running,
+                        ring_entities=camp_prio_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda cid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_campaign_trigger_template,
+                            id=cid,
+                            campaign_limit=config.campaign_limit,
+                            batch_limit=config.campaign_batch_limit,
+                        ),
+                    )
+            if config.enable_campaign_rebuild:
+                rebuild_prio_limit = max(0, config.campaign_rebuild_priority_parallel)
+                rebuild_reg_limit = max(0, config.campaign_rebuild_regular_parallel)
+                rebuild_total_limit = rebuild_prio_limit + rebuild_reg_limit
+                if shared_campaign_cap > 0:
+                    rem = max(0, shared_campaign_cap - _running_campaign_total(running, root))
+                    if (not prefer_rebuild) and (trg_prio_limit + trg_reg_limit) > 0:
+                        rem = 0
+                    rebuild_total_limit = min(rebuild_total_limit, rem)
+                    rebuild_prio_limit = min(rebuild_prio_limit, rebuild_total_limit)
+                    rebuild_reg_limit = min(rebuild_reg_limit, max(0, rebuild_total_limit - rebuild_prio_limit))
+                _fill_from_ring(
+                    ring=reb_prio_ring,
+                    ring_limit=rebuild_prio_limit,
+                    total_limit=rebuild_total_limit,
+                    root=root,
+                    task_type="campaign_rebuild",
+                    running=running,
+                    ring_entities=camp_prio_set,
+                    config=config,
+                    store=store,
+                    popens=popens,
+                    build_args=lambda cid: render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=config.cmd_campaign_rebuild_template,
+                        id=cid,
+                    ),
+                )
+                _fill_from_ring(
+                    ring=reb_reg_ring,
+                    ring_limit=rebuild_reg_limit,
+                    total_limit=rebuild_total_limit,
+                    root=root,
+                    task_type="campaign_rebuild",
+                    running=running,
+                    ring_entities=camp_reg_set,
+                    config=config,
+                    store=store,
+                    popens=popens,
+                    build_args=lambda cid: render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=config.cmd_campaign_rebuild_template,
+                        id=cid,
+                    ),
+                )
+                reb_cur_total = _running_count(running, root, "campaign_rebuild")
+                if reb_cur_total < rebuild_total_limit:
+                    spill = rebuild_total_limit - reb_cur_total
+                    if reb_reg_ring:
+                        _fill_from_ring(
+                            ring=reb_reg_ring,
+                            ring_limit=spill,
+                            total_limit=rebuild_total_limit,
+                            root=root,
+                            task_type="campaign_rebuild",
+                            running=running,
+                            ring_entities=camp_reg_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda cid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_campaign_rebuild_template,
+                                id=cid,
+                            ),
+                        )
+
+                    elif reb_prio_ring:
+                        _fill_from_ring(
+                            ring=reb_prio_ring,
+                            ring_limit=spill,
+                            total_limit=rebuild_total_limit,
+                            root=root,
+                            task_type="campaign_rebuild",
+                            running=running,
+                            ring_entities=camp_prio_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda cid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_campaign_rebuild_template,
+                                id=cid,
+                            ),
+                        )
+
+            if shared_campaign_cap > 0 and config.enable_campaign_rebuild and (trg_prio_limit + trg_reg_limit) > 0:
+                campaign_round_robin[root] = rr + 1
+
+            if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+                args = render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_import_template,
+                    import_limit=config.import_limit,
+                )
+                _submit_if_slot(
+                    config=config,
+                    store=store,
+                    running=running,
+                    root=root,
+                    task_type="import",
+                    entity_id=None,
+                    args=args,
+                    timeout_sec=config.command_timeout_sec,
+                    max_parallel_for_type=1,
+                    popens=popens,
+                )
+
+            last_cleanup = last_cleanup_ts.get(root, 0.0)
+            interval = max(1, config.contacts_cleanup_interval_sec)
+            if inst.mautic_timezone:
+                try:
+                    dt = datetime.now(ZoneInfo(inst.mautic_timezone))
+                except Exception:
+                    logging.warning("[%s] invalid mautic timezone in local.php: %s", root, inst.mautic_timezone)
+                    dt = datetime.now()
+            else:
+                dt = datetime.now()
+            in_quiet = dt.hour == max(0, min(23, config.contacts_cleanup_quiet_hour)) and dt.minute < max(
+                1, min(180, config.contacts_cleanup_quiet_window_min)
+            )
+            if config.enable_contacts_cleanup and in_quiet and (last_cleanup == 0.0 or now - last_cleanup >= interval):
+                try:
+                    before = db.count_contacts_without_comm(
+                        email_field=config.contacts_cleanup_email_field,
+                        phone_field=config.contacts_cleanup_phone_field,
+                        mode=config.contacts_cleanup_mode,
+                    )
+                    deleted = db.delete_contacts_without_comm(
+                        email_field=config.contacts_cleanup_email_field,
+                        phone_field=config.contacts_cleanup_phone_field,
+                        mode=config.contacts_cleanup_mode,
+                        max_delete=config.contacts_cleanup_max_delete_per_run,
+                    )
+                    logging.info("[%s] contacts_cleanup ok before=%s deleted=%s", root, before, deleted)
+                except Exception as e:
+                    logging.warning("[%s] contacts_cleanup failed: %s", root, e)
+                last_cleanup_ts[root] = now
+
+            last_cache_clear = last_cache_clear_ts.get(root, 0.0)
+            if (
+                config.enable_cache_clear
+                and dt.hour == max(0, min(23, config.cache_clear_quiet_hour))
+                and dt.minute < max(1, min(180, config.cache_clear_quiet_window_min))
+                and (last_cache_clear == 0.0 or now - last_cache_clear >= max(1, config.cache_clear_interval_sec))
+            ):
+                args = render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_cache_clear_template,
+                )
+                if _submit_if_slot(
+                    config=config,
+                    store=store,
+                    running=running,
+                    root=root,
+                    task_type="cache_clear",
+                    entity_id=None,
+                    args=args,
+                    timeout_sec=config.command_timeout_sec,
+                    max_parallel_for_type=1,
+                    popens=popens,
+                ):
+                    last_cache_clear_ts[root] = now
+
+            last_cache_warm = last_cache_warm_ts.get(root, 0.0)
+            if (
+                config.enable_cache_warm
+                and dt.hour == max(0, min(23, config.cache_warm_quiet_hour))
+                and dt.minute < max(1, min(180, config.cache_warm_quiet_window_min))
+                and (last_cache_warm == 0.0 or now - last_cache_warm >= max(1, config.cache_warm_interval_sec))
+            ):
+                args = render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=config.cmd_cache_warm_template,
+                )
+                if _submit_if_slot(
+                    config=config,
+                    store=store,
+                    running=running,
+                    root=root,
+                    task_type="cache_warm",
+                    entity_id=None,
+                    args=args,
+                    timeout_sec=config.command_timeout_sec,
+                    max_parallel_for_type=1,
+                    popens=popens,
+                ):
+                    last_cache_warm_ts[root] = now
+
+            for job in config.scheduled_jobs:
+                if not job.enabled:
+                    continue
+                prev = jobs_last_run.get((root, job.name), 0.0)
+                if prev > 0 and time.time() - prev < max(1, job.interval_sec):
+                    continue
+                if job.quiet_hour is not None:
+                    if inst.mautic_timezone:
+                        try:
+                            dt_job = datetime.now(ZoneInfo(inst.mautic_timezone))
+                        except Exception:
+                            logging.warning("[%s] invalid mautic timezone in local.php: %s", root, inst.mautic_timezone)
+                            dt_job = datetime.now()
+                    else:
+                        dt_job = datetime.now()
+                    if not (
+                        dt_job.hour == max(0, min(23, int(job.quiet_hour)))
+                        and dt_job.minute < max(1, min(180, int(job.quiet_window_min)))
+                    ):
+                        continue
+                args = render_mautic_command(
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
+                    root=root,
+                    template=job.command_template,
+                    batch_limit=config.segment_batch_limit,
+                    campaign_limit=config.campaign_limit,
+                    import_limit=config.import_limit,
+                )
+                if _submit_if_slot(
+                    config=config,
+                    store=store,
+                    running=running,
+                    root=root,
+                    task_type=f"job:{job.name}",
+                    entity_id=None,
+                    args=args,
+                    timeout_sec=job.timeout_sec if job.timeout_sec else config.command_timeout_sec,
+                    max_parallel_for_type=max(1, config.jobs_max_workers),
+                    popens=popens,
+                ):
+                    jobs_last_run[(root, job.name)] = time.time()
+
+        if single_cycle:
+            return
+        time.sleep(max(0.1, float(config.dispatch_interval_sec)))

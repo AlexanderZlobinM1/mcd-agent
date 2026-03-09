@@ -1,0 +1,110 @@
+# MCD operator-level config (split mode)
+# Main scheduler tuning knobs used by operator/MCC.
+#
+# IMPORTANT precedence:
+# 1) profile baseline is applied
+# 2) any value set manually in [runtime] below overrides profile
+#
+# Example:
+# - profile tiny gives segments 1
+# - if you set segment_regular_parallel_idle = 3 here
+# - final value will be 3 (customized tiny)
+
+[profile]
+# custom|passive|tiny|mini|midi|maxi|hiload
+name = "passive"
+
+# Profile defaults snapshot:
+# passive: planning-only, cron untouched, no Mautic task dispatch
+# tiny   : single ring, no throttle, no whitelist, segments 1, trigger 1, rebuild 1, campaign total 1 (single campaign chain rebuild->trigger)
+# mini   : single ring, no throttle, no whitelist, segments 4, trigger 2, rebuild 1, campaign total 1
+# midi   : dual ring, no throttle, whitelist on, priority size 10, seg 3+1, trigger 3+1
+# maxi   : dual ring, throttle 200/5m, whitelist on, seg 5+1, trigger 3+1, rebuild 2+1
+# hiload : dual ring, throttle 200/5m, whitelist on, seg 6+2, trigger 4+2, rebuild 3+1
+
+[runtime]
+# MCC dynamic runtime table (hot apply):
+#   mcc_cli host-runtime set --host <host> --set key=value
+# Effective precedence:
+#   MCC host-runtime override > local [runtime] > profile defaults
+
+# Ring layout: dual|single.
+ring_mode = "single"
+
+# Disable queue throttling logic entirely (true|false).
+disable_throttle = true
+
+# Ignore all whitelist sources (true|false).
+disable_whitelist = true
+
+# Segment weight threshold for entering priority ring.
+segment_priority_weight_threshold = 999999
+# Number of priority segment ids by score.
+segment_priority_size = 0
+# Number of priority campaign ids by score.
+campaign_priority_size = 0
+# Count of latest campaigns forced to priority.
+campaign_latest_priority_count = 0
+
+# Segment parallel slots for priority ring when not throttled.
+segment_priority_parallel_idle = 0
+# Segment parallel slots for regular ring when not throttled.
+segment_regular_parallel_idle = 1
+
+# Segment parallel slots for priority ring when throttled.
+segment_priority_parallel_throttled = 0
+# Segment parallel slots for regular ring when throttled.
+segment_regular_parallel_throttled = 1
+# During throttle run only whitelist segments.
+segment_throttle_whitelist_only = false
+# Allowed whitelist segment parallel slots during whitelist-only throttle.
+segment_throttle_whitelist_parallel = 1
+# During whitelist-only throttle kill running non-whitelist segment tasks.
+segment_throttle_kill_non_whitelist = false
+
+# Campaign UPDATE is treated as synonym of REBUILD and is not scheduled separately.
+# Keep both values at 0.
+campaign_update_priority_parallel = 0
+# Campaign UPDATE (synonym) regular ring slots.
+campaign_update_regular_parallel = 0
+# Total campaign workers cap across trigger+rebuild (0 = no shared cap).
+campaign_total_parallel = 1
+# Campaign TRIGGER parallel slots for priority ring.
+campaign_trigger_priority_parallel = 0
+# Campaign TRIGGER parallel slots for regular ring.
+campaign_trigger_regular_parallel = 1
+
+# Campaign REBUILD parallel slots for priority ring.
+campaign_rebuild_priority_parallel = 0
+# Campaign REBUILD parallel slots for regular ring.
+campaign_rebuild_regular_parallel = 1
+
+# Queue pending threshold for throttle activation.
+queue_throttle_threshold = 200
+# Window length (minutes) where queue must stay above threshold.
+queue_throttle_window_min = 5
+
+# Segment mode: id_weighted|classic_loop.
+segment_mode = "id_weighted"
+
+# Mark host as template source (true|false).
+# Template hosts are highlighted in MCC dashboard.
+host_template = false
+# Auto-promote clone to normal host when local OS hostname differs from configured [mcc].host_name.
+# When true, cloned host self-registers as new host in MCC and clears template role for the clone.
+template_autopromote_on_clone = true
+
+# Mautic 6 core patch policy for PluginUpdateEvent metadata bug.
+# - required : keep host auto-patched by daemon
+# - off      : do not auto-patch (manual only)
+mautic6_core_patch_policy = "required"
+# Optional version scope for patch auto-apply:
+# empty = no boundary, set values to limit patch window.
+mautic6_core_patch_version_min = ""
+mautic6_core_patch_version_max = ""
+# If local version is unknown, apply patch by default.
+mautic6_core_patch_apply_if_version_unknown = true
+
+# Note:
+# - segment_cycles_per_tick and segment_kill_* are system-level parameters
+#   and are configured in mcd-agent.system.example.toml.

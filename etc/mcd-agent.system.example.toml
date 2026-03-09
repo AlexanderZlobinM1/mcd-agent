@@ -1,0 +1,467 @@
+# MCD system-level config (split mode)
+# Low-level paths, SQL templates, command templates and service integration.
+#
+# This file is intended to be included from the main config file:
+# [include]
+# files = ["./mcd-agent.system.example.toml", "./mcd-agent.operator.example.toml"]
+#
+# Operator/runtime tuning should stay in mcd-agent.operator.example.toml.
+
+[discovery]
+# Roots for local.php discovery.
+roots = ["/var/www"]
+# Skip noisy paths.
+exclude_path_contains = ["/vendor/", "/node_modules/"]
+# Supported Mautic majors.
+supported_mautic_majors = [4, 5, 6, 7]
+
+[runtime]
+# MCC can hot-override supported runtime keys per host via:
+#   mcc_cli host-runtime set --host <host> --set key=value
+# Runtime precedence:
+#   MCC host-runtime override > local [runtime] > profile defaults
+
+# PHP binary for console commands.
+php_bin = "/usr/bin/php"
+# User for Mautic console execution.
+mautic_run_as_user = "www-data"
+
+# Global policy: long tasks are never killed by timeout.
+command_timeout_sec = 0
+# Watchdog timeout for running tasks, sec; 0 means disabled.
+worker_watchdog_sec = 0
+# Segment planner cycles per dispatch tick.
+segment_cycles_per_tick = 4
+# How to stop throttled segment workers: graceful|kill.
+segment_kill_mode = "graceful"
+# Grace period in seconds before hard kill when graceful stop is used.
+segment_kill_grace_sec = 10
+
+# SQLite file for task state / weight cache / inventory.
+state_db_path = "/opt/mcd/var/mcd-state.db"
+# Historical task retention depth in days (non-running rows older than this are purged).
+tasks_history_keep_days = 14
+# Hard cap for historical non-running task rows.
+tasks_history_max_rows = 200000
+# Enable periodic DB compaction in quiet window.
+tasks_compact_enabled = true
+# Minimum interval between compaction runs (sec).
+tasks_compact_interval_sec = 86400
+# Quiet window start hour for compaction (host local time).
+tasks_compact_quiet_hour = 3
+# Quiet window length in minutes for compaction.
+tasks_compact_quiet_window_min = 60
+# Run SQLite VACUUM after purge (only when no running tasks).
+tasks_compact_vacuum = true
+# Legacy pause file (backward-compatibility only).
+# Primary mode control is profile (`passive` vs others).
+scheduler_pause_flag_path = "/opt/mcd/var/scheduler.pause"
+# Weight recompute interval, sec (86400 = daily).
+weights_recalc_interval_sec = 86400
+# Retry count for failed command run.
+task_retry_max = 1
+# Delay before retry, sec.
+task_retry_delay_sec = 2
+# Action for stuck process: skip|restart.
+worker_stuck_policy = "skip"
+# Max restarts by watchdog for one task.
+worker_stuck_restart_limit = 1
+# Max concurrent generic jobs (from [[jobs]]).
+jobs_max_workers = 2
+
+# Segment ids forced to priority ring.
+segment_whitelist = []
+# Path to segment whitelist file (one id per line).
+segment_whitelist_file = "/etc/mcd/segment-whitelist.txt"
+# Campaign ids forced to priority ring.
+campaign_whitelist = []
+# Path to campaign whitelist file (one id per line).
+campaign_whitelist_file = "/etc/mcd/campaign-whitelist.txt"
+
+# Batch for mautic:segments:update.
+segment_batch_limit = 1000
+# Batch for mautic:campaigns:trigger.
+campaign_batch_limit = 1000
+# Campaign limit for trigger command.
+campaign_limit = 60000
+# Limit for mautic:import.
+import_limit = 1000
+
+# Enable import polling loop.
+enable_import_polling = true
+# Import polling interval, sec.
+import_poll_interval_sec = 15
+# Check MCC for newer MCD versions and show notify in operations.
+mcd_update_notify = true
+# Enable automatic MCD self-update from MCC.
+# Default is true; set false only for explicit manual control.
+mcd_auto_update_enabled = true
+# How often to re-check MCC version manifest, sec.
+mcd_update_check_interval_sec = 3600
+# Legacy channel alias (kept for backward compatibility).
+mcd_update_channel = "approved"
+# Update policy: off|lts|approved|test.
+# - off      : never auto-update
+# - lts      : only latest build flagged lts
+# - approved : latest approved build (default)
+# - test     : latest test build
+mcd_update_policy = "approved"
+# Force test build selection regardless of update policy.
+mcd_update_allow_test_build = false
+# Retry delay after MCC says "wait for free update slot".
+mcd_update_wait_retry_sec = 60
+# Number of local config history snapshots stored by MCD.
+mcd_config_history_limit = 10
+# Retention for delivered profile events in local SQLite outbound queue.
+# Older `status=sent` rows are pruned automatically in quiet window.
+outbound_events_sent_keep_days = 14
+
+# Mark this host as template source in MCC dashboard.
+# Template hosts can auto-promote clones to normal hosts (see key below).
+host_template = false
+# When true and host_template=true, clone is detected by hostname mismatch:
+# local OS hostname != configured [mcc].host_name.
+# Agent then pushes state as a new host identity and MCC auto-registers it.
+template_autopromote_on_clone = true
+
+# Service profiles (MCC-managed dynamic host tuning, independent from MCD build version).
+# Enable service-profile subsystem.
+service_profiles_enabled = true
+# Auto-apply profile from MCC on daemon loop.
+# Set true on test hosts first; for production rollout switch after validation.
+service_profiles_auto_apply = false
+# Poll interval (sec) for auto-apply cycle.
+service_profiles_poll_interval_sec = 3600
+# Components controlled by service profiles.
+# Supported: php_fpm, mysql
+service_profiles_components = ["php_fpm", "mysql"]
+
+# Global Mautic 6 core patch policy for PluginUpdateEvent metadata bug:
+# - required : daemon auto-checks and auto-applies hotfix every planning cycle
+# - off      : daemon never applies this patch automatically
+# You can still apply/revert manually via `mcd-cli mautic6-patch ...`.
+mautic6_core_patch_policy = "required"
+# Optional semantic version guardrails for auto-apply:
+# - empty means "no boundary"
+# - if min/max are set, patch is applied only when local Mautic version is in range
+#   (example for temporary bug window: min=6.0.0, max=6.0.8)
+mautic6_core_patch_version_min = ""
+mautic6_core_patch_version_max = ""
+# If local Mautic version cannot be resolved:
+# - true  => apply patch anyway
+# - false => skip patch until version is known
+mautic6_core_patch_apply_if_version_unknown = true
+
+# Enable campaign rebuild worker.
+enable_campaign_rebuild = false
+# Rebuild planner interval, sec.
+campaign_rebuild_poll_interval_sec = 300
+# Max cycles per rebuild tick.
+campaign_rebuild_max_cycles_per_tick = 4
+
+# Enable contacts cleanup task.
+enable_contacts_cleanup = false
+# Minimum interval between cleanup runs, sec.
+contacts_cleanup_interval_sec = 86400
+# Quiet window start hour (instance timezone).
+contacts_cleanup_quiet_hour = 2
+# Quiet window length in minutes.
+contacts_cleanup_quiet_window_min = 60
+# Leads table email field name.
+contacts_cleanup_email_field = "email"
+# Leads table phone field name.
+contacts_cleanup_phone_field = "mobile"
+# Cleanup mode:
+# - "email_and_mobile": delete only contacts where both fields are empty
+# - "email_only": delete contacts where email is empty (mobile ignored)
+contacts_cleanup_mode = "email_and_mobile"
+# Max rows deleted per cleanup run.
+contacts_cleanup_max_delete_per_run = 10000
+
+# Enable daily cache:clear task (MCD-managed, runtime-dynamic).
+enable_cache_clear = false
+# Minimum interval between cache:clear runs, sec.
+cache_clear_interval_sec = 86400
+# Quiet window start hour (instance timezone).
+cache_clear_quiet_hour = 7
+# Quiet window length in minutes.
+cache_clear_quiet_window_min = 60
+
+# Enable daily cache warm task (MCD-managed, runtime-dynamic).
+enable_cache_warm = false
+# Minimum interval between cache warm runs, sec.
+cache_warm_interval_sec = 86400
+# Quiet window start hour (instance timezone).
+cache_warm_quiet_hour = 8
+# Quiet window length in minutes.
+cache_warm_quiet_window_min = 60
+
+[sql]
+# Queue metric for throttling decision (must return one numeric value).
+mail_queue_count = "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE status = 'pending'"
+
+# Segment source ids (published).
+segments_due = "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id"
+# Campaign source ids (published only; window checks are intentionally ignored).
+# Note: for Mautic 4 the agent auto-removes `c.deleted` predicate at runtime
+# because some M4 schemas do not have this column.
+campaigns_due = "SELECT c.id FROM {prefix}campaigns c WHERE c.is_published = 1 AND (c.deleted IS NULL) ORDER BY c.id"
+
+# Segment weight source rows.
+segment_weights = "SELECT ll.id, UNIX_TIMESTAMP(ll.date_added) AS created_ts, UNIX_TIMESTAMP(ll.date_modified) AS modified_ts, UNIX_TIMESTAMP(ll.last_built_date) AS built_ts, COALESCE(a.recent_cnt, 0) AS recent_activity FROM {prefix}lead_lists ll LEFT JOIN (SELECT leadlist_id, COUNT(*) AS recent_cnt FROM {prefix}lead_lists_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY leadlist_id) a ON a.leadlist_id = ll.id WHERE ll.is_published = 1"
+# Campaign weight source rows (published only; no publish window filter).
+# Note: for Mautic 4 the agent auto-removes `c.deleted` predicate at runtime
+# because some M4 schemas do not have this column.
+campaign_weights = "SELECT c.id, UNIX_TIMESTAMP(COALESCE(c.publish_up, c.date_added)) AS publish_ts, COALESCE(p.pending_cnt, 0) AS pending_cnt, COALESCE(r.recent_cnt, 0) AS recent_activity FROM {prefix}campaigns c LEFT JOIN (SELECT campaign_id, COUNT(*) AS pending_cnt FROM {prefix}campaign_leads WHERE manually_removed = 0 AND date_last_exited IS NULL GROUP BY campaign_id) p ON p.campaign_id = c.id LEFT JOIN (SELECT campaign_id, COUNT(*) AS recent_cnt FROM {prefix}campaign_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY campaign_id) r ON r.campaign_id = c.id WHERE c.is_published = 1 AND (c.deleted IS NULL)"
+
+# Import queue metric (must return one numeric value).
+import_pending_count = "SELECT COUNT(*) AS cnt FROM {prefix}imports WHERE is_published = 1 AND (date_started IS NULL OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
+
+[commands]
+# Segment by id template.
+segment_update_template = "mautic:segments:update -i {id} --batch-limit={batch_limit}"
+# Full segment loop template.
+segment_full_update_template = "mautic:segments:update --batch-limit={batch_limit}"
+# Campaign update by id template (alias to rebuild in scheduler).
+campaign_update_template = "mautic:campaigns:update -i {id}"
+# Campaign trigger by id template.
+campaign_trigger_template = "mautic:campaigns:trigger -i {id} --campaign-limit={campaign_limit} --batch-limit={batch_limit}"
+# Campaign rebuild by id template.
+campaign_rebuild_template = "mautic:campaigns:rebuild -i {id}"
+# Import template.
+import_template = "mautic:import --limit={import_limit}"
+# Cache clear template.
+cache_clear_template = "cache:clear"
+# Cache warm template.
+cache_warm_template = "cache:warmup"
+
+[mcc]
+# Optional MCC URL for connected mode.
+url = ""
+# Optional MCC token for API auth.
+token = ""
+# Push state to MCC `/api/v1/agent/state`.
+push_enabled = true
+# Periodic full push interval (seconds).
+push_interval_sec = 300
+# Send immediately when state snapshot changes.
+push_on_change = true
+# Log-signal polling interval for alert-triggered push (seconds).
+push_alert_poll_interval_sec = 60
+# Journald window for alert signal aggregation (minutes).
+push_alert_window_min = 5
+# Optional explicit host name to map this agent in MCC inventory.
+# If empty, system hostname is used.
+host_name = ""
+# Optional explicit URL to MCD version manifest JSON.
+# If empty and mcc.url is set, default path is: {mcc.url}/mauticctl/mcd/manifest.json
+mcd_manifest_url = ""
+
+[plugins]
+# Base URL for plugin manifest/packages.
+repo_base_url = "https://servercontrol.sales-snap.com"
+# Manifest path pattern.
+manifest_path_template = "/mauticctl/packages/mautic{major}/manifest.json"
+# Run cache:clear after plugin actions.
+post_cache_clear = true
+# Run mautic:plugin:install after plugin actions.
+post_plugin_install = true
+# Metadata filename placed in plugin directory.
+state_filename = ".mcd-plugin.json"
+
+[custom]
+# Base URL for custom scripts manifest/files.
+# If empty, MCD falls back to [mcc].url.
+repo_base_url = ""
+# Manifest path for custom scripts.
+manifest_path = "/mauticctl/custom/manifest.json"
+# Local cache for downloaded manifest/scripts/logs.
+cache_dir = "/opt/mcd/var/custom"
+# Default run mode: auto|tmux|screen|direct.
+run_mode_default = "auto"
+# In auto mode prefer tmux when available.
+prefer_tmux = true
+# In auto mode fallback to screen when tmux is unavailable.
+prefer_screen = true
+# Session prefix for detached runs.
+tmux_session_prefix = "mcd-custom"
+# Enable periodic local cache cleanup for custom scripts.
+cleanup_enabled = true
+# Minimum interval between cleanup runs (sec).
+cleanup_interval_sec = 86400
+# Quiet window start hour for cleanup (local host time).
+cleanup_quiet_hour = 3
+# Quiet window duration for cleanup (minutes).
+cleanup_quiet_window_min = 60
+# Keep detached execution logs for this many days.
+logs_keep_days = 14
+# Hard cap for detached execution log files.
+logs_max_files = 200
+# Keep downloaded custom scripts for this many days.
+downloads_keep_days = 30
+# Hard cap for cached download entries (key directories/files).
+downloads_max_entries = 200
+
+[backup]
+# Enable MCD backup module (`mcd-cli backup ...`).
+enabled = false
+# Local state/semaphore dir (last run, last success, error, history).
+state_dir = "/opt/mcd/var/state/backup"
+# Lock dir (prevents parallel backup for one instance).
+lock_dir = "/opt/mcd/var/locks"
+# Local sshfs mount base dir.
+mount_base_dir = "/opt/mcd/var/backup/mounts"
+# Remote root dir inside mounted share.
+remote_root_dir = "backup"
+# Optional host folder override (default: system hostname).
+host_name = ""
+# Optional custom instance folder pattern.
+# Available placeholders: {instance_uid}, {instance_name}, {root}, {domain}
+# instance_name = "{instance_uid}"
+# Keep N latest date-folders on remote share.
+retention_copies = 10
+# Mount timeout (sec).
+mount_timeout_sec = 15
+# Unmount timeout (sec).
+unmount_timeout_sec = 10
+# Dump timeout (sec).
+# Use bounded value to avoid infinite backup guard pause on hung dump process.
+dump_timeout_sec = 10800
+# Restore behavior: apply archived files to `/`.
+restore_apply_files = true
+# Restore behavior: apply database dumps with myloader.
+restore_apply_databases = true
+
+[backup.schedule]
+# Run host backup on schedule from daemon loop.
+# Works in all profiles, including passive.
+enabled = false
+# Minimum interval between scheduled runs in seconds.
+interval_sec = 86400
+# Quiet-window start hour (local host time).
+quiet_hour = 2
+# Quiet-window duration in minutes.
+quiet_window_min = 60
+# Pre-backup guard window in seconds.
+# During this window MCD does not start NEW Mautic jobs (segments/campaigns/import/jobs).
+# Already running jobs are never killed by this guard.
+# After backup finishes, normal dispatch resumes automatically.
+pre_pause_sec = 3600
+
+[backup.secrets]
+# Secret-store key path for backup profile vault in local MCD sqlite DB.
+# Used to encrypt storage/mysql credentials for `backup profile-set`.
+key_path = "/opt/mcd/var/keys/backup-secrets.key"
+
+[backup.storage]
+# SSHFS target credentials/path.
+host = ""
+port = 22
+user = ""
+remote_path = "/"
+# Preferred auth via key file.
+key_file = "/root/.ssh/backup-storage"
+# Optional password reference key (external secret source integration).
+password_ref = ""
+# Optional password auth (not recommended; keep empty when key_file is used).
+password = ""
+
+[backup.mysql]
+# Optional dedicated MySQL credentials for backup/restore.
+# If empty, instance DB credentials from Mautic local.php are used.
+host = ""
+port = 3306
+user = ""
+password = ""
+# Optional password reference key (external secret source integration).
+password_ref = ""
+database = ""
+
+[backup.archive]
+# Optional config/files archive in backup directory.
+enabled = true
+name = "files.tar.gz"
+paths = [
+  "/etc/mysql",
+  "/etc/nginx",
+  "/etc/apache2",
+  "/etc/php",
+  "/etc/cron.d",
+  "/var/spool/cron",
+  "/etc/systemd/system",
+  "/opt/mcd/etc",
+  "/var/www",
+]
+
+[backup.mydumper]
+bin = "/usr/bin/mydumper"
+threads = 6
+verbose = 3
+compress = true
+long_query_guard = 0
+kill_long_queries = false
+# Run backup dump with lowered scheduler/IO priority (recommended for production).
+use_nice = true
+nice_level = 15
+use_ionice = true
+ionice_class = 2
+ionice_level = 7
+# Additional raw args passed to mydumper.
+# Notes:
+# - MCD auto-adds `--sync-thread-lock-mode=AUTO` when supported by local mydumper.
+# - MCD prefers `--trx-tables` when supported, otherwise falls back to
+#   `--trx-consistency-only` for older mydumper versions.
+# - If you set lock/transaction flags manually here, MCD will not override them.
+extra_args = []
+# myloader binary for restore.
+myloader_bin = "/usr/bin/myloader"
+# myloader parallel threads for restore.
+myloader_threads = 4
+
+[[jobs]]
+# Job name (for logs/state).
+name = "email-fetch"
+# Enable/disable this job.
+enabled = false
+# Interval in seconds.
+interval_sec = 900
+# Command template executed via Mautic console.
+command_template = "mautic:email:fetch"
+# Timeout for this job; 0 means no timeout.
+timeout_sec = 0
+
+[[jobs]]
+# Job name (for logs/state).
+name = "broadcasts-send"
+# Enable/disable this job.
+enabled = false
+# Interval in seconds.
+interval_sec = 60
+# Command template executed via Mautic console.
+command_template = "mautic:broadcasts:send --limit=100"
+# Timeout for this job; 0 means no timeout.
+timeout_sec = 0
+
+[[jobs]]
+# Job name (for logs/state).
+name = "messages-send"
+# Enable/disable this job.
+enabled = false
+# Interval in seconds.
+interval_sec = 60
+# Command template executed via Mautic console.
+command_template = "mautic:messages:send"
+# Timeout for this job; 0 means no timeout.
+timeout_sec = 0
+
+[[instances]]
+# Logical instance name in local inventory.
+name = "custom-instance-1"
+# Mautic root path.
+root = "/srv/mautic/custom"
+# Major version hint (4/5/6/7).
+mautic_major = 6
+# Explicit console path.
+console_path = "/srv/mautic/custom/bin/console"
+# Explicit local.php path.
+local_php_path = "/srv/mautic/custom/config/local.php"

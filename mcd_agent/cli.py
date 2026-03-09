@@ -1,0 +1,1897 @@
+from __future__ import annotations
+
+import argparse
+import base64
+from datetime import datetime, timezone
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+
+from mcd_agent import __version__
+from mcd_agent.backup import (
+    backup_profile_masked,
+    backup_profile_set,
+    backup_prune,
+    backup_restore,
+    backup_run,
+    backup_status,
+)
+from mcd_agent.config import load_config
+from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
+from mcd_agent.db import MauticDB
+from mcd_agent.daemon import TaskStore, run_loop
+from mcd_agent.discovery import discover_mautic
+from mcd_agent.env import build_policy_plan, default_policy, ipv6_status, parse_policy_text, set_ipv6_disabled
+from mcd_agent.executor import (
+    build_mautic_exec_args,
+    command_task_type,
+    execute_mautic_command,
+    execute_mautic_command_template,
+)
+from mcd_agent.inventory import InstanceInventory, ensure_seeded
+from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
+from mcd_agent.mautic6_core_patch import (
+    ensure_m6_plugin_update_metadata_patch,
+    patch_status as mautic6_patch_status,
+    revert_m6_plugin_update_metadata_patch,
+)
+from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
+from mcd_agent.plugins import run_plugins_interactive
+from mcd_agent.runtime_overrides import fetch_runtime_overrides, local_runtime_overrides, push_runtime_overrides, touch_poll_trigger
+from mcd_agent.service_profiles import fetch_service_profile, service_profiles_apply_once
+from mcd_agent.signals import collect_signals, format_signals_json, format_signals_text
+from mcd_agent.state_push import push_state_now, queue_profile_event
+from mcd_agent.self_update import apply_update, check_with_mcc, update_status
+from mcd_agent.tuner import format_tune_result, tune_segments
+from mcd_agent.uninstall import run_uninstall
+from mcd_agent.version_check import maybe_notify_update
+
+_MANUAL_CMD_SEP = "\x1f"
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def _to_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _push_state_after_change(cfg, reason: str) -> None:
+    try:
+        ok, msg = push_state_now(cfg, include_signals=False)
+        if ok:
+            logging.info("MCC immediate push (%s): %s", reason, msg)
+        else:
+            logging.warning("MCC immediate push (%s) skipped/failed: %s", reason, msg)
+    except Exception as e:
+        logging.warning("MCC immediate push (%s) failed: %s", reason, e)
+
+
+def _default_config_path() -> str:
+    # Priority:
+    # 1) explicit env override
+    # 2) standard install path
+    # 3) /etc symlink path
+    # 4) local repo example (dev fallback)
+    env_cfg = (os.getenv("MCD_CONFIG", "") or "").strip()
+    if env_cfg:
+        return env_cfg
+    candidates = (
+        "/opt/mcd/etc/mcd.toml",
+        "/etc/mcd/mcd.toml",
+    )
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    fallback = Path(__file__).resolve().parents[1] / "etc" / "mcd-agent.example.toml"
+    if fallback.exists():
+        return str(fallback)
+    return candidates[0]
+
+
+def _select_root_for_ops(cfg, root: str | None) -> str:
+    inv = InstanceInventory(cfg.state_db_path)
+    ensure_seeded(inv, cfg)
+    installs = inv.list_instances()
+    if root:
+        for inst in installs:
+            if inst.root == root or inst.instance_uid == root:
+                return inst.root
+        raise RuntimeError(f"Mautic install not found for root: {root}")
+    if not installs:
+        raise RuntimeError("No Mautic install found")
+    if len(installs) > 1:
+        roots = ", ".join(x.root for x in installs)
+        raise RuntimeError(f"Multiple installs found, pass --root: {roots}")
+    return installs[0].root
+
+
+def _run_manual_command_with_scheduler(
+    *,
+    cfg,
+    root: str,
+    command: str,
+    instance_id: int | None,
+    php_bin: str,
+    timeout_sec: int,
+    run_as_user: str | None,
+) -> tuple[int, str]:
+    task_type = command_task_type(command)
+    if not task_type:
+        return execute_mautic_command(
+            php_bin=php_bin,
+            root=root,
+            command=command,
+            instance_id=instance_id,
+            timeout_sec=timeout_sec,
+            run_as_user=run_as_user,
+        )
+
+    profile = (cfg.profile_name or "").strip().lower()
+    if profile == "passive":
+        return execute_mautic_command(
+            php_bin=php_bin,
+            root=root,
+            command=command,
+            instance_id=instance_id,
+            timeout_sec=timeout_sec,
+            run_as_user=run_as_user,
+        )
+
+    try:
+        cmd_args = build_mautic_exec_args(
+            php_bin=php_bin,
+            root=root,
+            command=command,
+            instance_id=instance_id,
+            run_as_user=run_as_user,
+        )
+    except ValueError as e:
+        return 2, str(e)
+    except FileNotFoundError as e:
+        return 3, str(e)
+
+    store = TaskStore(cfg.state_db_path)
+    req_id = store.enqueue_manual_request(
+        root=root,
+        task_type=task_type,
+        entity_id=instance_id,
+        command_str=_MANUAL_CMD_SEP.join(cmd_args),
+        timeout_sec=timeout_sec,
+    )
+
+    wait_sec = max(1.0, min(8.0, float(cfg.dispatch_interval_sec) * 3.0))
+    deadline = time.time() + wait_sec
+    terminal = {"launched", "done", "failed", "timeout", "lost", "skipped", "cancelled"}
+    while time.time() < deadline:
+        st = store.get_manual_request_status(req_id)
+        if st is None:
+            break
+        st_norm = st.strip().lower()
+        if st_norm in terminal:
+            if st_norm == "launched":
+                return 0, f"queued request_id={req_id} status=launched"
+            if st_norm in {"failed", "timeout", "lost"}:
+                return 1, f"queued request_id={req_id} status={st_norm}"
+            return 0, f"queued request_id={req_id} status={st_norm}"
+        time.sleep(0.15)
+
+    # Daemon did not pick it quickly (service down/paused/etc) -> fallback to direct run.
+    if store.cancel_manual_request(req_id):
+        rc, output = execute_mautic_command(
+            php_bin=php_bin,
+            root=root,
+            command=command,
+            instance_id=instance_id,
+            timeout_sec=timeout_sec,
+            run_as_user=run_as_user,
+        )
+        prefix = f"manual request_id={req_id} fallback=direct\n"
+        return rc, prefix + (output or "")
+
+    st = store.get_manual_request_status(req_id) or "unknown"
+    return 0, f"queued request_id={req_id} status={st}"
+
+
+def _select_installs_for_patch(cfg, root: str | None):
+    inv = InstanceInventory(cfg.state_db_path)
+    ensure_seeded(inv, cfg)
+    installs = inv.list_instances()
+    if root:
+        return [x for x in installs if x.root == root or x.instance_uid == root]
+    return installs
+
+
+def _read_runtime_patch_policy(config_path: str) -> str:
+    p = _resolve_mutable_config_path(config_path)
+    if not p.exists():
+        return "required"
+    text = p.read_text(encoding="utf-8")
+    m = re.search(r"(?ms)^\[runtime\]\s*(.*?)^(?=\[|\Z)", text)
+    if not m:
+        return "required"
+    body = m.group(1)
+    pm = re.search(r'(?m)^\s*mautic6_core_patch_policy\s*=\s*"([^"]+)"', body)
+    if not pm:
+        return "required"
+    v = pm.group(1).strip().lower()
+    return v if v in {"required", "off"} else "required"
+
+
+def _write_runtime_patch_policy(config_path: str, value: str) -> str:
+    policy = value.strip().lower()
+    if policy not in {"required", "off"}:
+        raise RuntimeError("invalid policy (allowed: required, off)")
+    p = _resolve_mutable_config_path(config_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    runtime_section = f'[runtime]\nmautic6_core_patch_policy = "{policy}"\n\n'
+    m = re.search(r"(?ms)^\[runtime\]\s*(.*?)^(?=\[|\Z)", text)
+    if not m:
+        p.write_text(runtime_section + text, encoding="utf-8")
+        return str(p)
+    body = m.group(1)
+    if re.search(r'(?m)^\s*mautic6_core_patch_policy\s*=\s*"[^"]+"', body):
+        body2 = re.sub(
+            r'(?m)^\s*mautic6_core_patch_policy\s*=\s*"[^"]+"',
+            f'mautic6_core_patch_policy = "{policy}"',
+            body,
+            count=1,
+        )
+    else:
+        body2 = f'mautic6_core_patch_policy = "{policy}"\n' + body
+    text2 = text[: m.start(1)] + body2 + text[m.end(1) :]
+    p.write_text(text2, encoding="utf-8")
+    return str(p)
+
+
+def _pick_active_instance_interactive(cfg, current_root: str | None) -> str | None:
+    inv = InstanceInventory(cfg.state_db_path)
+    ensure_seeded(inv, cfg)
+    rows = inv.list_instances()
+    if not rows:
+        print("No instances")
+        return None
+    if current_root:
+        for i in rows:
+            if i.root == current_root:
+                return current_root
+    if len(rows) == 1:
+        return rows[0].root
+    print("")
+    print("Select active instance:")
+    for idx, i in enumerate(rows, start=1):
+        print(f"{idx}. {i.instance_uid} {i.name} root={i.root} source={i.source} major={i.mautic_major}")
+    raw = _ask("Select [number, empty=cancel]: ").strip()
+    if not raw:
+        print("Active instance is required when multiple installs exist.")
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        print("Invalid selection")
+        return current_root
+    if n < 1 or n > len(rows):
+        print("Out of range")
+        return current_root
+    return rows[n - 1].root
+
+
+def _prepare_cache_permissions(cfg, root: str) -> tuple[bool, str]:
+    cache_dir = Path(root) / "var" / "cache"
+    prod_dir = cache_dir / "prod"
+    user = cfg.mautic_run_as_user or "www-data"
+    cmds: list[list[str]] = [
+        ["mkdir", "-p", str(prod_dir)],
+        ["chown", "-R", f"{user}:{user}", str(cache_dir)],
+        ["chmod", "-R", "u+rwX,g+rwX", str(cache_dir)],
+    ]
+    lines: list[str] = []
+    for cmd in cmds:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            lines.append(f"FAIL {' '.join(cmd)} :: {err}")
+            return False, "\n".join(lines)
+        lines.append(f"OK   {' '.join(cmd)}")
+
+    check = subprocess.run(["sudo", "-u", user, "test", "-w", str(prod_dir)])
+    if check.returncode != 0:
+        lines.append(f"WARN sudo -u {user} test -w {prod_dir} failed")
+        return False, "\n".join(lines)
+    lines.append(f"OK   writable by {user}: {prod_dir}")
+    return True, "\n".join(lines)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int, grace_sec: int) -> str:
+    if not _is_pid_alive(pid):
+        return "already-exited"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return "already-exited"
+    deadline = time.time() + max(0, int(grace_sec))
+    while time.time() < deadline:
+        if not _is_pid_alive(pid):
+            return "terminated"
+        time.sleep(0.2)
+    if _is_pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            return "terminated"
+    return "killed" if not _is_pid_alive(pid) else "failed"
+
+
+def _tracked_running_tasks(cfg) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if not Path(cfg.state_db_path).exists():
+        return rows
+    try:
+        con = sqlite3.connect(cfg.state_db_path)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT id, root, task_type, entity_id, pid, command_str "
+            "FROM tasks WHERE state='running' ORDER BY id"
+        )
+        for r in cur.fetchall():
+            rows.append(
+                {
+                    "id": int(r[0]),
+                    "root": str(r[1] or ""),
+                    "task_type": str(r[2] or ""),
+                    "entity_id": r[3],
+                    "pid": int(r[4]) if r[4] is not None else 0,
+                    "command_str": str(r[5] or ""),
+                }
+            )
+        con.close()
+    except Exception:
+        return []
+    return rows
+
+
+def _list_mautic_console_processes() -> list[tuple[int, str]]:
+    proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return []
+    out: list[tuple[int, str]] = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        args = parts[1]
+        if "bin/console" in args and "mautic:" in args:
+            out.append((pid, args))
+    return out
+
+
+def _run_cache_menu(cfg, root: str | None) -> int:
+    try:
+        target_root = _select_root_for_ops(cfg, root)
+    except Exception as e:
+        print(f"Cache menu error: {e}")
+        return 1
+
+    while True:
+        print("")
+        print(f"Cache Operations (root={target_root})")
+        print("1. Soft Clear (cache:clear)")
+        print("2. Warmup (cache:warmup)")
+        print("3. Hard Clear (delete var/cache/prod)")
+        print("0. Back")
+        choice = _ask("Select option: ").strip().lower()
+        if choice in {"0", "q", "quit", "exit"}:
+            return 0
+
+        ok, msg = _prepare_cache_permissions(cfg, target_root)
+        print(msg)
+        if not ok:
+            print("Cache permissions check failed. Stop.")
+            continue
+
+        if choice == "1":
+            rc, out = execute_mautic_command_template(
+                php_bin=cfg.php_bin,
+                root=target_root,
+                template="cache:clear",
+                timeout_sec=cfg.command_timeout_sec,
+                run_as_user=cfg.mautic_run_as_user,
+            )
+            print(out or f"cache:clear rc={rc}")
+            continue
+        if choice == "2":
+            rc, out = execute_mautic_command_template(
+                php_bin=cfg.php_bin,
+                root=target_root,
+                template="cache:warmup",
+                timeout_sec=cfg.command_timeout_sec,
+                run_as_user=cfg.mautic_run_as_user,
+            )
+            print(out or f"cache:warmup rc={rc}")
+            continue
+        if choice == "3":
+            prod_dir = Path(target_root) / "var" / "cache" / "prod"
+            proc = subprocess.run(["rm", "-rf", str(prod_dir)], capture_output=True, text=True)
+            if proc.returncode != 0:
+                print((proc.stderr or proc.stdout or "").strip() or f"rm -rf failed rc={proc.returncode}")
+                continue
+            ok2, msg2 = _prepare_cache_permissions(cfg, target_root)
+            print(msg2)
+            if ok2:
+                print("Hard cache cleanup done.")
+            continue
+        print("Unknown option")
+
+
+def _run_mautic6_patch_menu(cfg, root: str | None) -> int:
+    while True:
+        print("")
+        print("Mautic 6 Core Patch")
+        print(f"Policy: {_read_runtime_patch_policy(cfg.config_file_path)}")
+        print("1. Status")
+        print("2. Apply patch")
+        print("3. Revert patch")
+        print("4. Set policy required (daemon auto-patch)")
+        print("5. Set policy off (do not patch)")
+        print("0. Back")
+        choice = _ask("Select option: ").strip().lower()
+        if choice in {"0", "q", "quit", "exit"}:
+            return 0
+        if choice in {"1", "2", "3"}:
+            installs = _select_installs_for_patch(cfg, root)
+            if not installs:
+                print("No matching instances")
+                continue
+            for inst in installs:
+                if choice == "1":
+                    res = mautic6_patch_status(inst)
+                elif choice == "2":
+                    res = ensure_m6_plugin_update_metadata_patch(inst)
+                else:
+                    res = revert_m6_plugin_update_metadata_patch(inst)
+                print(json.dumps(res, ensure_ascii=True, indent=2))
+            if choice == "2":
+                _push_state_after_change(cfg, "mautic6-core-patch-apply")
+            elif choice == "3":
+                _push_state_after_change(cfg, "mautic6-core-patch-revert")
+            continue
+        if choice in {"4", "5"}:
+            policy = "required" if choice == "4" else "off"
+            try:
+                target = _write_runtime_patch_policy(cfg.config_file_path, policy)
+                print(f"Policy written: {policy} ({target})")
+                proc = subprocess.run(["systemctl", "restart", "mcd"], capture_output=True, text=True)
+                if proc.returncode == 0:
+                    print("service restarted: mcd")
+                else:
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    print(f"WARN service restart failed: {err}")
+                _push_state_after_change(cfg, "mautic6-core-patch-policy")
+            except Exception as e:
+                print(f"Policy update error: {e}")
+            continue
+        print("Unknown option")
+
+
+def _run_custom_menu(cfg) -> int:
+    while True:
+        print("")
+        print("Custom Scripts")
+        try:
+            rows, source = fetch_custom_manifest(cfg, use_cache_on_error=True)
+        except Exception as e:
+            print(f"Custom scripts error: {e}")
+            return 1
+        print(f"Manifest source: {source}")
+        print(format_custom_scripts_list(rows, with_idx=True))
+        print("Select by number or key, r=refresh, empty=back")
+        raw = _ask("Select script: ").strip()
+        if not raw:
+            return 0
+        if raw.lower() in {"r", "refresh"}:
+            continue
+
+        selected = None
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(rows):
+                selected = rows[idx - 1]
+        else:
+            for item in rows:
+                if str(item.get("key", "")).strip() == raw:
+                    selected = item
+                    break
+        if selected is None:
+            print("Invalid selection")
+            continue
+
+        key = str(selected.get("key", "")).strip()
+        if not key:
+            print("Invalid script key in manifest")
+            continue
+        args_help = str(selected.get("args_help", "")).strip()
+        if args_help:
+            print(f"Args hint: {args_help}")
+        args_line = _ask("Arguments (optional): ").strip()
+        try:
+            args = shlex.split(args_line) if args_line else []
+        except ValueError as e:
+            print(f"Arguments parse error: {e}")
+            continue
+        script_interactive = _to_bool(selected.get("interactive", False))
+        default_detach = not script_interactive
+        if script_interactive:
+            print("Script is marked interactive; foreground mode is recommended.")
+        prompt = (
+            "Run detached (tmux/screen if available)? [Y/n]: "
+            if default_detach
+            else "Run detached (tmux/screen if available)? [y/N]: "
+        )
+        detach_raw = _ask(prompt).strip().lower()
+        if not detach_raw:
+            detach = default_detach
+        else:
+            detach = detach_raw in {"y", "yes"}
+        rc, out = run_custom_script_by_key(
+            cfg,
+            script_key=key,
+            args=args,
+            detach=detach,
+            live_output=not detach,
+        )
+        if out:
+            print(out)
+        if rc != 0:
+            print(f"Script failed rc={rc}")
+
+
+def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
+    active_root = root
+    while active_root is None:
+        active_root = _pick_active_instance_interactive(cfg, active_root)
+        if active_root is None:
+            ans = _ask("No active instance selected. Retry? [Y/n]: ").strip().lower()
+            if ans in {"n", "no"}:
+                return 1
+
+    while True:
+        if active_root is None:
+            active_root = _pick_active_instance_interactive(cfg, active_root)
+            if active_root is None:
+                print("Active instance is required.")
+                continue
+        active_label = active_root or "-"
+        print("")
+        print(f"MCD Interactive (v{__version__})")
+        print(f"Active instance: {active_label}")
+        print("1. Plugins")
+        print("2. Mautic Upgrade")
+        print("3. Instances")
+        print("4. Cache")
+        print("5. Select Active Instance")
+        print("6. Environment")
+        print("7. Backup")
+        print("8. Mautic6 Core Patch")
+        print("9. Custom Scripts")
+        print("0. Exit")
+        choice = _ask("Select option: ").strip()
+        if choice == "1":
+            if not active_root:
+                print("Select active instance first")
+                continue
+            try:
+                run_plugins_interactive(
+                    config=cfg,
+                    root=active_root,
+                    selection=None,
+                    action=None,
+                    no_color=bool(no_color),
+                    yes=False,
+                )
+            except Exception as e:
+                print(f"Plugins error: {e}")
+                msg = str(e).lower()
+                if "repo_base_url" in msg or "manifest" in msg:
+                    print("Hint: configure plugins.repo_base_url or mcc.url in mcd config.")
+            continue
+        if choice == "2":
+            if not active_root:
+                print("Select active instance first")
+                continue
+            try:
+                run_upgrade_interactive(cfg, active_root)
+            except Exception as e:
+                print(f"Upgrade error: {e}")
+            continue
+        if choice == "3":
+            inv = InstanceInventory(cfg.state_db_path)
+            ensure_seeded(inv, cfg)
+            while True:
+                print("")
+                print("Instances")
+                print("1. List")
+                print("2. Rescan")
+                print("3. Add/Update manual")
+                print("4. Remove")
+                print("5. Set Active")
+                print("0. Back")
+                c2 = _ask("Select option: ").strip()
+                if c2 == "1":
+                    rows = inv.list_instances()
+                    for idx, i in enumerate(rows, start=1):
+                        mark = "*" if i.root == active_root else " "
+                        print(
+                            f"{idx}. [{mark}] {i.instance_uid} {i.name} "
+                            f"root={i.root} source={i.source} major={i.mautic_major}"
+                        )
+                    if not rows:
+                        print("No instances")
+                    continue
+                if c2 == "2":
+                    try:
+                        count = inv.rescan(cfg)
+                        print(f"Rescan complete: {count} instances")
+                    except Exception as e:
+                        print(f"Rescan error: {e}")
+                    continue
+                if c2 == "3":
+                    name = _ask("name: ").strip()
+                    root_v = _ask("root: ").strip()
+                    console = _ask("console path: ").strip()
+                    lphp = _ask("local.php path (optional): ").strip() or None
+                    major_raw = _ask("mautic major (optional): ").strip()
+                    major = int(major_raw) if major_raw else None
+                    db_host = _ask("db host (optional): ").strip() or None
+                    db_port_raw = _ask("db port (optional): ").strip()
+                    db_port = int(db_port_raw) if db_port_raw else None
+                    db_name = _ask("db name (optional): ").strip() or None
+                    db_user = _ask("db user (optional): ").strip() or None
+                    db_password = _ask("db password (optional): ").strip() or None
+                    db_prefix = _ask("db table prefix (optional): ").strip() or None
+                    if not (name and root_v and console):
+                        print("name/root/console are required")
+                        continue
+                    try:
+                        inv.add_or_update_manual(
+                            name=name,
+                            root=root_v,
+                            console_path=console,
+                            local_php_path=lphp,
+                            mautic_major=major,
+                            db_host=db_host,
+                            db_port=db_port,
+                            db_name=db_name,
+                            db_user=db_user,
+                            db_password=db_password,
+                            db_table_prefix=db_prefix,
+                        )
+                        print("Manual instance saved")
+                    except Exception as e:
+                        print(f"Save manual instance error: {e}")
+                    continue
+                if c2 == "4":
+                    name = _ask("uid, name or root: ").strip()
+                    try:
+                        if inv.remove(name):
+                            if active_root == name:
+                                active_root = None
+                            print("Removed")
+                        else:
+                            print("Not found")
+                    except Exception as e:
+                        print(f"Remove error: {e}")
+                    continue
+                if c2 == "5":
+                    rows = inv.list_instances()
+                    if not rows:
+                        print("No instances")
+                        continue
+                    for idx, i in enumerate(rows, start=1):
+                        print(f"{idx}. {i.instance_uid} {i.name} root={i.root} source={i.source} major={i.mautic_major}")
+                    raw = _ask("Select active [number]: ").strip()
+                    try:
+                        n = int(raw)
+                        if n < 1 or n > len(rows):
+                            raise ValueError
+                    except ValueError:
+                        print("Invalid selection")
+                        continue
+                    active_root = rows[n - 1].root
+                    print(f"Active instance set: {active_root}")
+                    continue
+                if c2 in {"0", "q", "quit", "exit"}:
+                    break
+                print("Unknown option")
+            continue
+        if choice == "4":
+            if not active_root:
+                print("Select active instance first")
+                continue
+            try:
+                _run_cache_menu(cfg, active_root)
+            except Exception as e:
+                print(f"Cache error: {e}")
+            continue
+        if choice == "5":
+            picked = _pick_active_instance_interactive(cfg, active_root)
+            if picked:
+                active_root = picked
+            continue
+        if choice == "6":
+            while True:
+                print("")
+                print("Environment")
+                print("1. IPv6 Status")
+                print("2. Disable IPv6")
+                print("3. Enable IPv6")
+                print("0. Back")
+                c3 = _ask("Select option: ").strip()
+                if c3 == "1":
+                    st = ipv6_status()
+                    for k, v in st.items():
+                        print(f"{k}={v}")
+                    continue
+                if c3 == "2":
+                    for line in set_ipv6_disabled(True):
+                        print(line)
+                    continue
+                if c3 == "3":
+                    for line in set_ipv6_disabled(False):
+                        print(line)
+                    continue
+                if c3 in {"0", "q", "quit", "exit"}:
+                    break
+                print("Unknown option")
+            continue
+        if choice == "7":
+            if not active_root:
+                print("Select active instance first")
+                continue
+            while True:
+                print("")
+                print(f"Backup (root={active_root})")
+                print("1. Run now")
+                print("2. Status")
+                print("3. Prune")
+                print("0. Back")
+                c3 = _ask("Select option: ").strip()
+                if c3 == "1":
+                    try:
+                        res = backup_run(cfg, active_root)
+                        print(res.message)
+                        if res.state_path:
+                            print(f"state={res.state_path}")
+                    except Exception as e:
+                        print(f"Backup run error: {e}")
+                    continue
+                if c3 == "2":
+                    try:
+                        st = backup_status(cfg, active_root)
+                        print(json.dumps(st, ensure_ascii=True, indent=2))
+                    except Exception as e:
+                        print(f"Backup status error: {e}")
+                    continue
+                if c3 == "3":
+                    try:
+                        res = backup_prune(cfg, active_root)
+                        print(res.message)
+                    except Exception as e:
+                        print(f"Backup prune error: {e}")
+                    continue
+                if c3 in {"0", "q", "quit", "exit"}:
+                    break
+                print("Unknown option")
+            continue
+        if choice == "8":
+            if not active_root:
+                print("Select active instance first")
+                continue
+            _run_mautic6_patch_menu(cfg, active_root)
+            continue
+        if choice == "9":
+            _run_custom_menu(cfg)
+            continue
+        if choice in {"0", "q", "quit", "exit"}:
+            return 0
+        print("Unknown option")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="MCD Agent", prog="mcd-cli")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--log-level", default="INFO")
+
+    sub = parser.add_subparsers(dest="cmd", required=False)
+    default_cfg = _default_config_path()
+
+    health = sub.add_parser("health", help="Print agent health")
+    health.add_argument("--json", action="store_true")
+
+    discover = sub.add_parser("discover", help="Discover local Mautic installs")
+    discover.add_argument("--config", default=default_cfg)
+
+    run = sub.add_parser("run", help="Run daemon loop")
+    run.add_argument("--config", default=default_cfg)
+
+    run_once = sub.add_parser("run-once", help="Run one polling cycle (debug)")
+    run_once.add_argument("--config", default=default_cfg)
+
+    exec_cmd = sub.add_parser("exec", help="Execute one Mautic command")
+    exec_cmd.add_argument("--config", default=default_cfg)
+    exec_cmd.add_argument("--root", required=True)
+    exec_cmd.add_argument(
+        "--command",
+        required=True,
+        choices=[
+            "campaign:trigger",
+            "segments:update",
+            "campaign:rebuild",
+            "campaigns:update",
+            "campaigns:trigger",
+            "import",
+        ],
+    )
+    exec_cmd.add_argument("--instance-id", type=int)
+    exec_cmd.add_argument("--php-bin", default="/usr/bin/php")
+    exec_cmd.add_argument("--timeout", type=int, default=1800)
+    exec_cmd.add_argument("--run-as-user", default="www-data")
+
+    def _add_shorthand_exec_args(p: argparse.ArgumentParser, *, with_instance_id: bool) -> None:
+        p.add_argument("--config", default=default_cfg)
+        p.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
+        if with_instance_id:
+            p.add_argument("-i", "--instance-id", type=int, dest="instance_id")
+        p.add_argument("--php-bin", default="/usr/bin/php")
+        p.add_argument("--timeout", type=int, default=1800)
+        p.add_argument("--run-as-user", default="www-data")
+
+    sh_seg = sub.add_parser("segments:update", help="Shorthand for exec --command segments:update")
+    _add_shorthand_exec_args(sh_seg, with_instance_id=True)
+
+    sh_ct = sub.add_parser("campaign:trigger", help="Shorthand for exec --command campaign:trigger")
+    _add_shorthand_exec_args(sh_ct, with_instance_id=True)
+
+    sh_cr = sub.add_parser("campaign:rebuild", help="Shorthand for exec --command campaign:rebuild")
+    _add_shorthand_exec_args(sh_cr, with_instance_id=True)
+
+    sh_cu = sub.add_parser("campaigns:update", help="Shorthand for exec --command campaigns:update")
+    _add_shorthand_exec_args(sh_cu, with_instance_id=True)
+
+    sh_ctr = sub.add_parser("campaigns:trigger", help="Shorthand for exec --command campaigns:trigger")
+    _add_shorthand_exec_args(sh_ctr, with_instance_id=True)
+
+    sh_imp = sub.add_parser("import", help="Shorthand for exec --command import")
+    _add_shorthand_exec_args(sh_imp, with_instance_id=False)
+
+    tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
+    tune.add_argument("--config", default=default_cfg)
+    tune.add_argument("--root")
+    tune.add_argument("--max-parallel", type=int, default=4)
+    tune.add_argument("--apply", action="store_true")
+    tune.add_argument("--apply-priority", action="store_true")
+
+    def _add_plugins_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--config", default=default_cfg)
+        p.add_argument("--root")
+        p.add_argument(
+        "--action",
+        choices=["auto", "install", "update", "reinstall", "remove"],
+        help="Action mode for selected plugins",
+        )
+        p.add_argument("--select", help="Selection expression, e.g. '1-3 6 10'")
+        p.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+        p.add_argument("--no-color", action="store_true")
+        p.add_argument("--list-available", action="store_true", help="Show plugins available in server manifest")
+        p.add_argument("--list-installed", action="store_true", help="Show plugins currently installed on host")
+
+    plugins = sub.add_parser("plugins", help="Interactive plugin sync/install from MCC repo")
+    _add_plugins_args(plugins)
+    plugin_alias = sub.add_parser("plugin", help=argparse.SUPPRESS)
+    _add_plugins_args(plugin_alias)
+
+    up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
+    up.add_argument("--config", default=default_cfg)
+    up.add_argument("--root")
+    up.add_argument("op", choices=["check", "apply", "interactive"], nargs="?", default="interactive")
+    up.add_argument("--mode", choices=["auto", "zip", "composer"], default="auto")
+    up.add_argument("--yes", action="store_true")
+    up.add_argument("--backup", action="store_true")
+    up.add_argument("--with-system-upgrade", action="store_true")
+
+    hub = sub.add_parser("interactive", help="Unified interactive menu")
+    hub.add_argument("--config", default=default_cfg)
+    hub.add_argument("--root")
+    hub.add_argument("--no-color", action="store_true")
+
+    inv = sub.add_parser("instances", help="Manage Mautic instance inventory")
+    inv.add_argument("--config", default=default_cfg)
+    inv.add_argument("op", choices=["list", "rescan", "add", "remove"], nargs="?", default="list")
+    inv.add_argument("--name")
+    inv.add_argument("--root")
+    inv.add_argument("--console-path")
+    inv.add_argument("--local-php-path")
+    inv.add_argument("--mautic-major", type=int)
+    inv.add_argument("--db-host")
+    inv.add_argument("--db-port", type=int)
+    inv.add_argument("--db-name")
+    inv.add_argument("--db-user")
+    inv.add_argument("--db-password")
+    inv.add_argument("--db-table-prefix")
+
+    reload_cfg = sub.add_parser("reload-config", help="Rescan instances from config/discovery")
+    reload_cfg.add_argument("--config", default=default_cfg)
+
+    env = sub.add_parser("env", help="Host environment operations")
+    env.add_argument("target", choices=["ipv6", "policy"])
+    env.add_argument("op", choices=["status", "disable", "enable", "show", "plan"])
+    env.add_argument("--policy-file")
+    env.add_argument("--policy-json")
+    env.add_argument("--policy-b64")
+    env.add_argument("--component", choices=["all", "apt", "iptables", "database", "php", "web", "web_cf_real_ip"], default="all")
+    env.add_argument("--json", action="store_true")
+
+    svc = sub.add_parser("service-profile", help="Fetch/apply MCC-managed service profiles (hardware-aware)")
+    svc.add_argument("--config", default=default_cfg)
+    svc.add_argument("op", choices=["fetch", "apply", "status"])
+    svc.add_argument("--component", choices=["php_fpm", "php-fpm", "mysql", "apt"], default="php_fpm")
+    svc.add_argument("--dry-run", action="store_true")
+    svc.add_argument("--json", action="store_true")
+
+    ro = sub.add_parser("runtime-overrides", help="Runtime overrides sync with MCC")
+    ro.add_argument("--config", default=default_cfg)
+    ro.add_argument("op", choices=["show", "fetch", "push", "trigger", "status"], nargs="?", default="show")
+    ro.add_argument("--merge", action="store_true", help="merge on push (default: replace)")
+    ro.add_argument("--json", action="store_true")
+
+    scheduler = sub.add_parser("scheduler", help="Pause/resume scheduler launches")
+    scheduler.add_argument("--config", default=default_cfg)
+    scheduler.add_argument("op", choices=["pause", "resume", "status"])
+
+    maintenance = sub.add_parser("maintenance", help="Temporary maintenance mode (no profile switch)")
+    maintenance.add_argument("--config", default=default_cfg)
+    maintenance.add_argument("op", choices=["on", "off", "status"])
+    maintenance.add_argument(
+        "--no-kill-running",
+        action="store_true",
+        help="Only pause scheduler, do not stop currently running Mautic console tasks",
+    )
+    maintenance.add_argument(
+        "--kill-orphans",
+        action="store_true",
+        help="Also stop orphan Mautic console tasks not tracked in MCD task DB",
+    )
+    maintenance.add_argument(
+        "--grace-sec",
+        type=int,
+        default=10,
+        help="SIGTERM grace period before SIGKILL for stopped processes",
+    )
+
+    profile = sub.add_parser("profile", help="Switch MCD profile (single source of state)")
+    profile.add_argument("--config", default=default_cfg)
+    profile.add_argument("op", choices=["status", "passive", "tiny", "mini", "midi", "maxi", "hiload", "custom"])
+    profile.add_argument("--yes", action="store_true")
+
+    tcheck = sub.add_parser("time-check", help="Timezone diagnostics for OS/PHP/MySQL/Mautic")
+    tcheck.add_argument("--config", default=default_cfg)
+
+    cfgchk = sub.add_parser("config-check", help="Validate config and optionally recover from MCC desired config")
+    cfgchk.add_argument("--config", default=default_cfg)
+    cfgchk.add_argument("--repair-from-mcc", action="store_true")
+    cfgchk.add_argument("--json", action="store_true")
+
+    signals = sub.add_parser("signals", help="Collect lightweight critical host signals")
+    signals.add_argument("--window-min", type=int, default=15)
+    signals.add_argument("--json", action="store_true")
+
+    upd = sub.add_parser("self-update", help="MCD self-update via MCC approved/test/lts channels")
+    upd.add_argument("--config", default=default_cfg)
+    upd.add_argument("op", choices=["check", "apply", "status"], nargs="?", default="status")
+    upd.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    upd.add_argument("--json", action="store_true")
+
+    m6p = sub.add_parser("mautic6-patch", help="Manage Mautic 6 core PluginUpdateEvent metadata patch")
+    m6p.add_argument("--config", default=default_cfg)
+    m6p.add_argument("--root", help="Instance root or instance uid (default: all)")
+    m6p.add_argument("op", choices=["status", "apply", "revert", "policy"], nargs="?", default="status")
+    m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
+    m6p.add_argument("--json", action="store_true")
+
+    uninst = sub.add_parser("uninstall", help="Remove MCD and restore pre-install crontab")
+    uninst.add_argument("--service-name", default="mcd")
+    uninst.add_argument("--install-dir", default="/opt/mcd")
+    uninst.add_argument("--etc-dir", default="/etc/mcd")
+    uninst.add_argument("--no-purge", action="store_true", help="Keep /opt/mcd and /etc/mcd")
+    uninst.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+
+    bkp = sub.add_parser("backup", help="Remote mydumper backup via sshfs")
+    bkp.add_argument("--config", default=default_cfg)
+    bkp.add_argument("--root", help="Optional instance root selector (accepted for MCC compatibility; backup scope is host-level)")
+    bkp.add_argument(
+        "op",
+        choices=["run", "status", "history", "prune", "restore", "profile-show", "profile-set"],
+        nargs="?",
+        default="status",
+    )
+    bkp.add_argument("--date", help="Restore from backup date folder YYYY-MM-DD")
+    bkp.add_argument("--path", help="Restore from explicit backup path")
+    bkp.add_argument("--profile-json-file", help="JSON file with backup profile payload for profile-set")
+    bkp.add_argument("--profile-json-stdin", action="store_true", help="Read backup profile JSON payload from stdin")
+    bkp.add_argument("--replace", action="store_true", help="Replace backup profile payload instead of merge")
+    bkp.add_argument("--json", action="store_true")
+
+    custom = sub.add_parser("custom", help="Run custom script from MCC manifest")
+    custom.add_argument("--config", default=default_cfg)
+    custom.add_argument("--list", action="store_true", help="List available custom scripts")
+    custom.add_argument("--json", action="store_true")
+    custom.add_argument(
+        "--detach",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Detached run control. Default: auto (interactive scripts run foreground).",
+    )
+    custom.add_argument("script", nargs="?", help="Script key (or display name) from custom manifest")
+    custom.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments for selected script (after --)")
+
+    return parser
+
+
+def _normalize_help_tokens(argv: list[str]) -> list[str]:
+    # Support Windows-style help tokens for operator convenience.
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        cur = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if cur == "--action" and nxt in {"/?", "-?"}:
+            out.append("--help")
+            i += 2
+            continue
+        out.append("--help" if cur in {"/?", "-?"} else cur)
+        i += 1
+    return out
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args(_normalize_help_tokens(sys.argv[1:]))
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+
+    if not args.cmd:
+        cfg = load_config(_default_config_path())
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        return _run_interactive_hub(cfg, None, False)
+
+    if args.cmd == "health":
+        payload = {"service": "mcd-agent", "version": __version__, "status": "ok"}
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print("mcd-agent ok")
+        return 0
+
+    if args.cmd == "config-check":
+        try:
+            cfg = load_config(args.config, allow_recover_from_mcc=bool(args.repair_from_mcc))
+            payload = {
+                "status": "ok",
+                "path": cfg.config_file_path,
+                "schema_version": int(cfg.config_schema_version),
+                "customized": bool(cfg.config_customized),
+                "sha256": cfg.config_sha256,
+                "profile": (cfg.profile_name or "").strip().lower(),
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(
+                    f"config ok path={payload['path']} schema={payload['schema_version']} "
+                    f"profile={payload['profile']} customized={payload['customized']}"
+                )
+            return 0
+        except Exception as e:
+            payload = {"status": "error", "reason": str(e)}
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(f"config error: {e}")
+            return 1
+
+    if args.cmd == "discover":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        installs = discover_mautic(
+            cfg.discovery_roots,
+            cfg.exclude_path_contains,
+            cfg.supported_mautic_majors,
+            cfg.custom_instances,
+        )
+        print(json.dumps([inst.safe_dict() for inst in installs], indent=2))
+        return 0
+
+    if args.cmd == "run":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            logging.info(note)
+        run_loop(cfg)
+        return 0
+
+    if args.cmd == "run-once":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            logging.info(note)
+        run_loop(cfg, single_cycle=True)
+        return 0
+
+    shorthand = {
+        "segments:update",
+        "campaign:trigger",
+        "campaign:rebuild",
+        "campaigns:update",
+        "campaigns:trigger",
+        "import",
+    }
+    if args.cmd in shorthand:
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            root = _select_root_for_ops(cfg, args.root)
+        except Exception as e:
+            print(str(e))
+            return 2
+        rc, output = _run_manual_command_with_scheduler(
+            cfg=cfg,
+            php_bin=args.php_bin,
+            root=root,
+            command=args.cmd,
+            instance_id=getattr(args, "instance_id", None),
+            timeout_sec=args.timeout,
+            run_as_user=args.run_as_user,
+        )
+        if output:
+            print(output)
+        return rc
+
+    if args.cmd == "exec":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        rc, output = _run_manual_command_with_scheduler(
+            cfg=cfg,
+            php_bin=args.php_bin,
+            root=args.root,
+            command=args.command,
+            instance_id=args.instance_id,
+            timeout_sec=args.timeout,
+            run_as_user=args.run_as_user,
+        )
+        if output:
+            print(output)
+        return rc
+
+    if args.cmd == "tune-segments":
+        payload = tune_segments(
+            config_path=args.config,
+            root=args.root,
+            max_parallel=args.max_parallel,
+            apply=bool(args.apply),
+            apply_priority=bool(args.apply_priority),
+        )
+        print(format_tune_result(payload))
+        return 0
+
+    if args.cmd in {"plugins", "plugin"}:
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        rc = run_plugins_interactive(
+            config=cfg,
+            root=args.root,
+            selection=args.select,
+            action=args.action,
+            no_color=bool(args.no_color),
+            yes=bool(args.yes),
+            list_available=bool(args.list_available),
+            list_installed=bool(args.list_installed),
+        )
+        if rc == 0:
+            _push_state_after_change(cfg, "plugins")
+        return rc
+
+    if args.cmd == "mautic-upgrade":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if args.op == "check":
+            return run_upgrade_check(cfg, args.root)
+        if args.op == "interactive":
+            rc = run_upgrade_interactive(cfg, args.root)
+            if rc == 0:
+                _push_state_after_change(cfg, "mautic-upgrade-interactive")
+            return rc
+        rc = run_upgrade_apply(
+            config=cfg,
+            root=args.root,
+            mode=args.mode,
+            yes=bool(args.yes),
+            do_backup=bool(args.backup),
+            with_system_upgrade=bool(args.with_system_upgrade),
+        )
+        if rc == 0:
+            _push_state_after_change(cfg, "mautic-upgrade-apply")
+        return rc
+
+    if args.cmd == "interactive":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        return _run_interactive_hub(cfg, args.root, bool(args.no_color))
+
+    if args.cmd == "instances":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        inv = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inv, cfg)
+        if args.op == "list":
+            rows = inv.list_instances()
+            if not rows:
+                print("No instances")
+                return 0
+            for i in rows:
+                print(f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}")
+            return 0
+        if args.op == "rescan":
+            count = inv.rescan(cfg)
+            print(f"Rescan complete: {count} instances")
+            _push_state_after_change(cfg, "instances-rescan")
+            return 0
+        if args.op == "add":
+            if not (args.name and args.root and args.console_path):
+                print("--name --root --console-path are required for add")
+                return 2
+            inv.add_or_update_manual(
+                name=args.name,
+                root=args.root,
+                console_path=args.console_path,
+                local_php_path=args.local_php_path,
+                mautic_major=args.mautic_major,
+                db_host=args.db_host,
+                db_port=args.db_port,
+                db_name=args.db_name,
+                db_user=args.db_user,
+                db_password=args.db_password,
+                db_table_prefix=args.db_table_prefix,
+            )
+            print("Manual instance saved")
+            _push_state_after_change(cfg, "instances-add")
+            return 0
+        if args.op == "remove":
+            if not args.name:
+                print("--name is required for remove")
+                return 2
+            print("Removed" if inv.remove(args.name) else "Not found")
+            _push_state_after_change(cfg, "instances-remove")
+            return 0
+
+    if args.cmd == "reload-config":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        inv = InstanceInventory(cfg.state_db_path)
+        count = inv.rescan(cfg)
+        print(f"Reload complete: {count} instances")
+        _push_state_after_change(cfg, "reload-config")
+        return 0
+
+    if args.cmd == "env":
+        if args.target == "ipv6":
+            if args.op == "status":
+                st = ipv6_status()
+                for k, v in st.items():
+                    print(f"{k}={v}")
+                return 0
+            if args.op in {"disable", "enable"}:
+                for line in set_ipv6_disabled(args.op == "disable"):
+                    print(line)
+                return 0
+            raise RuntimeError("unsupported env ipv6 operation")
+        if args.target == "policy":
+            if args.op == "show":
+                print(json.dumps(default_policy(), ensure_ascii=True, indent=2))
+                return 0
+            if args.op == "plan":
+                raw = ""
+                if args.policy_file:
+                    raw = Path(args.policy_file).read_text(encoding="utf-8")
+                elif args.policy_json:
+                    raw = str(args.policy_json)
+                elif args.policy_b64:
+                    raw = base64.b64decode(str(args.policy_b64)).decode("utf-8")
+                payload = parse_policy_text(raw)
+                if bool(args.json):
+                    print(json.dumps(payload, ensure_ascii=True, indent=2))
+                    return 0
+                for line in build_policy_plan(payload, component=str(args.component or "all")):
+                    print(line)
+                return 0
+            raise RuntimeError("unsupported env policy operation")
+        raise RuntimeError("unsupported env target")
+
+    if args.cmd == "service-profile":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        comp = str(args.component or "php_fpm")
+        if args.op == "status":
+            payload = {
+                "enabled": bool(cfg.service_profiles_enabled),
+                "auto_apply": bool(cfg.service_profiles_auto_apply),
+                "poll_interval_sec": int(cfg.service_profiles_poll_interval_sec),
+                "components": list(cfg.service_profiles_components or []),
+            }
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        if args.op == "fetch":
+            if comp not in {"php_fpm", "php-fpm", "mysql", "apt"}:
+                print(json.dumps({"status": "error", "reason": f"unsupported component: {comp}"}, ensure_ascii=True))
+                return 2
+            res = fetch_service_profile(cfg, comp)
+            print(json.dumps(res, ensure_ascii=True, indent=2))
+            return 0 if str(res.get("status", "")).strip().lower() == "ok" else 1
+        # apply
+        res = service_profiles_apply_once(cfg, component=comp, dry_run=bool(args.dry_run))
+        print(json.dumps(res, ensure_ascii=True, indent=2))
+        return 0 if str(res.get("status", "")).strip().lower() == "ok" else 1
+
+    if args.cmd == "runtime-overrides":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        op = str(args.op or "show").strip().lower()
+        if op in {"show", "status"}:
+            payload = {
+                "config": cfg.config_file_path,
+                "local_runtime_overrides": local_runtime_overrides(cfg),
+            }
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        if op == "fetch":
+            res = fetch_runtime_overrides(cfg)
+            print(json.dumps(res, ensure_ascii=True, indent=2))
+            return 0 if str(res.get("status", "")).strip().lower() in {"ok", "disabled"} else 1
+        if op == "push":
+            res = push_runtime_overrides(cfg, local_runtime_overrides(cfg), merge=bool(args.merge))
+            print(json.dumps(res, ensure_ascii=True, indent=2))
+            return 0 if str(res.get("status", "")).strip().lower() in {"ok", "disabled"} else 1
+        # trigger
+        path = touch_poll_trigger(cfg)
+        payload = {"status": "ok", "trigger_path": path}
+        if bool(args.json):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(f"runtime_overrides_trigger={path}")
+        return 0
+
+    if args.cmd == "scheduler":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        flag = Path(cfg.scheduler_pause_flag_path)
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        if args.op == "pause":
+            flag.write_text("paused\n", encoding="utf-8")
+            print(f"paused: {flag}")
+            return 0
+        if args.op == "resume":
+            if flag.exists():
+                flag.unlink()
+            print(f"resumed: {flag}")
+            return 0
+        paused = flag.exists()
+        running = 0
+        try:
+            con = sqlite3.connect(cfg.state_db_path)
+            cur = con.cursor()
+            cur.execute("SELECT COUNT(*) FROM tasks WHERE state='running'")
+            row = cur.fetchone()
+            running = int(row[0]) if row else 0
+            con.close()
+        except Exception:
+            running = -1
+        print(f"paused={str(paused).lower()} running_tasks={running}")
+        return 0
+
+    if args.cmd == "maintenance":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        flag = Path(cfg.scheduler_pause_flag_path)
+        flag.parent.mkdir(parents=True, exist_ok=True)
+
+        if args.op == "off":
+            if flag.exists():
+                flag.unlink()
+            tracked = _tracked_running_tasks(cfg)
+            consoles = _list_mautic_console_processes()
+            print(
+                "maintenance=off "
+                f"paused={str(flag.exists()).lower()} "
+                f"tracked_running={len(tracked)} "
+                f"mautic_console_total={len(consoles)}"
+            )
+            return 0
+
+        if args.op == "status":
+            tracked = _tracked_running_tasks(cfg)
+            tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
+            consoles = _list_mautic_console_processes()
+            orphan_count = sum(1 for pid, _ in consoles if pid not in tracked_pids)
+            print(
+                "maintenance={mode} paused={paused} tracked_running={tracked} "
+                "mautic_console_total={total} orphan_console={orphans}".format(
+                    mode="on" if flag.exists() else "off",
+                    paused=str(flag.exists()).lower(),
+                    tracked=len(tracked),
+                    total=len(consoles),
+                    orphans=orphan_count,
+                )
+            )
+            return 0
+
+        # op == "on"
+        flag.write_text("paused\n", encoding="utf-8")
+        stop_count = 0
+        failed_count = 0
+
+        if not bool(args.no_kill_running):
+            tracked = _tracked_running_tasks(cfg)
+            for task in tracked:
+                pid = int(task.get("pid") or 0)
+                if pid <= 0:
+                    continue
+                res = _kill_pid(pid, int(args.grace_sec))
+                if res in {"terminated", "killed", "already-exited"}:
+                    stop_count += 1
+                else:
+                    failed_count += 1
+                    print(
+                        "WARN stop failed: pid={pid} task={task_type} entity={entity} result={res}".format(
+                            pid=pid,
+                            task_type=str(task.get("task_type") or "-"),
+                            entity=str(task.get("entity_id") if task.get("entity_id") is not None else "-"),
+                            res=res,
+                        )
+                    )
+
+            if bool(args.kill_orphans):
+                tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
+                for pid, cmd in _list_mautic_console_processes():
+                    if pid in tracked_pids:
+                        continue
+                    res = _kill_pid(pid, int(args.grace_sec))
+                    if res in {"terminated", "killed", "already-exited"}:
+                        stop_count += 1
+                    else:
+                        failed_count += 1
+                        print(f"WARN orphan stop failed: pid={pid} result={res} cmd={cmd}")
+
+        tracked_after = _tracked_running_tasks(cfg)
+        consoles_after = _list_mautic_console_processes()
+        print(
+            "maintenance=on paused=true stopped={stopped} stop_failed={failed} "
+            "tracked_running={tracked} mautic_console_total={total}".format(
+                stopped=stop_count,
+                failed=failed_count,
+                tracked=len(tracked_after),
+                total=len(consoles_after),
+            )
+        )
+        return 0
+
+    if args.cmd == "time-check":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        inv = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inv, cfg)
+
+        os_now = datetime.now().astimezone()
+        utc_now = datetime.now(timezone.utc)
+        print(f"os_now={os_now.strftime('%Y-%m-%d %H:%M:%S %z')} tz={os_now.tzname()}")
+        print(f"daemon_utc_now={utc_now.strftime('%Y-%m-%d %H:%M:%S %z')}")
+        print("")
+
+        rows = inv.list_instances()
+        if not rows:
+            print("No instances")
+            return 0
+        for inst in rows:
+            print(f"[{inst.name}] root={inst.root}")
+            print(f"  mautic_timezone={inst.mautic_timezone or '-'}")
+            if not inst.db:
+                print("  db=not configured")
+                print("")
+                continue
+            db = MauticDB(inst.db)
+            try:
+                out = db.fetch_rows(
+                    "SELECT @@global.time_zone AS global_tz, @@session.time_zone AS session_tz, "
+                    "@@system_time_zone AS system_tz, NOW() AS mysql_now, UTC_TIMESTAMP() AS mysql_utc",
+                    limit=1,
+                )
+                row = out[0] if out else {}
+                print(
+                    "  mysql_tz: global={g} session={s} system={sys}".format(
+                        g=row.get("global_tz", "-"),
+                        s=row.get("session_tz", "-"),
+                        sys=row.get("system_tz", "-"),
+                    )
+                )
+                print(f"  mysql_now={row.get('mysql_now', '-')}")
+                print(f"  mysql_utc={row.get('mysql_utc', '-')}")
+            except Exception as e:
+                print(f"  mysql_error={e}")
+            print("")
+        return 0
+
+    if args.cmd == "signals":
+        payload = collect_signals(window_min=int(args.window_min))
+        if args.json:
+            print(format_signals_json(payload))
+        else:
+            print(format_signals_text(payload))
+        return 0
+
+    if args.cmd == "self-update":
+        cfg = load_config(args.config)
+        if args.op == "status":
+            st = update_status(cfg)
+            if args.json:
+                print(json.dumps(st, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(st, ensure_ascii=True, indent=2))
+            return 0
+        if args.op == "check":
+            decision = check_with_mcc(cfg, auto_update_enabled=False)
+            if args.json:
+                print(json.dumps(decision, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(decision, ensure_ascii=True, indent=2))
+            return 0
+        # apply
+        if not args.yes:
+            ans = _ask("Apply self-update now (if available)? [y/N]: ").strip().lower()
+            if ans not in {"y", "yes"}:
+                print("Cancelled")
+                return 1
+        decision = check_with_mcc(cfg, auto_update_enabled=True)
+        st = str(decision.get("status", "")).strip().lower()
+        if st == "wait":
+            print("MCC update slots are busy; retry in 60s")
+            return 2
+        if st in {"up_to_date", "disabled"}:
+            print(json.dumps(decision, ensure_ascii=True))
+            return 0
+        if st not in {"update", "update_available"}:
+            print(json.dumps(decision, ensure_ascii=True))
+            return 1
+        ok, msg = apply_update(cfg, decision)
+        print(msg)
+        return 0 if ok else 1
+
+    if args.cmd == "mautic6-patch":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if args.op == "policy":
+            if not args.policy:
+                raise RuntimeError("--policy is required for op=policy")
+            target_cfg = _write_runtime_patch_policy(args.config, args.policy)
+            out = {
+                "status": "ok",
+                "policy": args.policy,
+                "config_path": target_cfg,
+            }
+            proc = subprocess.run(["systemctl", "restart", "mcd"], capture_output=True, text=True)
+            out["service_restart_ok"] = proc.returncode == 0
+            if proc.returncode != 0:
+                out["service_restart_error"] = (proc.stderr or proc.stdout or "").strip()
+            if args.json:
+                print(json.dumps(out, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(out, ensure_ascii=True))
+            _push_state_after_change(cfg, "mautic6-core-patch-policy")
+            return 0 if proc.returncode == 0 else 1
+
+        installs = _select_installs_for_patch(cfg, args.root)
+        if not installs:
+            raise RuntimeError("No matching instances")
+        payload = []
+        rc = 0
+        for inst in installs:
+            if args.op == "status":
+                res = mautic6_patch_status(inst)
+            elif args.op == "apply":
+                res = ensure_m6_plugin_update_metadata_patch(inst)
+            elif args.op == "revert":
+                res = revert_m6_plugin_update_metadata_patch(inst)
+            else:
+                raise RuntimeError(f"unsupported op: {args.op}")
+            payload.append({"root": inst.root, "instance_uid": inst.instance_uid, "result": res})
+            st = str(res.get("status", "")).strip().lower()
+            if st == "error":
+                rc = 1
+
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            for row in payload:
+                print(json.dumps(row, ensure_ascii=True))
+        if args.op == "apply":
+            _push_state_after_change(cfg, "mautic6-core-patch-apply")
+        if args.op == "revert":
+            _push_state_after_change(cfg, "mautic6-core-patch-revert")
+        return rc
+
+    if args.cmd == "profile":
+        cfg = load_config(args.config)
+        old_profile_name = (cfg.profile_name or "").strip().lower() or None
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if args.op == "status":
+            res = profile_status(
+                pause_flag_path=cfg.scheduler_pause_flag_path,
+                config_path=args.config,
+            )
+            for line in res.lines:
+                print(line)
+            return 0
+        if not args.yes:
+            ans = _ask(f"Switch profile to {args.op}? [y/N]: ").strip().lower()
+            if ans not in {"y", "yes"}:
+                print("Cancelled")
+                return 1
+        res = profile_set(
+            profile=args.op,
+            pause_flag_path=cfg.scheduler_pause_flag_path,
+            install_dir="/opt/mcd",
+            config_path=args.config,
+        )
+        for line in res.lines:
+            print(line)
+        if res.ok:
+            cfg_after = load_config(args.config)
+            new_profile_name = (cfg_after.profile_name or "").strip().lower() or None
+            try:
+                queue_profile_event(
+                    cfg_after,
+                    source="mcd_cli",
+                    initiated_by_user=True,
+                    old_profile=old_profile_name,
+                    new_profile=new_profile_name,
+                    reason="profile_set",
+                    details={"command": f"profile {args.op}"},
+                )
+            except Exception as e:
+                logging.warning("profile-set event enqueue failed: %s", e)
+            _push_state_after_change(cfg_after, "profile-set")
+        return 0 if res.ok else 1
+
+    if args.cmd == "uninstall":
+        if not args.yes:
+            ans = _ask("This will remove MCD and restore previous crontab. Continue? [y/N]: ").strip().lower()
+            if ans not in {"y", "yes"}:
+                print("Cancelled")
+                return 1
+        res = run_uninstall(
+            service_name=args.service_name,
+            install_dir=args.install_dir,
+            etc_dir=args.etc_dir,
+            purge=not bool(args.no_purge),
+        )
+        for line in res.lines:
+            print(line)
+        return 0 if res.ok else 1
+
+    if args.cmd == "backup":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if args.op == "run":
+            res = backup_run(cfg, args.root)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                            "backup_path": res.backup_path,
+                            "duration_sec": res.duration_sec,
+                            "bytes_written": res.bytes_written,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+                if res.backup_path:
+                    print(f"path={res.backup_path}")
+            _push_state_after_change(cfg, "backup-run")
+            return 0 if res.ok else 1
+        if args.op == "prune":
+            res = backup_prune(cfg, args.root)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+            _push_state_after_change(cfg, "backup-prune")
+            return 0 if res.ok else 1
+        if args.op == "restore":
+            res = backup_restore(cfg, root=args.root, date=args.date, path=args.path)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                            "backup_path": res.backup_path,
+                            "duration_sec": res.duration_sec,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+                if res.backup_path:
+                    print(f"path={res.backup_path}")
+            _push_state_after_change(cfg, "backup-restore")
+            return 0 if res.ok else 1
+        if args.op == "profile-show":
+            masked = backup_profile_masked(cfg)
+            print(json.dumps(masked, ensure_ascii=True, indent=2))
+            return 0
+        if args.op == "profile-set":
+            raw = ""
+            if args.profile_json_stdin:
+                raw = sys.stdin.read()
+            elif args.profile_json_file:
+                raw = Path(args.profile_json_file).read_text(encoding="utf-8")
+            else:
+                raise RuntimeError("profile-set requires --profile-json-file or --profile-json-stdin")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise RuntimeError("backup profile payload must be a JSON object")
+            backup_profile_set(cfg, payload, merge=not bool(args.replace))
+            masked = backup_profile_masked(cfg)
+            print(json.dumps(masked, ensure_ascii=True, indent=2))
+            _push_state_after_change(cfg, "backup-profile-set")
+            return 0
+        st = backup_status(cfg, args.root)
+        if args.op == "history":
+            history = st.get("history", [])
+            if args.json:
+                print(json.dumps(history, ensure_ascii=True, indent=2))
+            else:
+                if not history:
+                    print("No backup history")
+                else:
+                    for row in history:
+                        print(json.dumps(row, ensure_ascii=True))
+            return 0
+        if args.json:
+            print(json.dumps(st, ensure_ascii=True, indent=2))
+        else:
+            print(json.dumps(st, ensure_ascii=True, indent=2))
+        return 0
+
+    if args.cmd == "custom":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if bool(args.list):
+            rows, source = fetch_custom_manifest(cfg, use_cache_on_error=True)
+            if bool(args.json):
+                payload = {"source": source, "scripts": rows}
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"Manifest source: {source}")
+                print(format_custom_scripts_list(rows, with_idx=True))
+            return 0
+        if not args.script:
+            return _run_custom_menu(cfg)
+        script_args = list(args.script_args or [])
+        if script_args and script_args[0] == "--":
+            script_args = script_args[1:]
+        rc, out = run_custom_script_by_key(
+            cfg,
+            script_key=str(args.script),
+            args=script_args,
+            detach=args.detach,
+            live_output=not bool(args.detach),
+        )
+        if out:
+            print(out)
+        return rc
+
+    parser.print_help()
+    return 1

@@ -1,0 +1,778 @@
+# MCD Changelog
+
+## 0.8.5 - 2026-03-09
+- Added: bounded retention for delivered outbound profile events.
+  - New runtime key `outbound_events_sent_keep_days` (default `14`).
+  - Daemon prunes old `sent` profile events in quiet window together with task compaction cycle.
+- Added: periodic cleanup for local custom-scripts cache.
+  - New runtime/system keys:
+    - `custom_cache_cleanup_enabled`
+    - `custom_cache_cleanup_interval_sec`
+    - `custom_cache_cleanup_quiet_hour`
+    - `custom_cache_cleanup_quiet_window_min`
+    - `custom_logs_keep_days`
+    - `custom_logs_max_files`
+    - `custom_downloads_keep_days`
+    - `custom_downloads_max_entries`
+  - Cleanup policy removes stale logs/downloads by age and hard-cap limits, and prunes downloads for keys missing from current custom manifest.
+
+## 0.8.4 - 2026-03-09
+- Added: runtime keys for template workflow:
+  - `runtime.host_template` (mark host as template source),
+  - `runtime.template_autopromote_on_clone` (auto-promote clone to normal host identity).
+- Added: agent identity resolver for clone-safe MCC calls.
+  - On detected clone, agent switches `hostname` to local OS hostname and clears `mcc_host_name` in API payload.
+  - Payload now includes `template_state`, `agent_hostname`, and `configured_host_name`.
+- Changed: runtime-overrides, service-profile fetch, self-update check/release and state push now use unified identity resolution.
+
+## 0.8.3 - 2026-03-09
+- Changed: custom scripts now support manifest flag `interactive` and run in foreground by default for such entries.
+  - Foreground execution uses live stdout/stderr stream and supports interactive stdin prompts.
+  - Detached launch (`tmux`/`screen`) remains available explicitly.
+- Changed: `mcd-cli custom` detach control switched to `--detach|--no-detach` (auto by default).
+  - Auto mode now respects manifest intent: interactive scripts default to foreground.
+- Changed: interactive menu `Custom Scripts` detach prompt is now profile-aware.
+  - For interactive scripts, default answer is foreground (`[y/N]` for detach).
+- Changed: custom scripts list output now shows `interactive=yes|no`.
+
+## 0.8.2 - 2026-03-09
+- Added: service-profile component `apt` (MCC-driven, hardware-aware).
+  - New fetch/apply support in `mcd-cli service-profile --component apt`.
+  - Daemon auto-apply loop accepts `apt` in `service_profiles_components`.
+- Added: APT profile executor with built-in repair primitives:
+  - optional cleanup for `third-party.sources`,
+  - optional dedupe for `.list` source entries,
+  - optional `mariadb_repo_setup` rebootstrap,
+  - optional Ondrej PPA ensure hooks (`php`, `nginx`, `apache2`),
+  - optional package presence/absence and upgrade mode controls.
+- Added: APT state push in standard `/api/v1/agent/state` payload (`apt_state`) with:
+  - `pending_updates`,
+  - `error_count`,
+  - duplicate source detection summary.
+
+## 0.8.1 - 2026-03-08
+- Fixed: `Custom Scripts` menu no longer fails hard on MCC `404` for manifest.
+  - Behavior now treats missing manifest as an empty catalog (`No custom scripts`) and caches empty manifest locally.
+  - Result: fresh MCC setup (before first custom publish) keeps interactive menu usable.
+- Fixed: custom repo base URL resolution now prefers plugin/static repo URL before MCC API URL.
+  - Root cause: when `mcc.url` pointed to API backend (e.g. `:18080`), custom manifest path resolved against API origin and returned `404`.
+  - Result: custom manifest fetch uses static repo origin consistently with plugin repo behavior.
+
+## 0.8.0 - 2026-03-08
+- Added: centralized custom script execution from MCC repository.
+  - New command: `mcd-cli custom [--list] [--json] [--no-detach] [<script_key_or_name>] [-- <args...>]`.
+  - Interactive hub now includes `Custom Scripts` menu with manifest-driven list and grouped labels.
+  - Scripts are resolved by manifest key (with display-name fallback) and never by local filename.
+- Added: detached custom script runtime with operator-safe behavior.
+  - MCD prefers `tmux` for long scripts, falls back to `screen`, then direct foreground execution.
+  - Downloaded scripts are cached locally and verified by `sha256` from manifest.
+- Added: custom manifest prefetch on daemon startup.
+  - MCD fetches manifest from MCC and uses local cache fallback when MCC is temporarily unreachable.
+- Added: custom script runtime config section (`[custom]`) with defaults:
+  - repo URL/path, cache directory, default run mode, tmux/screen preferences, and session prefix.
+
+## 0.7.21 - 2026-03-08
+- Fixed: segment scheduler now reuses regular slot(s) for priority ring when regular ring is empty.
+  - Root cause: strict split guard blocked priority spill, so `midi` could stay at `3` running segments instead of target `4` (`3+1`) when all segments were classified into priority.
+  - New behavior: if regular ring has no launch candidates, MCD borrows missing slot(s) for priority to keep total segment parallelism at configured limit.
+
+## 0.7.20 - 2026-03-07
+- Changed: profile-event delivery queue moved from pending file to SQLite (`state_db`) outbound events table.
+  - Added durable queue table `outbound_events` with event status (`pending|failed|sent`), retries and timestamps.
+  - Added one-time automatic migration of legacy `profile-event.pending.json` into SQLite queue.
+- Changed: profile-event delivery now records send result.
+  - Failed send attempts increment retry counters and keep event queued.
+  - Successful delivery marks event as `sent` instead of deleting it immediately.
+- Changed: SQLite access for task/state paths now uses `WAL` journal mode and `busy_timeout=5000ms` to reduce lock contention between daemon and CLI.
+
+## 0.7.19 - 2026-03-07
+- Added: profile drift guard against MCC desired state.
+  - Daemon periodically compares local active profile vs MCC `desired_profile`.
+  - On unexpected drift, agent backs up local config and restores canonical config from MCC (`config-desired`), then reloads runtime without manual intervention.
+- Added: profile change event queue on agent side.
+  - `mcd-cli profile ...` now writes a pending profile event and pushes it to MCC.
+  - Event delivery is retried automatically until successful push.
+- Changed: state push now includes optional `profile_event`, and pending profile events force immediate push (even when normal change-push is disabled).
+
+## 0.7.18 - 2026-03-07
+- Added: self-update pre-switch smoke gate.
+  - Agent now runs staged `compileall` + import smoke (`mcd_agent.backup`, `mcd_agent.self_update`, `mcd_agent.daemon`, `mcd_agent.cli`) before switching `/opt/mcd/src`.
+  - Guard includes mandatory symbol check for `backup_lock_active`.
+- Result: broken/partial release trees are rejected before source switch, preventing post-update crash loops.
+
+## 0.7.17 - 2026-03-07
+- Added: robust config load recovery path for broken/legacy host config during upgrades.
+  - `load_config()` now performs pre-parse cleanup of known legacy runtime keys.
+  - If config parse fails, agent can pull canonical desired config from MCC and recover automatically.
+  - Broken local config is preserved as `mcd.toml.broken-<timestamp>` before rewrite.
+- Added: CLI command `mcd-cli config-check` with optional `--repair-from-mcc` for explicit validation/recovery.
+- Changed: runtime override reads now strip legacy runtime keys to prevent stale parallel settings re-activation after update.
+
+## 0.7.16 - 2026-03-07
+- Added: service-profile component `mysql` (MCC-driven, hardware-aware).
+  - New fetch/apply support in `mcd-cli service-profile --component mysql`.
+  - Daemon auto-apply loop now supports `mysql` in `service_profiles_components`.
+- Added: safe MySQL profile apply with managed drop-in config file and rollback on restart failure.
+  - Writes only managed drop-in (`99-mcd-hw.cnf` by default) instead of replacing base package config.
+  - Supports both MySQL/Percona and MariaDB service names.
+- Changed: default service-profile components for new configs are now `["php_fpm","mysql"]`.
+
+## 0.7.15 - 2026-03-07
+- Fixed: ring planner is now resilient to transient DB query failures.
+  - Root cause: when `segments_due`/`campaigns_due` query failed, planner rebuilt rings from empty lists and effectively dropped pending entities from current cycle.
+  - New behavior: on query failure, scheduler preserves previously planned segment/campaign rings and continues dispatch from existing circles.
+  - Result: one blocked/limited DB query no longer clears rings or stalls cycle progression.
+- Fixed: planner DB connections now use bounded network timeouts.
+  - Added `connect_timeout=5s`, `read_timeout=120s`, `write_timeout=30s` for MCD planning DB calls.
+  - Result: a stuck DB socket/query can no longer freeze the daemon loop indefinitely.
+- Changed: backup dump timeout is normalized to a safe bounded value.
+  - `dump_timeout_sec <= 0` now resolves to `10800` seconds in effective config.
+  - Added runtime override key `backup_dump_timeout_sec` (MCC dynamic runtime table).
+  - Result: hung backup subprocess no longer keeps backup guard active forever.
+
+## 0.7.13 - 2026-03-06
+- Fixed: stale/ghost running tasks after daemon restart or PID reuse no longer block scheduler slots.
+  - Root cause: orphan adoption and monitor path treated `pid alive` as sufficient, so a reused PID from another process could keep an old task in `running` state.
+  - Added command-signature verification against `/proc/<pid>/cmdline` for adopted tasks and monitored orphan tasks.
+  - On mismatch, task is marked `lost` with `pid_cmd_mismatch` and removed from running map.
+  - Result: segment/campaign slot accounting recovers automatically from PID reuse artifacts and ring dispatch resumes.
+
+## 0.7.11 - 2026-03-05
+- Fixed: mydumper long-query-guard semantics in backup runner.
+  - `backup_mydumper_long_query_guard <= 0` is now treated as "guard disabled".
+  - Because mydumper interprets `--long-query-guard 0` as abort on any query `>0s`, MCD now maps disabled mode to a large safe value.
+  - Applied in both primary and fallback mydumper command builders.
+  - Result: default host config with `long_query_guard = 0` no longer fails immediately on busy databases.
+
+## 0.7.10 - 2026-03-05
+- Fixed: backup mydumper command now always passes `--long-query-guard` including explicit `0`.
+  - Root cause: argument was emitted only for values `> 0`, so configured `0` was omitted and mydumper default guard (`60s`) was used.
+  - Impact before fix: backup could fail on busy hosts with `There are queries in PROCESSLIST running longer than 60s, aborting dump` even when runtime intended to disable the guard.
+  - Result: runtime/config value is applied deterministically in both primary and fallback mydumper command builders.
+
+## 0.7.9 - 2026-03-04
+- Added: manual one-shot commands are now scheduler-aware in active profiles (`exec` and shorthand forms).
+  - Commands are enqueued to local `manual_requests` queue in agent SQLite state DB.
+  - Daemon launches queued manual tasks immediately on next dispatch cycle.
+  - Manual launches ignore ring slot limits for the launch moment (temporary extra slot).
+  - After manual launch, scheduler waits until active counts return to profile formula before spawning new ring tasks.
+  - Manual entity id is marked as executed for current cycle (ring position moved to tail), so it is not re-run immediately in same circle.
+- Added: direct fallback for manual command if daemon does not pick queued request quickly (request is cancelled and command is executed directly).
+- Added: task/request linkage (`manual_request_id`) for robust status propagation from running task monitor.
+- Added: `exec` command now supports `--config` (same default behavior as other commands).
+
+## 0.7.8 - 2026-03-04
+- Added: native shorthand Mautic execution commands in `mcd-cli` (no `exec` wrapper required):
+  - `mcd-cli segments:update [-i <id>] [--root <root|uid>]`
+  - `mcd-cli campaign:trigger [-i <id>] [--root <root|uid>]`
+  - `mcd-cli campaign:rebuild [-i <id>] [--root <root|uid>]`
+  - `mcd-cli campaigns:update [-i <id>] [--root <root|uid>]`
+  - `mcd-cli campaigns:trigger [-i <id>] [--root <root|uid>]`
+  - `mcd-cli import [--root <root|uid>]`
+- Added: shorthand commands support `--config` and automatic local instance root resolution when `--root` is omitted and host has a single known instance.
+- Result: operators can run short commands directly on host and from MCC `host-run` passthrough with same syntax.
+
+## 0.7.7 - 2026-03-04
+- Fixed: backup scheduler helper regression in daemon loop.
+  - Restored missing `_backup_done_for_local_date()` guard used by scheduled backup slot checks.
+  - Root cause: helper call remained after refactor while function definition was removed.
+  - Impact before fix: daemon crashed on startup (`NameError`) and entered systemd restart loop, blocking normal scheduler operation.
+
+## 0.7.6 - 2026-03-04
+- Fixed: dual-ring dispatch now rebinds freshly reconciled rings/sets in the same planning tick.
+  - Root cause: scheduler used previous-cycle ring/set objects until next plan refresh.
+  - Impact: `midi` could underfill segment regular slot and behave like `3` visible workers instead of stable `3+1`.
+
+## 0.7.5 - 2026-03-04
+- Changed: strict segment ring split for idle scheduler.
+  - Removed priority spillover when regular ring has no candidates.
+  - For `midi` this keeps fixed `3+1` behavior (no automatic `4+0` expansion).
+
+## 0.7.4 - 2026-03-04
+- Added: backup controls are now runtime-dynamic and can be changed live from MCC runtime table (no direct `mcd.toml` edits required):
+  - `backup_enabled`
+  - `backup_schedule_*`
+  - `backup_mydumper_threads`
+  - `backup_mydumper_long_query_guard`
+  - `backup_mydumper_kill_long_queries`
+  - `backup_mydumper_extra_args`
+  - `backup_mydumper_use_nice`
+  - `backup_mydumper_nice_level`
+  - `backup_mydumper_use_ionice`
+  - `backup_mydumper_ionice_class`
+  - `backup_mydumper_ionice_level`
+
+## 0.7.3 - 2026-03-03
+- Changed: safer backup defaults for production (applies to new/clean configs):
+  - `backup.mydumper.threads = 6`
+  - `backup.mydumper.kill_long_queries = false`
+  - `backup.mydumper.long_query_guard = 0`
+- Added: backup dump process priority controls:
+  - `backup.mydumper.use_nice = true`, `nice_level = 15`
+  - `backup.mydumper.use_ionice = true`, `ionice_class = 2`, `ionice_level = 7`
+  - mydumper execution is now wrapped with `ionice`/`nice` automatically when tools are available.
+- Changed: transaction/lock defaults for mydumper are now capability-aware:
+  - auto-add `--sync-thread-lock-mode=AUTO` when local mydumper supports it,
+  - prefer `--trx-tables` on supported versions,
+  - fallback to `--trx-consistency-only` on older versions.
+  - explicit operator-provided lock/transaction flags in `backup.mydumper.extra_args` still take precedence.
+
+## 0.7.2 - 2026-03-03
+- Added: runtime-overrides control channel in `mcd-cli`:
+  - `mcd-cli runtime-overrides show|fetch|push|trigger|status`
+  - `trigger` creates a local poll flag for daemon (`/opt/mcd/var/runtime-overrides.poll`).
+- Added: daemon-side runtime trigger handling:
+  - daemon now consumes runtime trigger flag and performs immediate MCC runtime-overrides pull/apply (no restart).
+- Added: runtime sync snapshots in local SQLite state DB (`runtime_sync` table):
+  - `local_runtime` (parsed from config runtime section),
+  - `mcc_runtime` (latest desired payload from MCC),
+  - `active_runtime` (last applied runtime sync result metadata).
+- Changed: state push payload now includes `runtime_overrides` (local observed runtime map), enabling MCC cache visibility without host polling.
+- Changed: daemon now detects local mutable-runtime config changes and pushes them immediately to MCC (`replace` mode), so MCD-side edits become visible in MCC without waiting for periodic state push.
+
+## 0.7.1 - 2026-03-03
+- Changed: segment priority-ring order is now deterministic by business priority, not by id.
+  - Order inside priority ring: whitelist first, then stale (>24h / never built), then by computed weight, then by id tie-break.
+  - Regular ring order is now by computed weight (desc), then id.
+- Changed: passive -> active profile switch now sanitizes legacy local config overrides.
+  - Clears stale legacy runtime keys (`max_parallel_*`, `segment_non_whitelist_policy`) from mutable config.
+  - Clears legacy SQL override keys (`segments_due`, `segment_weights`, `campaigns_due`, `import_pending_count`, `mail_queue_count`) so active profile uses current default scheduler SQL.
+  - Result: hosts leaving passive mode converge faster to current profile defaults without keeping old config artifacts.
+- Added: MCD-managed runtime-dynamic maintenance tasks:
+  - `contacts_cleanup_mode` (`email_and_mobile` or `email_only`) for lead cleanup policy.
+  - `enable_cache_clear` + schedule window (`cache_clear_*`) and command template.
+  - `enable_cache_warm` + schedule window (`cache_warm_*`) and command template.
+  - These knobs are runtime keys, so MCC runtime overrides can change behavior on-the-fly.
+- Changed: cron manager now also marks these as managed when profile is active:
+  - `doctrine:query:sql`
+  - `cache:clear`
+  - `cache:warm` / `cache:warmup`
+  - `mautic:emails:send`
+
+## 0.7.0 - 2026-03-03
+- Added: MCC runtime-overrides pull/apply loop in daemon (dynamic host table, no local file rewrite).
+  - MCD periodically fetches `POST /api/v1/agent/runtime-overrides` and applies supported runtime keys in-memory.
+  - Effective behavior changes immediately (without service restart) for hot-safe runtime knobs.
+  - Removing keys in MCC reverts host back to local base config values on next poll.
+- Added: conditional Mautic 6 core patch triggers by version range:
+  - `runtime.mautic6_core_patch_version_min`
+  - `runtime.mautic6_core_patch_version_max`
+  - `runtime.mautic6_core_patch_apply_if_version_unknown`
+  - patch can now be auto-stopped by updating runtime trigger values from MCC (no code change).
+- Added: remote runtime override normalization:
+  - supports flat keys (`segment_regular_parallel_idle`),
+  - `runtime.*` keys (`runtime.mautic6_core_patch_policy`),
+  - nested payload form (`{"runtime": {...}}`).
+- Added: safety guard for dynamic runtime table:
+  - static/bootstrap-only keys are blocked from hot apply (`state_db_path`, `scheduler_pause_flag_path`, `php_bin`, `mautic_run_as_user`),
+  - unsupported keys are ignored with explicit log entry.
+
+## 0.6.18 - 2026-03-03
+- Added: global Mautic 6 core hotfix watcher (independent from plugin flow).
+  - Detects and patches `ReloadHelper.php` bug where `PluginUpdateEvent` receives `null` metadata instead of `array`.
+  - Patch is idempotent and works for both layouts:
+    - zip: `<root>/app/bundles/.../ReloadHelper.php`
+    - composer: `<root>/docroot/app/bundles/.../ReloadHelper.php` (and `public/` variant)
+  - Daemon now checks/apply this hotfix on every planning cycle, so if file is overwritten by Mautic update, patch is re-applied automatically.
+- Added: manual Mautic 6 core patch controls in CLI and interactive menu.
+  - New command: `mcd-cli mautic6-patch status|apply|revert|policy`.
+  - Interactive menu item: `Mautic6 Core Patch`.
+  - Policy supports fixed daemon behavior:
+    - `required` (auto-patch always),
+    - `off` (never auto-patch).
+- Changed: plugin post-step fallback for `metadata=null` error remains as a safety net, but primary fix is now global Mautic 6 core patching.
+
+## 0.6.17 - 2026-03-03
+- Added: immediate MCC state push after successful mutating `mcd-cli` operations.
+  - Triggers on: `plugins`, `mautic-upgrade` (apply/interactive), `instances` add/remove/rescan, `reload-config`, `profile set`, backup ops (`run/prune/restore/profile-set`).
+  - Push path uses the same `/api/v1/agent/state` payload model as daemon, but does **not** force a fresh signals poll.
+- Changed: on-demand push helper now supports payload build without `signals`, so semaphore telemetry remains on periodic routine push only.
+
+## 0.6.16 - 2026-03-03
+- Added: MCD state push now includes per-instance `mautic_version` in payload.
+  - Version is resolved locally from instance root with composer/docroot-aware candidate roots.
+  - Detection path: `bin/console --version` / `about` fallback, then `composer.lock` fallback.
+- Result: after local Mautic upgrade (including interactive `mcd-cli` flow), version change is propagated to MCC via normal push path without manual rescan.
+
+## 0.6.15 - 2026-03-03
+- Changed: self-update is now backup-lock aware and never starts while host backup lock is active.
+  - Daemon checks backup lock before every auto-update cycle and defers update check to the next scheduler tick.
+  - Added explicit defer/resume logs:
+    - `auto-update deferred: backup lock active; retry on next cycle`
+    - `auto-update defer cleared: backup lock released`
+- Changed: `maybe_auto_update()` now also has an internal backup-lock guard, so direct calls are deferred safely as well.
+
+## 0.6.14 - 2026-03-03
+- Changed: backup scheduler now applies a global pre-backup dispatch guard for all new Mautic tasks.
+  - New config key: `[backup.schedule].pre_pause_sec` (default `3600`).
+  - During pre-backup window and while backup lock is active, daemon does not start new tasks:
+    - segments
+    - campaigns (trigger/rebuild)
+    - imports
+    - scheduled jobs
+  - Already running tasks are not killed by backup guard.
+  - Dispatch resumes automatically when backup run finishes (success or failure).
+- Changed: backup profile payload pushed to MCC now includes schedule key `pre_pause_sec`.
+
+## 0.6.13 - 2026-03-02
+- Changed: `mautic-upgrade` now performs patch-only upgrades inside current branch (`X.Y.x`) by default.
+  - Major/minor jumps are blocked in current flow.
+  - Upgrade target is resolved from MCC release cache (`/api/v1/agent/mautic/releases`) with safe local fallback.
+- Changed: interactive upgrade target menu is simplified to branch patch update only.
+- Changed: composer upgrade flow is hardened:
+  - resolves composer project root (`root`/`root/..`) before running composer,
+  - performs bounded version-token replacement (`current -> target`) before `composer update --with-dependencies`.
+- Changed: upgrade flow keeps environment/system upgrade recipe optional; default patch upgrade path no longer mixes distribution upgrade with PHP/system migration.
+
+## 0.6.12 - 2026-03-02
+- Changed: service-profile PHP target resolution is now runtime-aware:
+  - prefers currently running `php-fpm` version when multiple PHP versions are installed,
+  - falls back to latest installed version that has both `fpm` and `cli` trees.
+- Changed: `php-fpm` service name is now resolved dynamically (`phpX.Y-fpm`/fallback), reducing reload mismatches after PHP upgrades.
+- Changed: signal collector no longer scans hardcoded PHP-FPM unit list (`php8.0..8.4`) on every cycle.
+  - now detects active/installed `php*-fpm.service` units from systemd and reads only those journals.
+  - reduces unnecessary `journalctl` calls and log noise on hosts with a single installed PHP version.
+- Added: service-profile now manages Redis session overrides for both FPM and CLI:
+  - `/etc/php/<ver>/fpm/conf.d/90-redis-sessions.ini`
+  - `/etc/php/<ver>/cli/conf.d/90-redis-sessions.ini`
+- Added: Redis session settings are profile-driven with safe defaults (`127.0.0.1:6379`, DB 10, locking enabled) and participate in rollback logic on apply failures.
+- Result: after Mautic/PHP version upgrades, MCD applies the same tuning set (pool/opcache/redis/sysctl) to the active PHP version automatically.
+
+## 0.6.11 - 2026-03-02
+- Fixed: self-update now installs staged runtime dependencies before source switch:
+  - runs `/opt/mcd/venv/bin/python -m pip install -r <staged>/requirements.txt`,
+  - executes from stable working directory (`cwd=/`) to avoid deleted-CWD failures,
+  - aborts update before switch on dependency install error.
+- Added: startup dependency bootstrap in `mcd_agent.__main__`:
+  - on `ModuleNotFoundError` during CLI import after update, agent auto-runs `pip install -r requirements.txt` once and retries import.
+- Result: host updates no longer require manual dependency fixes after self-update; dependency handling is global and automatic.
+
+## 0.6.10 - 2026-03-02
+- Changed: service-profile fetch payload now sends both host identities:
+  - `hostname` (OS hostname),
+  - `mcc_host_name` (explicit MCC inventory host name from config, if set).
+- Result: MCC can resolve host identity more reliably when inventory name differs from system hostname.
+
+## 0.6.9 - 2026-03-02
+- Fixed: release packaging alignment for dynamic service profiles build.
+- Result: published test package version and internal agent `__version__` are consistent for MCC self-update flow.
+
+## 0.6.8 - 2026-03-02
+- Added: MCC-driven dynamic service profile apply path for host tuning (first component: `php-fpm`).
+  - New agent command: `mcd-cli service-profile status|fetch|apply --component php_fpm`.
+  - New daemon auto-apply loop controlled by runtime keys:
+    - `service_profiles_enabled`
+    - `service_profiles_auto_apply`
+    - `service_profiles_poll_interval_sec`
+    - `service_profiles_components`
+- Added: safe `php-fpm` apply mechanics with rollback:
+  - writes drop-in files under `/etc/php/<ver>/...` (`zz-mcd-hw.conf`, `99-mcd-hw.ini`),
+  - validates config with `php-fpm -tt`,
+  - reloads/restarts `php<ver>-fpm`,
+  - rolls back changed files on failure.
+- Added: host-side sysctl alignment for profile payload (`net.core.somaxconn`) with rollback safety.
+- Result: service tuning can now be changed dynamically on MCC without rebuilding MCD package.
+
+## 0.6.7 - 2026-03-02
+- Added: split-config safe deployment layout in MCC install playbook (enabled by default for new/explicit config uploads):
+  - `/opt/mcd/etc/mcd.toml` is now entrypoint include file (`MCD_CONFIG_ENTRYPOINT v1`),
+  - package defaults are loaded from `/opt/mcd/src/etc/mcd-agent.system.example.toml` and `/opt/mcd/src/etc/mcd-agent.operator.example.toml`,
+  - host-local overrides are stored in `/opt/mcd/etc/mcd.local.toml`.
+- Changed: profile/mode operations are split-layout aware:
+  - `mcd-cli profile ...` now updates effective mutable config file (local override) when entrypoint mode is detected.
+  - runtime override cleanup for profile baselines is applied to local override file in split mode.
+- Result: package/code updates can safely overwrite stock defaults while host custom settings remain in external override file.
+
+## 0.6.6 - 2026-03-02
+- Changed: backup `mydumper` command now auto-adds `--trx-consistency-only` by default.
+  - Applies to primary and fallback dump execution paths.
+  - Auto-injection is skipped when operator explicitly sets `--sync-thread-lock-mode=...` in `backup.mydumper.extra_args`.
+- Result: avoids unnecessary global-lock attempts and reduces lock-related warnings for standard Mautic (InnoDB) backups.
+
+## 0.6.5 - 2026-03-02
+- Fixed: stale backup directory cleanup (`.incomplete-*`) is now strict and verified.
+  - Cleanup now uses Python `shutil.rmtree` with explicit failure detection.
+  - If any stale incomplete backup directory cannot be removed, backup run fails immediately with a clear error message.
+- Result: no silent leftover `.incomplete-*` directories between retries.
+
+## 0.6.4 - 2026-03-02
+- Fixed: backup `mydumper` execution flow no longer re-runs fallback dump when primary run produced valid dump files but exited non-zero (global-lock warning path).
+- Fixed: backup now accepts a completed/verified dump directory after non-zero `mydumper` exit and proceeds to finalize (`.incomplete-*` -> `YYYY-MM-DD`) instead of failing.
+- Result: if DB dump is actually complete, host backup is finalized as `ok` and folder naming is correct.
+
+## 0.6.3 - 2026-03-01
+- Fixed: backup scheduler now prevents duplicate daily runs inside the same quiet-window slot.
+  - If a successful backup for current local date already exists, scheduler skips launch.
+- Fixed: `backup_run` is now idempotent for the current date.
+  - If target date directory already exists with successful marker, run returns `ok` with `ok_skip_existing` history instead of starting a new dump.
+- Result: no immediate re-run in the same `YYYY-MM-DD` backup path after successful completion.
+
+## 0.6.2 - 2026-03-01
+- Changed: backup run now performs automatic cleanup of stale `/.incomplete-*` directories in remote host backup path before creating a new backup.
+- Changed: failed backup run now removes current temporary `/.incomplete-*` directory instead of leaving partial artifacts.
+- Result: retry backup starts from clean state by default; failed temporary backup payload does not accumulate.
+
+## 0.6.1 - 2026-03-01
+- Added: backup lock aware segment scheduler behavior.
+  - While host backup/restore lock is active, MCD pauses only **new** segment launches.
+  - Already running segment tasks are not interrupted and finish normally.
+  - Campaign/import/other task dispatch stays independent.
+- Added: daemon transition logs for backup-driven segment pause/resume.
+
+## 0.6.0 - 2026-03-01
+- Added: host-level full restore flow in backup module:
+  - `mcd-cli backup restore [--date YYYY-MM-DD|--path ...]`
+  - restores archived files to `/` and restores DB dumps via `myloader`.
+- Added: encrypted backup profile vault in local MCD SQLite (`backup_profile` table), including migration-safe profile merge/set flow.
+- Added: backup profile CLI operations:
+  - `backup profile-show`
+  - `backup profile-set --profile-json-file ...`
+  - `backup profile-set --profile-json-stdin` (safe for shell history).
+- Added: daemon backup scheduler (`[backup.schedule]`) with quiet-window + interval controls, independent of Mautic task dispatch.
+- Added: agent state push now includes:
+  - `backup_state` (last run/success/error/path/restore markers),
+  - `backup_profile` payload for secure storage on MCC side.
+- Changed: backup archive default scope now includes operational host paths required for full-state restore (`/etc/nginx`, `/etc/apache2`, `/etc/php`, `/etc/mysql`, `/etc/cron.d`, `/etc/systemd/system`, `/opt/mcd/etc`, `/var/www`, cron spool).
+
+## 0.5.6 - 2026-03-01
+- Changed: segment ring planner now forces stale segments into priority ring:
+  - segment is considered stale when `last_built_date` is older than 24 hours, or missing.
+  - stale rule is independent from normal weight threshold/top-N logic.
+- Behavior: when regular ring becomes empty (for example on first runs after long inactivity), its slot is automatically reused by priority ring (`3+1` effectively becomes `4+0` for that cycle).
+- Behavior: after stale segments are rebuilt, they stop matching stale rule and return to normal weight-based ring placement.
+
+## 0.5.5 - 2026-02-28
+- Changed: host self-update no longer runs `pip install` during apply.
+- Changed: self-update now stages release source to `var/updates/src.next-*` and performs atomic source switch to `/opt/mcd/src` (no in-place delete of current working directory).
+- Fixed: eliminated mass auto-update failures caused by `pip` startup in removed CWD (`FileNotFoundError: os.getcwd()` / `OSError: No such file or directory`).
+- Rollback: on failure after switch, source is restored from pre-switch snapshot without dependency reinstall step.
+
+## 0.5.4 - 2026-02-28
+- Fixed: self-update archive extraction now ignores developer/runtime artifacts (`.venv*`, `__pycache__`, `.DS_Store`, cache dirs) before replacing `/opt/mcd/src`.
+- Fixed: self-update source copy now preserves symlinks (`symlinks=True`) and no longer fails on broken dev symlinks from packaged virtual environments.
+- Result: host auto-update applies cleanly from MCC packages without manual archive cleanup.
+
+## 0.5.3 - 2026-02-28
+- Added: bounded task-history retention for local SQLite state DB:
+  - `runtime.tasks_history_keep_days`
+  - `runtime.tasks_history_max_rows`
+- Added: quiet-window state DB compaction controls:
+  - `runtime.tasks_compact_enabled`
+  - `runtime.tasks_compact_interval_sec`
+  - `runtime.tasks_compact_quiet_hour`
+  - `runtime.tasks_compact_quiet_window_min`
+  - `runtime.tasks_compact_vacuum`
+- Changed: daemon now runs periodic non-running task history prune and optional `VACUUM` (in quiet window), keeping only operationally required depth.
+- Docs: updated system config example and README with state DB structure and retention/compaction behavior.
+
+## 0.5.2 - 2026-02-28
+- Fixed: self-update state persistence no longer loses `last_status`/`last_result` after apply attempt (post-apply state is re-read before writing next schedule timestamp).
+- Changed: `config_customized` is now computed as effective deviation from selected profile baseline, not just presence of `[runtime]` keys.
+- Result: operators see real profile state (not false `custom` due static runtime block), and self-update diagnostics reflect actual apply outcome.
+
+## 0.5.1 - 2026-02-28
+- Added: `mcd-cli --version` global flag to print installed agent version.
+- Added: interactive hub header now shows running version (`MCD Interactive (vX.Y.Z)`).
+- Changed: minimal patch release over 0.5.0 for operator visibility and verification.
+
+## 0.5.0 - 2026-02-27
+- Changed: designated as first production major update baseline for MCC-driven MCD self-update rollout.
+- Changed: update workflow is now expected to be managed through MCC release catalog (`approved/test/lts`) with host-side MCD self-apply.
+- Result: next MCD code updates can be published on MCC only, while hosts upgrade themselves by policy.
+
+## 0.4.9 - 2026-02-27
+- Added: MCD self-update flow through MCC API (`mcd-cli self-update check|apply|status`).
+- Added: update policy model in runtime config:
+  - `mcd_update_policy = off|lts|approved|test`
+  - `mcd_update_allow_test_build`
+  - `mcd_update_wait_retry_sec`
+- Changed: default `mcd_auto_update_enabled` is now `true` (unless explicitly disabled).
+- Added: daemon periodic self-update check/apply loop (`maybe_auto_update`) integrated into scheduler cycle.
+- Added: local MCD config history snapshot file with retention (`mcd_config_history_limit`, default 10).
+- Result: MCC can trigger update by command, while MCD performs upgrade locally and reports final state.
+
+## 0.4.8 - 2026-02-27
+- Added: `mcd-cli maintenance on|off|status` command for temporary maintenance mode without profile switching.
+- Behavior:
+  - `maintenance on` sets scheduler pause flag and (by default) stops running Mautic console tasks.
+  - `maintenance on --kill-orphans` also stops orphan `bin/console mautic:*` processes not tracked in MCD task DB.
+  - `maintenance off` removes pause flag only.
+  - `maintenance status` reports paused state, tracked running tasks, and console process counters.
+- Result: maintenance windows for DB operations can be started/stopped quickly without changing active profile.
+
+## 0.4.7 - 2026-02-27
+- Fixed: campaign SQL compatibility for Mautic 4 in scheduler loops.
+- Changed: for Mautic 4 instances, agent now automatically strips `AND (c.deleted IS NULL)` from `sql.campaigns_due` and `sql.campaign_weights` at runtime.
+- Result: campaign rings are built correctly on Mautic 4 schemas where `{prefix}campaigns.deleted` column does not exist.
+
+## 0.4.6 - 2026-02-27
+- Changed: CLI now auto-resolves default config path in this order:
+  - `MCD_CONFIG` env var (if set)
+  - `/opt/mcd/etc/mcd.toml`
+  - `/etc/mcd/mcd.toml`
+  - local repo example config (dev fallback)
+- Changed: commands with `--config` now use the same auto-resolved default, including `profile`.
+- Result: local profile switch no longer requires explicit config argument in standard installs (`mcd-cli profile passive --yes`).
+
+## 0.4.5 - 2026-02-25
+- Fixed: `tiny` profile now keeps import polling active; `mautic:import` is no longer skipped by campaign-chain branch.
+- Fixed: default `sql.import_pending_count` now supports numeric import statuses (`1,2`) in addition to string statuses (`pending`, `in_progress`) for mixed Mautic schemas.
+- Result: pending imports are detected and executed on tiny-profile hosts such as Alex.
+
+## 0.4.4 - 2026-02-25
+- Added: MCD push payload now includes `config_state` snapshot (`schema_version`, `customized`, `sha256`, full TOML text).
+- Added: agent config metadata fields in runtime (`config_file_path`, `config_schema_version`, `config_customized`, `config_sha256`) for deterministic state export.
+- Result: MCC can persist exact host config state and preserve behavior across frequent daemon code upgrades.
+
+## 0.4.3 - 2026-02-25
+- Added: environment policy task `web.cloudflare_real_ip` (plan-only) with Cloudflare CIDR template and `CF-Connecting-IP` header settings.
+- Added: policy plan component selector `web_cf_real_ip` in `mcd-cli env policy plan`.
+- Result: MCD now exposes Cloudflare real-IP nginx environment task in policy list without applying changes automatically.
+
+## 0.4.2 - 2026-02-25
+- Changed: default campaign selection logic is now strictly `is_published=1` (+ not deleted), without `publish_up/publish_down` window filtering.
+- Changed: default `sql.campaigns_due` and `sql.campaign_weights` templates were updated to remove publish window constraints.
+- Result: MCD campaign loops treat published campaigns as active by DB publish flag only.
+
+## 0.4.1 - 2026-02-25
+- Fixed: profile switching now removes profile-managed runtime override keys from `[runtime]` in `mcd.toml`.
+- Result: named profiles (`passive|tiny|mini|midi|maxi|hiload`) are now deterministic and no longer inherit stale parallel/ring/throttle values from old manual runtime overrides.
+- Changed: `mcd-cli profile passive` and `mcd-cli profile <named>` both enforce profile baseline cleanup before service restart.
+
+## 0.4.0 - 2026-02-24
+- Added: centralized environment policy scaffold (`version=1`) for host-level domains:
+  - `apt`
+  - `iptables`
+  - `database` (MariaDB/MySQL)
+  - `php` (php-fpm pool knobs)
+  - `web` (nginx/apache high-level knobs)
+- Added: `mcd-cli env policy show` to print default policy template.
+- Added: `mcd-cli env policy plan` to render host-local execution plan from policy payload (`--policy-file|--policy-json|--policy-b64`, `--component`).
+- Safety: policy workflow is plan-only in this release; no host configuration is applied by policy commands.
+
+## 0.3.36 - 2026-02-23
+- Fixed: web signal collection now includes nginx file logs (`/var/log/nginx/access.log*`, `/var/log/nginx/error.log*`) in addition to systemd journal.
+- Added: `web_critical` signal counter (upstream/PHP web error patterns from nginx error log within selected window).
+- Changed: web component level now accounts for both HTTP 5xx and critical nginx/web upstream errors.
+- Result: MCC dashboard semaphore now reflects real 500/web incidents on hosts where nginx does not write to journald.
+
+## 0.3.35 - 2026-02-22
+- Fixed: plugin inventory now ignores invalid/non-bundle directory names (including nested `plugins` directory marker).
+- Changed: plugin list and state push accept only valid bundle naming pattern (`*Bundle`) and skip service directories.
+- Result: prevents phantom `plugins` bundle from appearing in MCC cache/dashboard.
+
+## 0.3.34 - 2026-02-22
+- Fixed: install type detection now supports composer layout where instance root contains `config/local.php` + `bin/console` and web root is `docroot`.
+- Fixed: plugin operations now resolve plugin directory with layout-aware search order:
+  - `<root>/plugins`
+  - `<root>/docroot/plugins`
+  - `<root>/public/plugins`
+- Fixed: state push plugin inventory uses the same layout-aware plugin directory resolver.
+- Result: composer instances now correctly report install type and installed plugins.
+
+## 0.3.33 - 2026-02-22
+- Fixed: autodiscovery domain/name selection now prefers `site_url` host from Mautic `local.php`, with web vhost `server_name` as fallback.
+- Result: instance name/uid are aligned with actual Mautic canonical URL even when nginx/apache has extra aliases.
+
+## 0.3.32 - 2026-02-22
+- Fixed: autodiscovery candidate resolver now also checks two levels up from vhost root (covers additional composer/docroot layouts and symlinked webroots).
+- Changed: autodiscovery instance `name` now prefers detected primary domain (when available), with root-name fallback.
+- Result: better instance naming and more stable root resolution for composer installs.
+
+## 0.3.31 - 2026-02-22
+- Fixed: autodiscovery now resolves composer-style vhost roots (`docroot/public`) to effective Mautic project root automatically.
+- Changed: discovery now checks candidate paths (`vhost root`, resolved path, parent) and accepts the first path where both `local.php` and console are found.
+- Result: composer installs are discovered without manual instance config.
+
+## 0.3.30 - 2026-02-22
+- Fixed: Mautic 4 plugin workflow now applies transaction-safety patch regardless of selected bundle (not only when Hostnet is selected in current action).
+- Fixed: added HostnetAuthBundle M4 compatibility patch for `plugins/HostnetAuthBundle/HostnetAuthBundle.php`:
+  - removes fragile explicit transaction wrapper in install/update hook and executes idempotent schema query directly.
+  - prevents `mautic:plugins:reload` failure `There is no active transaction` from Hostnet plugin hook.
+- Changed: existing M4 Engine transaction guard patch remains and is applied opportunistically when needed.
+
+## 0.3.29 - 2026-02-21
+- Added: automatic HostnetAuthBundle compatibility patch for Mautic 4 in plugin workflow.
+- Behavior: when HostnetAuthBundle is installed/updated, MCD patches `app/bundles/IntegrationsBundle/Migration/Engine.php` to guard `commit()/rollback()` by active transaction checks before running post-steps.
+- Result: prevents `mautic:plugins:reload` failure `There is no active transaction` on affected Mautic 4 stacks.
+
+## 0.3.28 - 2026-02-21
+- Fixed: install type detection no longer relies on `composer.lock` (it exists in many zip/package installs and produced false `composer`).
+- Added: shared install-type detector (`mcd_agent.install_type`) with conservative rules:
+  - `composer` for documented `mautic/recommended-project` layout (`docroot/public` under composer project root).
+  - default fallback is `zip`.
+- Changed: `mcd state push` now sends install type from the new detector.
+- Changed: `mautic-upgrade --mode auto` now uses the same detector (aligns upgrade mode with cached install type).
+
+## 0.3.27 - 2026-02-21
+- Changed: profile `maxi` campaign rebuild parallel changed to `2+1` (`campaign_rebuild_priority_parallel=2`, `campaign_rebuild_regular_parallel=1`).
+- Changed: profile `hiload` campaign rebuild parallel changed to `3+1` (`campaign_rebuild_priority_parallel=3`, `campaign_rebuild_regular_parallel=1`).
+- Docs: profile defaults in README/spec/operator examples synced to new rebuild values.
+
+## 0.3.26 - 2026-02-21
+- Changed: `mini` profile now uses shared campaign cap `campaign_total_parallel=1`.
+- Result: `campaigns:trigger` and `campaigns:rebuild` in `mini` cannot exceed one concurrent campaign task in total.
+
+## 0.3.25 - 2026-02-21
+- Fixed: campaign publish-window SQL context now provides instance-local time (`{now_local}`) based on Mautic timezone from `local.php`.
+- Changed: default `campaigns_due`/`campaign_weights` SQL templates now use `{now_local}` for publish window checks.
+- Changed: operator/system config examples synced with current `tiny` profile (segments `1`, single campaign chain worker).
+
+## 0.3.24 - 2026-02-21
+- Fixed: `mcd-cli plugins` no longer loops forever in non-interactive mode when selection input is empty/EOF (`empty=back` now exits cleanly for non-TTY).
+- Result: prevents runaway CPU from orphaned non-interactive plugin sessions.
+
+## 0.3.23 - 2026-02-21
+- Fixed: MCD state push now includes installed plugin inventory per instance (`plugins` with version from `plugins/*/Config/config.php`).
+- Result: MCC cache/dashboard receives plugin changes from host side without manual MCC instance sync.
+
+## 0.3.22 - 2026-02-21
+- Added: `install_type` in pushed instance snapshot (`composer|zip`) for MCC cache dashboard.
+
+## 0.3.21 - 2026-02-21
+- Fixed: state push module import to inventory type (`MauticInstall`) for runtime compatibility.
+- Changed: main deploy config (`mcd-agent.example.toml`) now includes `[mcc]` push settings to work even when split include files are not copied to target host.
+
+## 0.3.20 - 2026-02-21
+- Added: MCC push state loop in daemon.
+- Added: periodic push every 5 minutes by default (`mcc.push_interval_sec = 300`).
+- Added: out-of-band push on state snapshot change (`mcc.push_on_change = true`).
+- Added: alert-driven checks from critical log signals (`mcc.push_alert_poll_interval_sec = 60`, window `5` min).
+- Added: new MCC push options in `[mcc]` config (`push_enabled`, `push_*`, `host_name`).
+
+## 0.3.19 - 2026-02-21
+- Fixed: `signals` module now uses `timezone.utc` (Python 3.10 compatible) instead of `datetime.UTC`.
+
+## 0.3.18 - 2026-02-21
+- Added: lightweight critical host signal collector command: `mcd-cli signals [--window-min N] [--json]`.
+- Added: default critical signal set (last window only): `oom_kill`, `mysql_critical`, `php_fpm_max_children`, `http_5xx`.
+- Added: bounded journal scan with short timeouts to keep host overhead low by default.
+
+## 0.3.17 - 2026-02-20
+- Changed: `tiny` profile now uses exactly `1` segment worker (`segment_regular_parallel_idle=1`).
+- Changed: `tiny` campaign scheduler is now single-worker chain mode: `campaigns:rebuild -i <id>` then `campaigns:trigger -i <id>` for the same ID.
+- Changed: `tiny` campaign ring uses published campaigns in newest-first order and iterates in a plain cycle (single ring, no whitelist, no priority rings).
+
+## 0.3.16 - 2026-02-20
+- Changed: removed `mcd-cli mode ...` command from public CLI.
+- Changed: only `mcd-cli profile ...` remains for passive/active-profile switching and status.
+
+## 0.3.15 - 2026-02-20
+- Changed: operator-facing state switch is now `profile` only (`mcd-cli profile ...`).
+- Changed: `profile status` output no longer prints duplicate `mode=...`; only `profile=...` is shown.
+
+## 0.3.14 - 2026-02-20
+- Changed: default deployment profile in example configs is now `passive` for new hosts.
+- Added: explicit `[profile].name = "passive"` override in `mcd-agent.example.toml` to keep passive-by-default behavior stable.
+
+## 0.3.13 - 2026-02-19
+- Changed: backup module is host-level by design (one run backs up all discovered instance databases with DB creds + optional system archive).
+- Changed: backup state file path is now host-scoped (`/opt/mcd/var/state/backup/host-<host>.json`).
+- Added: backup config option `[backup].host_name` for explicit remote host folder naming.
+
+## 0.3.12 - 2026-02-19
+- Added: new backup module (`mcd-cli backup run|status|history|prune`) for direct remote host-level backups via `sshfs + mydumper`.
+- Added: backup semaphores/state in local JSON (`last_status`, `last_success_at`, `last_error`, `last_backup_path`, `history`) per host.
+- Added: backup completion marker `.mcd-backup.json` in remote backup folder.
+- Added: backup config sections in system config example: `[backup]`, `[backup.storage]`, `[backup.archive]`, `[backup.mydumper]`.
+- Added: interactive menu section `Backup` with run/status/prune actions for active instance.
+
+## 0.3.11 - 2026-02-19
+- Fixed: campaign time-window SQL now uses daemon UTC placeholder (`{now_utc}`) to avoid local DB clock skew in publish window checks.
+- Fixed: `campaign_trigger` and `campaign_rebuild` now keep independent ring cursors, so one loop does not advance the other.
+- Fixed: ring dispatch no longer rotates queue on failed spawn attempt (busy slot), preventing repeated lock on the same campaign ID.
+- Fixed: single-ring mode preserves source queue order (no forced `sorted(...)`), so scheduler respects SQL/ring ordering.
+
+## 0.3.10 - 2026-02-19
+- Fixed: campaign scheduler fairness with `campaign_total_parallel` cap.
+- In shared-cap mode (e.g. `tiny` with total=1), trigger/rebuild now alternate dispatch priority to prevent rebuild starvation.
+- Result: new active campaigns are not blocked by long trigger-only loop when rebuild pass is required first.
+
+## 0.3.9 - 2026-02-19
+- Fixed: `mcd-cli exec --command segments:update --instance-id N` now applies `-i N` correctly.
+- Changed: `exec` id-based routing now consistently supports entity id for segment/campaign command family.
+
+## 0.3.8 - 2026-02-19
+- Added: new `passive` profile (planning/statistics mode, no Mautic task dispatch).
+- Changed: `mode active|passive` is now profile-based:
+  - `mode passive`: sets profile to `passive`, restores cron, restarts `mcd`.
+  - `mode active`: restores previous non-passive profile (or `tiny` fallback), comments managed cron, restarts `mcd`.
+- Changed: scheduler no longer depends on `scheduler.pause` as primary control; profile `passive` controls planning-only behavior.
+- Added: `campaign_total_parallel` runtime cap; in `tiny` profile campaign workers (`trigger` + `rebuild`) share one total slot.
+
+## 0.3.7 - 2026-02-19
+- Fixed profile matrix defaults for one-ring hosts:
+  - `tiny`: single ring, `segments=2`, `campaign_trigger=1`, `campaign_rebuild=1`, `campaign_update=0`.
+  - `mini`: single ring, `segments=4`, `campaign_trigger=2`, `campaign_rebuild=1`, `campaign_update=0`.
+- Changed: all named profiles now keep `campaign_update_* = 0` because `campaigns:update` is alias to `campaigns:rebuild` and is not scheduled separately.
+
+## 0.3.6 - 2026-02-19
+- Changed: scheduler no longer runs a separate `campaigns:update` loop; `campaigns:update` is treated as synonym of `campaigns:rebuild`.
+- Fixed: removed duplicate campaign pre-processing passes (`update` + `rebuild`) that could overrun campaign worker slots.
+- Changed: `mcd-cli exec --command campaigns:update` now executes rebuild-equivalent command for backward compatibility.
+
+## 0.3.5 - 2026-02-18
+- Changed: plugin list modes (`--list-available`, `--list-installed`) now output clean list views without interactive status table noise.
+
+## 0.3.4 - 2026-02-18
+- Fixed: `plugins --list-available` and `--list-installed` now work without `--root` on multi-instance hosts (iterates all instances).
+- Clarified install behavior: `plugins --action install` force-installs/replaces selected bundles regardless of current state.
+
+## 0.3.3 - 2026-02-18
+- Fixed: `mcd-cli` help output now uses proper program name (`mcd-cli`) instead of `__main__.py`.
+- Added: `plugin` alias for `plugins` command (`mcd-cli plugin ...`).
+- Added: plugin list modes `--list-available` and `--list-installed`.
+- Changed: `plugins --action install` now force-installs/replaces selected plugins regardless of prior state.
+- Added: `--action /?` convenience handling (shows plugin command help).
+
+## 0.3.2 - 2026-02-18
+- Added: `mcd-cli` help aliases `/?` and `-?` at root and subcommand levels.
+- Example: `mcd-cli /?`, `mcd-cli instances /?`, `mcd-cli plugins /?`.
+
+## 0.3.1 - 2026-02-18
+- Fixed: dataclass field order regression in `MauticInstall` after domain uid changes.
+
+## 0.3.0 - 2026-02-18
+- Added: instance uid strategy based on active web server domain (`nginx/apache sites-enabled`) with deterministic short collision suffix.
+- Changed: Mautic autodiscovery now uses active web roots first and validates Mautic by specific files (`app/config/local.php` or `config/local.php`) plus console path.
+- Added: environment operations for IPv6 (`mcd-cli env ipv6 status|disable|enable`) with persistent `/etc/sysctl.d/99-disable-ipv6.conf`.
+- Added: interactive menu section `Environment` with IPv6 status/disable/enable.
+
+## 0.2.7 - 2026-02-18
+- Added: stable short `instance_uid` for each Mautic instance (derived from install root).
+- Changed: `mcd-cli instances list` now prints `uid=...` for every instance.
+- Changed: instance remove/select now accepts `uid` in addition to name/root.
+- Changed: MCC `host-run --instance` now accepts instance uid from MCD inventory.
+
+## 0.2.6 - 2026-02-18
+- Added: plugin manifest `pre_sql` hooks execution before `mautic:plugin:install`.
+- Added: DB SQL template execution method with `{prefix}` rendering for plugin pre-fixes.
+- Fixed: plugins error hint is now shown only for repo/manifest configuration errors.
+
+## 0.2.5 - 2026-02-18
+- Fixed: plugins menu no longer appears to hang on manifest load; added visible progress line and stricter network timeout/error message.
+- Fixed: plugin integrity check no longer uses potentially heavy recursive glob; replaced with bounded non-following symlink scan to avoid long stalls.
+- Ops note (team): part of the observed "manifest hang" was host networking (IPv6 path/connectivity), not only MCD logic.
+
+## 0.2.4 - 2026-02-18
+- Fixed: plugins menu now works out-of-the-box even if `plugins.repo_base_url` and `mcc.url` are not set explicitly.
+- Changed: default plugin repository base URL in config loader is `https://servercontrol.sales-snap.com`.
+
+## 0.2.3 - 2026-02-18
+- Fixed: interactive mode with multiple instances now requires a valid active instance selection and no longer gets stuck in non-working state.
+- Fixed: active instance selection flow is strict when multiple installs exist (cannot silently continue with empty selection).
+
+## 0.2.2 - 2026-02-18
+- Fixed: interactive menu no longer crashes with traceback when plugin repo is not configured; shows user-friendly error and returns to menu.
+- Fixed: protected interactive operations (`Plugins`, `Mautic Upgrade`, `Cache`, `Instances` actions) with error handling.
+- Changed: plugin HTTP user-agent now uses current MCD version dynamically.
+- Process rule: patch version is incremented on each delivered change batch.
+
+## 0.2.1 - 2026-02-18
+- Added: active instance selection model in interactive menu; operations run against one selected instance.
+- Added: upgrade targets selection (`next step`, `latest in current major`, `latest known major`).
+- Added: support for local upgrade packages from `/opt/mcd/cache/updates/*-update.zip`.
+- Added: passive/active mode switching with cron backup/comment/restore workflow.
+- Added: uninstall command with cron rollback support.
+- Fixed: instance inventory collision when multiple installs had same folder name (`public_html`) by switching uniqueness to `root`.
+- Added: version update check settings (`mcd_update_notify`, `mcd_auto_update_enabled`, `mcd_update_check_interval_sec`, `mcd_update_channel`, `mcc.mcd_manifest_url`) with notify-only default behavior.

@@ -1,0 +1,61 @@
+# MCD main config (dev/example split mode)
+#
+# Split config layout:
+# - system file: low-level paths, SQL, command templates
+# - operator file: profile and scheduler tuning
+# - for production entrypoint+local override, see README section "Split Config"
+#
+# Merge order:
+# 1) include files in listed order
+# 2) this file values
+#
+# Profile precedence rule:
+# - profile applies baseline defaults first
+# - any value set manually in [runtime] overrides profile value
+
+[include]
+files = [
+  "./mcd-agent.system.example.toml",
+  "./mcd-agent.operator.example.toml",
+]
+
+[config]
+# Config schema version for migration/import logic.
+# Keep this value when editing config manually so MCC can track format.
+schema_version = 1
+
+[daemon]
+# Polling refresh (sec): reload due ids/weights/queue metrics.
+poll_interval_sec = 30
+# Dispatch refill (sec): keeps target parallelism by running-count.
+dispatch_interval_sec = 0.2
+
+[profile]
+# Default for NEW deployments: passive.
+# Use `mcd-cli profile <name> --yes` (or MCC wrapper) to switch host profile later.
+name = "passive"
+
+[mcc]
+# Push endpoint on MCC API.
+url = ""
+# Bearer token for agent push auth.
+token = ""
+# Enable push model from MCD to MCC.
+push_enabled = true
+# Periodic state push every 5 minutes.
+push_interval_sec = 300
+# Immediate push when snapshot changes.
+push_on_change = true
+# Critical log-signal poll interval (seconds).
+push_alert_poll_interval_sec = 60
+# Critical log-signal window (minutes).
+push_alert_window_min = 5
+# Optional explicit host name for MCC inventory mapping.
+host_name = ""
+
+[custom]
+# Optional custom scripts base URL.
+# If empty, MCD uses [mcc].url.
+repo_base_url = ""
+# Manifest path for centralized custom scripts.
+manifest_path = "/mauticctl/custom/manifest.json"
