@@ -74,6 +74,11 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   - service profile payload is stored on MCC and can be changed without MCD release rebuild.
   - MCD fetches and applies host-specific profile by hardware plan (`php-fpm`, `mysql`, `apt` components).
   - optional daemon auto-apply loop is controlled via runtime config.
+- Transitional shared agent-state backend for all installations:
+  - optional `state.backend = "mysql_hybrid"` stores outbound events + latest state snapshot in MySQL/MariaDB,
+  - agent uses dedicated state DB (`state.mysql_database`, default `mcd_state`) and auto-creates it if missing,
+  - local SQLite remains as minimal fallback queue when shared DB is unavailable,
+  - keeps current scheduler/task runtime stable while moving state to DB-backed mode.
 
 ## Profiles
 Set in config:
@@ -172,10 +177,15 @@ Manual command behavior:
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component mysql`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml fetch --component apt --json`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component apt --dry-run`
+
+Notes:
+- `php_fpm` apply now includes both FPM pool/opcache/redis tuning and global PHP ini baseline (`98-mcd-php.ini` for FPM/CLI).
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml trigger`
+- `python -m mcd_agent state-db --config ./etc/mcd-agent.example.toml status --json`
+- `printf 'ROOT_DB_PASSWORD' | python -m mcd_agent state-db --config ./etc/mcd-agent.example.toml init --admin-user root --admin-password-stdin --admin-unix-socket /var/run/mysqld/mysqld.sock --json`
 - `python -m mcd_agent maintenance --config ./etc/mcd-agent.example.toml status`
 - `python -m mcd_agent maintenance --config ./etc/mcd-agent.example.toml on --kill-orphans --grace-sec 10`
 - `python -m mcd_agent maintenance --config ./etc/mcd-agent.example.toml off`
@@ -254,9 +264,23 @@ Important:
   - global default: `runtime.command_timeout_sec = 0` and `runtime.worker_watchdog_sec = 0` (long-running tasks are not killed by timeout).
   - `runtime.worker_stuck_policy = skip|restart` and `runtime.worker_stuck_restart_limit` control reaction on stuck processes.
   - `runtime.state_db_path` sets SQLite process-state storage path (default `/opt/mcd/var/mcd-state.db`).
+  - optional `[state]` section enables shared state backend:
+    - `backend = "sqlite|mysql_hybrid"`
+    - `mysql_host/mysql_port/mysql_database/mysql_user/mysql_password`
+    - `mysql_unix_socket` (optional explicit socket path for local auth)
+    - `mysql_table_prefix`, `mysql_*_timeout_sec`
+    - `mysql_snapshot_enabled`
+  - runtime hot-apply keys from MCC include `state_backend` and `state_mysql_*` (including `state_mysql_unix_socket`).
+  - when host is local and password is empty, agent auto-detects common MySQL unix sockets for local auth.
+  - in `mysql_hybrid` mode, agent attempts to create state DB automatically; on failure it keeps legacy SQLite behavior and reports init error to MCC (`state_backend` payload).
+  - in `mysql_hybrid` mode, task/state runtime tables (`tasks`, `manual_requests`, `weight_cache`, `runtime_sync`) are primary in MySQL.
+  - local SQLite stays as failover-only shadow (running/pending minimum) and is pruned after successful migration.
+  - first successful MySQL bootstrap performs one-time SQLite -> MySQL migration for these runtime tables.
+  - manual DB bootstrap is available via `mcd-cli state-db init` and is allowed for legacy mode when DB is missing or inaccessible.
+  - bootstrap uses temporary admin credentials only for init, creates dedicated `mcd_state` runtime DB user, and persists only runtime credentials.
   - `runtime.tasks_history_keep_days` sets retention depth for non-running task rows.
   - `runtime.tasks_history_max_rows` sets hard cap for historical non-running rows.
-  - runtime-sync snapshots are kept in SQLite table `runtime_sync`:
+  - runtime-sync snapshots are kept in backend runtime table `runtime_sync`:
   - `local_runtime` (runtime section from local config)
   - `mcc_runtime` (desired runtime payload fetched from MCC)
   - `active_runtime` (last runtime apply metadata)

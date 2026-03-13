@@ -42,10 +42,17 @@ from mcd_agent.state_push import (
     read_pending_profile_event,
     should_poll_alert,
 )
+from mcd_agent.state_backend import (
+    mysql_state_connection,
+    mysql_state_enabled,
+    mysql_state_table_names,
+    normalized_state_backend,
+)
 
 _CMD_SEP = "\x1f"
 _M4_CAMPAIGN_DELETED_CLAUSE_RE = re.compile(r"\s+AND\s*\(?\s*c\.deleted\s+IS\s+NULL\s*\)?", re.IGNORECASE)
 _SEGMENT_STALE_PRIORITY_SEC = 24 * 3600
+_SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
 
 
 def _backup_done_for_local_date(config: AgentConfig, local_dt: datetime) -> bool:
@@ -473,8 +480,9 @@ def _compute_throttle_active(samples: deque[tuple[float, int]], threshold: int, 
 
 
 class TaskStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, cfg: AgentConfig | None = None) -> None:
         self.path = path
+        self.cfg = cfg
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -486,9 +494,21 @@ class TaskStore:
             self.conn.execute("PRAGMA busy_timeout=5000")
         except Exception:
             pass
-        self._init_schema()
+        self._init_sqlite_schema()
 
-    def _init_schema(self) -> None:
+        self._mysql_mode = bool(
+            cfg is not None
+            and normalized_state_backend(cfg) == "mysql_hybrid"
+            and mysql_state_enabled(cfg)
+        )
+        self._mysql_tables = mysql_state_table_names(cfg) if self._mysql_mode and cfg is not None else {}
+        self._mysql_conn = None
+        self._mysql_retry_after_ts = 0.0
+        if self._mysql_mode:
+            if self._mysql_available(force_probe=True) and self._migrate_sqlite_to_mysql_once():
+                self._sqlite_prune_for_failover()
+
+    def _init_sqlite_schema(self) -> None:
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -510,7 +530,7 @@ class TaskStore:
             )
             """
         )
-        self._ensure_column("tasks", "manual_request_id", "ALTER TABLE tasks ADD COLUMN manual_request_id INTEGER")
+        self._ensure_sqlite_column("tasks", "manual_request_id", "ALTER TABLE tasks ADD COLUMN manual_request_id INTEGER")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_running ON tasks(state, root, task_type)")
         self.conn.execute("DROP INDEX IF EXISTS idx_tasks_task_key_running")
         self.conn.execute(
@@ -558,14 +578,329 @@ class TaskStore:
         )
         self.conn.commit()
 
-    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+    def _ensure_sqlite_column(self, table: str, column: str, ddl: str) -> None:
         cur = self.conn.execute(f"PRAGMA table_info({table})")
         cols = {str(r["name"]) for r in cur.fetchall()}
         if column not in cols:
             self.conn.execute(ddl)
 
+    def _mysql_mark_error(self) -> None:
+        self._mysql_retry_after_ts = time.time() + 15.0
+        try:
+            if self._mysql_conn is not None:
+                self._mysql_conn.close()
+        except Exception:
+            pass
+        self._mysql_conn = None
+
+    def _mysql_available(self, *, force_probe: bool = False) -> bool:
+        if not self._mysql_mode or self.cfg is None:
+            return False
+        now = time.time()
+        if not force_probe and now < self._mysql_retry_after_ts:
+            return False
+        if self._mysql_conn is not None:
+            try:
+                self._mysql_conn.ping(reconnect=True)
+                return True
+            except Exception:
+                self._mysql_mark_error()
+        try:
+            self._mysql_conn = mysql_state_connection(self.cfg)
+            self._mysql_retry_after_ts = 0.0
+            return True
+        except Exception:
+            self._mysql_mark_error()
+            return False
+
+    def _mysql_query(self, sql: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
+        if not self._mysql_available():
+            raise RuntimeError("mysql_unavailable")
+        assert self._mysql_conn is not None
+        try:
+            with self._mysql_conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall() or []
+                return [dict(r) for r in rows if isinstance(r, dict)]
+        except Exception:
+            self._mysql_mark_error()
+            raise
+
+    def _mysql_exec(self, sql: str, params: tuple[object, ...] = ()) -> tuple[int, int]:
+        if not self._mysql_available():
+            raise RuntimeError("mysql_unavailable")
+        assert self._mysql_conn is not None
+        try:
+            with self._mysql_conn.cursor() as cur:
+                cur.execute(sql, params)
+                return int(cur.lastrowid or 0), int(cur.rowcount or 0)
+        except Exception:
+            self._mysql_mark_error()
+            raise
+
+    def _mysql_exec_many(self, sql: str, params: list[tuple[object, ...]]) -> int:
+        if not params:
+            return 0
+        if not self._mysql_available():
+            raise RuntimeError("mysql_unavailable")
+        assert self._mysql_conn is not None
+        try:
+            with self._mysql_conn.cursor() as cur:
+                cur.executemany(sql, params)
+                return int(cur.rowcount or 0)
+        except Exception:
+            self._mysql_mark_error()
+            raise
+
+    def _sqlite_fetchall_dicts(self, sql: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
+        cur = self.conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def _sqlite_prune_for_failover(self) -> None:
+        """In mysql mode keep only minimum local fallback footprint."""
+        if not self._mysql_mode:
+            return
+        try:
+            self.conn.execute("DELETE FROM tasks WHERE state!='running'")
+            self.conn.execute("DELETE FROM manual_requests WHERE status NOT IN ('pending','launched')")
+            self.conn.execute("DELETE FROM weight_cache")
+            # Keep runtime_sync only for migration marker and local runtime hints.
+            self.conn.execute(
+                """
+                DELETE FROM runtime_sync
+                WHERE key NOT IN ('taskstore_mysql_migrated_v1', 'local_runtime', 'mcc_runtime')
+                """
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def _migrate_sqlite_to_mysql_once(self) -> bool:
+        if not self._mysql_mode:
+            return False
+        marker = self.conn.execute(
+            "SELECT payload_json FROM runtime_sync WHERE key='taskstore_mysql_migrated_v1' LIMIT 1"
+        ).fetchone()
+        if marker:
+            raw = str(marker["payload_json"] or "")
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {}
+            if str(payload.get("status") or "").strip().lower() == "ok":
+                return True
+        if not self._mysql_available():
+            return False
+
+        tasks_table = self._mysql_tables.get("tasks", "")
+        weight_table = self._mysql_tables.get("weight_cache", "")
+        runtime_table = self._mysql_tables.get("runtime_sync", "")
+        req_table = self._mysql_tables.get("manual_requests", "")
+        if not all([tasks_table, weight_table, runtime_table, req_table]):
+            return False
+
+        migrated = {"tasks": 0, "weights": 0, "runtime_sync": 0, "manual_requests": 0}
+        try:
+            # tasks
+            rows = self._sqlite_fetchall_dicts(
+                """
+                SELECT id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec,
+                       attempts, manual_request_id, state, note, started_at, finished_at, rc
+                FROM tasks
+                ORDER BY id ASC
+                """
+            )
+            if rows:
+                self._mysql_exec_many(
+                    f"""
+                    INSERT INTO `{tasks_table}`(
+                      id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec,
+                      attempts, manual_request_id, state, note, started_at, finished_at, rc
+                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      root=VALUES(root),
+                      task_key=VALUES(task_key),
+                      task_type=VALUES(task_type),
+                      entity_id=VALUES(entity_id),
+                      command_str=VALUES(command_str),
+                      pid=VALUES(pid),
+                      timeout_sec=VALUES(timeout_sec),
+                      attempts=VALUES(attempts),
+                      manual_request_id=VALUES(manual_request_id),
+                      state=VALUES(state),
+                      note=VALUES(note),
+                      started_at=VALUES(started_at),
+                      finished_at=VALUES(finished_at),
+                      rc=VALUES(rc)
+                    """,
+                    [
+                        (
+                            int(r["id"]),
+                            str(r["root"] or ""),
+                            str(r["task_key"] or ""),
+                            str(r["task_type"] or ""),
+                            r["entity_id"],
+                            str(r["command_str"] or ""),
+                            int(r["pid"] or 0),
+                            int(r["timeout_sec"] or 0),
+                            int(r["attempts"] or 1),
+                            r["manual_request_id"],
+                            str(r["state"] or ""),
+                            r.get("note"),
+                            float(r["started_at"] or 0.0),
+                            (float(r["finished_at"]) if r.get("finished_at") is not None else None),
+                            r.get("rc"),
+                        )
+                        for r in rows
+                    ],
+                )
+                migrated["tasks"] = len(rows)
+
+            # weight_cache
+            rows = self._sqlite_fetchall_dicts(
+                "SELECT kind, root, entity_id, weight, computed_at FROM weight_cache"
+            )
+            if rows:
+                self._mysql_exec_many(
+                    f"""
+                    INSERT INTO `{weight_table}`(kind, root, entity_id, weight, computed_at)
+                    VALUES(%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      weight=VALUES(weight),
+                      computed_at=VALUES(computed_at)
+                    """,
+                    [
+                        (
+                            str(r["kind"] or ""),
+                            str(r["root"] or ""),
+                            int(r["entity_id"] or 0),
+                            float(r["weight"] or 0.0),
+                            float(r["computed_at"] or 0.0),
+                        )
+                        for r in rows
+                    ],
+                )
+                migrated["weights"] = len(rows)
+
+            # runtime_sync
+            rows = self._sqlite_fetchall_dicts("SELECT key, payload_json, updated_at FROM runtime_sync")
+            if rows:
+                self._mysql_exec_many(
+                    f"""
+                    INSERT INTO `{runtime_table}`(`key`, payload_json, updated_at)
+                    VALUES(%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      payload_json=VALUES(payload_json),
+                      updated_at=VALUES(updated_at)
+                    """,
+                    [
+                        (
+                            str(r["key"] or ""),
+                            str(r["payload_json"] or "{}"),
+                            float(r["updated_at"] or time.time()),
+                        )
+                        for r in rows
+                    ],
+                )
+                migrated["runtime_sync"] = len(rows)
+
+            # manual_requests
+            rows = self._sqlite_fetchall_dicts(
+                """
+                SELECT id, root, task_type, entity_id, command_str, timeout_sec, status,
+                       note, task_key, requested_at, launched_at, finished_at
+                FROM manual_requests
+                ORDER BY id ASC
+                """
+            )
+            if rows:
+                self._mysql_exec_many(
+                    f"""
+                    INSERT INTO `{req_table}`(
+                      id, root, task_type, entity_id, command_str, timeout_sec, status,
+                      note, task_key, requested_at, launched_at, finished_at
+                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      root=VALUES(root),
+                      task_type=VALUES(task_type),
+                      entity_id=VALUES(entity_id),
+                      command_str=VALUES(command_str),
+                      timeout_sec=VALUES(timeout_sec),
+                      status=VALUES(status),
+                      note=VALUES(note),
+                      task_key=VALUES(task_key),
+                      requested_at=VALUES(requested_at),
+                      launched_at=VALUES(launched_at),
+                      finished_at=VALUES(finished_at)
+                    """,
+                    [
+                        (
+                            int(r["id"]),
+                            str(r["root"] or ""),
+                            str(r["task_type"] or ""),
+                            r["entity_id"],
+                            str(r["command_str"] or ""),
+                            int(r["timeout_sec"] or 0),
+                            str(r["status"] or "pending"),
+                            r.get("note"),
+                            r.get("task_key"),
+                            float(r["requested_at"] or 0.0),
+                            (float(r["launched_at"]) if r.get("launched_at") is not None else None),
+                            (float(r["finished_at"]) if r.get("finished_at") is not None else None),
+                        )
+                        for r in rows
+                    ],
+                )
+                migrated["manual_requests"] = len(rows)
+
+            self.conn.execute(
+                """
+                INSERT INTO runtime_sync(key, payload_json, updated_at)
+                VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
+                """,
+                (
+                    "taskstore_mysql_migrated_v1",
+                    json.dumps(
+                        {"status": "ok", "migrated": migrated, "at": int(time.time())},
+                        ensure_ascii=False,
+                    ),
+                    time.time(),
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.execute(
+                """
+                INSERT INTO runtime_sync(key, payload_json, updated_at)
+                VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
+                """,
+                (
+                    "taskstore_mysql_migrated_v1",
+                    json.dumps(
+                        {"status": "error", "error": str(e), "at": int(time.time())},
+                        ensure_ascii=False,
+                    ),
+                    time.time(),
+                ),
+            )
+            self.conn.commit()
+            return False
+        return True
+
     def mark_old_running_lost(self) -> None:
         now = time.time()
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    self._mysql_exec(
+                        f"UPDATE `{tasks_table}` SET state='lost', note=%s, finished_at=%s WHERE state='running'",
+                        ("daemon_restart", now),
+                    )
+                except Exception:
+                    pass
         self.conn.execute(
             "UPDATE tasks SET state='lost', note='daemon_restart', finished_at=? WHERE state='running'",
             (now,),
@@ -573,6 +908,57 @@ class TaskStore:
         self.conn.commit()
 
     def add_running(self, task: RunningTask) -> int:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    row_id, _ = self._mysql_exec(
+                        f"""
+                        INSERT INTO `{tasks_table}`(
+                          root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            task.root,
+                            task.task_key,
+                            task.task_type,
+                            task.entity_id,
+                            task.command_str,
+                            task.pid,
+                            task.timeout_sec,
+                            task.attempts,
+                            task.manual_request_id,
+                            "running",
+                            task.started_at,
+                        ),
+                    )
+                    # Minimal failover shadow (running rows only).
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO tasks(
+                          id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            int(row_id),
+                            task.root,
+                            task.task_key,
+                            task.task_type,
+                            task.entity_id,
+                            task.command_str,
+                            task.pid,
+                            task.timeout_sec,
+                            task.attempts,
+                            task.manual_request_id,
+                            "running",
+                            task.started_at,
+                        ),
+                    )
+                    self.conn.commit()
+                    return int(row_id)
+                except Exception:
+                    pass
+
         cur = self.conn.execute(
             """
             INSERT INTO tasks(
@@ -597,29 +983,115 @@ class TaskStore:
         return int(cur.lastrowid)
 
     def finish(self, row_id: int, state: str, rc: int | None, note: str | None) -> None:
+        now = time.time()
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    _, changed = self._mysql_exec(
+                        f"UPDATE `{tasks_table}` SET state=%s, rc=%s, note=%s, finished_at=%s WHERE id=%s",
+                        (state, rc, note, now, int(row_id)),
+                    )
+                    if int(changed) > 0:
+                        # Keep SQLite tiny in mysql mode: running failover only.
+                        self.conn.execute("DELETE FROM tasks WHERE id=?", (int(row_id),))
+                        self.conn.commit()
+                        return
+                except Exception:
+                    pass
+
         self.conn.execute(
             "UPDATE tasks SET state=?, rc=?, note=?, finished_at=? WHERE id=?",
-            (state, rc, note, time.time(), row_id),
+            (state, rc, note, now, int(row_id)),
         )
         self.conn.commit()
 
-    def running_rows(self) -> list[sqlite3.Row]:
-        cur = self.conn.execute("SELECT * FROM tasks WHERE state='running'")
-        return cur.fetchall()
+    def running_rows(self) -> list[dict[str, object]]:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    return self._mysql_query(f"SELECT * FROM `{tasks_table}` WHERE state='running' ORDER BY id ASC")
+                except Exception:
+                    pass
+        return self._sqlite_fetchall_dicts("SELECT * FROM tasks WHERE state='running' ORDER BY id ASC")
+
+    def running_count(self) -> int:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state='running'")
+                    return int((rows[0].get("cnt") if rows else 0) or 0)
+                except Exception:
+                    pass
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks WHERE state='running'").fetchone()
+        return int(row["cnt"] if row else 0)
+
+    def running_task_summaries(self) -> list[dict[str, object]]:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    return self._mysql_query(
+                        f"""
+                        SELECT id, root, task_type, entity_id, pid, command_str
+                        FROM `{tasks_table}`
+                        WHERE state='running'
+                        ORDER BY id ASC
+                        """
+                    )
+                except Exception:
+                    pass
+        return self._sqlite_fetchall_dicts(
+            "SELECT id, root, task_type, entity_id, pid, command_str FROM tasks WHERE state='running' ORDER BY id ASC"
+        )
 
     def get_weights(self, kind: str, root: str, max_age_sec: int) -> dict[int, float]:
         min_ts = time.time() - max(1, max_age_sec)
+        out: dict[int, float] = {}
+        if self._mysql_mode:
+            table = self._mysql_tables.get("weight_cache", "")
+            if table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(
+                        f"SELECT entity_id, weight FROM `{table}` WHERE kind=%s AND root=%s AND computed_at>=%s",
+                        (kind, root, min_ts),
+                    )
+                    for row in rows:
+                        out[int(row["entity_id"])] = float(row["weight"])
+                    return out
+                except Exception:
+                    pass
+
         cur = self.conn.execute(
             "SELECT entity_id, weight FROM weight_cache WHERE kind=? AND root=? AND computed_at>=?",
             (kind, root, min_ts),
         )
-        out: dict[int, float] = {}
         for row in cur.fetchall():
             out[int(row["entity_id"])] = float(row["weight"])
         return out
 
     def put_weights(self, kind: str, root: str, weights: dict[int, float]) -> None:
         now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("weight_cache", "")
+            if table and self._mysql_available():
+                try:
+                    self._mysql_exec(f"DELETE FROM `{table}` WHERE kind=%s AND root=%s", (kind, root))
+                    params = [(kind, root, int(eid), float(w), now) for eid, w in weights.items()]
+                    if params:
+                        self._mysql_exec_many(
+                            f"INSERT INTO `{table}`(kind, root, entity_id, weight, computed_at) VALUES(%s,%s,%s,%s,%s)",
+                            params,
+                        )
+                    # Not required in mysql mode; keep sqlite cache small.
+                    self.conn.execute("DELETE FROM weight_cache WHERE kind=? AND root=?", (kind, root))
+                    self.conn.commit()
+                    return
+                except Exception:
+                    pass
+
         self.conn.execute("DELETE FROM weight_cache WHERE kind=? AND root=?", (kind, root))
         self.conn.executemany(
             "INSERT INTO weight_cache(kind, root, entity_id, weight, computed_at) VALUES(?,?,?,?,?)",
@@ -642,6 +1114,48 @@ class TaskStore:
         deleted_rows = 0
         keep_days = max(0, int(keep_days))
         max_rows = max(0, int(max_rows))
+
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    if keep_days > 0:
+                        cutoff = float(now_ts) - (float(keep_days) * 86400.0)
+                        _, cnt = self._mysql_exec(
+                            f"DELETE FROM `{tasks_table}` WHERE state!='running' AND COALESCE(finished_at, started_at) < %s",
+                            (cutoff,),
+                        )
+                        deleted_rows += int(cnt)
+
+                    rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state!='running'")
+                    non_running = int((rows[0].get("cnt") if rows else 0) or 0)
+                    if max_rows > 0 and non_running > max_rows:
+                        overflow = non_running - max_rows
+                        _, cnt = self._mysql_exec(
+                            f"""
+                            DELETE FROM `{tasks_table}`
+                            WHERE id IN (
+                              SELECT id FROM (
+                                SELECT id
+                                FROM `{tasks_table}`
+                                WHERE state!='running'
+                                ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                                LIMIT %s
+                              ) t
+                            )
+                            """,
+                            (overflow,),
+                        )
+                        deleted_rows += int(cnt)
+                        rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state!='running'")
+                        non_running = int((rows[0].get("cnt") if rows else 0) or 0)
+
+                    # Keep sqlite fallback minimal (running only) in mysql mode.
+                    self.conn.execute("DELETE FROM tasks WHERE state!='running'")
+                    self.conn.commit()
+                    return deleted_rows, non_running, False
+                except Exception:
+                    pass
 
         if keep_days > 0:
             cutoff = float(now_ts) - (float(keep_days) * 86400.0)
@@ -682,13 +1196,28 @@ class TaskStore:
         return deleted_rows, non_running, vacuum_done
 
     def put_runtime_sync(self, key: str, payload: dict[str, object]) -> None:
+        now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("runtime_sync", "")
+            if table and self._mysql_available():
+                try:
+                    self._mysql_exec(
+                        f"""
+                        INSERT INTO `{table}`(`key`, payload_json, updated_at)
+                        VALUES(%s,%s,%s)
+                        ON DUPLICATE KEY UPDATE payload_json=VALUES(payload_json), updated_at=VALUES(updated_at)
+                        """,
+                        (str(key), json.dumps(payload, ensure_ascii=False), now),
+                    )
+                except Exception:
+                    pass
         self.conn.execute(
             """
             INSERT INTO runtime_sync(key, payload_json, updated_at)
             VALUES(?,?,?)
             ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
             """,
-            (str(key), json.dumps(payload, ensure_ascii=False), time.time()),
+            (str(key), json.dumps(payload, ensure_ascii=False), now),
         )
         self.conn.commit()
 
@@ -701,6 +1230,32 @@ class TaskStore:
         command_str: str,
         timeout_sec: int,
     ) -> int:
+        now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    req_id, _ = self._mysql_exec(
+                        f"""
+                        INSERT INTO `{table}`(
+                          root, task_type, entity_id, command_str, timeout_sec, status, requested_at
+                        ) VALUES(%s,%s,%s,%s,%s,'pending',%s)
+                        """,
+                        (str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO manual_requests(
+                          id, root, task_type, entity_id, command_str, timeout_sec, status, requested_at
+                        ) VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (int(req_id), str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), "pending", now),
+                    )
+                    self.conn.commit()
+                    return int(req_id)
+                except Exception:
+                    pass
+
         cur = self.conn.execute(
             """
             INSERT INTO manual_requests(
@@ -713,14 +1268,32 @@ class TaskStore:
                 entity_id,
                 str(command_str),
                 int(timeout_sec),
-                time.time(),
+                now,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def pending_manual_requests(self, root: str, limit: int = 32) -> list[sqlite3.Row]:
-        cur = self.conn.execute(
+    def pending_manual_requests(self, root: str, limit: int = 32) -> list[dict[str, object]]:
+        lim = max(1, int(limit))
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    return self._mysql_query(
+                        f"""
+                        SELECT *
+                        FROM `{table}`
+                        WHERE status='pending' AND root=%s
+                        ORDER BY requested_at ASC, id ASC
+                        LIMIT {lim}
+                        """,
+                        (str(root),),
+                    )
+                except Exception:
+                    pass
+
+        return self._sqlite_fetchall_dicts(
             """
             SELECT *
             FROM manual_requests
@@ -728,47 +1301,136 @@ class TaskStore:
             ORDER BY requested_at ASC, id ASC
             LIMIT ?
             """,
-            (str(root), max(1, int(limit))),
+            (str(root), lim),
         )
-        return cur.fetchall()
 
     def get_manual_request_status(self, req_id: int) -> str | None:
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(
+                        f"SELECT status FROM `{table}` WHERE id=%s LIMIT 1",
+                        (int(req_id),),
+                    )
+                    if rows:
+                        return str(rows[0].get("status") or "")
+                except Exception:
+                    pass
         row = self.conn.execute("SELECT status FROM manual_requests WHERE id=?", (int(req_id),)).fetchone()
         if not row:
             return None
         return str(row["status"])
 
     def cancel_manual_request(self, req_id: int, note: str = "fallback_direct_exec") -> bool:
+        now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    _, cnt = self._mysql_exec(
+                        f"""
+                        UPDATE `{table}`
+                        SET status='cancelled', note=%s, finished_at=%s
+                        WHERE id=%s AND status='pending'
+                        """,
+                        (str(note), now, int(req_id)),
+                    )
+                    self.conn.execute(
+                        """
+                        UPDATE manual_requests
+                        SET status='cancelled', note=?, finished_at=?
+                        WHERE id=? AND status='pending'
+                        """,
+                        (str(note), now, int(req_id)),
+                    )
+                    self.conn.commit()
+                    return int(cnt) > 0
+                except Exception:
+                    pass
+
         cur = self.conn.execute(
             """
             UPDATE manual_requests
             SET status='cancelled', note=?, finished_at=?
             WHERE id=? AND status='pending'
             """,
-            (str(note), time.time(), int(req_id)),
+            (str(note), now, int(req_id)),
         )
         self.conn.commit()
         return int(cur.rowcount or 0) > 0
 
     def mark_manual_request_launched(self, req_id: int, task_key: str) -> None:
+        now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    self._mysql_exec(
+                        f"""
+                        UPDATE `{table}`
+                        SET status='launched', task_key=%s, launched_at=%s, note=NULL
+                        WHERE id=%s AND status='pending'
+                        """,
+                        (str(task_key), now, int(req_id)),
+                    )
+                    self.conn.execute(
+                        """
+                        UPDATE manual_requests
+                        SET status='launched', task_key=?, launched_at=?, note=NULL
+                        WHERE id=? AND status='pending'
+                        """,
+                        (str(task_key), now, int(req_id)),
+                    )
+                    self.conn.commit()
+                    return
+                except Exception:
+                    pass
+
         self.conn.execute(
             """
             UPDATE manual_requests
             SET status='launched', task_key=?, launched_at=?, note=NULL
             WHERE id=? AND status='pending'
             """,
-            (str(task_key), time.time(), int(req_id)),
+            (str(task_key), now, int(req_id)),
         )
         self.conn.commit()
 
     def finish_manual_request(self, req_id: int, status: str, note: str | None = None) -> None:
+        now = time.time()
+        if self._mysql_mode:
+            table = self._mysql_tables.get("manual_requests", "")
+            if table and self._mysql_available():
+                try:
+                    self._mysql_exec(
+                        f"""
+                        UPDATE `{table}`
+                        SET status=%s, note=%s, finished_at=%s
+                        WHERE id=%s AND status IN ('pending','launched')
+                        """,
+                        (str(status), note, now, int(req_id)),
+                    )
+                    self.conn.execute(
+                        """
+                        UPDATE manual_requests
+                        SET status=?, note=?, finished_at=?
+                        WHERE id=? AND status IN ('pending','launched')
+                        """,
+                        (str(status), note, now, int(req_id)),
+                    )
+                    self.conn.commit()
+                    return
+                except Exception:
+                    pass
+
         self.conn.execute(
             """
             UPDATE manual_requests
             SET status=?, note=?, finished_at=?
             WHERE id=? AND status IN ('pending','launched')
             """,
-            (str(status), note, time.time(), int(req_id)),
+            (str(status), note, now, int(req_id)),
         )
         self.conn.commit()
 
@@ -806,6 +1468,17 @@ def _pid_cmdline_args(pid: int) -> list[str]:
 def _task_signature_tokens(command_str: str) -> list[str]:
     args = [x for x in str(command_str or "").split(_CMD_SEP) if x]
     signature = [x for x in args if x.startswith("mautic:") or x.endswith("/bin/console") or x == "bin/console"]
+    id_opt_names = {"-i", "--id", "--list-id", "--campaign-id", "--segment-id"}
+    id_opt_prefixes = ("--id=", "--list-id=", "--campaign-id=", "--segment-id=")
+    identity: list[str] = []
+    for idx, arg in enumerate(args):
+        if arg in id_opt_names and idx + 1 < len(args):
+            identity.extend([arg, args[idx + 1]])
+            continue
+        if any(arg.startswith(prefix) for prefix in id_opt_prefixes):
+            identity.append(arg)
+    if identity:
+        signature.extend(identity)
     if signature:
         return signature
     # Fallback for unexpected/custom templates: use short tail.
@@ -902,6 +1575,41 @@ def _is_running(running: dict[str, RunningTask], root: str, task_type: str, enti
         if t.root == root and t.task_type == task_type and t.entity_id == entity_id:
             return True
     return False
+
+
+def _ring_has_launchable(
+    ring: deque[int],
+    *,
+    running: dict[str, RunningTask],
+    root: str,
+    task_type: str,
+) -> bool:
+    for eid in ring:
+        if not _is_running(running, root, task_type, eid):
+            return True
+    return False
+
+
+def _running_entities_stuck_for(
+    running: dict[str, RunningTask],
+    *,
+    root: str,
+    task_type: str,
+    entity_ids: set[int],
+    now_ts: float,
+    stuck_sec: int,
+) -> int:
+    if stuck_sec <= 0:
+        return 0
+    count = 0
+    for t in running.values():
+        if t.root != root or t.task_type != task_type or t.entity_id is None:
+            continue
+        if t.entity_id not in entity_ids:
+            continue
+        if now_ts - float(t.started_at) >= float(stuck_sec):
+            count += 1
+    return count
 
 
 def _submit_if_slot(
@@ -1175,7 +1883,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         segment_whitelist = set()
         campaign_whitelist = set()
 
-    store = TaskStore(config.state_db_path)
+    store = TaskStore(config.state_db_path, config)
     store.put_runtime_sync("local_runtime", local_runtime_overrides(config))
     inventory = InstanceInventory(config.state_db_path)
     seeded = ensure_seeded(inventory, config)
@@ -1870,6 +2578,45 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     seg_prio_limit = max(0, config.segment_priority_parallel_idle)
                     seg_reg_limit = max(0, config.segment_regular_parallel_idle)
                 seg_total_limit = seg_prio_limit + seg_reg_limit
+                eff_seg_prio_limit = seg_prio_limit
+                eff_seg_reg_limit = seg_reg_limit
+                prefer_priority_spill = False
+                if (
+                    not throttled.get(root, False)
+                    and seg_prio_limit > 0
+                    and seg_reg_limit > 0
+                    and seg_prio_set
+                ):
+                    prio_backlog = _ring_has_launchable(
+                        seg_prio_ring,
+                        running=running,
+                        root=root,
+                        task_type="segment",
+                    )
+                    stuck_prio = _running_entities_stuck_for(
+                        running,
+                        root=root,
+                        task_type="segment",
+                        entity_ids=seg_prio_set,
+                        now_ts=now,
+                        stuck_sec=_SEGMENT_STUCK_SPILLOVER_SEC,
+                    )
+                    if prio_backlog and stuck_prio > 0:
+                        # Keep 3+1 behavior as default, but when priority is
+                        # blocked by long-running tasks we temporarily borrow
+                        # regular launch slot for priority backlog.
+                        eff_seg_prio_limit = min(seg_total_limit, seg_prio_limit + seg_reg_limit)
+                        eff_seg_reg_limit = 0
+                        prefer_priority_spill = True
+                        logging.warning(
+                            "[%s] segment priority spillover active: stuck_prio=%s limits=%s+%s -> %s+%s",
+                            root,
+                            stuck_prio,
+                            seg_prio_limit,
+                            seg_reg_limit,
+                            eff_seg_prio_limit,
+                            eff_seg_reg_limit,
+                        )
                 seg_resume_ring = segment_resume_rings.setdefault(root, deque())
 
                 if throttled.get(root, False) and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
@@ -1939,7 +2686,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 else:
                     _fill_from_ring(
                         ring=seg_prio_ring,
-                        ring_limit=seg_prio_limit,
+                        ring_limit=eff_seg_prio_limit,
                         total_limit=seg_total_limit,
                         root=root,
                         task_type="segment",
@@ -1959,7 +2706,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     )
                     _fill_from_ring(
                         ring=seg_reg_ring,
-                        ring_limit=seg_reg_limit,
+                        ring_limit=eff_seg_reg_limit,
                         total_limit=seg_total_limit,
                         root=root,
                         task_type="segment",
@@ -1980,7 +2727,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total < seg_total_limit:
                         spill = seg_total_limit - seg_cur_total
-                        if seg_reg_ring:
+                        if prefer_priority_spill and seg_prio_ring and spill > 0:
+                            _fill_from_ring(
+                                ring=seg_prio_ring,
+                                ring_limit=eff_seg_prio_limit,
+                                total_limit=seg_total_limit,
+                                root=root,
+                                task_type="segment",
+                                running=running,
+                                ring_entities=seg_prio_set,
+                                config=config,
+                                store=store,
+                                popens=popens,
+                                build_args=lambda sid: render_mautic_command(
+                                    php_bin=config.php_bin,
+                                    run_as_user=config.mautic_run_as_user,
+                                    root=root,
+                                    template=config.cmd_segment_update_template,
+                                    id=sid,
+                                    batch_limit=config.segment_batch_limit,
+                                ),
+                            )
+                        elif seg_reg_ring:
                             _fill_from_ring(
                                 ring=seg_reg_ring,
                                 ring_limit=spill,
@@ -2114,6 +2882,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
             shared_campaign_cap = max(0, config.campaign_total_parallel)
             rr = campaign_round_robin.get(root, 0)
+            trigger_lane_configured = (
+                max(0, int(config.campaign_trigger_priority_parallel))
+                + max(0, int(config.campaign_trigger_regular_parallel))
+            ) > 0
             prefer_rebuild = (
                 shared_campaign_cap > 0
                 and config.enable_campaign_rebuild
@@ -2312,7 +3084,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             ),
                         )
 
-            if shared_campaign_cap > 0 and config.enable_campaign_rebuild and (trg_prio_limit + trg_reg_limit) > 0:
+            if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
 
             if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:

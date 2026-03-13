@@ -1,5 +1,101 @@
 # MCD Changelog
 
+## 0.8.18 - 2026-03-13
+- Added: plugin repo IP fallback as configuration parameter (`[plugins].repo_fallback_ip`).
+  - Behavior: MCD first fetches manifest/packages via normal FQDN URL.
+  - On HTTP/network failure, MCD retries once with DNS override (`host -> repo_fallback_ip`) while preserving original URL host.
+  - No hardcoded origin IP in code; fallback is fully configurable per host.
+- Added: runtime key support for centralized MCC control:
+  - `plugins_repo_fallback_ip`
+  - `plugins_repo_base_url`
+- Added: example setting in `mcd-agent.system.example.toml` for operator-side tuning.
+
+## 0.8.17 - 2026-03-12
+- Changed: `php_fpm` service-profile apply now also enforces a managed global PHP ini baseline (`98-mcd-php.ini`) for both FPM and CLI.
+  - Adds explicit tuning for `memory_limit`, timeouts, input vars, post/upload sizes, realpath cache, output buffering.
+  - Keeps rollback safety: all written files are restored on failed validate/reload.
+
+## 0.8.16 - 2026-03-12
+- Changed: in `state_backend=mysql_hybrid`, scheduler task state is now primary in MySQL (`tasks`, `manual_requests`, `weight_cache`, `runtime_sync`).
+  - SQLite remains local failover storage only (running/pending minimum), not primary history.
+- Added: one-time bootstrap migration from local SQLite into MySQL state tables on first successful MySQL start.
+  - Existing task/runtime rows are copied to MySQL with id-preserving upsert.
+  - After successful migration, SQLite is pruned to failover-only footprint.
+- Changed: CLI running-task views now read through `TaskStore` backend logic, so output matches effective backend (MySQL or SQLite fallback).
+
+## 0.8.15 - 2026-03-12
+- Fixed: campaign shared-cap round-robin no longer gets stuck in rebuild-only mode.
+  - Root cause: round-robin counter update depended on runtime trigger limits *after* cap/prefer filtering.
+    In `campaign_total_parallel=1` mode, rebuild-preferred tick zeroed trigger limits and stopped counter advancement.
+  - Impact: scheduler could continuously spawn `campaign_rebuild` and almost never run `campaign_trigger`
+    until daemon restart.
+  - Result: trigger/rebuild alternation remains stable for shared-cap profiles (`tiny`/`mini` customizations).
+
+## 0.8.14 - 2026-03-12
+- Fixed: `state-db status` now evaluates effective runtime state (local config + MCC desired runtime overrides), not only raw local file values.
+- Result: CLI `state-db` status is aligned with real daemon mode after MCC-driven `state_backend/state_mysql_*` runtime sync.
+
+## 0.8.13 - 2026-03-12
+- Fixed: state DB bootstrap now pushes runtime keys to MCC desired runtime map (not observed snapshot), so host converges to `mysql_hybrid` after successful init.
+- Added: `mcd-cli runtime-overrides push --target observed|desired` for explicit destination control (default: `observed`).
+
+## 0.8.12 - 2026-03-12
+- Fixed: interactive `Environment -> Bootstrap State DB` now handles wrong DB admin password explicitly.
+  - On auth failure, CLI shows immediate clear error (`DB auth failed...`) and offers password retry loop.
+  - Operator can retry password without leaving menu or re-entering host/port/user fields.
+
+## 0.8.11 - 2026-03-12
+- Fixed: state DB bootstrap now also syncs `state_backend/state_mysql_*` runtime keys to MCC as host runtime overrides (`merge=true`) and triggers immediate runtime poll.
+  - Prevents MCC from reverting host back to legacy `root`/no-password state values after successful local bootstrap.
+  - Result: after root-password bootstrap, host reliably converges to MySQL mode in dashboard.
+
+## 0.8.10 - 2026-03-11
+- Fixed: `Environment -> Bootstrap State DB` is now available for legacy hosts when state DB is missing or inaccessible (including access-denied cases), not only `unknown database`.
+- Changed: bootstrap flow now uses temporary admin credentials only for initialization.
+  - Root/admin password is never persisted.
+  - Agent creates dedicated runtime DB user (`mcd_state`) with minimal privileges on state DB.
+  - Runtime config is switched to `mysql_hybrid` and stores only state DB runtime credentials.
+- Added: `mcd-cli state-db init` now supports `--admin-unix-socket` and uses the same bootstrap flow as interactive menu.
+
+## 0.8.9 - 2026-03-11
+- Fixed: MySQL state backend now supports local unix-socket auth flow for passwordless local DB users.
+  - Agent auto-detects common local socket paths when `state_mysql_host` is local and password is empty.
+  - Explicit `state.mysql_unix_socket` (or runtime `state_mysql_unix_socket`) is supported.
+- Changed: state backend runtime keys are no longer blocked from MCC runtime hot-apply.
+  - `state_backend` and `state_mysql_*` keys can now be pushed via MCC runtime overrides and applied immediately.
+- Result: hosts can switch from `legacy` to `mysql` state mode without manual TOML edits when local DB auth is available.
+
+## 0.8.8 - 2026-03-11
+- Added: explicit state DB lifecycle controls in CLI (`mcd-cli state-db status|init`).
+  - `init` is allowed only when `state.backend=mysql_hybrid` and the target state database is missing.
+  - Supports admin credentials input (interactive prompt or `--admin-password-stdin`).
+- Added: interactive hub Environment menu now shows state backend status and conditional action:
+  - `State Backend Status`
+  - `Create State DB (admin credentials)` only for missing DB case.
+- Changed: agent state push now always includes `state_backend` probe result so MCC can display effective mode (`mysql` vs `legacy`) and init errors.
+
+## 0.8.7 - 2026-03-11
+- Added: general DB-backed state mode for all installations (`[state].backend = "mysql_hybrid"`).
+  - Outbound profile events are written to MySQL/MariaDB first (host-scoped rows).
+  - Agent uses a dedicated state DB (`state.mysql_database`, default `mcd_state`) and auto-creates it if missing.
+  - Local SQLite outbound queue remains as fallback when shared DB is unavailable.
+- Added: latest MCC payload snapshot upsert to shared state DB (optional).
+  - Sensitive fields are masked (`password/token/secret`), raw `config_state.toml` is omitted.
+  - Snapshot push result is tracked (`sent/failed`) in shared state table.
+- Added: state backend runtime keys to config model and runtime map.
+  - These keys are blocked from remote hot-apply for process safety (require restart).
+- Docs: state backend is documented as general mode (not cluster-only), with cluster replication as optional bonus.
+
+## 0.8.6 - 2026-03-10
+- Fixed: orphan `segment` tasks no longer stick to wrong PID after PID reuse.
+  - Root cause: task signature check matched only generic tokens (`bin/console` + `mautic:*`) and ignored per-entity identity.
+  - Impact: after daemon restart, an old running row (for example `-i 142`) could be falsely considered alive when OS reused PID for another `segments:update` process, keeping priority slots blocked for hours.
+  - New behavior: PID command signature now includes entity selector tokens (`-i/--id/--list-id/--campaign-id/--segment-id` and value), so mismatch is detected and stale rows are marked `lost`.
+  - Result: stuck priority slots are released correctly and stale segments can continue cycling through rings.
+- Fixed: dual-ring segment scheduler now prevents stale starvation when priority slots are occupied by very long-running tasks.
+  - New behavior: if priority ring has backlog and at least one priority worker is running longer than `2h`, scheduler temporarily borrows regular launch slot for priority backlog (`3+1 -> 4+0` for new launches only).
+  - Result: stale/priority segments continue to enter rings even while heavy segments are still executing.
+
 ## 0.8.5 - 2026-03-09
 - Added: bounded retention for delivered outbound profile events.
   - New runtime key `outbound_events_sent_keep_days` (default `14`).

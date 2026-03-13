@@ -70,6 +70,18 @@ class AgentConfig:
     mautic_run_as_user: str | None
     command_timeout_sec: int
     state_db_path: str
+    state_backend: str
+    state_mysql_host: str | None
+    state_mysql_unix_socket: str | None
+    state_mysql_port: int
+    state_mysql_database: str | None
+    state_mysql_user: str | None
+    state_mysql_password: str | None
+    state_mysql_table_prefix: str
+    state_mysql_connect_timeout_sec: int
+    state_mysql_read_timeout_sec: int
+    state_mysql_write_timeout_sec: int
+    state_mysql_snapshot_enabled: bool
     tasks_history_keep_days: int
     tasks_history_max_rows: int
     tasks_compact_enabled: bool
@@ -160,6 +172,7 @@ class AgentConfig:
     template_autopromote_on_clone: bool
     mcc_mcd_manifest_url: str | None
     plugins_repo_base_url: str | None
+    plugins_repo_fallback_ip: str | None
     plugins_manifest_path_template: str
     plugins_post_cache_clear: bool
     plugins_post_install: bool
@@ -769,6 +782,18 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mautic_run_as_user": "mautic_run_as_user",
     "command_timeout_sec": "command_timeout_sec",
     "state_db_path": "state_db_path",
+    "state_backend": "state_backend",
+    "state_mysql_host": "state_mysql_host",
+    "state_mysql_unix_socket": "state_mysql_unix_socket",
+    "state_mysql_port": "state_mysql_port",
+    "state_mysql_database": "state_mysql_database",
+    "state_mysql_user": "state_mysql_user",
+    "state_mysql_password": "state_mysql_password",
+    "state_mysql_table_prefix": "state_mysql_table_prefix",
+    "state_mysql_connect_timeout_sec": "state_mysql_connect_timeout_sec",
+    "state_mysql_read_timeout_sec": "state_mysql_read_timeout_sec",
+    "state_mysql_write_timeout_sec": "state_mysql_write_timeout_sec",
+    "state_mysql_snapshot_enabled": "state_mysql_snapshot_enabled",
     "tasks_history_keep_days": "tasks_history_keep_days",
     "tasks_history_max_rows": "tasks_history_max_rows",
     "tasks_compact_enabled": "tasks_compact_enabled",
@@ -844,6 +869,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_allow_test_build": "mcd_update_allow_test_build",
     "mcd_update_wait_retry_sec": "mcd_update_wait_retry_sec",
     "mcd_config_history_limit": "mcd_config_history_limit",
+    "plugins_repo_base_url": "plugins_repo_base_url",
+    "plugins_repo_fallback_ip": "plugins_repo_fallback_ip",
     "outbound_events_sent_keep_days": "outbound_events_sent_keep_days",
     "custom_cache_cleanup_enabled": "custom_cache_cleanup_enabled",
     "custom_cache_cleanup_interval_sec": "custom_cache_cleanup_interval_sec",
@@ -1126,6 +1153,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     mcc = data.get("mcc", {})
     plugins = data.get("plugins", {})
     custom = data.get("custom", {}) if isinstance(data.get("custom", {}), dict) else {}
+    state = data.get("state", {}) if isinstance(data.get("state", {}), dict) else {}
     backup = data.get("backup", {})
     backup_storage = backup.get("storage", {}) if isinstance(backup, dict) else {}
     backup_mydumper = backup.get("mydumper", {}) if isinstance(backup, dict) else {}
@@ -1136,6 +1164,11 @@ def _load_config_inner(path: str) -> AgentConfig:
     profile = data.get("profile", {})
 
     profile_name = str(profile.get("name", runtime.get("profile", "custom"))).strip().lower() or "custom"
+    state_backend = str(runtime.get("state_backend", state.get("backend", "sqlite"))).strip().lower() or "sqlite"
+    if state_backend in {"mysql", "mariadb", "hybrid"}:
+        state_backend = "mysql_hybrid"
+    if state_backend not in {"sqlite", "mysql_hybrid"}:
+        state_backend = "sqlite"
     ring_mode = str(runtime.get("ring_mode", "dual")).strip().lower()
     disable_throttle = bool(runtime.get("disable_throttle", False))
     disable_whitelist = bool(runtime.get("disable_whitelist", False))
@@ -1194,6 +1227,45 @@ def _load_config_inner(path: str) -> AgentConfig:
         mautic_run_as_user=str(runtime.get("mautic_run_as_user")).strip() if runtime.get("mautic_run_as_user") else "www-data",
         command_timeout_sec=int(runtime.get("command_timeout_sec", 0)),
         state_db_path=str(runtime.get("state_db_path", "/opt/mcd/var/mcd-state.db")),
+        state_backend=state_backend,
+        state_mysql_host=(
+            str(runtime.get("state_mysql_host", state.get("mysql_host", ""))).strip()
+            or None
+        ),
+        state_mysql_unix_socket=(
+            str(runtime.get("state_mysql_unix_socket", state.get("mysql_unix_socket", ""))).strip()
+            or None
+        ),
+        state_mysql_port=int(runtime.get("state_mysql_port", state.get("mysql_port", 3306))),
+        state_mysql_database=(
+            str(runtime.get("state_mysql_database", state.get("mysql_database", "mcd_state"))).strip()
+            or None
+        ),
+        state_mysql_user=(
+            str(runtime.get("state_mysql_user", state.get("mysql_user", ""))).strip()
+            or None
+        ),
+        state_mysql_password=(
+            str(runtime.get("state_mysql_password", state.get("mysql_password", "")))
+            if (runtime.get("state_mysql_password") is not None or state.get("mysql_password") is not None)
+            else None
+        ),
+        state_mysql_table_prefix=(
+            str(runtime.get("state_mysql_table_prefix", state.get("mysql_table_prefix", "mcd_"))).strip()
+            or "mcd_"
+        ),
+        state_mysql_connect_timeout_sec=int(
+            runtime.get("state_mysql_connect_timeout_sec", state.get("mysql_connect_timeout_sec", 5))
+        ),
+        state_mysql_read_timeout_sec=int(
+            runtime.get("state_mysql_read_timeout_sec", state.get("mysql_read_timeout_sec", 15))
+        ),
+        state_mysql_write_timeout_sec=int(
+            runtime.get("state_mysql_write_timeout_sec", state.get("mysql_write_timeout_sec", 15))
+        ),
+        state_mysql_snapshot_enabled=bool(
+            runtime.get("state_mysql_snapshot_enabled", state.get("mysql_snapshot_enabled", True))
+        ),
         tasks_history_keep_days=int(runtime.get("tasks_history_keep_days", 14)),
         tasks_history_max_rows=int(runtime.get("tasks_history_max_rows", 200000)),
         tasks_compact_enabled=bool(runtime.get("tasks_compact_enabled", True)),
@@ -1370,6 +1442,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         template_autopromote_on_clone=bool(runtime.get("template_autopromote_on_clone", True)),
         mcc_mcd_manifest_url=str(mcc.get("mcd_manifest_url")) if mcc.get("mcd_manifest_url") else None,
         plugins_repo_base_url=str(plugins.get("repo_base_url", "https://servercontrol.sales-snap.com")).rstrip("/"),
+        plugins_repo_fallback_ip=str(plugins.get("repo_fallback_ip")).strip() if plugins.get("repo_fallback_ip") else None,
         plugins_manifest_path_template=str(
             plugins.get("manifest_path_template", "/mauticctl/packages/mautic{major}/manifest.json")
         ),

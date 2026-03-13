@@ -235,6 +235,26 @@ cache_clear_template = "cache:clear"
 # Cache warm template.
 cache_warm_template = "cache:warmup"
 
+[state]
+# Agent state backend:
+# - "sqlite"       : legacy local-only state
+# - "mysql_hybrid" : primary shared state in MySQL/MariaDB + local SQLite fallback queue
+backend = "sqlite"
+# Shared MySQL/MariaDB endpoint for MCD state (general DB-backed mode).
+mysql_host = ""
+mysql_port = 3306
+mysql_database = "mcd_state"
+mysql_user = ""
+mysql_password = ""
+# Prefix for service tables inside state DB.
+mysql_table_prefix = "mcd_"
+# Network timeouts (sec) for state DB operations.
+mysql_connect_timeout_sec = 5
+mysql_read_timeout_sec = 15
+mysql_write_timeout_sec = 15
+# Store latest built MCC payload snapshot in shared state DB.
+mysql_snapshot_enabled = true
+
 [mcc]
 # Optional MCC URL for connected mode.
 url = ""
@@ -260,6 +280,10 @@ mcd_manifest_url = ""
 [plugins]
 # Base URL for plugin manifest/packages.
 repo_base_url = "https://servercontrol.sales-snap.com"
+# Optional fallback origin IP used only when primary FQDN fetch fails.
+# Request URL/Host remains the same; only DNS resolution is forced to this IP.
+# Example: repo_fallback_ip = "65.21.54.91"
+repo_fallback_ip = ""
 # Manifest path pattern.
 manifest_path_template = "/mauticctl/packages/mautic{major}/manifest.json"
 # Run cache:clear after plugin actions.

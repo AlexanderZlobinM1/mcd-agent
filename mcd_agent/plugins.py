@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -110,23 +113,122 @@ def _repo_base_url(config: AgentConfig) -> str:
     raise RuntimeError("plugins.repo_base_url or mcc.url must be configured")
 
 
-def _fetch_json(url: str, token: str | None, timeout_sec: int = 12) -> dict[str, Any]:
+_DNS_OVERRIDE_LOCK = threading.Lock()
+
+
+def _is_ip_literal(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _url_host(url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    return parsed.hostname
+
+
+def _urlopen_with_dns_override(
+    req: urllib.request.Request,
+    *,
+    timeout_sec: int,
+    resolve_host: str,
+    resolve_ip: str,
+):
+    orig_getaddrinfo = socket.getaddrinfo
+    resolve_host_l = resolve_host.lower()
+
+    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # type: ignore[no-untyped-def]
+        h = str(host or "")
+        if h.lower() == resolve_host_l:
+            h = resolve_ip
+        return orig_getaddrinfo(h, port, family, type, proto, flags)
+
+    with _DNS_OVERRIDE_LOCK:
+        socket.getaddrinfo = _patched_getaddrinfo
+        try:
+            return urllib.request.urlopen(req, timeout=timeout_sec)
+        finally:
+            socket.getaddrinfo = orig_getaddrinfo
+
+
+def _fetch_json(
+    url: str,
+    token: str | None,
+    *,
+    timeout_sec: int = 12,
+    fallback_ip: str | None = None,
+) -> dict[str, Any]:
     headers = {"Accept": "application/json", "User-Agent": f"mcd-agent/{__version__}"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        data = resp.read().decode("utf-8")
-    return json.loads(data)
+    primary_err: Exception | None = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = resp.read().decode("utf-8")
+        return json.loads(data)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        primary_err = e
+
+    host = _url_host(url)
+    fallback_ip_clean = str(fallback_ip or "").strip()
+    if not fallback_ip_clean or not host or _is_ip_literal(host):
+        assert primary_err is not None
+        raise primary_err
+
+    logging.warning("plugins manifest primary fetch failed (%s), fallback via %s -> %s", primary_err, host, fallback_ip_clean)
+    try:
+        with _urlopen_with_dns_override(
+            req,
+            timeout_sec=timeout_sec,
+            resolve_host=host,
+            resolve_ip=fallback_ip_clean,
+        ) as resp:
+            data = resp.read().decode("utf-8")
+        return json.loads(data)
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        assert primary_err is not None
+        raise primary_err
 
 
-def _fetch_file(url: str, token: str | None, dst: Path) -> None:
+def _fetch_file(url: str, token: str | None, dst: Path, *, fallback_ip: str | None = None) -> None:
     headers: dict[str, str] = {"User-Agent": f"mcd-agent/{__version__}"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=120) as resp, dst.open("wb") as f:
-        shutil.copyfileobj(resp, f)
+    primary_err: Exception | None = None
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp, dst.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+        return
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        primary_err = e
+
+    host = _url_host(url)
+    fallback_ip_clean = str(fallback_ip or "").strip()
+    if not fallback_ip_clean or not host or _is_ip_literal(host):
+        assert primary_err is not None
+        raise primary_err
+
+    logging.warning("plugins package primary fetch failed (%s), fallback via %s -> %s", primary_err, host, fallback_ip_clean)
+    try:
+        with _urlopen_with_dns_override(
+            req,
+            timeout_sec=120,
+            resolve_host=host,
+            resolve_ip=fallback_ip_clean,
+        ) as resp, dst.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        assert primary_err is not None
+        raise primary_err
 
 
 def _parse_selection(expr: str, max_index: int) -> list[int]:
@@ -306,6 +408,7 @@ def _install_or_replace_plugin(
     bundle: str,
     package_url: str,
     token: str | None,
+    fallback_ip: str | None,
     state_filename: str,
     state_payload: dict[str, Any],
 ) -> None:
@@ -317,7 +420,7 @@ def _install_or_replace_plugin(
     with tempfile.TemporaryDirectory(prefix=f"mcd-plugin-{bundle}-") as td:
         td_path = Path(td)
         archive_path = td_path / package_url.rsplit("/", 1)[-1]
-        _fetch_file(package_url, token, archive_path)
+        _fetch_file(package_url, token, archive_path, fallback_ip=fallback_ip)
 
         unpack_dir = td_path / "unpack"
         unpack_dir.mkdir(parents=True, exist_ok=True)
@@ -535,7 +638,12 @@ def run_plugins_interactive(
     logging.info("plugins manifest: %s", manifest_url)
     print("Loading plugin manifest...")
     try:
-        manifest = _fetch_json(manifest_url, config.mcc_token, timeout_sec=12)
+        manifest = _fetch_json(
+            manifest_url,
+            config.mcc_token,
+            timeout_sec=12,
+            fallback_ip=config.plugins_repo_fallback_ip,
+        )
     except urllib.error.URLError as e:
         raise RuntimeError(f"Cannot fetch manifest (network/timeout): {e}") from e
 
@@ -759,6 +867,7 @@ def run_plugins_interactive(
             bundle=bundle,
             package_url=package_url,
             token=config.mcc_token,
+            fallback_ip=config.plugins_repo_fallback_ip,
             state_filename=config.plugins_state_filename,
             state_payload={
                 "bundle": bundle,

@@ -3,14 +3,15 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+import getpass
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -45,10 +46,17 @@ from mcd_agent.mautic6_core_patch import (
 )
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
 from mcd_agent.plugins import run_plugins_interactive
-from mcd_agent.runtime_overrides import fetch_runtime_overrides, local_runtime_overrides, push_runtime_overrides, touch_poll_trigger
+from mcd_agent.runtime_overrides import (
+    apply_remote_overrides,
+    fetch_runtime_overrides,
+    local_runtime_overrides,
+    push_runtime_overrides,
+    touch_poll_trigger,
+)
 from mcd_agent.service_profiles import fetch_service_profile, service_profiles_apply_once
 from mcd_agent.signals import collect_signals, format_signals_json, format_signals_text
 from mcd_agent.state_push import push_state_now, queue_profile_event
+from mcd_agent.state_backend import create_state_database_with_admin, state_backend_status, state_database_exists
 from mcd_agent.self_update import apply_update, check_with_mcc, update_status
 from mcd_agent.tuner import format_tune_result, tune_segments
 from mcd_agent.uninstall import run_uninstall
@@ -87,6 +95,193 @@ def _push_state_after_change(cfg, reason: str) -> None:
             logging.warning("MCC immediate push (%s) skipped/failed: %s", reason, msg)
     except Exception as e:
         logging.warning("MCC immediate push (%s) failed: %s", reason, e)
+
+
+def _state_backend_status_payload(cfg) -> dict[str, object]:
+    cfg_eff = cfg
+    # Status must reflect effective runtime (local config + MCC runtime overrides),
+    # otherwise CLI can show legacy while daemon already runs in mysql_hybrid.
+    try:
+        fetched = fetch_runtime_overrides(cfg)
+        if str(fetched.get("status", "")).strip().lower() == "ok":
+            ro = fetched.get("runtime_overrides")
+            if isinstance(ro, dict) and ro:
+                applied = apply_remote_overrides(cfg, ro)
+                cfg_eff = applied.get("config", cfg)
+    except Exception:
+        cfg_eff = cfg
+    try:
+        raw = state_backend_status(cfg_eff, probe=True)
+        if isinstance(raw, dict):
+            return raw
+    except Exception as e:
+        return {
+            "desired_backend": "unknown",
+            "active_backend": "sqlite",
+            "mode": "legacy",
+            "reason": "status_error",
+            "error": str(e),
+        }
+    return {
+        "desired_backend": "unknown",
+        "active_backend": "sqlite",
+        "mode": "legacy",
+        "reason": "status_unavailable",
+    }
+
+
+def _print_state_backend_status(cfg) -> dict[str, object]:
+    st = _state_backend_status_payload(cfg)
+    print(json.dumps(st, ensure_ascii=True, indent=2))
+    return st
+
+
+def _state_db_missing_only(cfg, st: dict[str, object]) -> bool:
+    mode = str(st.get("mode", "") or "").strip().lower()
+    active = str(st.get("active_backend", "") or "").strip().lower()
+    if mode != "legacy" or active not in {"", "sqlite"}:
+        return False
+    exists, msg = state_database_exists(cfg)
+    if msg == "ok":
+        return not bool(exists)
+    txt = str(msg or "").lower()
+    if any(token in txt for token in ("unknown database", "access denied", "denied")):
+        return True
+    reason = str(st.get("reason", "") or "").strip().lower()
+    return reason in {"legacy_sqlite_mode", "mysql_config_missing", "mysql_init_failed", "status_error", "status_unavailable"}
+
+
+def _toml_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
+    return json.dumps("" if value is None else str(value), ensure_ascii=True)
+
+
+def _upsert_runtime_values(config_path: str, updates: dict[str, object]) -> str:
+    if not updates:
+        return str(_resolve_mutable_config_path(config_path))
+    p = _resolve_mutable_config_path(config_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    runtime_lines = [f"{k} = {_toml_literal(v)}" for k, v in updates.items()]
+    section = "[runtime]\n" + "\n".join(runtime_lines) + "\n\n"
+    m = re.search(r"(?ms)^(\[runtime\]\s*\n)(.*?)(?=^\[|\Z)", text)
+    if not m:
+        p.write_text(section + text, encoding="utf-8")
+        return str(p)
+    body = m.group(2)
+    key_set = set(updates.keys())
+    out_lines: list[str] = []
+    key_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+    for raw in body.splitlines():
+        km = key_re.match(raw)
+        if km and km.group(1) in key_set:
+            continue
+        out_lines.append(raw)
+    while out_lines and not out_lines[0].strip():
+        out_lines.pop(0)
+    merged: list[str] = list(runtime_lines)
+    if out_lines:
+        merged.append("")
+        merged.extend(out_lines)
+    new_body = "\n".join(merged).rstrip("\n")
+    text2 = text[: m.start(2)] + new_body + text[m.end(2) :]
+    p.write_text(text2, encoding="utf-8")
+    return str(p)
+
+
+def _gen_state_runtime_password(length: int = 28) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "".join(secrets.choice(alphabet) for _ in range(max(16, int(length))))
+
+
+def _is_mysql_auth_error(msg: str) -> bool:
+    txt = str(msg or "").strip().lower()
+    return (
+        "access denied" in txt
+        or "using password" in txt
+        or "authentication failed" in txt
+    )
+
+
+def _state_runtime_bootstrap_defaults(cfg) -> dict[str, object]:
+    runtime_user = str(cfg.state_mysql_user or "").strip()
+    if not runtime_user or runtime_user.lower() == "root":
+        runtime_user = "mcd_state"
+    runtime_host = str(cfg.state_mysql_host or "").strip() or "127.0.0.1"
+    runtime_socket = str(cfg.state_mysql_unix_socket or "").strip()
+    runtime_db = str(cfg.state_mysql_database or "").strip() or "mcd_state"
+    runtime_port = int(cfg.state_mysql_port or 3306)
+    return {
+        "state_backend": "mysql_hybrid",
+        "state_mysql_host": runtime_host,
+        "state_mysql_port": runtime_port,
+        "state_mysql_database": runtime_db,
+        "state_mysql_user": runtime_user,
+        "state_mysql_password": _gen_state_runtime_password(),
+        "state_mysql_unix_socket": runtime_socket,
+    }
+
+
+def _bootstrap_state_db_with_admin(
+    cfg,
+    *,
+    admin_user: str,
+    admin_password: str | None,
+    admin_host: str | None = None,
+    admin_port: int | None = None,
+    admin_socket: str | None = None,
+) -> tuple[bool, str, object]:
+    runtime = _state_runtime_bootstrap_defaults(cfg)
+    ok, msg = create_state_database_with_admin(
+        cfg,
+        admin_user=admin_user,
+        admin_password=admin_password if admin_password not in {"", None} else None,
+        admin_host=admin_host,
+        admin_port=admin_port,
+        admin_unix_socket=admin_socket,
+        runtime_user=str(runtime["state_mysql_user"]),
+        runtime_password=str(runtime["state_mysql_password"]),
+        runtime_database=str(runtime["state_mysql_database"]),
+        runtime_host=str(runtime["state_mysql_host"]),
+        runtime_port=int(runtime["state_mysql_port"]),
+        runtime_unix_socket=str(runtime["state_mysql_unix_socket"] or ""),
+    )
+    if not ok:
+        return False, msg, cfg
+    runtime_updates = {
+        "state_backend": runtime["state_backend"],
+        "state_mysql_host": runtime["state_mysql_host"],
+        "state_mysql_port": runtime["state_mysql_port"],
+        "state_mysql_database": runtime["state_mysql_database"],
+        "state_mysql_user": runtime["state_mysql_user"],
+        "state_mysql_password": runtime["state_mysql_password"],
+        "state_mysql_unix_socket": runtime["state_mysql_unix_socket"],
+    }
+    persisted = _upsert_runtime_values(
+        cfg.config_file_path,
+        runtime_updates,
+    )
+    cfg2 = load_config(cfg.config_file_path)
+    sync_msg = "mcc_runtime_sync=skipped"
+    try:
+        pushed = push_runtime_overrides(cfg2, runtime_updates, merge=True, target="desired")
+        pstatus = str(pushed.get("status", "")).strip().lower()
+        if pstatus in {"ok", "disabled"}:
+            touch_poll_trigger(cfg2)
+            sync_msg = f"mcc_runtime_sync={pstatus}"
+        else:
+            preason = str(pushed.get("reason", "")).strip()
+            sync_msg = f"mcc_runtime_sync=failed({preason or pstatus or 'unknown'})"
+    except Exception as e:
+        sync_msg = f"mcc_runtime_sync=failed({e})"
+    return True, f"{msg}; runtime saved in {persisted}; {sync_msg}", cfg2
 
 
 def _default_config_path() -> str:
@@ -173,7 +368,7 @@ def _run_manual_command_with_scheduler(
     except FileNotFoundError as e:
         return 3, str(e)
 
-    store = TaskStore(cfg.state_db_path)
+    store = TaskStore(cfg.state_db_path, cfg)
     req_id = store.enqueue_manual_request(
         root=root,
         task_type=task_type,
@@ -355,27 +550,19 @@ def _kill_pid(pid: int, grace_sec: int) -> str:
 
 def _tracked_running_tasks(cfg) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    if not Path(cfg.state_db_path).exists():
-        return rows
     try:
-        con = sqlite3.connect(cfg.state_db_path)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT id, root, task_type, entity_id, pid, command_str "
-            "FROM tasks WHERE state='running' ORDER BY id"
-        )
-        for r in cur.fetchall():
+        store = TaskStore(cfg.state_db_path, cfg)
+        for r in store.running_task_summaries():
             rows.append(
                 {
-                    "id": int(r[0]),
-                    "root": str(r[1] or ""),
-                    "task_type": str(r[2] or ""),
-                    "entity_id": r[3],
-                    "pid": int(r[4]) if r[4] is not None else 0,
-                    "command_str": str(r[5] or ""),
+                    "id": int(r.get("id") or 0),
+                    "root": str(r.get("root") or ""),
+                    "task_type": str(r.get("task_type") or ""),
+                    "entity_id": r.get("entity_id"),
+                    "pid": int(r.get("pid") or 0),
+                    "command_str": str(r.get("command_str") or ""),
                 }
             )
-        con.close()
     except Exception:
         return []
     return rows
@@ -757,11 +944,16 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
             continue
         if choice == "6":
             while True:
+                st_backend = _state_backend_status_payload(cfg)
+                show_create_state_db = _state_db_missing_only(cfg, st_backend)
                 print("")
                 print("Environment")
                 print("1. IPv6 Status")
                 print("2. Disable IPv6")
                 print("3. Enable IPv6")
+                print("4. State Backend Status")
+                if show_create_state_db:
+                    print("5. Bootstrap State DB (root password)")
                 print("0. Back")
                 c3 = _ask("Select option: ").strip()
                 if c3 == "1":
@@ -776,6 +968,45 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                 if c3 == "3":
                     for line in set_ipv6_disabled(False):
                         print(line)
+                    continue
+                if c3 == "4":
+                    _print_state_backend_status(cfg)
+                    continue
+                if c3 == "5" and show_create_state_db:
+                    host_default = str(cfg.state_mysql_host or "localhost")
+                    port_default = int(cfg.state_mysql_port or 3306)
+                    admin_host = (_ask(f"DB admin host [{host_default}]: ").strip() or host_default)
+                    admin_port_raw = _ask(f"DB admin port [{port_default}]: ").strip()
+                    try:
+                        admin_port = int(admin_port_raw) if admin_port_raw else port_default
+                    except ValueError:
+                        print("Invalid port")
+                        continue
+                    admin_user = (_ask("DB admin user [root]: ").strip() or "root")
+                    sock_default = str(cfg.state_mysql_unix_socket or "").strip()
+                    sock_prompt = f"DB admin unix socket [{sock_default or 'auto'}]: "
+                    admin_sock = _ask(sock_prompt).strip() or sock_default or None
+                    while True:
+                        admin_pwd = getpass.getpass("DB admin password (empty allowed): ")
+                        ok, msg, cfg_after = _bootstrap_state_db_with_admin(
+                            cfg,
+                            admin_user=admin_user,
+                            admin_password=admin_pwd if admin_pwd != "" else None,
+                            admin_host=admin_host,
+                            admin_port=admin_port,
+                            admin_socket=admin_sock,
+                        )
+                        if ok:
+                            print(msg)
+                            cfg = cfg_after
+                            _push_state_after_change(cfg, "state-db-init")
+                            break
+                        print(f"Bootstrap failed: {msg}")
+                        if _is_mysql_auth_error(msg):
+                            print("DB auth failed: wrong admin password/user or socket/auth mismatch.")
+                        retry = (_ask("Retry DB admin password? [Y/n]: ").strip() or "y").lower()
+                        if retry not in {"y", "yes", "1", "true"}:
+                            break
                     continue
                 if c3 in {"0", "q", "quit", "exit"}:
                     break
@@ -979,11 +1210,22 @@ def _build_parser() -> argparse.ArgumentParser:
     ro.add_argument("--config", default=default_cfg)
     ro.add_argument("op", choices=["show", "fetch", "push", "trigger", "status"], nargs="?", default="show")
     ro.add_argument("--merge", action="store_true", help="merge on push (default: replace)")
+    ro.add_argument("--target", choices=["observed", "desired"], default="observed", help="push target for runtime map")
     ro.add_argument("--json", action="store_true")
 
     scheduler = sub.add_parser("scheduler", help="Pause/resume scheduler launches")
     scheduler.add_argument("--config", default=default_cfg)
     scheduler.add_argument("op", choices=["pause", "resume", "status"])
+
+    sdb = sub.add_parser("state-db", help="State DB status/bootstrap for legacy->mysql_hybrid migration")
+    sdb.add_argument("--config", default=default_cfg)
+    sdb.add_argument("op", choices=["status", "init"], nargs="?", default="status")
+    sdb.add_argument("--admin-host")
+    sdb.add_argument("--admin-port", type=int)
+    sdb.add_argument("--admin-user", default="root")
+    sdb.add_argument("--admin-unix-socket")
+    sdb.add_argument("--admin-password-stdin", action="store_true")
+    sdb.add_argument("--json", action="store_true")
 
     maintenance = sub.add_parser("maintenance", help="Temporary maintenance mode (no profile switch)")
     maintenance.add_argument("--config", default=default_cfg)
@@ -1416,7 +1658,12 @@ def main() -> int:
             print(json.dumps(res, ensure_ascii=True, indent=2))
             return 0 if str(res.get("status", "")).strip().lower() in {"ok", "disabled"} else 1
         if op == "push":
-            res = push_runtime_overrides(cfg, local_runtime_overrides(cfg), merge=bool(args.merge))
+            res = push_runtime_overrides(
+                cfg,
+                local_runtime_overrides(cfg),
+                merge=bool(args.merge),
+                target=str(args.target or "observed"),
+            )
             print(json.dumps(res, ensure_ascii=True, indent=2))
             return 0 if str(res.get("status", "")).strip().lower() in {"ok", "disabled"} else 1
         # trigger
@@ -1447,16 +1694,75 @@ def main() -> int:
         paused = flag.exists()
         running = 0
         try:
-            con = sqlite3.connect(cfg.state_db_path)
-            cur = con.cursor()
-            cur.execute("SELECT COUNT(*) FROM tasks WHERE state='running'")
-            row = cur.fetchone()
-            running = int(row[0]) if row else 0
-            con.close()
+            running = TaskStore(cfg.state_db_path, cfg).running_count()
         except Exception:
             running = -1
         print(f"paused={str(paused).lower()} running_tasks={running}")
         return 0
+
+    if args.cmd == "state-db":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        st = _state_backend_status_payload(cfg)
+        if args.op == "status":
+            if args.json:
+                print(json.dumps(st, ensure_ascii=True, indent=2))
+            else:
+                print(
+                    "desired={desired} active={active} mode={mode} db={db} reason={reason}".format(
+                        desired=str(st.get("desired_backend", "-")),
+                        active=str(st.get("active_backend", "-")),
+                        mode=str(st.get("mode", "-")),
+                        db=str(st.get("database", "-")),
+                        reason=str(st.get("reason", "-")),
+                    )
+                )
+                if st.get("error"):
+                    print(f"error={st.get('error')}")
+            return 0
+
+        # op == init
+        if not _state_db_missing_only(cfg, st):
+            out = {
+                "ok": False,
+                "reason": "state_db_init_allowed_only_in_legacy_missing_or_inaccessible_state",
+                "status": st,
+            }
+            if args.json:
+                print(json.dumps(out, ensure_ascii=True, indent=2))
+            else:
+                print("State DB bootstrap is allowed only in legacy mode when state DB is missing/inaccessible.")
+                print(json.dumps(st, ensure_ascii=True))
+            return 1
+
+        host_default = str(args.admin_host or cfg.state_mysql_host or "localhost")
+        port_default = int(args.admin_port or cfg.state_mysql_port or 3306)
+        user_default = str(args.admin_user or "root")
+        sock_default = str(args.admin_unix_socket or cfg.state_mysql_unix_socket or "").strip()
+        if bool(args.admin_password_stdin):
+            admin_pwd = sys.stdin.read().rstrip("\n")
+        else:
+            admin_pwd = getpass.getpass("DB admin password (empty allowed): ")
+        ok, msg, cfg_after = _bootstrap_state_db_with_admin(
+            cfg,
+            admin_user=user_default,
+            admin_password=admin_pwd if admin_pwd != "" else None,
+            admin_host=host_default,
+            admin_port=port_default,
+            admin_socket=sock_default or None,
+        )
+        after = _state_backend_status_payload(cfg_after if ok else cfg)
+        out = {"ok": bool(ok), "message": msg, "status": after}
+        if args.json:
+            print(json.dumps(out, ensure_ascii=True, indent=2))
+        else:
+            print(msg)
+            print(json.dumps(after, ensure_ascii=True))
+        if ok:
+            _push_state_after_change(cfg_after, "state-db-init")
+        return 0 if ok else 1
 
     if args.cmd == "maintenance":
         cfg = load_config(args.config)

@@ -53,6 +53,25 @@ push_alert_window_min = 5
 # Optional explicit host name for MCC inventory mapping.
 host_name = ""
 
+[state]
+# Shared state mode for all installations:
+# - sqlite       : local-only state
+# - mysql_hybrid : primary state in MySQL/MariaDB + local SQLite fallback queue
+backend = "sqlite"
+mysql_host = ""
+# Optional explicit unix socket path (recommended for root@localhost auth_socket).
+# When empty, agent auto-detects common local sockets for passwordless local auth.
+mysql_unix_socket = ""
+mysql_port = 3306
+mysql_database = "mcd_state"
+mysql_user = ""
+mysql_password = ""
+mysql_table_prefix = "mcd_"
+mysql_connect_timeout_sec = 5
+mysql_read_timeout_sec = 15
+mysql_write_timeout_sec = 15
+mysql_snapshot_enabled = true
+
 [custom]
 # Optional custom scripts base URL.
 # If empty, MCD uses [mcc].url.

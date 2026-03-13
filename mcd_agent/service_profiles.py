@@ -221,6 +221,32 @@ def _build_redis_sessions_override(profile: dict[str, Any]) -> str:
     )
 
 
+def _build_php_ini_override(profile: dict[str, Any]) -> str:
+    php = profile.get("php")
+    php_cfg = php if isinstance(php, dict) else {}
+    memory_limit_mb = int(php_cfg.get("memory_limit_mb", 512) or 512)
+    max_execution_time_sec = int(php_cfg.get("max_execution_time_sec", 120) or 120)
+    max_input_time_sec = int(php_cfg.get("max_input_time_sec", 120) or 120)
+    max_input_vars = int(php_cfg.get("max_input_vars", 5000) or 5000)
+    post_max_size_mb = int(php_cfg.get("post_max_size_mb", 64) or 64)
+    upload_max_filesize_mb = int(php_cfg.get("upload_max_filesize_mb", 64) or 64)
+    realpath_cache_size_kb = int(php_cfg.get("realpath_cache_size_kb", 2048) or 2048)
+    realpath_cache_ttl_sec = int(php_cfg.get("realpath_cache_ttl_sec", 600) or 600)
+    output_buffering = int(php_cfg.get("output_buffering", 4096) or 4096)
+    return (
+        "; managed by mcd service profile (php.ini baseline)\n"
+        f"memory_limit={memory_limit_mb}M\n"
+        f"max_execution_time={max_execution_time_sec}\n"
+        f"max_input_time={max_input_time_sec}\n"
+        f"max_input_vars={max_input_vars}\n"
+        f"post_max_size={post_max_size_mb}M\n"
+        f"upload_max_filesize={upload_max_filesize_mb}M\n"
+        f"realpath_cache_size={realpath_cache_size_kb}K\n"
+        f"realpath_cache_ttl={realpath_cache_ttl_sec}\n"
+        f"output_buffering={output_buffering}\n"
+    )
+
+
 def _build_sysctl_override(profile: dict[str, Any]) -> str:
     somaxconn = int(profile.get("sysctl_somaxconn", profile.get("listen_backlog", 4096)) or 4096)
     return (
@@ -345,11 +371,14 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
     pool_override = Path(f"/etc/php/{php_ver}/fpm/pool.d/zz-mcd-hw.conf")
     opcache_fpm = Path(f"/etc/php/{php_ver}/fpm/conf.d/99-mcd-hw.ini")
     opcache_cli = Path(f"/etc/php/{php_ver}/cli/conf.d/99-mcd-hw.ini")
+    php_ini_fpm = Path(f"/etc/php/{php_ver}/fpm/conf.d/98-mcd-php.ini")
+    php_ini_cli = Path(f"/etc/php/{php_ver}/cli/conf.d/98-mcd-php.ini")
     redis_fpm = Path(f"/etc/php/{php_ver}/fpm/conf.d/90-redis-sessions.ini")
     redis_cli = Path(f"/etc/php/{php_ver}/cli/conf.d/90-redis-sessions.ini")
 
     pool_content = _build_pool_override(profile)
     opcache_content = _build_opcache_override(profile)
+    php_ini_content = _build_php_ini_override(profile)
     redis_sessions_enabled = bool(profile.get("redis_sessions_enabled", True))
     redis_content = _build_redis_sessions_override(profile)
     sysctl_content = _build_sysctl_override(profile)
@@ -358,13 +387,15 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
         pool_override: pool_override.read_text(encoding="utf-8") if pool_override.exists() else None,
         opcache_fpm: opcache_fpm.read_text(encoding="utf-8") if opcache_fpm.exists() else None,
         opcache_cli: opcache_cli.read_text(encoding="utf-8") if opcache_cli.exists() else None,
+        php_ini_fpm: php_ini_fpm.read_text(encoding="utf-8") if php_ini_fpm.exists() else None,
+        php_ini_cli: php_ini_cli.read_text(encoding="utf-8") if php_ini_cli.exists() else None,
         redis_fpm: redis_fpm.read_text(encoding="utf-8") if redis_fpm.exists() else None,
         redis_cli: redis_cli.read_text(encoding="utf-8") if redis_cli.exists() else None,
         _SYSCTL_PATH: _SYSCTL_PATH.read_text(encoding="utf-8") if _SYSCTL_PATH.exists() else None,
     }
 
     if dry_run:
-        files = [str(pool_override), str(opcache_fpm), str(opcache_cli), str(_SYSCTL_PATH)]
+        files = [str(pool_override), str(opcache_fpm), str(opcache_cli), str(php_ini_fpm), str(php_ini_cli), str(_SYSCTL_PATH)]
         if redis_sessions_enabled:
             files.insert(3, str(redis_fpm))
             files.insert(4, str(redis_cli))
@@ -385,6 +416,10 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
             changed.append(str(opcache_fpm))
         if _write_file(opcache_cli, opcache_content):
             changed.append(str(opcache_cli))
+        if _write_file(php_ini_fpm, php_ini_content):
+            changed.append(str(php_ini_fpm))
+        if _write_file(php_ini_cli, php_ini_content):
+            changed.append(str(php_ini_cli))
         if redis_sessions_enabled:
             if _write_file(redis_fpm, redis_content):
                 changed.append(str(redis_fpm))

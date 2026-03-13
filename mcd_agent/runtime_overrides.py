@@ -62,11 +62,15 @@ def push_runtime_overrides(
     runtime_overrides: dict[str, Any],
     *,
     merge: bool = False,
+    target: str = "observed",
 ) -> dict[str, Any]:
     base = _api_base(cfg)
     if not base:
         return {"status": "disabled", "reason": "mcc_url_not_set"}
     ident = resolve_agent_identity(cfg)
+    target_mode = str(target or "observed").strip().lower()
+    if target_mode not in {"observed", "desired"}:
+        target_mode = "observed"
     payload = {
         "hostname": str(ident.get("effective_hostname") or ""),
         "mcc_host_name": str(ident.get("effective_mcc_host_name") or ""),
@@ -75,6 +79,7 @@ def push_runtime_overrides(
         "agent_version": __version__,
         "runtime_overrides": runtime_overrides if isinstance(runtime_overrides, dict) else {},
         "push_mode": "merge" if merge else "replace",
+        "target": target_mode,
     }
     url = base + "/api/v1/agent/runtime-overrides"
     try:
