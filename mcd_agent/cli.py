@@ -1191,6 +1191,7 @@ def _build_parser() -> argparse.ArgumentParser:
     reload_cfg.add_argument("--config", default=default_cfg)
 
     env = sub.add_parser("env", help="Host environment operations")
+    env.add_argument("--config", default=default_cfg)
     env.add_argument("target", choices=["ipv6", "policy"])
     env.add_argument("op", choices=["status", "disable", "enable", "show", "plan"])
     env.add_argument("--policy-file")
@@ -1580,6 +1581,10 @@ def main() -> int:
         return 0
 
     if args.cmd == "env":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
         if args.target == "ipv6":
             if args.op == "status":
                 st = ipv6_status()
@@ -1589,6 +1594,7 @@ def main() -> int:
             if args.op in {"disable", "enable"}:
                 for line in set_ipv6_disabled(args.op == "disable"):
                     print(line)
+                _push_state_after_change(cfg, f"env-ipv6-{args.op}")
                 return 0
             raise RuntimeError("unsupported env ipv6 operation")
         if args.target == "policy":
@@ -1638,7 +1644,10 @@ def main() -> int:
         # apply
         res = service_profiles_apply_once(cfg, component=comp, dry_run=bool(args.dry_run))
         print(json.dumps(res, ensure_ascii=True, indent=2))
-        return 0 if str(res.get("status", "")).strip().lower() == "ok" else 1
+        ok = str(res.get("status", "")).strip().lower() == "ok"
+        if ok and not bool(args.dry_run):
+            _push_state_after_change(cfg, f"service-profile-{comp}-apply")
+        return 0 if ok else 1
 
     if args.cmd == "runtime-overrides":
         cfg = load_config(args.config)

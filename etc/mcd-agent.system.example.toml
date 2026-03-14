@@ -270,6 +270,8 @@ push_on_change = true
 push_alert_poll_interval_sec = 60
 # Journald window for alert signal aggregation (minutes).
 push_alert_window_min = 5
+# APT metrics refresh interval (seconds). Agent refreshes sooner if APT/DPKG state changed.
+push_apt_state_interval_sec = 120
 # Optional explicit host name to map this agent in MCC inventory.
 # If empty, system hostname is used.
 host_name = ""

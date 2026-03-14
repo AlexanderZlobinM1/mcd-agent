@@ -166,6 +166,7 @@ class AgentConfig:
     mcc_push_on_change: bool
     mcc_push_alert_poll_interval_sec: int
     mcc_push_alert_window_min: int
+    mcc_push_apt_state_interval_sec: int
     outbound_events_sent_keep_days: int
     mcc_host_name: str | None
     host_template: bool
@@ -1436,6 +1437,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcc_push_on_change=bool(mcc.get("push_on_change", True)),
         mcc_push_alert_poll_interval_sec=int(mcc.get("push_alert_poll_interval_sec", 60)),
         mcc_push_alert_window_min=int(mcc.get("push_alert_window_min", 5)),
+        mcc_push_apt_state_interval_sec=int(mcc.get("push_apt_state_interval_sec", 120)),
         outbound_events_sent_keep_days=int(runtime.get("outbound_events_sent_keep_days", 14)),
         mcc_host_name=str(mcc.get("host_name")).strip() if mcc.get("host_name") else None,
         host_template=bool(runtime.get("host_template", False)),

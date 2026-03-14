@@ -427,6 +427,7 @@ class MCCStatePusher:
         self.latest_signals_ts = 0.0
         self.latest_apt_state: dict[str, Any] | None = None
         self.latest_apt_state_ts = 0.0
+        self.latest_apt_probe_key = ""
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -435,13 +436,41 @@ class MCCStatePusher:
         self.latest_signals = payload
         self.latest_signals_ts = now_ts
 
+    def _apt_probe_key(self) -> str:
+        """
+        Lightweight fingerprint for local APT state.
+        If package DB/sources changed, refresh apt_state immediately
+        even when cache interval is not yet elapsed.
+        """
+        paths = [
+            Path("/var/lib/dpkg/status"),
+            Path("/var/lib/apt/periodic/update-success-stamp"),
+            Path("/var/lib/apt/lists"),
+            Path("/etc/apt/sources.list"),
+            Path("/etc/apt/sources.list.d"),
+        ]
+        parts: list[str] = []
+        for p in paths:
+            try:
+                st = p.stat()
+                parts.append(f"{p}:{int(st.st_mtime_ns)}:{int(st.st_size)}")
+            except Exception:
+                parts.append(f"{p}:missing")
+        return "|".join(parts)
+
     def _apt_state(self, now_ts: float) -> dict[str, Any]:
-        interval = max(60, int(getattr(self.cfg, "mcc_push_apt_state_interval_sec", 300) or 300))
-        if self.latest_apt_state and (now_ts - self.latest_apt_state_ts) < interval:
+        interval = max(30, int(getattr(self.cfg, "mcc_push_apt_state_interval_sec", 120) or 120))
+        probe_key = self._apt_probe_key()
+        if (
+            self.latest_apt_state
+            and self.latest_apt_probe_key == probe_key
+            and (now_ts - self.latest_apt_state_ts) < interval
+        ):
             return dict(self.latest_apt_state)
         payload = collect_apt_state(timeout_sec=30)
         self.latest_apt_state = payload
         self.latest_apt_state_ts = now_ts
+        self.latest_apt_probe_key = probe_key
         return dict(payload)
 
     def should_push(self, now_ts: float, payload_no_ts: dict[str, Any]) -> tuple[bool, bool]:

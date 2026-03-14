@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.8.20 - 2026-03-14
+- Changed: agent now refreshes `apt_state` not only by timer but also immediately when local APT/DPKG state fingerprint changes.
+  - Fingerprint includes dpkg status and apt sources/list timestamps.
+  - Result: dashboard APT metrics converge faster after local `apt` operations (no long stale wait).
+- Added: new MCC push config key `mcc.push_apt_state_interval_sec` (default `120` sec).
+- Changed: `mcd-cli service-profile apply` now triggers immediate MCC state push on successful non-dry-run apply.
+- Changed: `mcd-cli env ipv6 enable|disable` now triggers immediate MCC state push.
+
+## 0.8.19 - 2026-03-13
+- Fixed: `mcd-cli plugins` now resolves `plugins_repo_fallback_ip` from MCC runtime-overrides when local TOML does not define it.
+  - This makes interactive/CLI plugin operations honor centralized MCC fallback settings (not only daemon in-memory runtime).
+  - Result: plugin manifest/package fetch fallback works in CLI mode on blocked FQDN source networks.
+
 ## 0.8.18 - 2026-03-13
 - Added: plugin repo IP fallback as configuration parameter (`[plugins].repo_fallback_ip`).
   - Behavior: MCD first fetches manifest/packages via normal FQDN URL.

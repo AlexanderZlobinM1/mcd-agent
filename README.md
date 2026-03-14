@@ -61,8 +61,10 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 - instance list is loaded from local inventory (SQLite) and can be refreshed on demand
 - MCC push model:
   - periodic push to MCC (`/api/v1/agent/state`) every 5 minutes by default
+  - apt state is refreshed at `mcc.push_apt_state_interval_sec` (default 120 sec) and also refreshed immediately when local APT/DPKG state changes
   - extra push on state change
   - extra push on alert signal changes
+  - mutating CLI operations push immediately (for example `service-profile apply`, `env ipv6 enable|disable`)
   - push includes host `config_state` snapshot (`schema_version`, `customized`, `sha256`, full TOML) so MCC stores exact observed behavior
 - MCD self-update model:
   - MCC returns build plan (`test|approved|lts`) via authenticated API.

@@ -25,6 +25,7 @@ from mcd_agent.config import AgentConfig
 from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.executor import execute_mautic_command_template
+from mcd_agent.runtime_overrides import fetch_runtime_overrides
 
 
 _C_RESET = "\033[0m"
@@ -132,6 +133,25 @@ def _url_host(url: str) -> str | None:
     except Exception:
         return None
     return parsed.hostname
+
+
+def _plugins_fallback_ip(config: AgentConfig) -> str | None:
+    local = str(config.plugins_repo_fallback_ip or "").strip()
+    if local:
+        return local
+    if not (config.mcc_url and config.mcc_token):
+        return None
+    try:
+        fetched = fetch_runtime_overrides(config)
+        if str(fetched.get("status", "")).strip().lower() != "ok":
+            return None
+        runtime = fetched.get("runtime_overrides")
+        if not isinstance(runtime, dict):
+            return None
+        remote = str(runtime.get("plugins_repo_fallback_ip", "")).strip()
+        return remote or None
+    except Exception:
+        return None
 
 
 def _urlopen_with_dns_override(
@@ -635,14 +655,17 @@ def run_plugins_interactive(
     major = install.mautic_major or 6
     base = _repo_base_url(config)
     manifest_url = base + config.plugins_manifest_path_template.format(major=major)
+    fallback_ip = _plugins_fallback_ip(config)
     logging.info("plugins manifest: %s", manifest_url)
+    if fallback_ip:
+        logging.info("plugins manifest fallback_ip: %s", fallback_ip)
     print("Loading plugin manifest...")
     try:
         manifest = _fetch_json(
             manifest_url,
             config.mcc_token,
             timeout_sec=12,
-            fallback_ip=config.plugins_repo_fallback_ip,
+            fallback_ip=fallback_ip,
         )
     except urllib.error.URLError as e:
         raise RuntimeError(f"Cannot fetch manifest (network/timeout): {e}") from e
@@ -867,7 +890,7 @@ def run_plugins_interactive(
             bundle=bundle,
             package_url=package_url,
             token=config.mcc_token,
-            fallback_ip=config.plugins_repo_fallback_ip,
+            fallback_ip=fallback_ip,
             state_filename=config.plugins_state_filename,
             state_payload={
                 "bundle": bundle,
