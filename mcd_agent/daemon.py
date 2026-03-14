@@ -53,6 +53,12 @@ _CMD_SEP = "\x1f"
 _M4_CAMPAIGN_DELETED_CLAUSE_RE = re.compile(r"\s+AND\s*\(?\s*c\.deleted\s+IS\s+NULL\s*\)?", re.IGNORECASE)
 _SEGMENT_STALE_PRIORITY_SEC = 24 * 3600
 _SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
+_SQL_SEGMENTS_ALL_PUBLISHED = (
+    "SELECT ll.id "
+    "FROM {prefix}lead_lists ll "
+    "WHERE ll.is_published = 1 "
+    "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
 
 
 def _backup_done_for_local_date(config: AgentConfig, local_dt: datetime) -> bool:
@@ -1922,6 +1928,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     throttled: dict[str, bool] = {}
     last_import_poll_ts: dict[str, float] = {}
     import_pending_cache: dict[str, int] = {}
+    segment_last_full_scan_ts: dict[str, float] = {}
+    segment_force_full_scan_until: dict[str, float] = {}
     last_cleanup_ts: dict[str, float] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
@@ -2259,8 +2267,40 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                 segment_ids: list[int] | None = None
                 campaign_ids: list[int] | None = None
+                if now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
+                    try:
+                        import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
+                    except Exception as e:
+                        logging.warning("[%s] import query failed: %s", root, e)
+                        import_pending_cache[root] = 0
+                    last_import_poll_ts[root] = now
+                import_pending_now = max(0, int(import_pending_cache.get(root, 0)))
+                import_force_until = float(segment_force_full_scan_until.get(root, 0.0))
+                import_hold_sec = max(120, int(config.import_poll_interval_sec) * 8)
+                if import_pending_now > 0:
+                    import_force_until = max(import_force_until, now + float(import_hold_sec))
+                    segment_force_full_scan_until[root] = import_force_until
+                force_segment_full_scan = now < import_force_until
+                full_scan_interval_sec = max(0, int(getattr(config, "segment_full_scan_interval_sec", 300) or 0))
+                if (
+                    not force_segment_full_scan
+                    and full_scan_interval_sec > 0
+                    and now - float(segment_last_full_scan_ts.get(root, 0.0)) >= float(full_scan_interval_sec)
+                ):
+                    force_segment_full_scan = True
                 try:
-                    segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
+                    if force_segment_full_scan:
+                        segment_ids = db.fetch_ids(_SQL_SEGMENTS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
+                        segment_last_full_scan_ts[root] = now
+                        logging.info(
+                            "[%s] segment full-scan planned (reason=%s pending_imports=%s interval=%ss)",
+                            root,
+                            "import_activity" if now < import_force_until else "periodic_full_scan",
+                            import_pending_now,
+                            full_scan_interval_sec,
+                        )
+                    else:
+                        segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
                 except Exception as e:
                     logging.warning("[%s] segment query failed: %s", root, e)
 
@@ -2382,14 +2422,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         threshold=config.queue_throttle_threshold,
                         window_min=config.queue_throttle_window_min,
                     )
-
-                if now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
-                    try:
-                        import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
-                    except Exception as e:
-                        logging.warning("[%s] import query failed: %s", root, e)
-                        import_pending_cache[root] = 0
-                    last_import_poll_ts[root] = now
 
             next_plan_refresh_at = now + max(1, config.poll_interval_sec)
 

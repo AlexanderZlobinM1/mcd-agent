@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.8.23 - 2026-03-14
+- Fixed: segment due planning now accounts for both membership additions and removals/changes more consistently.
+  - `sql.segments_due` default now includes additional due signals:
+    - segment definition changes (`lead_lists.date_modified > last_built_date`),
+    - active member lead changes (`leads.date_modified/date_added > last_built_date` for members in `lead_lists_leads`).
+- Added: periodic segment full-scan fallback (`runtime.segment_full_scan_interval_sec`).
+  - Agent periodically rebuild-plans from all published segments (ordered by oldest `last_built_date`) even when due SQL is quiet.
+  - Default by profile:
+    - `tiny=60s`, `mini=120s`, `passive/midi/maxi/hiload=300s`, generic runtime default `300s`.
+- Added: import-aware full-scan boost for segments.
+  - While imports are pending (and for a short hold window after), segment planning is forced to full-scan mode.
+  - This prevents missed/late segment refresh after import-driven contact changes.
+- Added: startup migration now upgrades legacy `sql.segments_due` defaults from both old forms:
+  - pre-0.8.22 full published-order default,
+  - 0.8.22 due-only default.
+
 ## 0.8.22 - 2026-03-14
 - Fixed: scheduler `sql.segments_due` default no longer scans all published segments every cycle.
   - New due-only default includes segments that are:

@@ -29,13 +29,7 @@ LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
 _LEGACY_SQL_SEGMENTS_DUE_DEFAULT = (
     "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id"
 )
-_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT = (
-    "SELECT c.id FROM {prefix}campaigns c "
-    "WHERE c.is_published = 1 "
-    "AND (c.deleted IS NULL) "
-    "ORDER BY c.id"
-)
-_DEFAULT_SQL_SEGMENTS_DUE = (
+_LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822 = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
     "WHERE ll.is_published = 1 "
@@ -53,6 +47,42 @@ _DEFAULT_SQL_SEGMENTS_DUE = (
     ") "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
+_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "ORDER BY c.id"
+)
+_DEFAULT_SQL_SEGMENTS_DUE = (
+    "SELECT ll.id "
+    "FROM {prefix}lead_lists ll "
+    "WHERE ll.is_published = 1 "
+    "AND ("
+    "  ll.last_built_date IS NULL "
+    "  OR ll.last_built_date < '{window_start_utc_24h}' "
+    "  OR COALESCE(ll.date_modified, ll.date_added) > COALESCE(ll.last_built_date, '1970-01-01 00:00:00') "
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_lists_leads lll "
+    "    WHERE lll.leadlist_id = ll.id "
+    "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_lists_leads lll "
+    "    INNER JOIN {prefix}leads l ON l.id = lll.lead_id "
+    "    WHERE lll.leadlist_id = ll.id "
+    "      AND lll.manually_removed = 0 "
+    "      AND ("
+    "        ll.last_built_date IS NULL "
+    "        OR COALESCE(l.date_modified, l.date_added) > ll.last_built_date"
+    "      ) "
+    "    LIMIT 1"
+    "  )"
+    ") "
+    "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
 _DEFAULT_SQL_CAMPAIGNS_DUE = (
     "SELECT c.id FROM {prefix}campaigns c "
     "WHERE c.is_published = 1 "
@@ -60,6 +90,12 @@ _DEFAULT_SQL_CAMPAIGNS_DUE = (
     "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
     "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
     "ORDER BY c.id"
+)
+_DEFAULT_SQL_SEGMENTS_ALL_PUBLISHED = (
+    "SELECT ll.id "
+    "FROM {prefix}lead_lists ll "
+    "WHERE ll.is_published = 1 "
+    "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
 
 
@@ -143,6 +179,7 @@ class AgentConfig:
     segment_priority_parallel_idle: int
     segment_regular_parallel_idle: int
     segment_cycles_per_tick: int
+    segment_full_scan_interval_sec: int
     segment_priority_parallel_throttled: int
     segment_regular_parallel_throttled: int
     segment_kill_mode: str
@@ -330,6 +367,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=1,
+            segment_full_scan_interval_sec=60,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=1,
             campaign_priority_size=0,
@@ -352,6 +390,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=4,
+            segment_full_scan_interval_sec=120,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=4,
             campaign_priority_size=0,
@@ -378,6 +417,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_latest_priority_count=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=0,
+            segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=0,
             campaign_total_parallel=0,
@@ -398,6 +438,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_priority_size=10,
             segment_priority_parallel_idle=3,
             segment_regular_parallel_idle=1,
+            segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=3,
             segment_regular_parallel_throttled=1,
             campaign_total_parallel=0,
@@ -420,6 +461,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_priority_size=10,
             segment_priority_parallel_idle=5,
             segment_regular_parallel_idle=1,
+            segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=1,
             segment_regular_parallel_throttled=0,
             segment_throttle_whitelist_only=True,
@@ -445,6 +487,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_priority_size=10,
             segment_priority_parallel_idle=6,
             segment_regular_parallel_idle=2,
+            segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=2,
             segment_regular_parallel_throttled=0,
             segment_throttle_whitelist_only=True,
@@ -662,7 +705,10 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
         text,
         "sql",
         {
-            "segments_due": ({_LEGACY_SQL_SEGMENTS_DUE_DEFAULT}, _DEFAULT_SQL_SEGMENTS_DUE),
+            "segments_due": (
+                {_LEGACY_SQL_SEGMENTS_DUE_DEFAULT, _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822},
+                _DEFAULT_SQL_SEGMENTS_DUE,
+            ),
             "campaigns_due": ({_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT}, _DEFAULT_SQL_CAMPAIGNS_DUE),
         },
     )
@@ -923,6 +969,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_mode": "segment_mode",
     "segment_priority_parallel_idle": "segment_priority_parallel_idle",
     "segment_regular_parallel_idle": "segment_regular_parallel_idle",
+    "segment_full_scan_interval_sec": "segment_full_scan_interval_sec",
     "segment_cycles_per_tick": "segment_cycles_per_tick",
     "segment_priority_parallel_throttled": "segment_priority_parallel_throttled",
     "segment_regular_parallel_throttled": "segment_regular_parallel_throttled",
@@ -1395,6 +1442,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_mode=str(runtime.get("segment_mode", "id_weighted")),
         segment_priority_parallel_idle=int(runtime.get("segment_priority_parallel_idle", 4)),
         segment_regular_parallel_idle=int(runtime.get("segment_regular_parallel_idle", 1)),
+        segment_full_scan_interval_sec=int(runtime.get("segment_full_scan_interval_sec", 300)),
         segment_cycles_per_tick=int(runtime.get("segment_cycles_per_tick", 1)),
         segment_priority_parallel_throttled=int(runtime.get("segment_priority_parallel_throttled", 2)),
         segment_regular_parallel_throttled=int(runtime.get("segment_regular_parallel_throttled", 0)),
