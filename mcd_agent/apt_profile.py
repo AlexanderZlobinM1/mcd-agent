@@ -197,6 +197,43 @@ def _parse_phasing_packages(raw: str) -> set[str]:
     return out
 
 
+def _parse_policy_phasing_packages(raw: str) -> set[str]:
+    out: set[str] = set()
+    current = ""
+    for line in (raw or "").splitlines():
+        x = line.rstrip()
+        s = x.strip()
+        if not s:
+            continue
+        # apt-cache policy block header: "<pkg>:"
+        if not x.startswith((" ", "\t")) and s.endswith(":") and "/" not in s:
+            current = s[:-1].strip()
+            continue
+        if not current:
+            continue
+        if "(phased " in s.lower():
+            out.add(current)
+    return out
+
+
+def _policy_phasing_packages(packages: set[str], timeout_sec: int = 45) -> set[str]:
+    names = sorted({str(x).strip() for x in packages if str(x).strip()})
+    if not names:
+        return set()
+    out: set[str] = set()
+    # Keep command line bounded for safety.
+    chunk = 50
+    for i in range(0, len(names), chunk):
+        part = names[i : i + chunk]
+        try:
+            p = _run(["apt-cache", "policy", *part], timeout_sec=timeout_sec)
+            merged = f"{p.stdout or ''}\n{p.stderr or ''}"
+            out.update(_parse_policy_phasing_packages(merged))
+        except Exception:
+            continue
+    return out
+
+
 def _pending_updates(timeout_sec: int = 45) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     upgradable: list[dict[str, str]] = []
@@ -243,6 +280,11 @@ def _pending_updates(timeout_sec: int = 45) -> tuple[dict[str, Any], list[str]]:
         hold_set = set()
     phasing_set = _parse_phasing_packages(sim_stdout)
     upgradable_names = {str(row.get("name", "")).strip() for row in upgradable if str(row.get("name", "")).strip()}
+    # Ubuntu phased updates often appear as "kept back" without explicit phasing section.
+    # Fallback to apt-cache policy phased marker, e.g. "(phased 60%)".
+    if upgradable_names:
+        policy_phasing = _policy_phasing_packages(upgradable_names, timeout_sec=max(10, int(timeout_sec)))
+        phasing_set.update(policy_phasing)
     phasing_set = {x for x in phasing_set if x in upgradable_names}
     hold_set = {x for x in hold_set if x in upgradable_names}
 

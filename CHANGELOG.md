@@ -1,5 +1,31 @@
 # MCD Changelog
 
+## 0.8.28 - 2026-03-14
+- Fixed: APT phased update detection now also uses `apt-cache policy` phased marker parsing (e.g. `(phased 60%)`), not only `apt-get -s upgrade` text blocks.
+  - Prevents phased-only updates from being misclassified as regular pending updates (`updates_pending`/red).
+  - Result: phased-only cases are classified as `updates_deferred` (yellow) consistently, including cluster nodes.
+
+## 0.8.27 - 2026-03-14
+- Fixed: Gluster peer connectivity parsing in `cluster_db.gluster`.
+  - `gluster peer status --xml` now evaluates `<connected>1</connected>` / state `3` correctly.
+  - Prevents false `peers_connected=0` and false degraded Gluster semaphore when peers are healthy.
+
+## 0.8.26 - 2026-03-14
+- Added: cluster telemetry extensions in `cluster_db` payload for MCC dashboard:
+  - `haproxy`: service state, backend server statuses, and effective DB route mode (`local|backup|remote|down|unknown`).
+  - `gluster`: glusterd state, volume start status, peer connectivity summary, and detected gluster mounts.
+- Purpose: enable cluster-level HAProxy/Gluster semaphores in MCC with detailed hover diagnostics.
+
+## 0.8.25 - 2026-03-14
+- Added: periodic cluster DB telemetry collection in agent state payload (`cluster_db`), pushed to MCC cache.
+  - Source connections: state DB MySQL credentials first, backup MySQL credentials fallback.
+  - Collected diagnostics:
+    - Galera: readiness/connectivity/primary state, local sync state, cluster size, recv/send queue averages, flow control pause.
+    - Replica: IO/SQL thread status and seconds-behind lag.
+    - Read-only flags: `read_only`, `super_read_only`.
+- Changed: telemetry is cached in-memory per push interval to avoid extra DB probing load.
+- Purpose: cluster health semaphores in MCC dashboard with host-local measurements and no UI-side polling.
+
 ## 0.8.24 - 2026-03-14
 - Added: `mcd-cli scheduler status` now supports diagnostic output:
   - `--verbose` prints tracked running tasks (`task_type`, `entity_id`, `pid`, `root`, `command_str`).
