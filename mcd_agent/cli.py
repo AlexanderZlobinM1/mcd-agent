@@ -1217,6 +1217,8 @@ def _build_parser() -> argparse.ArgumentParser:
     scheduler = sub.add_parser("scheduler", help="Pause/resume scheduler launches")
     scheduler.add_argument("--config", default=default_cfg)
     scheduler.add_argument("op", choices=["pause", "resume", "status"])
+    scheduler.add_argument("--verbose", action="store_true", help="Show tracked running task details on status")
+    scheduler.add_argument("--json", action="store_true")
 
     sdb = sub.add_parser("state-db", help="State DB status/bootstrap for legacy->mysql_hybrid migration")
     sdb.add_argument("--config", default=default_cfg)
@@ -1706,7 +1708,30 @@ def main() -> int:
             running = TaskStore(cfg.state_db_path, cfg).running_count()
         except Exception:
             running = -1
+        tracked: list[dict[str, object]] = []
+        if bool(getattr(args, "verbose", False)) or bool(getattr(args, "json", False)):
+            tracked = _tracked_running_tasks(cfg)
+        if bool(getattr(args, "json", False)):
+            payload: dict[str, object] = {
+                "paused": bool(paused),
+                "running_tasks": int(running),
+            }
+            if bool(getattr(args, "verbose", False)):
+                payload["tracked_tasks"] = tracked
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
         print(f"paused={str(paused).lower()} running_tasks={running}")
+        if bool(getattr(args, "verbose", False)):
+            for task in tracked:
+                print(
+                    "task type={task_type} entity={entity} pid={pid} root={root} cmd={cmd}".format(
+                        task_type=str(task.get("task_type") or "-"),
+                        entity=str(task.get("entity_id") if task.get("entity_id") is not None else "-"),
+                        pid=str(task.get("pid") or "-"),
+                        root=str(task.get("root") or "-"),
+                        cmd=str(task.get("command_str") or "-"),
+                    )
+                )
         return 0
 
     if args.cmd == "state-db":

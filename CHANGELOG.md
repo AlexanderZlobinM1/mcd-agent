@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.24 - 2026-03-14
+- Added: `mcd-cli scheduler status` now supports diagnostic output:
+  - `--verbose` prints tracked running tasks (`task_type`, `entity_id`, `pid`, `root`, `command_str`).
+  - `--json` returns structured scheduler status payload.
+- Purpose: faster factual ring/task troubleshooting on test hosts without killing/altering running jobs.
+
 ## 0.8.23 - 2026-03-14
 - Fixed: segment due planning now accounts for both membership additions and removals/changes more consistently.
   - `sql.segments_due` default now includes additional due signals:
