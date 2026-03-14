@@ -26,6 +26,42 @@ LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
     "segment_non_whitelist_policy",
 )
 
+_LEGACY_SQL_SEGMENTS_DUE_DEFAULT = (
+    "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id"
+)
+_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "ORDER BY c.id"
+)
+_DEFAULT_SQL_SEGMENTS_DUE = (
+    "SELECT ll.id "
+    "FROM {prefix}lead_lists ll "
+    "WHERE ll.is_published = 1 "
+    "AND ("
+    "  ll.last_built_date IS NULL "
+    "  OR ll.last_built_date < '{window_start_utc_24h}' "
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_lists_leads lll "
+    "    WHERE lll.leadlist_id = ll.id "
+    "      AND lll.manually_removed = 0 "
+    "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
+    ") "
+    "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
+_DEFAULT_SQL_CAMPAIGNS_DUE = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "ORDER BY c.id"
+)
+
 
 @dataclass(frozen=True)
 class ManualInstanceConfig:
@@ -549,6 +585,49 @@ def _remove_section_keys_text(text: str, section: str, keys: set[str]) -> tuple[
     return text2, removed
 
 
+def _replace_section_string_defaults_text(
+    text: str,
+    section: str,
+    replacements: dict[str, tuple[set[str], str]],
+) -> tuple[str, int]:
+    if not replacements:
+        return text, 0
+    m = re.search(rf"(?ms)^(\[{re.escape(section)}\]\s*\n)(.*?)(?=^\[|\Z)", text)
+    if not m:
+        return text, 0
+    header = m.group(1)
+    body = m.group(2)
+    changed = 0
+    out_lines: list[str] = []
+    line_re = re.compile(
+        r'^(\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)"((?:[^"\\]|\\.)*)"(\s*(?:#.*)?)$'
+    )
+    for line in body.splitlines(keepends=True):
+        base_line = line[:-1] if line.endswith("\n") else line
+        suffix_nl = "\n" if line.endswith("\n") else ""
+        lm = line_re.match(base_line)
+        if not lm:
+            out_lines.append(line)
+            continue
+        key = lm.group(2)
+        spec = replacements.get(key)
+        if not spec:
+            out_lines.append(line)
+            continue
+        expected_values, new_value = spec
+        current_value = lm.group(3)
+        if current_value not in expected_values:
+            out_lines.append(line)
+            continue
+        escaped = new_value.replace("\\", "\\\\").replace('"', '\\"')
+        out_lines.append(f'{lm.group(1)}"{escaped}"{lm.group(4)}{suffix_nl}')
+        changed += 1
+    if changed <= 0:
+        return text, 0
+    text2 = text[: m.start()] + header + "".join(out_lines) + text[m.end() :]
+    return text2, changed
+
+
 def _auto_migrate_legacy_runtime_keys(config_path: str) -> int:
     """
     Remove legacy runtime keys from mutable config file before parsing.
@@ -566,6 +645,31 @@ def _auto_migrate_legacy_runtime_keys(config_path: str) -> int:
         return 0
     p.write_text(text2, encoding="utf-8")
     return removed
+
+
+def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
+    """
+    Upgrade legacy SQL defaults in mutable config to current due-only defaults.
+    """
+    p = _resolve_mutable_config_path(config_path)
+    if not p.exists():
+        return 0
+    try:
+        text = p.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    text2, changed = _replace_section_string_defaults_text(
+        text,
+        "sql",
+        {
+            "segments_due": ({_LEGACY_SQL_SEGMENTS_DUE_DEFAULT}, _DEFAULT_SQL_SEGMENTS_DUE),
+            "campaigns_due": ({_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT}, _DEFAULT_SQL_CAMPAIGNS_DUE),
+        },
+    )
+    if changed <= 0:
+        return 0
+    p.write_text(text2, encoding="utf-8")
+    return changed
 
 
 def _strip_legacy_runtime_keys(runtime: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1331,7 +1435,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         queue_throttle_threshold=int(runtime.get("queue_throttle_threshold", 200)),
         queue_throttle_window_min=int(runtime.get("queue_throttle_window_min", 5)),
         sql_mail_queue_count=str(sql.get("mail_queue_count", "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE status = 'pending'")),
-        sql_segments_due=str(sql.get("segments_due", "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id")),
+        sql_segments_due=str(sql.get("segments_due", _DEFAULT_SQL_SEGMENTS_DUE)),
         sql_segment_weights=str(
             sql.get(
                 "segment_weights",
@@ -1354,10 +1458,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         sql_campaigns_due=str(
             sql.get(
                 "campaigns_due",
-                "SELECT c.id FROM {prefix}campaigns c "
-                "WHERE c.is_published = 1 "
-                "AND (c.deleted IS NULL) "
-                "ORDER BY c.id",
+                _DEFAULT_SQL_CAMPAIGNS_DUE,
             )
         ),
         sql_campaign_weights=str(
@@ -1592,6 +1693,10 @@ def load_config(path: str, *, allow_recover_from_mcc: bool = True) -> AgentConfi
     # re-applying stale pre-profile settings after upgrades.
     try:
         _auto_migrate_legacy_runtime_keys(path)
+    except Exception:
+        pass
+    try:
+        _auto_migrate_legacy_sql_defaults(path)
     except Exception:
         pass
 

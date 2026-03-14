@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.8.22 - 2026-03-14
+- Fixed: scheduler `sql.segments_due` default no longer scans all published segments every cycle.
+  - New due-only default includes segments that are:
+    - never built,
+    - stale (`last_built_date` older than 24h),
+    - or have new members in `lead_lists_leads` since the last build.
+  - Result: tiny/mini single-ring execution converges faster and avoids long queue latency before relevant segment IDs are reached.
+- Fixed: scheduler `sql.campaigns_due` default now respects campaign active window (`publish_up/publish_down`) and excludes out-of-window campaigns from ring planning.
+- Added: automatic config migration on agent start for legacy SQL defaults in `[sql]`:
+  - `segments_due = "SELECT id FROM ... WHERE is_published = 1 ORDER BY id"`
+  - `campaigns_due = "SELECT c.id FROM ... WHERE c.is_published = 1 ... ORDER BY c.id"`
+  - Legacy defaults are upgraded in-place to new due-aware defaults (only when the exact legacy defaults are detected).
+
 ## 0.8.21 - 2026-03-14
 - Changed: `apt_state` payload now classifies pending updates into:
   - `pending_regular` (actionable updates),
