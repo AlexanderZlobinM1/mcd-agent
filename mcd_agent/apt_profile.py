@@ -128,32 +128,158 @@ def _parse_upgradable_count(raw: str) -> int:
     return count
 
 
-def _pending_updates(timeout_sec: int = 45) -> tuple[int, list[str]]:
+def _parse_upgradable_packages(raw: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in (raw or "").splitlines():
+        x = line.strip()
+        if not x:
+            continue
+        if x.lower().startswith("listing"):
+            continue
+        if x.startswith("WARNING:"):
+            continue
+        if "/" not in x or "upgradable from:" not in x:
+            continue
+        parts = x.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].split("/", 1)[0].strip()
+        candidate = str(parts[1]).strip()
+        if not name or name in seen:
+            continue
+        m = re.search(r"\[upgradable from:\s*([^\]]+)\]", x)
+        current = m.group(1).strip() if m else ""
+        out.append({"name": name, "current": current, "candidate": candidate})
+        seen.add(name)
+    return out
+
+
+def _parse_sim_upgrade_packages(raw: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in (raw or "").splitlines():
+        x = line.strip()
+        if not x.startswith("Inst "):
+            continue
+        parts = x.split()
+        if len(parts) < 2:
+            continue
+        name = str(parts[1]).strip()
+        if not name or name in seen:
+            continue
+        out.append({"name": name, "current": "", "candidate": ""})
+        seen.add(name)
+    return out
+
+
+def _parse_phasing_packages(raw: str) -> set[str]:
+    out: set[str] = set()
+    in_block = False
+    for line in (raw or "").splitlines():
+        x = line.strip()
+        low = x.lower()
+        if "deferred due to phasing" in low:
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if not x:
+            continue
+        if re.match(r"^\d+\s+upgraded,\s+\d+\s+newly installed,", x):
+            break
+        if x.startswith("The following "):
+            break
+        for tok in x.split():
+            name = tok.strip()
+            if re.match(r"^[A-Za-z0-9][A-Za-z0-9+_.:-]*$", name):
+                out.add(name)
+    return out
+
+
+def _pending_updates(timeout_sec: int = 45) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
+    upgradable: list[dict[str, str]] = []
     try:
         p = _run(["apt", "list", "--upgradable"], timeout_sec=timeout_sec)
         merged = f"{p.stdout or ''}\n{p.stderr or ''}"
         cnt = _parse_upgradable_count(merged)
+        upgradable = _parse_upgradable_packages(merged)
         if p.returncode not in (0,):
             errors.append(f"apt_list_upgradable_rc_{p.returncode}")
-            return cnt, errors
-        return cnt, errors
+            return (
+                {
+                    "pending_total": int(cnt),
+                    "pending_regular": int(cnt),
+                    "pending_phasing": 0,
+                    "pending_hold": 0,
+                    "pending_updates": int(cnt),
+                    "upgradable_packages": upgradable,
+                    "phasing_packages": [],
+                    "held_packages": [],
+                },
+                errors,
+            )
     except Exception as e:
         errors.append(f"apt_list_upgradable_exception:{e}")
 
-    # Fallback path.
+    sim_stdout = ""
     try:
         p2 = _run(["apt-get", "-s", "upgrade"], timeout_sec=timeout_sec)
-        cnt = 0
-        for line in (p2.stdout or "").splitlines():
-            if line.startswith("Inst "):
-                cnt += 1
+        sim_stdout = p2.stdout or ""
+        if not upgradable:
+            upgradable = _parse_sim_upgrade_packages(sim_stdout)
+        cnt = len(upgradable)
         if p2.returncode not in (0, 100):
             errors.append(f"apt_get_sim_upgrade_rc_{p2.returncode}")
-        return cnt, errors
     except Exception as e:
         errors.append(f"apt_get_sim_upgrade_exception:{e}")
-        return 0, errors
+    hold_set: set[str] = set()
+    try:
+        p3 = _run(["apt-mark", "showhold"], timeout_sec=timeout_sec)
+        if p3.returncode == 0:
+            hold_set = {x.strip() for x in (p3.stdout or "").splitlines() if x.strip()}
+    except Exception:
+        hold_set = set()
+    phasing_set = _parse_phasing_packages(sim_stdout)
+    upgradable_names = {str(row.get("name", "")).strip() for row in upgradable if str(row.get("name", "")).strip()}
+    phasing_set = {x for x in phasing_set if x in upgradable_names}
+    hold_set = {x for x in hold_set if x in upgradable_names}
+
+    pending_regular = 0
+    pending_pack_rows: list[dict[str, str]] = []
+    for row in upgradable:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        tags: list[str] = []
+        if name in phasing_set:
+            tags.append("phasing")
+        if name in hold_set:
+            tags.append("hold")
+        if not tags:
+            pending_regular += 1
+        pending_pack_rows.append(
+            {
+                "name": name,
+                "current": str(row.get("current", "")).strip(),
+                "candidate": str(row.get("candidate", "")).strip(),
+                "state": "+".join(tags) if tags else "regular",
+            }
+        )
+
+    payload = {
+        "pending_total": int(len(pending_pack_rows)),
+        "pending_regular": int(pending_regular),
+        "pending_phasing": int(len(phasing_set)),
+        "pending_hold": int(len(hold_set)),
+        # Backward-compatible field consumed by MCC and older clients.
+        "pending_updates": int(pending_regular),
+        "upgradable_packages": pending_pack_rows[:200],
+        "phasing_packages": sorted(phasing_set),
+        "held_packages": sorted(hold_set),
+    }
+    return payload, errors
 
 
 def _apt_update_errors(text: str) -> list[str]:
@@ -227,7 +353,11 @@ def _run_mariadb_repo_setup(version: str, *, timeout_sec: int) -> tuple[bool, st
 
 
 def collect_apt_state(*, timeout_sec: int = 45) -> dict[str, Any]:
-    pending, pending_err = _pending_updates(timeout_sec=max(10, int(timeout_sec)))
+    pending_info, pending_err = _pending_updates(timeout_sec=max(10, int(timeout_sec)))
+    pending = int(pending_info.get("pending_updates", 0) or 0)
+    pending_total = int(pending_info.get("pending_total", pending) or pending)
+    pending_phasing = int(pending_info.get("pending_phasing", 0) or 0)
+    pending_hold = int(pending_info.get("pending_hold", 0) or 0)
     duplicates = detect_duplicate_list_sources()
     errors: list[str] = list(pending_err)
     dup_count = int(duplicates.get("count", 0) or 0)
@@ -239,15 +369,29 @@ def collect_apt_state(*, timeout_sec: int = 45) -> dict[str, Any]:
         status = "error"
     elif pending > 0:
         status = "updates_pending"
+    elif pending_phasing > 0 or pending_hold > 0:
+        status = "updates_deferred"
 
-    level = 0 if status == "ok" else 5
+    if status == "ok":
+        level = 0
+    elif status == "updates_deferred":
+        level = 2
+    else:
+        level = 5
     return {
         "status": status,
         "level": level,
+        "pending_total": int(pending_total),
         "pending_updates": int(pending),
+        "pending_regular": int(pending),
+        "pending_phasing": int(pending_phasing),
+        "pending_hold": int(pending_hold),
         "error_count": int(len(errors)),
         "errors": errors[:20],
         "duplicate_sources": duplicates,
+        "upgradable_packages": list(pending_info.get("upgradable_packages", []) or [])[:200],
+        "phasing_packages": list(pending_info.get("phasing_packages", []) or [])[:200],
+        "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 

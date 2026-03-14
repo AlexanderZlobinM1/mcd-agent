@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.21 - 2026-03-14
+- Changed: `apt_state` payload now classifies pending updates into:
+  - `pending_regular` (actionable updates),
+  - `pending_phasing` (deferred by phased rollout),
+  - `pending_hold` (packages on hold).
+- Added: `pending_total`, `upgradable_packages[].state`, `phasing_packages[]`, `held_packages[]` in agent APT state.
+- Changed: backward-compatible `pending_updates` now maps to `pending_regular` so MCC can treat `hold/phasing` separately from real pending updates.
+- Added: APT status `updates_deferred` with semaphore level `2` when only phased/held updates remain.
+
 ## 0.8.20 - 2026-03-14
 - Changed: agent now refreshes `apt_state` not only by timer but also immediately when local APT/DPKG state fingerprint changes.
   - Fingerprint includes dpkg status and apt sources/list timestamps.
