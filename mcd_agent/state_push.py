@@ -17,6 +17,7 @@ import subprocess
 import time
 from typing import Any
 import uuid
+from urllib.parse import parse_qsl, urlsplit
 from urllib import request
 from urllib.error import URLError, HTTPError
 import xml.etree.ElementTree as ET
@@ -980,6 +981,149 @@ def _collect_installed_plugins(root: str, limit: int = 200) -> list[dict[str, st
     return rows
 
 
+def _read_php_array_string(cfg_text: str, key: str) -> str:
+    pat = re.compile(rf"['\"]{re.escape(key)}['\"]\s*=>\s*['\"]([^'\"]*)['\"]", re.IGNORECASE)
+    m = pat.search(cfg_text or "")
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip()
+
+
+def _parse_sender_config_from_local_php(root: str) -> tuple[dict[str, str], str]:
+    candidates: list[Path] = []
+    for cand in _candidate_roots(root):
+        candidates.extend(
+            [
+                cand / "config" / "local.php",
+                cand / "app" / "config" / "local.php",
+                cand / "docroot" / "config" / "local.php",
+            ]
+        )
+    checked: set[str] = set()
+    for p in candidates:
+        ps = str(p)
+        if ps in checked:
+            continue
+        checked.add(ps)
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        cfg = {
+            "mailer_dsn": _read_php_array_string(txt, "mailer_dsn"),
+            "mailer_transport": _read_php_array_string(txt, "mailer_transport"),
+            "mail_transport": _read_php_array_string(txt, "mail_transport"),
+            "email_transport": _read_php_array_string(txt, "email_transport"),
+            "mailer_host": _read_php_array_string(txt, "mailer_host"),
+        }
+        return cfg, ps
+    return {}, ""
+
+
+def _sender_mask_dsn(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        u = urlsplit(s)
+        host = str(u.hostname or "").strip()
+        if u.port:
+            host = f"{host}:{int(u.port)}"
+        qkeys = sorted({str(k).strip() for k, _v in parse_qsl(u.query, keep_blank_values=True) if str(k).strip()})
+        base = f"{u.scheme}://{host}" if u.scheme else host
+        if qkeys:
+            base += f"?{','.join(qkeys)}"
+        return base or s[:80]
+    except Exception:
+        return re.sub(r":[^:@/]{4,}@", ":***@", s)[:120]
+
+
+def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str, str]:
+    plugin_names = {str(x.get("bundle", "")).strip().lower() for x in plugins if isinstance(x, dict)}
+    cfg, source_path = _parse_sender_config_from_local_php(root)
+    transport = (
+        str(cfg.get("mailer_transport", "") or "").strip().lower()
+        or str(cfg.get("mail_transport", "") or "").strip().lower()
+        or str(cfg.get("email_transport", "") or "").strip().lower()
+    )
+    dsn_raw = str(cfg.get("mailer_dsn", "") or "").strip()
+    dsn_low = dsn_raw.lower()
+    dsn_masked = _sender_mask_dsn(dsn_raw)
+    dsn_scheme = ""
+    dsn_host = ""
+    if dsn_raw:
+        try:
+            u = urlsplit(dsn_raw)
+            dsn_scheme = str(u.scheme or "").strip().lower()
+            dsn_host = str(u.hostname or "").strip().lower()
+        except Exception:
+            dsn_scheme = ""
+            dsn_host = ""
+    mailer_host = str(cfg.get("mailer_host", "") or "").strip().lower()
+
+    has_ses_plugin = "amazonsesbundle" in plugin_names
+    has_zender = "mauticzenderbundle" in plugin_names
+
+    key = "unknown"
+    label = "unknown"
+    if any(x in dsn_low for x in ("ses+", "amazonaws.com")) or "ses" in transport or "amazonaws.com" in mailer_host:
+        api_mode = ("+smtp" not in dsn_low) and ("smtp" not in transport)
+        if api_mode and has_ses_plugin:
+            key = "mautic_ses_api"
+            label = "mautic+ses+api"
+        elif api_mode:
+            key = "ses_api"
+            label = "ses+api"
+        else:
+            key = "ses_smtp"
+            label = "ses+smtp"
+    elif "sendgrid+" in dsn_low or "sendgrid" in transport:
+        key = "sendgrid_api"
+        label = "sendgrid+api"
+    elif "mailgun+" in dsn_low or "mailgun" in transport:
+        key = "mailgun_api"
+        label = "mailgun+api"
+    elif "smtp://" in dsn_low or transport == "smtp":
+        key = "smtp"
+        label = "smtp"
+    elif transport in {"sendmail", "mail"}:
+        key = "sendmail"
+        label = "sendmail"
+    elif has_zender:
+        key = "zender_api"
+        label = "zender+api"
+
+    title_lines = [
+        f"Sender type: {label}",
+        f"detected_key: {key}",
+        f"source: {source_path or '-'}",
+        f"transport: {transport or '-'}",
+    ]
+    if dsn_masked:
+        title_lines.append(f"dsn: {dsn_masked}")
+    if dsn_scheme:
+        title_lines.append(f"dsn_scheme: {dsn_scheme}")
+    if dsn_host:
+        title_lines.append(f"dsn_host: {dsn_host}")
+    if mailer_host:
+        title_lines.append(f"mailer_host: {mailer_host}")
+    hints: list[str] = []
+    if has_ses_plugin:
+        hints.append("AmazonSesBundle")
+    if has_zender:
+        hints.append("MauticZenderBundle")
+    if hints:
+        title_lines.append("plugin_hints: " + ",".join(hints))
+
+    return {
+        "sender_type": label,
+        "sender_key": key,
+        "sender_title": "\n".join(title_lines),
+    }
+
+
 class MCCStatePusher:
     def __init__(self, cfg: AgentConfig) -> None:
         self.cfg = cfg
@@ -1156,6 +1300,8 @@ class MCCStatePusher:
         identity = resolve_agent_identity(self.cfg)
         instances = []
         for i in installs:
+            plugins = _collect_installed_plugins(i.root)
+            sender = _detect_sender_profile(i.root, plugins)
             instances.append(
                 {
                     "instance_uid": i.instance_uid,
@@ -1165,7 +1311,10 @@ class MCCStatePusher:
                     "mautic_major": i.mautic_major,
                     "mautic_version": _collect_mautic_version(i.root, self.cfg.php_bin),
                     "install_type": detect_install_type(i.root),
-                    "plugins": _collect_installed_plugins(i.root),
+                    "plugins": plugins,
+                    "sender_type": str(sender.get("sender_type", "") or "").strip() or "unknown",
+                    "sender_key": str(sender.get("sender_key", "") or "").strip() or "unknown",
+                    "sender_title": str(sender.get("sender_title", "") or "").strip(),
                 }
             )
         instances.sort(key=lambda x: str(x["instance_uid"]))

@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.32 - 2026-03-15
+- Added: sender telemetry in state push for each discovered Mautic instance:
+  - `sender_type` (human label),
+  - `sender_key` (stable key),
+  - `sender_title` (detection details for tooltip/debug).
+- Added: sender profile auto-detection from local Mautic config (`config/local.php` and composer/zip variants) with plugin hints.
+- Supported sender labels currently include:
+  - `mautic+ses+api`, `ses+api`, `ses+smtp`, `sendgrid+api`, `mailgun+api`, `smtp`, `sendmail`, `zender+api`, `unknown`.
+
 ## 0.8.31 - 2026-03-15
 - Added: permissions-guard repair event details in agent telemetry payload (`signals.details.fs_permissions_fix_recent`).
   - Per-event fields: `ts`, `path`, `sample_path`, `reason`, `actor`, `actor_source`, `before_owner_group`, `before_mode`, `result`, `error`.
