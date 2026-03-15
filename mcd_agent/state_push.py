@@ -2,19 +2,27 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import timezone, datetime
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
+import socket
 import subprocess
 import time
 from typing import Any
 import uuid
 from urllib import request
 from urllib.error import URLError, HTTPError
+import xml.etree.ElementTree as ET
+
+import pymysql
+from pymysql.cursors import DictCursor
 
 from mcd_agent import __version__
 from mcd_agent.apt_profile import collect_apt_state
@@ -36,6 +44,10 @@ from mcd_agent.state_backend import (
 
 _BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle$")
 _SEMVER_RE = re.compile(r"(\d+\.\d+\.\d+)")
+_LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
+    "/var/run/mysqld/mysqld.sock",
+    "/run/mysqld/mysqld.sock",
+)
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -308,6 +320,558 @@ def _extract_version_from_php_text(text: str) -> str:
     return "-"
 
 
+def _to_bool(v: Any) -> bool | None:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in {"1", "on", "yes", "true"}:
+        return True
+    if s in {"0", "off", "no", "false"}:
+        return False
+    return None
+
+
+def _to_int(v: Any) -> int | None:
+    try:
+        if v is None:
+            return None
+        return int(str(v).strip())
+    except Exception:
+        return None
+
+
+def _to_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(str(v).strip())
+    except Exception:
+        return None
+
+
+def _is_local_mysql_host(host: str | None) -> bool:
+    raw = str(host or "").strip().lower()
+    return raw in {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _pick_local_socket(password: str | None, host: str | None) -> str | None:
+    if str(password or "") != "":
+        return None
+    if not _is_local_mysql_host(host):
+        return None
+    for cand in _LOCAL_SOCKET_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _run_quick(cmd: list[str], *, timeout_sec: int = 3) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_sec)),
+        )
+        return int(proc.returncode), (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except Exception as e:
+        return 124, "", str(e)
+
+
+def _collect_haproxy_db_state(*, timeout_sec: int = 3) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "status": "na",
+        "service": "missing",
+        "mode": "na",  # local|backup|remote|down|unknown|na
+        "backend": None,
+        "local_server": None,
+        "local_status": None,
+        "backup_up": [],
+        "up_servers": [],
+        "servers": [],
+        "error": "",
+    }
+
+    has_cfg = os.path.exists("/etc/haproxy/haproxy.cfg")
+    has_bin = shutil.which("haproxy") is not None
+    if not has_cfg and not has_bin:
+        return out
+
+    rc, stdout, stderr = _run_quick(["systemctl", "is-active", "haproxy"], timeout_sec=2)
+    service_state = (stdout or stderr or "unknown").strip().lower()
+    out["service"] = service_state
+    if rc != 0 or service_state != "active":
+        out["status"] = "error"
+        out["mode"] = "down"
+        out["error"] = "service_not_active"
+        return out
+
+    sock_path = "/run/haproxy/admin.sock"
+    if not os.path.exists(sock_path):
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = "stats_socket_missing"
+        return out
+
+    raw = ""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(max(1.0, float(timeout_sec)))
+            s.connect(sock_path)
+            s.sendall(b"show stat\n")
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+            raw = b"".join(chunks).decode("utf-8", errors="replace")
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    except Exception as e:
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = f"stats_socket_read_failed: {e}"
+        return out
+
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    header_idx = -1
+    for i, ln in enumerate(lines):
+        if ln.startswith("# "):
+            header_idx = i
+            break
+    if header_idx < 0:
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = "stats_header_missing"
+        return out
+
+    csv_text = lines[header_idx][2:] + "\n" + "\n".join(lines[header_idx + 1 :])
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text))
+        rows: list[dict[str, str]] = []
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            norm = {str(k).strip(): str(v or "").strip() for k, v in row.items() if k is not None}
+            if norm.get("pxname"):
+                rows.append(norm)
+    except Exception as e:
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = f"stats_parse_failed: {e}"
+        return out
+
+    srv_rows = [
+        r
+        for r in rows
+        if str(r.get("svname", "")).upper() not in {"", "FRONTEND", "BACKEND"}
+    ]
+    if not srv_rows:
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = "no_backend_servers"
+        return out
+
+    by_backend: dict[str, list[dict[str, str]]] = {}
+    for r in srv_rows:
+        b = str(r.get("pxname", "")).strip()
+        if not b:
+            continue
+        by_backend.setdefault(b, []).append(r)
+    if not by_backend:
+        out["status"] = "degraded"
+        out["mode"] = "unknown"
+        out["error"] = "empty_backend_map"
+        return out
+
+    mysql_backends = [b for b in by_backend.keys() if "mysql" in b.lower()]
+    backend = (mysql_backends[0] if mysql_backends else sorted(by_backend.keys())[0]).strip()
+    rows_sel = by_backend.get(backend, [])
+    out["backend"] = backend
+
+    def _srv_up(st: str) -> bool:
+        u = str(st or "").strip().upper()
+        return u.startswith("UP") or u in {"OPEN", "L7OK", "L4OK"}
+
+    local_row: dict[str, Any] | None = None
+    backup_up: list[str] = []
+    up_servers: list[str] = []
+    servers_view: list[dict[str, Any]] = []
+    for r in rows_sel:
+        sv = str(r.get("svname", "")).strip()
+        st = str(r.get("status", "")).strip()
+        addr = str(r.get("addr", "")).strip()
+        bck = str(r.get("bck", "")).strip()
+        act = str(r.get("act", "")).strip()
+        item: dict[str, Any] = {
+            "name": sv,
+            "status": st,
+            "addr": addr,
+            "bck": bck,
+            "act": act,
+            "check_status": str(r.get("check_status", "")).strip(),
+            "lastchg": _to_int(r.get("lastchg")),
+            "scur": _to_int(r.get("scur")),
+        }
+        servers_view.append(item)
+        is_up = _srv_up(st)
+        if is_up:
+            up_servers.append(sv)
+        if bck == "1" and is_up:
+            backup_up.append(sv)
+        is_local = ("local" in sv.lower()) or addr.startswith("127.0.0.1") or addr.startswith("localhost")
+        if is_local and local_row is None:
+            local_row = item
+
+    out["servers"] = servers_view
+    out["backup_up"] = backup_up
+    out["up_servers"] = up_servers
+    if local_row is not None:
+        out["local_server"] = local_row.get("name")
+        out["local_status"] = local_row.get("status")
+
+    local_up = bool(local_row and _srv_up(str(local_row.get("status", ""))))
+    if local_up:
+        out["status"] = "ok"
+        out["mode"] = "local"
+    elif backup_up:
+        out["status"] = "degraded"
+        out["mode"] = "backup"
+    elif up_servers:
+        out["status"] = "degraded"
+        out["mode"] = "remote"
+    else:
+        out["status"] = "error"
+        out["mode"] = "down"
+    return out
+
+
+def _collect_gluster_state(*, timeout_sec: int = 5) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "status": "na",
+        "service": "missing",
+        "volumes_total": 0,
+        "volumes_started": 0,
+        "volumes": [],
+        "peers_total": 0,
+        "peers_connected": 0,
+        "mounts_total": 0,
+        "mounts": [],
+        "error": "",
+    }
+
+    gluster_bin = shutil.which("gluster")
+    if not gluster_bin:
+        return out
+
+    rc, stdout, stderr = _run_quick(["systemctl", "is-active", "glusterd"], timeout_sec=2)
+    service_state = (stdout or stderr or "unknown").strip().lower()
+    out["service"] = service_state
+    if rc != 0 or service_state != "active":
+        out["status"] = "error"
+        out["error"] = "glusterd_not_active"
+        return out
+
+    # Gluster mounts (client-side view)
+    mounts: list[str] = []
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                parts = ln.split()
+                if len(parts) < 3:
+                    continue
+                fstype = parts[2].strip().lower()
+                if "gluster" in fstype:
+                    mounts.append(parts[1].strip())
+    except Exception:
+        mounts = []
+    out["mounts"] = mounts
+    out["mounts_total"] = len(mounts)
+
+    # Volume info
+    rc, vol_xml, vol_err = _run_quick([gluster_bin, "volume", "info", "--xml"], timeout_sec=timeout_sec)
+    if rc != 0 or not vol_xml:
+        out["status"] = "degraded"
+        out["error"] = f"volume_info_failed: {vol_err or rc}"
+        return out
+    try:
+        root = ET.fromstring(vol_xml)
+        op_ret = int((root.findtext("opRet") or "0").strip())
+    except Exception as e:
+        out["status"] = "degraded"
+        out["error"] = f"volume_xml_parse_failed: {e}"
+        return out
+    if op_ret != 0:
+        out["status"] = "degraded"
+        out["error"] = "volume_info_opret_nonzero"
+        return out
+
+    volumes: list[dict[str, Any]] = []
+    for v in root.findall(".//volumes/volume"):
+        name = str(v.findtext("name") or "").strip()
+        st_str = str(v.findtext("statusStr") or v.findtext("status") or "").strip()
+        bricks = v.findall(".//bricks/brick")
+        volumes.append(
+            {
+                "name": name,
+                "status": st_str,
+                "bricks": len(bricks),
+            }
+        )
+    out["volumes"] = volumes
+    out["volumes_total"] = len(volumes)
+    started = 0
+    for v in volumes:
+        s = str(v.get("status", "")).strip().lower()
+        if s.startswith("start") or s in {"1", "started"}:
+            started += 1
+    out["volumes_started"] = started
+
+    # Peer status (best-effort)
+    peers_total = 0
+    peers_connected = 0
+    rc, peer_xml, _peer_err = _run_quick([gluster_bin, "peer", "status", "--xml"], timeout_sec=timeout_sec)
+    if rc == 0 and peer_xml:
+        try:
+            prow = ET.fromstring(peer_xml)
+            for p in prow.findall(".//peerStatus/peer"):
+                peers_total += 1
+                connected_val = str(p.findtext("connected") or "").strip().lower()
+                state_val = str(p.findtext("state") or "").strip()
+                state_str = str(p.findtext("stateStr") or "").strip().lower()
+                is_connected = connected_val in {"1", "yes", "true", "on"} or state_val == "3" or "connected" in state_str
+                if is_connected:
+                    peers_connected += 1
+        except Exception:
+            pass
+    out["peers_total"] = peers_total
+    out["peers_connected"] = peers_connected
+
+    if out["volumes_total"] == 0:
+        out["status"] = "degraded"
+    else:
+        all_started = out["volumes_started"] == out["volumes_total"]
+        peers_ok = (peers_total == 0) or (peers_connected == peers_total)
+        if all_started and peers_ok:
+            out["status"] = "ok"
+        else:
+            out["status"] = "degraded"
+    return out
+
+
+def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict[str, Any]:
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    haproxy_state = _collect_haproxy_db_state(timeout_sec=max(2, int(timeout_sec)))
+    gluster_state = _collect_gluster_state(timeout_sec=max(3, int(timeout_sec)))
+    out: dict[str, Any] = {
+        "checked_at_utc": now_utc,
+        "status": "na",
+        "role": "unknown",
+        "source": "",
+        "haproxy": haproxy_state,
+        "gluster": gluster_state,
+        "errors": [],
+    }
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_candidate(
+        *,
+        source: str,
+        host: str | None,
+        port: int | None,
+        user: str | None,
+        password: str | None,
+    ) -> None:
+        u = str(user or "").strip()
+        if not u:
+            return
+        h = str(host or "").strip() or "localhost"
+        p = int(port or 3306)
+        pwd = str(password or "")
+        sock = _pick_local_socket(password=pwd, host=h)
+        key = "|".join([source, h, str(p), u, sock or "", str(bool(pwd))])
+        if key in seen:
+            return
+        seen.add(key)
+        row: dict[str, Any] = {
+            "source": source,
+            "host": h,
+            "port": p,
+            "user": u,
+            "password": pwd,
+        }
+        if sock:
+            row["unix_socket"] = sock
+        candidates.append(row)
+
+    add_candidate(
+        source="state_mysql",
+        host=getattr(cfg, "state_mysql_host", None),
+        port=getattr(cfg, "state_mysql_port", 3306),
+        user=getattr(cfg, "state_mysql_user", None),
+        password=getattr(cfg, "state_mysql_password", None),
+    )
+    add_candidate(
+        source="backup_mysql",
+        host=getattr(cfg, "backup_mysql_host", None),
+        port=getattr(cfg, "backup_mysql_port", 3306) or 3306,
+        user=getattr(cfg, "backup_mysql_user", None),
+        password=getattr(cfg, "backup_mysql_password", None),
+    )
+
+    if not candidates:
+        out["status"] = "na"
+        out["errors"] = ["no_mysql_credentials"]
+        return out
+
+    def _query_map(cur, sql: str) -> dict[str, str]:
+        cur.execute(sql)
+        rows = cur.fetchall() or []
+        m: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            k = str(row.get("Variable_name") or row.get("variable_name") or "").strip().lower()
+            if not k:
+                continue
+            m[k] = str(row.get("Value") or row.get("value") or "").strip()
+        return m
+
+    errors: list[str] = []
+    for cand in candidates:
+        try:
+            kwargs: dict[str, Any] = {
+                "user": cand["user"],
+                "password": cand.get("password", ""),
+                "charset": "utf8mb4",
+                "autocommit": True,
+                "cursorclass": DictCursor,
+                "connect_timeout": max(2, int(timeout_sec)),
+                "read_timeout": max(3, int(timeout_sec)),
+                "write_timeout": max(3, int(timeout_sec)),
+            }
+            if cand.get("unix_socket"):
+                kwargs["unix_socket"] = cand["unix_socket"]
+            else:
+                kwargs["host"] = cand["host"]
+                kwargs["port"] = int(cand.get("port", 3306) or 3306)
+
+            with pymysql.connect(**kwargs) as conn:
+                with conn.cursor() as cur:
+                    vars_map = _query_map(
+                        cur,
+                        "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('wsrep_on','read_only','super_read_only')",
+                    )
+                    wsrep_map = _query_map(cur, "SHOW GLOBAL STATUS LIKE 'wsrep_%'")
+
+                    replica_row: dict[str, Any] | None = None
+                    try:
+                        cur.execute("SHOW REPLICA STATUS")
+                        rr = cur.fetchone()
+                        if isinstance(rr, dict) and rr:
+                            replica_row = rr
+                    except Exception:
+                        replica_row = None
+                    if replica_row is None:
+                        try:
+                            cur.execute("SHOW SLAVE STATUS")
+                            rr = cur.fetchone()
+                            if isinstance(rr, dict) and rr:
+                                replica_row = rr
+                        except Exception:
+                            replica_row = None
+
+            role = "standalone"
+            wsrep_on = _to_bool(vars_map.get("wsrep_on"))
+            if bool(wsrep_map) or wsrep_on:
+                role = "galera"
+            elif replica_row:
+                role = "replica"
+
+            out = {
+                "checked_at_utc": now_utc,
+                "status": "ok",
+                "role": role,
+                "source": str(cand.get("source", "")),
+                "haproxy": haproxy_state,
+                "gluster": gluster_state,
+                "read_only": _to_bool(vars_map.get("read_only")),
+                "super_read_only": _to_bool(vars_map.get("super_read_only")),
+                "errors": [],
+            }
+
+            if role == "galera":
+                galera = {
+                    "ready": _to_bool(wsrep_map.get("wsrep_ready")),
+                    "connected": _to_bool(wsrep_map.get("wsrep_connected")),
+                    "cluster_status": str(wsrep_map.get("wsrep_cluster_status") or "").strip() or None,
+                    "local_state_comment": str(wsrep_map.get("wsrep_local_state_comment") or "").strip() or None,
+                    "cluster_size": _to_int(wsrep_map.get("wsrep_cluster_size")),
+                    "recv_queue_avg": _to_float(wsrep_map.get("wsrep_local_recv_queue_avg"))
+                    if wsrep_map.get("wsrep_local_recv_queue_avg") not in {None, ""}
+                    else _to_float(wsrep_map.get("wsrep_local_recv_queue")),
+                    "send_queue_avg": _to_float(wsrep_map.get("wsrep_local_send_queue_avg"))
+                    if wsrep_map.get("wsrep_local_send_queue_avg") not in {None, ""}
+                    else _to_float(wsrep_map.get("wsrep_local_send_queue")),
+                    "flow_control_paused": _to_float(wsrep_map.get("wsrep_flow_control_paused")),
+                }
+                out["galera"] = galera
+                healthy = bool(galera.get("ready")) and bool(galera.get("connected"))
+                if str(galera.get("cluster_status") or "").lower() != "primary":
+                    healthy = False
+                if str(galera.get("local_state_comment") or "").lower() != "synced":
+                    healthy = False
+                out["status"] = "ok" if healthy else "degraded"
+            elif role == "replica":
+                io_running = str(
+                    (replica_row or {}).get("Replica_IO_Running")
+                    or (replica_row or {}).get("Slave_IO_Running")
+                    or ""
+                ).strip()
+                sql_running = str(
+                    (replica_row or {}).get("Replica_SQL_Running")
+                    or (replica_row or {}).get("Slave_SQL_Running")
+                    or ""
+                ).strip()
+                lag = _to_int(
+                    (replica_row or {}).get("Seconds_Behind_Source")
+                    if (replica_row or {}).get("Seconds_Behind_Source") is not None
+                    else (replica_row or {}).get("Seconds_Behind_Master")
+                )
+                replica = {
+                    "io_running": io_running,
+                    "sql_running": sql_running,
+                    "seconds_behind": lag,
+                }
+                out["replica"] = replica
+                healthy = io_running.lower() in {"yes", "on", "1", "running"} and sql_running.lower() in {
+                    "yes",
+                    "on",
+                    "1",
+                    "running",
+                }
+                if lag is not None and lag > 30:
+                    healthy = False
+                out["status"] = "ok" if healthy else "degraded"
+            return out
+        except Exception as e:
+            errors.append(f"{cand.get('source')}: {e}")
+
+    out["status"] = "error"
+    out["errors"] = errors[-5:]
+    return out
+
+
 def _candidate_roots(root: str) -> list[Path]:
     root_path = Path(root)
     candidates: list[Path] = [root_path]
@@ -428,6 +992,8 @@ class MCCStatePusher:
         self.latest_apt_state: dict[str, Any] | None = None
         self.latest_apt_state_ts = 0.0
         self.latest_apt_probe_key = ""
+        self.latest_cluster_db_state: dict[str, Any] | None = None
+        self.latest_cluster_db_state_ts = 0.0
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -471,6 +1037,15 @@ class MCCStatePusher:
         self.latest_apt_state = payload
         self.latest_apt_state_ts = now_ts
         self.latest_apt_probe_key = probe_key
+        return dict(payload)
+
+    def _cluster_db_state(self, now_ts: float) -> dict[str, Any]:
+        interval = max(30, int(getattr(self.cfg, "mcc_push_apt_state_interval_sec", 120) or 120))
+        if self.latest_cluster_db_state and (now_ts - self.latest_cluster_db_state_ts) < interval:
+            return dict(self.latest_cluster_db_state)
+        payload = _collect_cluster_db_state(self.cfg, timeout_sec=5)
+        self.latest_cluster_db_state = payload
+        self.latest_cluster_db_state_ts = now_ts
         return dict(payload)
 
     def should_push(self, now_ts: float, payload_no_ts: dict[str, Any]) -> tuple[bool, bool]:
@@ -565,6 +1140,7 @@ class MCCStatePusher:
             "backup_state": backup_state_for_push(self.cfg),
             "backup_profile": backup_profile_for_push(self.cfg),
             "apt_state": self._apt_state(now_ts),
+            "cluster_db": self._cluster_db_state(now_ts),
             "state_backend": state_backend_status(self.cfg, probe=True),
             "instances": instances,
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
