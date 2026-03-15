@@ -1,5 +1,30 @@
 # MCD Changelog
 
+## 0.8.31 - 2026-03-15
+- Added: permissions-guard repair event details in agent telemetry payload (`signals.details.fs_permissions_fix_recent`).
+  - Per-event fields: `ts`, `path`, `sample_path`, `reason`, `actor`, `actor_source`, `before_owner_group`, `before_mode`, `result`, `error`.
+  - Actor detection is best-effort: prefers `auditd` (`ausearch`) and falls back to ownership-based guess.
+- Changed: permissions-guard daemon logs now include detailed repair/error context (reason, actor/source, previous owner/mode, path).
+- Changed: MCC state push keeps permissions-fix counters as delta and now also ships pending repair events for dashboard hover diagnostics.
+
+## 0.8.30 - 2026-03-15
+- Added: permissions-fix delta signal in MCC state payload (`signals.totals.fs_permissions_fix`).
+  - Source: filesystem permissions watchdog repairs in daemon loop.
+  - Counting model: per-push delta (repaired paths + optional console exec fix), reset after successful push.
+  - Purpose: MCC dashboard can classify permission-fix activity by day (today vs previous days) without extra DB schema.
+
+## 0.8.29 - 2026-03-15
+- Added: filesystem permissions watchdog for Mautic instance roots.
+  - New runtime keys (MCC dynamic overrides supported):
+    - `fs_permissions_guard_enabled`
+    - `fs_permissions_guard_interval_sec`
+    - `fs_permissions_guard_paths`
+    - `fs_permissions_guard_fix_console_exec`
+    - `fs_permissions_guard_console_relpath`
+  - Agent now periodically verifies/repairs owner+mode on critical paths (`var/cache`, `var/logs`, `var/spool`, `var/tmp`, media/config paths).
+  - Agent also enforces executable bit on `bin/console` (`chmod ug+x`) and runtime owner when configured.
+  - Watchdog runs in all profiles, including `passive`.
+
 ## 0.8.28 - 2026-03-14
 - Fixed: APT phased update detection now also uses `apt-cache policy` phased marker parsing (e.g. `(phased 60%)`), not only `apt-get -s upgrade` text blocks.
   - Prevents phased-only updates from being misclassified as regular pending updates (`updates_pending`/red).

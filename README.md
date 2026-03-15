@@ -258,6 +258,13 @@ Important:
   - used for quiet-window jobs (contacts cleanup) so daemon behavior follows instance timezone.
 - Runtime execution user:
   - `runtime.mautic_run_as_user` (default `www-data`) is used for Mautic console commands.
+- Filesystem permissions watchdog:
+  - `runtime.fs_permissions_guard_enabled` enables periodic owner/mode guard for critical Mautic paths.
+  - `runtime.fs_permissions_guard_interval_sec` controls per-instance check interval.
+  - `runtime.fs_permissions_guard_paths` defines relative instance paths to enforce (`var/cache`, `var/logs`, `var/spool`, `var/tmp`, media/config paths).
+  - `runtime.fs_permissions_guard_fix_console_exec` forces `bin/console` executable bit (`chmod ug+x`) and runtime owner.
+  - `runtime.fs_permissions_guard_console_relpath` allows custom console location (default `bin/console`).
+  - guard runs in all profiles, including `passive` (planning-only mode still keeps filesystem ownership healthy).
 - Runtime tuning for large campaigns:
   - `runtime.campaign_limit` controls per-run trigger batch size.
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.

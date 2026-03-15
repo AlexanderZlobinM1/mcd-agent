@@ -20,6 +20,7 @@ from mcd_agent.backup import backup_lock_active, backup_run, backup_status
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
 from mcd_agent.executor import render_mautic_command
+from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
 from mcd_agent.runtime_overrides import (
@@ -1933,6 +1934,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_cleanup_ts: dict[str, float] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
+    last_fs_permissions_guard_ts: dict[str, float] = {}
     last_tasks_compact_ts = 0.0
     last_outbound_events_prune_ts = 0.0
     last_custom_cache_cleanup_ts = 0.0
@@ -2424,6 +2426,95 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     )
 
             next_plan_refresh_at = now + max(1, config.poll_interval_sec)
+
+        if config.fs_permissions_guard_enabled:
+            guard_interval_sec = max(15, int(config.fs_permissions_guard_interval_sec or 300))
+            for inst in installs:
+                root = str(inst.root or "").strip()
+                if not root:
+                    continue
+                last_ts = float(last_fs_permissions_guard_ts.get(root, 0.0))
+                if last_ts > 0 and now - last_ts < guard_interval_sec:
+                    continue
+                try:
+                    res = ensure_instance_permissions(
+                        root=root,
+                        run_as_user=config.mautic_run_as_user or "www-data",
+                        guard_paths=config.fs_permissions_guard_paths,
+                        fix_console_exec=bool(config.fs_permissions_guard_fix_console_exec),
+                        console_relpath=config.fs_permissions_guard_console_relpath,
+                    )
+                    if res.repaired_paths or res.console_exec_fixed:
+                        fix_count = len(res.repaired_paths) + (1 if res.console_exec_fixed else 0)
+                        repaired_events = [e for e in (res.repair_events or []) if bool(getattr(e, "repaired", False))]
+                        event_payload = [
+                            {
+                                "ts": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "path": str(getattr(e, "rel_path", "") or getattr(e, "target_path", "") or "").strip(),
+                                "sample_path": str(getattr(e, "sample_path", "") or "").strip(),
+                                "reason": str(getattr(e, "reason", "") or "").strip(),
+                                "actor": str(getattr(e, "actor", "") or "").strip(),
+                                "actor_source": str(getattr(e, "actor_source", "") or "").strip(),
+                                "before_owner_group": str(getattr(e, "before_owner_group", "") or "").strip(),
+                                "before_mode": str(getattr(e, "before_mode", "") or "").strip(),
+                                "result": "repaired",
+                                "error": "",
+                            }
+                            for e in repaired_events
+                        ]
+                        try:
+                            pusher.add_fs_permissions_fix(
+                                fix_count,
+                                events=event_payload,
+                                now_ts=now,
+                            )
+                        except Exception:
+                            pass
+                        detail_parts: list[str] = []
+                        for ev in repaired_events[:8]:
+                            detail_parts.append(
+                                (
+                                    f"path={ev.rel_path or ev.target_path} "
+                                    f"reason={ev.reason or '-'} "
+                                    f"actor={ev.actor or 'unknown'} "
+                                    f"source={ev.actor_source or 'unknown'} "
+                                    f"before={ev.before_owner_group or '-'} mode={ev.before_mode or '-'}"
+                                )
+                            )
+                        logging.warning(
+                            "[%s] fs permissions guard repaired count=%s paths=%s console_exec_fixed=%s details=%s",
+                            root,
+                            str(fix_count),
+                            ",".join(res.repaired_paths) if res.repaired_paths else "-",
+                            "yes" if res.console_exec_fixed else "no",
+                            " || ".join(detail_parts) if detail_parts else "-",
+                        )
+                    if res.errors:
+                        failed_parts: list[str] = []
+                        for ev in (res.repair_events or []):
+                            if bool(getattr(ev, "repaired", False)):
+                                continue
+                            err = str(getattr(ev, "error", "") or "").strip()
+                            if not err:
+                                continue
+                            failed_parts.append(
+                                (
+                                    f"path={ev.rel_path or ev.target_path} "
+                                    f"reason={ev.reason or '-'} "
+                                    f"actor={ev.actor or 'unknown'} "
+                                    f"source={ev.actor_source or 'unknown'} "
+                                    f"error={err}"
+                                )
+                            )
+                        logging.warning(
+                            "[%s] fs permissions guard errors: %s%s",
+                            root,
+                            " | ".join(res.errors),
+                            f" || details={' || '.join(failed_parts[:8])}" if failed_parts else "",
+                        )
+                except Exception as e:
+                    logging.warning("[%s] fs permissions guard failed: %s", root, e)
+                last_fs_permissions_guard_ts[root] = now
 
         if pusher.enabled():
             pending_profile_event = read_pending_profile_event(config)

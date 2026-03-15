@@ -196,6 +196,28 @@ cache_warm_quiet_hour = 8
 # Quiet window length in minutes.
 cache_warm_quiet_window_min = 60
 
+# Filesystem permissions watchdog (MCD-managed, runtime-dynamic).
+# Keeps critical Mautic writable paths owned by `mautic_run_as_user`.
+fs_permissions_guard_enabled = true
+# Minimum interval between checks per instance, sec.
+fs_permissions_guard_interval_sec = 300
+# Relative paths under instance root to monitor and auto-repair.
+fs_permissions_guard_paths = [
+  "var/cache",
+  "var/logs",
+  "var/spool",
+  "var/tmp",
+  "app/config",
+  "config",
+  "media/files",
+  "media/images",
+  "translations",
+]
+# Ensure console runner is executable (chmod ug+x) and owned by runtime user.
+fs_permissions_guard_fix_console_exec = true
+# Console path relative to instance root.
+fs_permissions_guard_console_relpath = "bin/console"
+
 [sql]
 # Queue metric for throttling decision (must return one numeric value).
 mail_queue_count = "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE status = 'pending'"

@@ -10,6 +10,7 @@ import time
 from typing import Any, cast
 from urllib import request
 from urllib.error import HTTPError, URLError
+from mcd_agent.fs_permissions import default_guard_paths, normalize_guard_paths
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -210,6 +211,11 @@ class AgentConfig:
     cache_warm_interval_sec: int
     cache_warm_quiet_hour: int
     cache_warm_quiet_window_min: int
+    fs_permissions_guard_enabled: bool
+    fs_permissions_guard_interval_sec: int
+    fs_permissions_guard_paths: list[str]
+    fs_permissions_guard_fix_console_exec: bool
+    fs_permissions_guard_console_relpath: str
     segment_batch_limit: int
     campaign_batch_limit: int
     campaign_limit: int
@@ -1005,6 +1011,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "cache_warm_interval_sec": "cache_warm_interval_sec",
     "cache_warm_quiet_hour": "cache_warm_quiet_hour",
     "cache_warm_quiet_window_min": "cache_warm_quiet_window_min",
+    "fs_permissions_guard_enabled": "fs_permissions_guard_enabled",
+    "fs_permissions_guard_interval_sec": "fs_permissions_guard_interval_sec",
+    "fs_permissions_guard_paths": "fs_permissions_guard_paths",
+    "fs_permissions_guard_fix_console_exec": "fs_permissions_guard_fix_console_exec",
+    "fs_permissions_guard_console_relpath": "fs_permissions_guard_console_relpath",
     "segment_batch_limit": "segment_batch_limit",
     "campaign_batch_limit": "campaign_batch_limit",
     "campaign_limit": "campaign_limit",
@@ -1362,6 +1373,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         cleanup_mode = "email_only"
     else:
         cleanup_mode = "email_and_mobile"
+    fs_guard_paths = normalize_guard_paths(runtime.get("fs_permissions_guard_paths", default_guard_paths()))
 
     cfg = AgentConfig(
         config_file_path=str(Path(path).resolve()),
@@ -1474,6 +1486,14 @@ def _load_config_inner(path: str) -> AgentConfig:
         cache_warm_interval_sec=int(runtime.get("cache_warm_interval_sec", 86_400)),
         cache_warm_quiet_hour=int(runtime.get("cache_warm_quiet_hour", 8)),
         cache_warm_quiet_window_min=int(runtime.get("cache_warm_quiet_window_min", 60)),
+        fs_permissions_guard_enabled=bool(runtime.get("fs_permissions_guard_enabled", True)),
+        fs_permissions_guard_interval_sec=int(runtime.get("fs_permissions_guard_interval_sec", 300)),
+        fs_permissions_guard_paths=fs_guard_paths,
+        fs_permissions_guard_fix_console_exec=bool(runtime.get("fs_permissions_guard_fix_console_exec", True)),
+        fs_permissions_guard_console_relpath=str(
+            runtime.get("fs_permissions_guard_console_relpath", "bin/console")
+        ).strip()
+        or "bin/console",
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),
         campaign_batch_limit=int(runtime.get("campaign_batch_limit", 1000)),
         campaign_limit=int(runtime.get("campaign_limit", 60000)),

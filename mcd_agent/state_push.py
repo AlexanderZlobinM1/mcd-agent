@@ -994,6 +994,11 @@ class MCCStatePusher:
         self.latest_apt_probe_key = ""
         self.latest_cluster_db_state: dict[str, Any] | None = None
         self.latest_cluster_db_state_ts = 0.0
+        # Filesystem-permissions repair deltas.
+        # We push deltas (not cumulative totals) so MCC 3-day aggregation
+        # remains correct and stable across daemon restarts.
+        self._fs_permissions_fix_pending = 0
+        self._fs_permissions_events_pending: list[dict[str, Any]] = []
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -1001,6 +1006,59 @@ class MCCStatePusher:
     def set_signals(self, payload: dict[str, Any], now_ts: float) -> None:
         self.latest_signals = payload
         self.latest_signals_ts = now_ts
+
+    def add_fs_permissions_fix(
+        self,
+        count: int = 1,
+        *,
+        events: list[dict[str, Any]] | None = None,
+        now_ts: float | None = None,
+    ) -> None:
+        n = int(count or 0)
+        if n > 0:
+            self._fs_permissions_fix_pending += n
+        if events:
+            ts = float(now_ts if now_ts is not None else time.time())
+            event_ts = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            out: list[dict[str, Any]] = []
+            for row in events:
+                if not isinstance(row, dict):
+                    continue
+                out.append(
+                    {
+                        "ts": str(row.get("ts", "")).strip() or event_ts,
+                        "path": str(row.get("path", "")).strip(),
+                        "sample_path": str(row.get("sample_path", "")).strip(),
+                        "reason": str(row.get("reason", "")).strip(),
+                        "actor": str(row.get("actor", "")).strip(),
+                        "actor_source": str(row.get("actor_source", "")).strip(),
+                        "before_owner_group": str(row.get("before_owner_group", "")).strip(),
+                        "before_mode": str(row.get("before_mode", "")).strip(),
+                        "result": str(row.get("result", "")).strip() or "repaired",
+                        "error": str(row.get("error", "")).strip(),
+                    }
+                )
+            if out:
+                self._fs_permissions_events_pending.extend(out)
+                self._fs_permissions_events_pending = self._fs_permissions_events_pending[-200:]
+        if n <= 0 and not events:
+            return
+
+    def _signals_payload(self) -> dict[str, Any]:
+        base = self.latest_signals if isinstance(self.latest_signals, dict) else {}
+        out = dict(base)
+        totals_raw = out.get("totals")
+        totals = dict(totals_raw) if isinstance(totals_raw, dict) else {}
+        pending = int(self._fs_permissions_fix_pending or 0)
+        totals["fs_permissions_fix"] = int(totals.get("fs_permissions_fix", 0) or 0) + pending
+        out["totals"] = totals
+        out["fs_permissions_fix_pending"] = pending
+        if self._fs_permissions_events_pending:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["fs_permissions_fix_recent"] = self._fs_permissions_events_pending[-50:]
+            out["details"] = details
+        return out
 
     def _apt_probe_key(self) -> str:
         """
@@ -1072,6 +1130,8 @@ class MCCStatePusher:
     def mark_pushed(self, now_ts: float, payload_no_ts: dict[str, Any]) -> None:
         self.last_push_ts = now_ts
         self.last_hash = _hash_payload(payload_no_ts)
+        self._fs_permissions_fix_pending = 0
+        self._fs_permissions_events_pending = []
 
     def _store_state_snapshot(self, payload: dict[str, Any], now_ts: float) -> None:
         payload_hash = _hash_payload(payload)
@@ -1146,7 +1206,7 @@ class MCCStatePusher:
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         if include_signals:
-            payload["signals"] = self.latest_signals or {}
+            payload["signals"] = self._signals_payload()
             payload["signals_collected_at_ts"] = int(self.latest_signals_ts or 0)
         if isinstance(profile_event, dict) and profile_event:
             payload["profile_event"] = profile_event
