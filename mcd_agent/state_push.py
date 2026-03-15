@@ -1065,11 +1065,15 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
 
     has_ses_plugin = "amazonsesbundle" in plugin_names
     has_zender = "mauticzenderbundle" in plugin_names
+    # Mautic 4 commonly uses legacy transport names (e.g. mautic.transport.amazon_api).
+    transport_is_amazon = "amazon" in transport
+    transport_is_amazon_api = "amazon_api" in transport
+    transport_is_ses = ("ses" in transport) or transport_is_amazon
 
     key = "unknown"
     label = "unknown"
-    if any(x in dsn_low for x in ("ses+", "amazonaws.com")) or "ses" in transport or "amazonaws.com" in mailer_host:
-        api_mode = ("+smtp" not in dsn_low) and ("smtp" not in transport)
+    if any(x in dsn_low for x in ("ses+", "amazonaws.com")) or transport_is_ses or "amazonaws.com" in mailer_host:
+        api_mode = transport_is_amazon_api or (("+smtp" not in dsn_low) and ("smtp" not in transport))
         if api_mode and has_ses_plugin:
             key = "mautic_ses_api"
             label = "mautic+ses+api"

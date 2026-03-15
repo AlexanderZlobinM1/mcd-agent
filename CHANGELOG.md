@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.33 - 2026-03-15
+- Fixed: sender-type detection for Mautic 4 legacy transport names.
+  - `mautic.transport.amazon_api` and related `amazon*` transport values are now classified as SES sender flow.
+  - With `AmazonSesBundle` installed, legacy Amazon API transport now maps to `mautic+ses+api` (instead of `unknown`).
+- Result: sender column in MCC dashboard now resolves correctly for Mautic 4 installations using legacy transport format.
+
 ## 0.8.32 - 2026-03-15
 - Added: sender telemetry in state push for each discovered Mautic instance:
   - `sender_type` (human label),
