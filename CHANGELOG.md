@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.8.35 - 2026-03-16
+- Fixed: legacy `sql.campaigns_due` migration now also upgrades DESC/no-deleted variants to the current safe default with campaign active-window filters:
+  - `(publish_up IS NULL OR publish_up <= now_local)`
+  - `(publish_down IS NULL OR publish_down >= now_local)`
+- Added legacy patterns handled by migration:
+  - `... AND (c.deleted IS NULL) ORDER BY c.id DESC`
+  - `... WHERE c.is_published = 1 ORDER BY c.id`
+  - `... WHERE c.is_published = 1 ORDER BY c.id DESC`
+- Impact: prevents endless processing of expired campaigns and restores predictable execution for scheduled campaigns.
+
 ## 0.8.34 - 2026-03-16
 - Changed: sender classification now uses active transport/DSN only (`mailer_dsn` + transport keys).
   - Removed plugin-driven classification dependency for SES labels.

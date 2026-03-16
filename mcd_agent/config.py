@@ -54,6 +54,22 @@ _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT = (
     "AND (c.deleted IS NULL) "
     "ORDER BY c.id"
 )
+_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT_DESC = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "ORDER BY c.id DESC"
+)
+_LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "ORDER BY c.id"
+)
+_LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED_DESC = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "ORDER BY c.id DESC"
+)
 _DEFAULT_SQL_SEGMENTS_DUE = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
@@ -715,7 +731,15 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
                 {_LEGACY_SQL_SEGMENTS_DUE_DEFAULT, _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822},
                 _DEFAULT_SQL_SEGMENTS_DUE,
             ),
-            "campaigns_due": ({_LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT}, _DEFAULT_SQL_CAMPAIGNS_DUE),
+            "campaigns_due": (
+                {
+                    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT,
+                    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT_DESC,
+                    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED,
+                    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED_DESC,
+                },
+                _DEFAULT_SQL_CAMPAIGNS_DUE,
+            ),
         },
     )
     if changed <= 0:
