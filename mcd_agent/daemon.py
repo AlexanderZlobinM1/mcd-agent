@@ -21,6 +21,7 @@ from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom
 from mcd_agent.db import MauticDB
 from mcd_agent.executor import render_mautic_command
 from mcd_agent.fs_permissions import ensure_instance_permissions
+from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
 from mcd_agent.runtime_overrides import (
@@ -44,6 +45,7 @@ from mcd_agent.state_push import (
     should_poll_alert,
 )
 from mcd_agent.state_backend import (
+    ensure_mysql_state_schema,
     mysql_state_connection,
     mysql_state_enabled,
     mysql_state_table_names,
@@ -209,6 +211,22 @@ def _extract_int(row: dict[str, object], key: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _state_node_id(cfg: AgentConfig | None) -> str:
+    if cfg is None:
+        return "local-node"
+    ident = resolve_agent_identity(cfg)
+    for key in (
+        "effective_mcc_host_name",
+        "effective_hostname",
+        "local_hostname",
+        "configured_host_name",
+    ):
+        raw = str(ident.get(key) or "").strip()
+        if raw:
+            return raw[:191]
+    return "unknown-host"
 
 
 def _segment_weights(
@@ -502,6 +520,7 @@ class TaskStore:
         except Exception:
             pass
         self._init_sqlite_schema()
+        self._node_id = _state_node_id(cfg)
 
         self._mysql_mode = bool(
             cfg is not None
@@ -512,6 +531,11 @@ class TaskStore:
         self._mysql_conn = None
         self._mysql_retry_after_ts = 0.0
         if self._mysql_mode:
+            if self.cfg is not None:
+                try:
+                    ensure_mysql_state_schema(self.cfg)
+                except Exception:
+                    self._mysql_mark_error()
             if self._mysql_available(force_probe=True) and self._migrate_sqlite_to_mysql_once():
                 self._sqlite_prune_for_failover()
 
@@ -721,10 +745,11 @@ class TaskStore:
                 self._mysql_exec_many(
                     f"""
                     INSERT INTO `{tasks_table}`(
-                      id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec,
+                      host_name, root, task_key, task_type, entity_id, command_str, pid, timeout_sec,
                       attempts, manual_request_id, state, note, started_at, finished_at, rc
                     ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
+                      host_name=VALUES(host_name),
                       root=VALUES(root),
                       task_key=VALUES(task_key),
                       task_type=VALUES(task_type),
@@ -742,7 +767,7 @@ class TaskStore:
                     """,
                     [
                         (
-                            int(r["id"]),
+                            self._node_id,
                             str(r["root"] or ""),
                             str(r["task_key"] or ""),
                             str(r["task_type"] or ""),
@@ -770,14 +795,15 @@ class TaskStore:
             if rows:
                 self._mysql_exec_many(
                     f"""
-                    INSERT INTO `{weight_table}`(kind, root, entity_id, weight, computed_at)
-                    VALUES(%s,%s,%s,%s,%s)
+                    INSERT INTO `{weight_table}`(host_name, kind, root, entity_id, weight, computed_at)
+                    VALUES(%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
                       weight=VALUES(weight),
                       computed_at=VALUES(computed_at)
                     """,
                     [
                         (
+                            self._node_id,
                             str(r["kind"] or ""),
                             str(r["root"] or ""),
                             int(r["entity_id"] or 0),
@@ -794,14 +820,15 @@ class TaskStore:
             if rows:
                 self._mysql_exec_many(
                     f"""
-                    INSERT INTO `{runtime_table}`(`key`, payload_json, updated_at)
-                    VALUES(%s,%s,%s)
+                    INSERT INTO `{runtime_table}`(host_name, `key`, payload_json, updated_at)
+                    VALUES(%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
                       payload_json=VALUES(payload_json),
                       updated_at=VALUES(updated_at)
                     """,
                     [
                         (
+                            self._node_id,
                             str(r["key"] or ""),
                             str(r["payload_json"] or "{}"),
                             float(r["updated_at"] or time.time()),
@@ -824,10 +851,11 @@ class TaskStore:
                 self._mysql_exec_many(
                     f"""
                     INSERT INTO `{req_table}`(
-                      id, root, task_type, entity_id, command_str, timeout_sec, status,
+                      host_name, root, task_type, entity_id, command_str, timeout_sec, status,
                       note, task_key, requested_at, launched_at, finished_at
                     ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
+                      host_name=VALUES(host_name),
                       root=VALUES(root),
                       task_type=VALUES(task_type),
                       entity_id=VALUES(entity_id),
@@ -842,7 +870,7 @@ class TaskStore:
                     """,
                     [
                         (
-                            int(r["id"]),
+                            self._node_id,
                             str(r["root"] or ""),
                             str(r["task_type"] or ""),
                             r["entity_id"],
@@ -903,8 +931,12 @@ class TaskStore:
             if tasks_table and self._mysql_available():
                 try:
                     self._mysql_exec(
-                        f"UPDATE `{tasks_table}` SET state='lost', note=%s, finished_at=%s WHERE state='running'",
-                        ("daemon_restart", now),
+                        f"""
+                        UPDATE `{tasks_table}`
+                        SET state='lost', note=%s, finished_at=%s
+                        WHERE host_name=%s AND state='running'
+                        """,
+                        ("daemon_restart", now, self._node_id),
                     )
                 except Exception:
                     pass
@@ -922,10 +954,11 @@ class TaskStore:
                     row_id, _ = self._mysql_exec(
                         f"""
                         INSERT INTO `{tasks_table}`(
-                          root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
-                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                          host_name, root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
+                            self._node_id,
                             task.root,
                             task.task_key,
                             task.task_type,
@@ -996,8 +1029,12 @@ class TaskStore:
             if tasks_table and self._mysql_available():
                 try:
                     _, changed = self._mysql_exec(
-                        f"UPDATE `{tasks_table}` SET state=%s, rc=%s, note=%s, finished_at=%s WHERE id=%s",
-                        (state, rc, note, now, int(row_id)),
+                        f"""
+                        UPDATE `{tasks_table}`
+                        SET state=%s, rc=%s, note=%s, finished_at=%s
+                        WHERE id=%s AND host_name=%s
+                        """,
+                        (state, rc, note, now, int(row_id), self._node_id),
                     )
                     if int(changed) > 0:
                         # Keep SQLite tiny in mysql mode: running failover only.
@@ -1018,7 +1055,10 @@ class TaskStore:
             tasks_table = self._mysql_tables.get("tasks", "")
             if tasks_table and self._mysql_available():
                 try:
-                    return self._mysql_query(f"SELECT * FROM `{tasks_table}` WHERE state='running' ORDER BY id ASC")
+                    return self._mysql_query(
+                        f"SELECT * FROM `{tasks_table}` WHERE host_name=%s AND state='running' ORDER BY id ASC",
+                        (self._node_id,),
+                    )
                 except Exception:
                     pass
         return self._sqlite_fetchall_dicts("SELECT * FROM tasks WHERE state='running' ORDER BY id ASC")
@@ -1028,7 +1068,10 @@ class TaskStore:
             tasks_table = self._mysql_tables.get("tasks", "")
             if tasks_table and self._mysql_available():
                 try:
-                    rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state='running'")
+                    rows = self._mysql_query(
+                        f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE host_name=%s AND state='running'",
+                        (self._node_id,),
+                    )
                     return int((rows[0].get("cnt") if rows else 0) or 0)
                 except Exception:
                     pass
@@ -1044,9 +1087,10 @@ class TaskStore:
                         f"""
                         SELECT id, root, task_type, entity_id, pid, command_str
                         FROM `{tasks_table}`
-                        WHERE state='running'
+                        WHERE host_name=%s AND state='running'
                         ORDER BY id ASC
-                        """
+                        """,
+                        (self._node_id,),
                     )
                 except Exception:
                     pass
@@ -1062,8 +1106,12 @@ class TaskStore:
             if table and self._mysql_available():
                 try:
                     rows = self._mysql_query(
-                        f"SELECT entity_id, weight FROM `{table}` WHERE kind=%s AND root=%s AND computed_at>=%s",
-                        (kind, root, min_ts),
+                        f"""
+                        SELECT entity_id, weight
+                        FROM `{table}`
+                        WHERE host_name=%s AND kind=%s AND root=%s AND computed_at>=%s
+                        """,
+                        (self._node_id, kind, root, min_ts),
                     )
                     for row in rows:
                         out[int(row["entity_id"])] = float(row["weight"])
@@ -1085,11 +1133,17 @@ class TaskStore:
             table = self._mysql_tables.get("weight_cache", "")
             if table and self._mysql_available():
                 try:
-                    self._mysql_exec(f"DELETE FROM `{table}` WHERE kind=%s AND root=%s", (kind, root))
-                    params = [(kind, root, int(eid), float(w), now) for eid, w in weights.items()]
+                    self._mysql_exec(
+                        f"DELETE FROM `{table}` WHERE host_name=%s AND kind=%s AND root=%s",
+                        (self._node_id, kind, root),
+                    )
+                    params = [(self._node_id, kind, root, int(eid), float(w), now) for eid, w in weights.items()]
                     if params:
                         self._mysql_exec_many(
-                            f"INSERT INTO `{table}`(kind, root, entity_id, weight, computed_at) VALUES(%s,%s,%s,%s,%s)",
+                            f"""
+                            INSERT INTO `{table}`(host_name, kind, root, entity_id, weight, computed_at)
+                            VALUES(%s,%s,%s,%s,%s,%s)
+                            """,
                             params,
                         )
                     # Not required in mysql mode; keep sqlite cache small.
@@ -1129,12 +1183,18 @@ class TaskStore:
                     if keep_days > 0:
                         cutoff = float(now_ts) - (float(keep_days) * 86400.0)
                         _, cnt = self._mysql_exec(
-                            f"DELETE FROM `{tasks_table}` WHERE state!='running' AND COALESCE(finished_at, started_at) < %s",
-                            (cutoff,),
+                            f"""
+                            DELETE FROM `{tasks_table}`
+                            WHERE host_name=%s AND state!='running' AND COALESCE(finished_at, started_at) < %s
+                            """,
+                            (self._node_id, cutoff),
                         )
                         deleted_rows += int(cnt)
 
-                    rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state!='running'")
+                    rows = self._mysql_query(
+                        f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE host_name=%s AND state!='running'",
+                        (self._node_id,),
+                    )
                     non_running = int((rows[0].get("cnt") if rows else 0) or 0)
                     if max_rows > 0 and non_running > max_rows:
                         overflow = non_running - max_rows
@@ -1145,16 +1205,19 @@ class TaskStore:
                               SELECT id FROM (
                                 SELECT id
                                 FROM `{tasks_table}`
-                                WHERE state!='running'
+                                WHERE host_name=%s AND state!='running'
                                 ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
                                 LIMIT %s
                               ) t
                             )
                             """,
-                            (overflow,),
+                            (self._node_id, overflow),
                         )
                         deleted_rows += int(cnt)
-                        rows = self._mysql_query(f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE state!='running'")
+                        rows = self._mysql_query(
+                            f"SELECT COUNT(*) AS cnt FROM `{tasks_table}` WHERE host_name=%s AND state!='running'",
+                            (self._node_id,),
+                        )
                         non_running = int((rows[0].get("cnt") if rows else 0) or 0)
 
                     # Keep sqlite fallback minimal (running only) in mysql mode.
@@ -1210,11 +1273,11 @@ class TaskStore:
                 try:
                     self._mysql_exec(
                         f"""
-                        INSERT INTO `{table}`(`key`, payload_json, updated_at)
-                        VALUES(%s,%s,%s)
+                        INSERT INTO `{table}`(host_name, `key`, payload_json, updated_at)
+                        VALUES(%s,%s,%s,%s)
                         ON DUPLICATE KEY UPDATE payload_json=VALUES(payload_json), updated_at=VALUES(updated_at)
                         """,
-                        (str(key), json.dumps(payload, ensure_ascii=False), now),
+                        (self._node_id, str(key), json.dumps(payload, ensure_ascii=False), now),
                     )
                 except Exception:
                     pass
@@ -1245,10 +1308,10 @@ class TaskStore:
                     req_id, _ = self._mysql_exec(
                         f"""
                         INSERT INTO `{table}`(
-                          root, task_type, entity_id, command_str, timeout_sec, status, requested_at
-                        ) VALUES(%s,%s,%s,%s,%s,'pending',%s)
+                          host_name, root, task_type, entity_id, command_str, timeout_sec, status, requested_at
+                        ) VALUES(%s,%s,%s,%s,%s,%s,'pending',%s)
                         """,
-                        (str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
+                        (self._node_id, str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
                     )
                     self.conn.execute(
                         """
@@ -1291,11 +1354,11 @@ class TaskStore:
                         f"""
                         SELECT *
                         FROM `{table}`
-                        WHERE status='pending' AND root=%s
+                        WHERE host_name=%s AND status='pending' AND root=%s
                         ORDER BY requested_at ASC, id ASC
                         LIMIT {lim}
                         """,
-                        (str(root),),
+                        (self._node_id, str(root)),
                     )
                 except Exception:
                     pass
@@ -1317,8 +1380,8 @@ class TaskStore:
             if table and self._mysql_available():
                 try:
                     rows = self._mysql_query(
-                        f"SELECT status FROM `{table}` WHERE id=%s LIMIT 1",
-                        (int(req_id),),
+                        f"SELECT status FROM `{table}` WHERE id=%s AND host_name=%s LIMIT 1",
+                        (int(req_id), self._node_id),
                     )
                     if rows:
                         return str(rows[0].get("status") or "")
@@ -1339,9 +1402,9 @@ class TaskStore:
                         f"""
                         UPDATE `{table}`
                         SET status='cancelled', note=%s, finished_at=%s
-                        WHERE id=%s AND status='pending'
+                        WHERE id=%s AND host_name=%s AND status='pending'
                         """,
-                        (str(note), now, int(req_id)),
+                        (str(note), now, int(req_id), self._node_id),
                     )
                     self.conn.execute(
                         """
@@ -1377,9 +1440,9 @@ class TaskStore:
                         f"""
                         UPDATE `{table}`
                         SET status='launched', task_key=%s, launched_at=%s, note=NULL
-                        WHERE id=%s AND status='pending'
+                        WHERE id=%s AND host_name=%s AND status='pending'
                         """,
-                        (str(task_key), now, int(req_id)),
+                        (str(task_key), now, int(req_id), self._node_id),
                     )
                     self.conn.execute(
                         """
@@ -1414,9 +1477,9 @@ class TaskStore:
                         f"""
                         UPDATE `{table}`
                         SET status=%s, note=%s, finished_at=%s
-                        WHERE id=%s AND status IN ('pending','launched')
+                        WHERE id=%s AND host_name=%s AND status IN ('pending','launched')
                         """,
-                        (str(status), note, now, int(req_id)),
+                        (str(status), note, now, int(req_id), self._node_id),
                     )
                     self.conn.execute(
                         """

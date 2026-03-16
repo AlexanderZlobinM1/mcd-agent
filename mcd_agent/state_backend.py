@@ -443,6 +443,7 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
             f"""
             CREATE TABLE IF NOT EXISTS `{tasks_table}` (
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              host_name VARCHAR(191) NOT NULL,
               root VARCHAR(512) NOT NULL,
               task_key VARCHAR(768) NOT NULL,
               task_type VARCHAR(64) NOT NULL,
@@ -457,30 +458,33 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
               started_at DOUBLE NOT NULL,
               finished_at DOUBLE NULL,
               rc INT NULL,
-              KEY idx_tasks_running (state, root, task_type, started_at),
-              KEY idx_tasks_key (task_key)
+              KEY idx_tasks_running (host_name, state, root(191), task_type, started_at),
+              KEY idx_tasks_key (host_name, task_key(191))
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS `{weight_cache_table}` (
+              host_name VARCHAR(191) NOT NULL,
               kind VARCHAR(32) NOT NULL,
               root VARCHAR(512) NOT NULL,
               entity_id BIGINT NOT NULL,
               weight DOUBLE NOT NULL,
               computed_at DOUBLE NOT NULL,
-              PRIMARY KEY (kind, root, entity_id),
-              KEY idx_weight_cache_lookup (kind, root, computed_at)
+              PRIMARY KEY (host_name, kind, root(191), entity_id),
+              KEY idx_weight_cache_lookup (host_name, kind, root(191), computed_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS `{runtime_sync_table}` (
-              `key` VARCHAR(191) PRIMARY KEY,
+              host_name VARCHAR(191) NOT NULL,
+              `key` VARCHAR(191) NOT NULL,
               payload_json LONGTEXT NOT NULL,
-              updated_at DOUBLE NOT NULL
+              updated_at DOUBLE NOT NULL,
+              PRIMARY KEY (host_name, `key`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -488,6 +492,7 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
             f"""
             CREATE TABLE IF NOT EXISTS `{manual_requests_table}` (
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              host_name VARCHAR(191) NOT NULL,
               root VARCHAR(512) NOT NULL,
               task_type VARCHAR(64) NOT NULL,
               entity_id BIGINT NULL,
@@ -499,11 +504,129 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
               requested_at DOUBLE NOT NULL,
               launched_at DOUBLE NULL,
               finished_at DOUBLE NULL,
-              KEY idx_manual_requests_pending (status, root, requested_at)
+              KEY idx_manual_requests_pending (host_name, status, root(191), requested_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+
+        # Legacy -> host-scoped migration for shared mysql_hybrid state tables.
+        # Goal: every node can write only its own records in cluster mode.
+        legacy_host = "legacy-shared"
+
+        def _has_column(table: str, column: str) -> bool:
+            cur.execute(
+                """
+                SELECT 1
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
+                LIMIT 1
+                """,
+                (table, column),
+            )
+            return cur.fetchone() is not None
+
+        def _has_index(table: str, index_name: str) -> bool:
+            cur.execute(
+                """
+                SELECT 1
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s
+                LIMIT 1
+                """,
+                (table, index_name),
+            )
+            return cur.fetchone() is not None
+
+        def _index_columns(table: str, index_name: str) -> list[str]:
+            cur.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s
+                ORDER BY SEQ_IN_INDEX ASC
+                """,
+                (table, index_name),
+            )
+            rows = cur.fetchall() or []
+            return [str(r.get("COLUMN_NAME") or "") for r in rows if isinstance(r, dict)]
+
+        def _rebuild_index(table: str, index_name: str, expr: str) -> None:
+            if _has_index(table, index_name):
+                cur.execute(f"ALTER TABLE `{table}` DROP INDEX `{index_name}`")
+            cur.execute(f"ALTER TABLE `{table}` ADD INDEX `{index_name}` ({expr})")
+
+        # tasks: add host scope + host-aware indexes
+        if not _has_column(tasks_table, "host_name"):
+            cur.execute(
+                f"""
+                ALTER TABLE `{tasks_table}`
+                ADD COLUMN host_name VARCHAR(191) NOT NULL DEFAULT '{legacy_host}' AFTER id
+                """
+            )
+        if _index_columns(tasks_table, "idx_tasks_running") != ["host_name", "state", "root", "task_type", "started_at"]:
+            _rebuild_index(tasks_table, "idx_tasks_running", "host_name, state, root(191), task_type, started_at")
+        if _index_columns(tasks_table, "idx_tasks_key") != ["host_name", "task_key"]:
+            _rebuild_index(tasks_table, "idx_tasks_key", "host_name, task_key(191)")
+
+        # weight_cache: reset legacy shared entries and switch PK to host scope.
+        # Weight cache is derived data and safe to rebuild.
+        if not _has_column(weight_cache_table, "host_name"):
+            cur.execute(f"TRUNCATE TABLE `{weight_cache_table}`")
+            cur.execute(
+                f"""
+                ALTER TABLE `{weight_cache_table}`
+                ADD COLUMN host_name VARCHAR(191) NOT NULL DEFAULT '{legacy_host}' FIRST
+                """
+            )
+        if _index_columns(weight_cache_table, "PRIMARY") != ["host_name", "kind", "root", "entity_id"]:
+            cur.execute(f"ALTER TABLE `{weight_cache_table}` DROP PRIMARY KEY")
+            cur.execute(
+                f"""
+                ALTER TABLE `{weight_cache_table}`
+                ADD PRIMARY KEY (host_name, kind, root(191), entity_id)
+                """
+            )
+        if _index_columns(weight_cache_table, "idx_weight_cache_lookup") != ["host_name", "kind", "root", "computed_at"]:
+            _rebuild_index(weight_cache_table, "idx_weight_cache_lookup", "host_name, kind, root(191), computed_at")
+
+        # runtime_sync: make keys host-scoped.
+        if not _has_column(runtime_sync_table, "host_name"):
+            cur.execute(
+                f"""
+                ALTER TABLE `{runtime_sync_table}`
+                ADD COLUMN host_name VARCHAR(191) NOT NULL DEFAULT '{legacy_host}' FIRST
+                """
+            )
+        # Replace legacy PK(key) with PK(host_name,key).
+        if _index_columns(runtime_sync_table, "PRIMARY") != ["host_name", "key"]:
+            cur.execute(f"ALTER TABLE `{runtime_sync_table}` DROP PRIMARY KEY")
+            cur.execute(
+                f"""
+                ALTER TABLE `{runtime_sync_table}`
+                ADD PRIMARY KEY (host_name, `key`)
+                """
+            )
+
+        # manual_requests: add host scope + host-aware pending index.
+        if not _has_column(manual_requests_table, "host_name"):
+            cur.execute(
+                f"""
+                ALTER TABLE `{manual_requests_table}`
+                ADD COLUMN host_name VARCHAR(191) NOT NULL DEFAULT '{legacy_host}' AFTER id
+                """
+            )
+        if _index_columns(manual_requests_table, "idx_manual_requests_pending") != ["host_name", "status", "root", "requested_at"]:
+            _rebuild_index(manual_requests_table, "idx_manual_requests_pending", "host_name, status, root(191), requested_at")
     _SCHEMA_READY.add(key)
+
+
+def ensure_mysql_state_schema(cfg: AgentConfig) -> None:
+    """Ensure state MySQL DB/tables are present and migrated to current layout."""
+    if not mysql_state_enabled(cfg):
+        return
+    _ensure_mysql_database(cfg)
+    with _mysql_conn(cfg) as conn:
+        _ensure_mysql_schema(cfg, conn)
 
 
 def queue_outbound_event_mysql(

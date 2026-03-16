@@ -1,5 +1,34 @@
 # MCD Changelog
 
+## 0.8.37 - 2026-03-16
+- Fixed: mysql-hybrid schema migration could fail on long composite indexes in utf8mb4 (`ERROR 1071 key too long`), leaving mixed legacy/new state tables.
+  - Reworked TaskStore MySQL indexes/PK to use safe prefix lengths:
+    - `tasks.idx_tasks_running`: `root(191)`
+    - `tasks.idx_tasks_key`: `task_key(191)`
+    - `weight_cache.PRIMARY`: `root(191)`
+    - `weight_cache.idx_weight_cache_lookup`: `root(191)`
+    - `manual_requests.idx_manual_requests_pending`: `root(191)`
+- Added: explicit TaskStore startup schema ensure (`ensure_mysql_state_schema`) before sqlite->mysql migration.
+  - Guarantees host-scoped table migration is applied before runtime writes in cluster/shared-DB mode.
+  - Prevents partial migrations where only one table got `host_name` and others stayed legacy.
+
+## 0.8.36 - 2026-03-16
+- Fixed: mysql-hybrid scheduler state is now node-scoped in shared DB mode (cluster-safe writes/reads).
+  - Added host/node scope (`host_name`) to TaskStore MySQL tables:
+    - `mcd_tasks`
+    - `mcd_weight_cache`
+    - `mcd_runtime_sync`
+    - `mcd_manual_requests`
+  - Agent now always reads/writes only its own rows (`host_name=<this node>`), so one node cannot overwrite/delete another node's scheduler state.
+- Fixed: `weight_cache` conflict class in Galera clusters.
+  - Weight cache writes are now isolated per node key-space.
+  - Legacy shared `weight_cache` rows are truncated once during schema migration (derived data is rebuilt automatically).
+- Added: in-place schema migration for legacy mysql-hybrid tables on startup.
+  - Adds host-scoped columns/indexes/PK where needed.
+  - Converts `runtime_sync` primary key from global `key` to composite `(host_name, key)`.
+  - Rebuilds host-aware indexes for tasks/manual requests.
+- Changed: sqlite->mysql migration path now inserts task/manual rows without forcing legacy row IDs, avoiding cross-node ID contention in shared DB mode.
+
 ## 0.8.35 - 2026-03-16
 - Fixed: legacy `sql.campaigns_due` migration now also upgrades DESC/no-deleted variants to the current safe default with campaign active-window filters:
   - `(publish_up IS NULL OR publish_up <= now_local)`
