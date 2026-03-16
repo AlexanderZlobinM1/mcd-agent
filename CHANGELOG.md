@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.8.38 - 2026-03-16
+- Changed (default behavior): reduced MCC API noise to match aggregated push model.
+  - `[mcc].push_on_change` default is now `false` (periodic push remains enabled).
+  - New `[mcc].runtime_overrides_poll_enabled` default `false`:
+    - periodic `/api/v1/agent/runtime-overrides` polling is disabled by default,
+    - MCC-triggered immediate runtime sync (`runtime-overrides.poll`) still works.
+  - New `[mcc].profile_guard_enabled` default `false`:
+    - periodic `/api/v1/agent/config-desired` drift-check is disabled by default.
+- Updated example configs:
+  - `control-plane/agent/etc/mcd-agent.example.toml`
+  - `control-plane/agent/etc/mcd-agent.system.example.toml`
+  - Added new MCC flags and documented low-noise defaults.
+
 ## 0.8.37 - 2026-03-16
 - Fixed: mysql-hybrid schema migration could fail on long composite indexes in utf8mb4 (`ERROR 1071 key too long`), leaving mixed legacy/new state tables.
   - Reworked TaskStore MySQL indexes/PK to use safe prefix lengths:

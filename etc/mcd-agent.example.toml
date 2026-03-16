@@ -44,14 +44,18 @@ token = ""
 push_enabled = true
 # Periodic state push every 5 minutes.
 push_interval_sec = 300
-# Immediate push when snapshot changes.
-push_on_change = true
+# Immediate push on arbitrary snapshot changes (usually noisy). Keep off by default.
+push_on_change = false
 # Critical log-signal poll interval (seconds).
 push_alert_poll_interval_sec = 60
 # Critical log-signal window (minutes).
 push_alert_window_min = 5
 # APT metrics refresh interval (seconds). Agent refreshes sooner if APT/DPKG state changed.
 push_apt_state_interval_sec = 120
+# Periodic runtime-overrides pull from MCC (disabled by default; MCC trigger still works).
+runtime_overrides_poll_enabled = false
+# Periodic config drift guard via /agent/config-desired (disabled by default).
+profile_guard_enabled = false
 # Optional explicit host name for MCC inventory mapping.
 host_name = ""
 

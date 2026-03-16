@@ -262,6 +262,8 @@ class AgentConfig:
     mcc_push_alert_poll_interval_sec: int
     mcc_push_alert_window_min: int
     mcc_push_apt_state_interval_sec: int
+    mcc_runtime_overrides_poll_enabled: bool
+    mcc_profile_guard_enabled: bool
     outbound_events_sent_keep_days: int
     mcc_host_name: str | None
     host_template: bool
@@ -1627,10 +1629,12 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcc_token=str(mcc.get("token")) if mcc.get("token") else None,
         mcc_push_enabled=bool(mcc.get("push_enabled", True)),
         mcc_push_interval_sec=int(mcc.get("push_interval_sec", 300)),
-        mcc_push_on_change=bool(mcc.get("push_on_change", True)),
+        mcc_push_on_change=bool(mcc.get("push_on_change", False)),
         mcc_push_alert_poll_interval_sec=int(mcc.get("push_alert_poll_interval_sec", 60)),
         mcc_push_alert_window_min=int(mcc.get("push_alert_window_min", 5)),
         mcc_push_apt_state_interval_sec=int(mcc.get("push_apt_state_interval_sec", 120)),
+        mcc_runtime_overrides_poll_enabled=bool(mcc.get("runtime_overrides_poll_enabled", False)),
+        mcc_profile_guard_enabled=bool(mcc.get("profile_guard_enabled", False)),
         outbound_events_sent_keep_days=int(runtime.get("outbound_events_sent_keep_days", 14)),
         mcc_host_name=str(mcc.get("host_name")).strip() if mcc.get("host_name") else None,
         host_template=bool(runtime.get("host_template", False)),

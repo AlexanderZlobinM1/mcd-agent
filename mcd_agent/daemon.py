@@ -2011,6 +2011,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     update_deferred_by_backup = False
     next_service_profile_apply_at = 0.0
     next_runtime_overrides_poll_at = 0.0
+    runtime_overrides_sync_requested = False
     next_profile_guard_at = 0.0
     last_runtime_overrides_fp = ""
     last_runtime_overrides_error = ""
@@ -2038,10 +2039,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.warning("runtime-overrides local push failed: %s", pushed.get("reason", "unknown"))
 
         if consume_poll_trigger(config):
+            runtime_overrides_sync_requested = True
             next_runtime_overrides_poll_at = 0.0
             logging.info("runtime-overrides poll trigger consumed: immediate MCC sync requested")
 
-        if config.mcc_url and config.mcc_token and now >= next_runtime_overrides_poll_at:
+        runtime_poll_enabled = bool(getattr(config, "mcc_runtime_overrides_poll_enabled", False))
+        should_runtime_poll = runtime_poll_enabled and now >= next_runtime_overrides_poll_at
+        if config.mcc_url and config.mcc_token and (runtime_overrides_sync_requested or should_runtime_poll):
             ro = fetch_runtime_overrides(config)
             status = str(ro.get("status", "")).strip().lower()
             poll_interval = max(15, min(300, int(config.mcc_push_interval_sec or config.poll_interval_sec or 60)))
@@ -2111,6 +2115,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.warning("runtime-overrides fetch failed: %s", reason)
                 last_runtime_overrides_error = reason
                 next_runtime_overrides_poll_at = now + max(30, poll_interval)
+            runtime_overrides_sync_requested = False
 
         if config.tasks_compact_enabled:
             quiet_hour = max(0, min(23, int(config.tasks_compact_quiet_hour)))
@@ -2605,7 +2610,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         error=None if ok else str(msg),
                     )
 
-        if config.mcc_url and config.mcc_token and now >= next_profile_guard_at:
+        if (
+            bool(getattr(config, "mcc_profile_guard_enabled", False))
+            and config.mcc_url
+            and config.mcc_token
+            and now >= next_profile_guard_at
+        ):
             guard_interval = max(60, int(config.mcc_push_interval_sec or config.poll_interval_sec or 300))
             try:
                 drift = check_profile_drift_with_mcc(
