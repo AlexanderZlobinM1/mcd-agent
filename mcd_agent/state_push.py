@@ -1073,16 +1073,26 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
     key = "unknown"
     label = "unknown"
     if any(x in dsn_low for x in ("ses+", "amazonaws.com")) or transport_is_ses or "amazonaws.com" in mailer_host:
-        api_mode = transport_is_amazon_api or (("+smtp" not in dsn_low) and ("smtp" not in transport))
-        if api_mode and has_ses_plugin:
+        # Sender classification is based on active transport/DSN only.
+        # Installed plugins are shown as hints in tooltip, but do not drive the final label.
+        if dsn_scheme == "mautic+ses+api":
             key = "mautic_ses_api"
             label = "mautic+ses+api"
-        elif api_mode:
+        elif dsn_scheme == "ses+api" or "ses+api://" in dsn_low:
             key = "ses_api"
             label = "ses+api"
-        else:
+        elif "ses+smtp" in dsn_low:
             key = "ses_smtp"
             label = "ses+smtp"
+        elif transport_is_amazon_api or (transport_is_ses and "api" in transport):
+            key = "ses_api"
+            label = "ses+api"
+        elif "smtp" in transport:
+            key = "ses_smtp"
+            label = "ses+smtp"
+        else:
+            key = "ses_api"
+            label = "ses+api"
     elif "sendgrid+" in dsn_low or "sendgrid" in transport:
         key = "sendgrid_api"
         label = "sendgrid+api"

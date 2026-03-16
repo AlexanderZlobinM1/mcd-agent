@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.34 - 2026-03-16
+- Changed: sender classification now uses active transport/DSN only (`mailer_dsn` + transport keys).
+  - Removed plugin-driven classification dependency for SES labels.
+  - If active DSN is `ses+api://...`, sender is now classified as `ses+api` even when SES plugins are installed.
+  - Legacy fallback remains for transport-only cases (for example `mautic.transport.amazon_api` -> `ses+api`).
+
 ## 0.8.33 - 2026-03-15
 - Fixed: sender-type detection for Mautic 4 legacy transport names.
   - `mautic.transport.amazon_api` and related `amazon*` transport values are now classified as SES sender flow.
