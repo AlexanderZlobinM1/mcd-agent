@@ -2012,6 +2012,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_service_profile_apply_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     runtime_overrides_sync_requested = False
+    # Always perform an initial runtime-overrides sync after daemon start/restart.
+    # This is required even when periodic polling is disabled to avoid running
+    # with stale local-only runtime after self-update/service restart.
+    startup_runtime_sync_pending = bool(config.mcc_url and config.mcc_token)
     next_profile_guard_at = 0.0
     last_runtime_overrides_fp = ""
     last_runtime_overrides_error = ""
@@ -2045,7 +2049,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
         runtime_poll_enabled = bool(getattr(config, "mcc_runtime_overrides_poll_enabled", False))
         should_runtime_poll = runtime_poll_enabled and now >= next_runtime_overrides_poll_at
-        if config.mcc_url and config.mcc_token and (runtime_overrides_sync_requested or should_runtime_poll):
+        if config.mcc_url and config.mcc_token and (
+            startup_runtime_sync_pending or runtime_overrides_sync_requested or should_runtime_poll
+        ):
             ro = fetch_runtime_overrides(config)
             status = str(ro.get("status", "")).strip().lower()
             poll_interval = max(15, min(300, int(config.mcc_push_interval_sec or config.poll_interval_sec or 60)))
@@ -2104,9 +2110,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "unsupported_keys": unsupported_keys,
                         },
                     )
+                startup_runtime_sync_pending = False
                 last_runtime_overrides_error = ""
                 next_runtime_overrides_poll_at = now + poll_interval
             elif status == "disabled":
+                startup_runtime_sync_pending = False
                 last_runtime_overrides_error = ""
                 next_runtime_overrides_poll_at = now + poll_interval
             else:

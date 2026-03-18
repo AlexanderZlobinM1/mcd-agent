@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.39 - 2026-03-18
+- Fixed: runtime-overrides startup sync is now mandatory after daemon start/restart (including post self-update restart), even when periodic runtime-overrides polling is disabled.
+  - Added startup sync pending state with retry/backoff until first successful MCC fetch.
+  - Prevents hosts from remaining on stale local-only runtime (rings/backup/runtime flags) after service restart.
+- Result: after restart, agent reliably re-applies MCC runtime overrides without requiring manual `runtime-overrides trigger`.
+
 ## 0.8.38 - 2026-03-16
 - Changed (default behavior): reduced MCC API noise to match aggregated push model.
   - `[mcc].push_on_change` default is now `false` (periodic push remains enabled).
