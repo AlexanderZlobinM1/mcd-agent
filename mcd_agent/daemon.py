@@ -218,10 +218,10 @@ def _state_node_id(cfg: AgentConfig | None) -> str:
         return "local-node"
     ident = resolve_agent_identity(cfg)
     for key in (
-        "effective_mcc_host_name",
-        "effective_hostname",
         "local_hostname",
+        "effective_hostname",
         "configured_host_name",
+        "effective_mcc_host_name",
     ):
         raw = str(ident.get(key) or "").strip()
         if raw:

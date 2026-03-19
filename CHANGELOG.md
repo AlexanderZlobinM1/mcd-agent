@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.8.40 - 2026-03-19
+- Fixed: added guarded MySQL state backoff for `mysql_hybrid` state backend.
+  - On repeated MySQL failures, state operations now enter timed backoff (`mysql_backoff_active`) instead of retrying every loop.
+  - Backoff is adaptive for critical classes (`1040 too many connections`, `1290 super-read-only`) to reduce pressure on cluster DB.
+  - `state_backend` payload now includes retry metadata (`retry_after_sec`, `retry_after_utc`, error code) while backoff is active.
+- Fixed: reduced state-push DB write/read noise in fast loops.
+  - Added empty-queue cooldown for profile-event reads to avoid per-cycle DB polling when queue is empty.
+  - Added snapshot upsert throttling: unchanged payload hash is no longer upserted every cycle.
+  - Added cached `state_backend` probe payload between push cycles.
+- Changed: MySQL state node identity resolution now prefers local host identity (`local_hostname`) before MCC alias.
+  - Prevents cross-node row collisions in shared/clustered state DB when nodes share one MCC host alias.
+
 ## 0.8.39 - 2026-03-18
 - Fixed: runtime-overrides startup sync is now mandatory after daemon start/restart (including post self-update restart), even when periodic runtime-overrides polling is disabled.
   - Added startup sync pending state with retry/backoff until first successful MCC fetch.

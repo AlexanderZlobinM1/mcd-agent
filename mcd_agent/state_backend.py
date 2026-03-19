@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import os
 import re
+import time
 from typing import Any
 
 import pymysql
@@ -19,6 +20,96 @@ _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/var/run/mysqld/mysqld.sock",
     "/run/mysqld/mysqld.sock",
 )
+_MYSQL_BACKOFF: dict[str, dict[str, Any]] = {}
+_MYSQL_BACKOFF_BASE_SEC = 15
+_MYSQL_BACKOFF_MAX_SEC = 900
+_MYSQL_BACKOFF_READONLY_SEC = 600
+_MYSQL_BACKOFF_TOOMANY_SEC = 120
+
+
+def _backoff_key(cfg: AgentConfig) -> str:
+    try:
+        return _schema_key(cfg)
+    except Exception:
+        host = str(getattr(cfg, "state_mysql_host", "") or "").strip()
+        port = int(getattr(cfg, "state_mysql_port", 3306) or 3306)
+        db = str(getattr(cfg, "state_mysql_database", "") or "mcd_state").strip()
+        pref = str(getattr(cfg, "state_mysql_table_prefix", "") or "mcd_").strip()
+        return f"{host}|{port}|{db}|{pref}"
+
+
+def _utc_from_ts(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _mysql_error_code(exc: Exception) -> int | None:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        args = getattr(cur, "args", ())
+        if args:
+            try:
+                return int(args[0])
+            except Exception:
+                pass
+        nxt = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return None
+
+
+def _mysql_backoff_status(cfg: AgentConfig) -> tuple[bool, dict[str, Any] | None]:
+    key = _backoff_key(cfg)
+    row = _MYSQL_BACKOFF.get(key)
+    if not isinstance(row, dict):
+        return False, None
+    until_ts = float(row.get("until_ts") or 0.0)
+    now = time.time()
+    if until_ts <= now:
+        _MYSQL_BACKOFF.pop(key, None)
+        return False, None
+    out = dict(row)
+    out["retry_after_sec"] = int(max(1, until_ts - now))
+    out["retry_after_utc"] = _utc_from_ts(until_ts)
+    return True, out
+
+
+def _mysql_backoff_clear(cfg: AgentConfig) -> None:
+    _MYSQL_BACKOFF.pop(_backoff_key(cfg), None)
+
+
+def _mysql_backoff_set(cfg: AgentConfig, err: Exception | str) -> None:
+    key = _backoff_key(cfg)
+    prev = _MYSQL_BACKOFF.get(key, {})
+    failures = int(prev.get("failures") or 0) + 1
+    code: int | None = None
+    err_txt = str(err)
+    if isinstance(err, Exception):
+        code = _mysql_error_code(err)
+    base = _MYSQL_BACKOFF_BASE_SEC
+    if code == 1290:
+        base = _MYSQL_BACKOFF_READONLY_SEC
+    elif code == 1040:
+        base = _MYSQL_BACKOFF_TOOMANY_SEC
+    delay = min(_MYSQL_BACKOFF_MAX_SEC, int(base * (2 ** max(0, failures - 1))))
+    until_ts = time.time() + float(delay)
+    _MYSQL_BACKOFF[key] = {
+        "failures": failures,
+        "last_error": err_txt[:500],
+        "last_error_code": code,
+        "until_ts": until_ts,
+    }
+
+
+def _mysql_preflight(cfg: AgentConfig) -> tuple[bool, str]:
+    active, st = _mysql_backoff_status(cfg)
+    if not active or not isinstance(st, dict):
+        return True, "ok"
+    retry_sec = int(st.get("retry_after_sec") or 0)
+    last_err = str(st.get("last_error") or "").strip()
+    if last_err:
+        return False, f"mysql_backoff_active:{retry_sec}s:{last_err}"
+    return False, f"mysql_backoff_active:{retry_sec}s"
 
 
 def _mask_scalar(value: Any) -> Any:
@@ -117,10 +208,10 @@ def _safe_prefix(raw: str | None) -> str:
 def _host_name_for_state(cfg: AgentConfig) -> str:
     ident = resolve_agent_identity(cfg)
     for key in (
-        "effective_mcc_host_name",
-        "effective_hostname",
         "local_hostname",
+        "effective_hostname",
         "configured_host_name",
+        "effective_mcc_host_name",
     ):
         raw = str(ident.get(key) or "").strip()
         if raw:
@@ -259,6 +350,14 @@ def state_backend_status(cfg: AgentConfig, *, probe: bool = True) -> dict[str, A
     if sock:
         status["unix_socket"] = sock
     status["reason"] = "mysql_probe_pending"
+    backoff_active, backoff = _mysql_backoff_status(cfg)
+    if backoff_active and isinstance(backoff, dict):
+        status["reason"] = "mysql_backoff_active"
+        status["error"] = str(backoff.get("last_error") or "").strip()
+        status["error_code"] = backoff.get("last_error_code")
+        status["retry_after_sec"] = int(backoff.get("retry_after_sec") or 0)
+        status["retry_after_utc"] = str(backoff.get("retry_after_utc") or "")
+        return status
     if not probe:
         return status
     existed_before = False
@@ -270,14 +369,21 @@ def state_backend_status(cfg: AgentConfig, *, probe: bool = True) -> dict[str, A
         _ensure_mysql_database(cfg)
         with _mysql_conn(cfg) as conn:
             _ensure_mysql_schema(cfg, conn)
+        _mysql_backoff_clear(cfg)
         status["active_backend"] = "mysql"
         status["mode"] = "mysql"
         status["reason"] = "ok"
         status["created_now"] = bool(not existed_before)
         return status
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
+        _active, _backoff = _mysql_backoff_status(cfg)
         status["reason"] = "mysql_init_failed"
         status["error"] = str(e)
+        status["error_code"] = _mysql_error_code(e)
+        if _active and isinstance(_backoff, dict):
+            status["retry_after_sec"] = int(_backoff.get("retry_after_sec") or 0)
+            status["retry_after_utc"] = str(_backoff.get("retry_after_utc") or "")
         status["created_now"] = False
         return status
 
@@ -639,6 +745,9 @@ def queue_outbound_event_mysql(
 ) -> tuple[bool, str]:
     if not mysql_state_enabled(cfg):
         return False, "mysql_state_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return False, preflight_msg
     host_name = _host_name_for_state(cfg)
     events_table, _ = _table_names(cfg)
     try:
@@ -659,14 +768,19 @@ def queue_outbound_event_mysql(
                     """,
                     (host_name, event_id, event_type, payload_json, float(created_at)),
                 )
+        _mysql_backoff_clear(cfg)
         return True, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return False, str(e)
 
 
 def read_pending_outbound_event_mysql(cfg: AgentConfig, *, event_type: str) -> tuple[dict[str, Any] | None, str]:
     if not mysql_state_enabled(cfg):
         return None, "mysql_state_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return None, preflight_msg
     host_name = _host_name_for_state(cfg)
     events_table, _ = _table_names(cfg)
     try:
@@ -714,8 +828,10 @@ def read_pending_outbound_event_mysql(cfg: AgentConfig, *, event_type: str) -> t
                         ),
                     )
             return None, "invalid_payload"
+        _mysql_backoff_clear(cfg)
         return raw, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return None, str(e)
 
 
@@ -728,6 +844,9 @@ def mark_outbound_event_mysql(
 ) -> tuple[bool, str]:
     if not mysql_state_enabled(cfg):
         return False, "mysql_state_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return False, preflight_msg
     host_name = _host_name_for_state(cfg)
     now_ts = datetime.now(timezone.utc).timestamp()
     events_table, _ = _table_names(cfg)
@@ -754,14 +873,19 @@ def mark_outbound_event_mysql(
                         """,
                         (float(now_ts), str(error or "delivery_failed")[:2000], host_name, event_id),
                     )
+        _mysql_backoff_clear(cfg)
         return True, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return False, str(e)
 
 
 def prune_outbound_events_mysql(cfg: AgentConfig, *, event_type: str, cutoff_ts: float) -> tuple[int, str]:
     if not mysql_state_enabled(cfg):
         return 0, "mysql_state_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return 0, preflight_msg
     host_name = _host_name_for_state(cfg)
     events_table, _ = _table_names(cfg)
     try:
@@ -780,8 +904,10 @@ def prune_outbound_events_mysql(cfg: AgentConfig, *, event_type: str, cutoff_ts:
                     (host_name, event_type, float(cutoff_ts)),
                 )
                 deleted = int(cur.rowcount or 0)
+        _mysql_backoff_clear(cfg)
         return deleted, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return 0, str(e)
 
 
@@ -796,6 +922,9 @@ def upsert_state_snapshot_mysql(
         return False, "mysql_state_disabled"
     if not bool(getattr(cfg, "state_mysql_snapshot_enabled", True)):
         return False, "snapshot_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return False, preflight_msg
 
     host_name = _host_name_for_state(cfg)
     _, snapshots_table = _table_names(cfg)
@@ -825,8 +954,10 @@ def upsert_state_snapshot_mysql(
                     """,
                     (host_name, payload_hash, payload_json, profile_name, int(instances_count), float(created_at)),
                 )
+        _mysql_backoff_clear(cfg)
         return True, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return False, str(e)
 
 
@@ -841,6 +972,9 @@ def mark_state_snapshot_push_result_mysql(
         return False, "mysql_state_disabled"
     if not bool(getattr(cfg, "state_mysql_snapshot_enabled", True)):
         return False, "snapshot_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return False, preflight_msg
 
     host_name = _host_name_for_state(cfg)
     _, snapshots_table = _table_names(cfg)
@@ -859,8 +993,10 @@ def mark_state_snapshot_push_result_mysql(
                     """,
                     (status, None if delivered else str(message or "")[:2000], host_name, payload_hash),
                 )
+        _mysql_backoff_clear(cfg)
         return True, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return False, str(e)
 
 
@@ -868,12 +1004,17 @@ def ensure_mysql_state_ready(cfg: AgentConfig) -> tuple[bool, str]:
     """Ensure state DB and schema exist and are reachable by runtime creds."""
     if not mysql_state_enabled(cfg):
         return False, "mysql_state_disabled"
+    ok_preflight, preflight_msg = _mysql_preflight(cfg)
+    if not ok_preflight:
+        return False, preflight_msg
     try:
         _ensure_mysql_database(cfg)
         with _mysql_conn(cfg) as conn:
             _ensure_mysql_schema(cfg, conn)
+        _mysql_backoff_clear(cfg)
         return True, "ok"
     except Exception as e:
+        _mysql_backoff_set(cfg, e)
         return False, str(e)
 
 

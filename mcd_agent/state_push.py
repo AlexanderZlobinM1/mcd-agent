@@ -49,6 +49,18 @@ _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/var/run/mysqld/mysqld.sock",
     "/run/mysqld/mysqld.sock",
 )
+_PROFILE_EVENT_EMPTY_UNTIL: dict[str, float] = {}
+
+
+def _profile_event_cache_key(cfg: AgentConfig) -> str:
+    return "|".join(
+        [
+            str(getattr(cfg, "state_db_path", "") or "").strip(),
+            str(getattr(cfg, "mcc_host_name", "") or "").strip(),
+            str(getattr(cfg, "state_mysql_host", "") or "").strip(),
+            str(getattr(cfg, "state_mysql_database", "") or "").strip(),
+        ]
+    )
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -159,6 +171,7 @@ def queue_profile_event(
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now_ts = time.time()
+    _PROFILE_EVENT_EMPTY_UNTIL.pop(_profile_event_cache_key(cfg), None)
     payload: dict[str, Any] = {
         "event_id": uuid.uuid4().hex,
         "source": (source or "mcd_cli"),
@@ -203,8 +216,15 @@ def queue_profile_event(
 
 
 def read_pending_profile_event(cfg: AgentConfig) -> dict[str, Any] | None:
+    now_ts = time.time()
+    cache_key = _profile_event_cache_key(cfg)
+    empty_until = float(_PROFILE_EVENT_EMPTY_UNTIL.get(cache_key, 0.0) or 0.0)
+    if now_ts < empty_until:
+        return None
+
     raw_mysql, mysql_msg = read_pending_outbound_event_mysql(cfg, event_type="profile_event")
     if isinstance(raw_mysql, dict):
+        _PROFILE_EVENT_EMPTY_UNTIL.pop(cache_key, None)
         return raw_mysql
     if mysql_msg not in {"mysql_state_disabled", "empty"}:
         logging.warning("outbound_events mysql read failed, fallback to sqlite: %s", mysql_msg)
@@ -221,10 +241,13 @@ def read_pending_profile_event(cfg: AgentConfig) -> dict[str, Any] | None:
             """
         ).fetchone()
         if row is None:
+            cooldown = max(5, min(60, int(getattr(cfg, "mcc_push_interval_sec", 10) or 10)))
+            _PROFILE_EVENT_EMPTY_UNTIL[cache_key] = now_ts + float(cooldown)
             return None
         payload_json = str(row["payload_json"] or "")
         raw = json.loads(payload_json)
         if isinstance(raw, dict):
+            _PROFILE_EVENT_EMPTY_UNTIL.pop(cache_key, None)
             return raw
         # Invalid payload in queue: mark failed and keep diagnostics.
         conn.execute(
@@ -240,6 +263,8 @@ def read_pending_profile_event(cfg: AgentConfig) -> dict[str, Any] | None:
         pass
     finally:
         conn.close()
+    cooldown = max(5, min(60, int(getattr(cfg, "mcc_push_interval_sec", 10) or 10)))
+    _PROFILE_EVENT_EMPTY_UNTIL[cache_key] = now_ts + float(cooldown)
     return None
 
 
@@ -253,6 +278,7 @@ def clear_pending_profile_event(
     target_id = (event_id or "").strip()
     if not target_id:
         return
+    _PROFILE_EVENT_EMPTY_UNTIL.pop(_profile_event_cache_key(cfg), None)
     mysql_ok, mysql_msg = mark_outbound_event_mysql(
         cfg,
         event_id=target_id,
@@ -1152,6 +1178,10 @@ class MCCStatePusher:
         self.latest_apt_probe_key = ""
         self.latest_cluster_db_state: dict[str, Any] | None = None
         self.latest_cluster_db_state_ts = 0.0
+        self.latest_state_backend: dict[str, Any] | None = None
+        self.latest_state_backend_ts = 0.0
+        self._last_snapshot_hash = ""
+        self._last_snapshot_ts = 0.0
         # Filesystem-permissions repair deltas.
         # We push deltas (not cumulative totals) so MCC 3-day aggregation
         # remains correct and stable across daemon restarts.
@@ -1264,6 +1294,15 @@ class MCCStatePusher:
         self.latest_cluster_db_state_ts = now_ts
         return dict(payload)
 
+    def _state_backend_payload(self, now_ts: float) -> dict[str, Any]:
+        interval = max(30, min(300, int(getattr(self.cfg, "mcc_push_interval_sec", 60) or 60)))
+        if self.latest_state_backend and (now_ts - self.latest_state_backend_ts) < interval:
+            return dict(self.latest_state_backend)
+        payload = state_backend_status(self.cfg, probe=True)
+        self.latest_state_backend = payload
+        self.latest_state_backend_ts = now_ts
+        return dict(payload)
+
     def should_push(self, now_ts: float, payload_no_ts: dict[str, Any]) -> tuple[bool, bool]:
         force_alert = False
         new_hash = _hash_payload(payload_no_ts)
@@ -1293,13 +1332,22 @@ class MCCStatePusher:
 
     def _store_state_snapshot(self, payload: dict[str, Any], now_ts: float) -> None:
         payload_hash = _hash_payload(payload)
+        interval = max(30, min(300, int(getattr(self.cfg, "mcc_push_interval_sec", 60) or 60)))
+        if (
+            self._last_snapshot_hash == payload_hash
+            and (now_ts - self._last_snapshot_ts) < interval
+        ):
+            return
         ok, msg = upsert_state_snapshot_mysql(
             self.cfg,
             payload=payload,
             payload_hash=payload_hash,
             created_at=now_ts,
         )
-        if not ok and msg not in {"mysql_state_disabled", "snapshot_disabled"}:
+        if ok:
+            self._last_snapshot_hash = payload_hash
+            self._last_snapshot_ts = now_ts
+        elif msg not in {"mysql_state_disabled", "snapshot_disabled"}:
             logging.warning("state snapshot mysql upsert failed: %s", msg)
 
     def build_payload(
@@ -1364,7 +1412,7 @@ class MCCStatePusher:
             "backup_profile": backup_profile_for_push(self.cfg),
             "apt_state": self._apt_state(now_ts),
             "cluster_db": self._cluster_db_state(now_ts),
-            "state_backend": state_backend_status(self.cfg, probe=True),
+            "state_backend": self._state_backend_payload(now_ts),
             "instances": instances,
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
