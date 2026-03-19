@@ -1381,11 +1381,13 @@ def _load_config_inner(path: str) -> AgentConfig:
             mcd_update_policy = "lts"
         elif ch in {"rc", "test"}:
             mcd_update_policy = "test"
+        elif ch == "cluster":
+            mcd_update_policy = "cluster"
         elif ch == "off":
             mcd_update_policy = "off"
         else:
             mcd_update_policy = "approved"
-    if mcd_update_policy not in {"off", "lts", "approved", "test"}:
+    if mcd_update_policy not in {"off", "lts", "approved", "test", "cluster"}:
         mcd_update_policy = "approved"
     m6_patch_policy = str(runtime.get("mautic6_core_patch_policy", "required")).strip().lower() or "required"
     if m6_patch_policy not in {"required", "off"}:

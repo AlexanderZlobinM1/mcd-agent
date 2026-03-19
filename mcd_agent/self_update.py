@@ -78,7 +78,7 @@ def _api_base(cfg: AgentConfig) -> str | None:
 
 def _update_policy(cfg: AgentConfig) -> str:
     p = (cfg.mcd_update_policy or "").strip().lower()
-    if p in {"off", "lts", "approved", "test"}:
+    if p in {"off", "lts", "approved", "test", "cluster"}:
         return p
     ch = (cfg.mcd_update_channel or "").strip().lower()
     if ch in {"stable", "approved"}:
@@ -87,6 +87,8 @@ def _update_policy(cfg: AgentConfig) -> str:
         return "test"
     if ch == "lts":
         return "lts"
+    if ch == "cluster":
+        return "cluster"
     if ch == "off":
         return "off"
     return "approved"

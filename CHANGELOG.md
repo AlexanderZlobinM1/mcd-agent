@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.8.41 - 2026-03-19
+- Added: new self-update policy/channel target `cluster` for controlled rollout streams.
+  - Agent policy resolver now accepts `cluster` alongside `approved/test/lts/off`.
+  - Legacy channel mapping now supports `mcd_update_channel=cluster`.
+  - `mcd-cli self-update` help reflects `cluster` channel support.
+- Purpose: enable dedicated rollout lane for cluster hosts without mixing them with generic approved/test/lts flows.
+
 ## 0.8.40 - 2026-03-19
 - Fixed: added guarded MySQL state backoff for `mysql_hybrid` state backend.
   - On repeated MySQL failures, state operations now enter timed backoff (`mysql_backoff_active`) instead of retrying every loop.
