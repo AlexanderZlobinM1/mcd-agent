@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.45 - 2026-03-21
+- Fixed: Zabbix MySQL bootstrap now supports hosts where `root@localhost` requires password.
+  - Added safe fallback DB admin credential source from `/etc/mysql/debian.cnf` (`[client]` section).
+  - Bootstrap probe/apply now tries:
+    1. socket auth as local root (`root_socket`),
+    2. distro-maintained DB admin from `debian.cnf` (`debian_cnf`).
+  - Result: one-shot `zbx_monitor@127.0.0.1` bootstrap can complete on mixed MariaDB/MySQL auth layouts without manual SQL.
+
 ## 0.8.44 - 2026-03-20
 - Added: one-time Zabbix MySQL monitor bootstrap in agent APT workflow.
   - Agent can now create/grant `zbx_monitor@127.0.0.1` idempotently with marker tracking.

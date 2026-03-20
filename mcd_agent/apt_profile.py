@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 from datetime import datetime, timezone
 import json
 import os
@@ -455,12 +456,49 @@ def _run_mysql_root_sql(sql: str, *, timeout_sec: int = 20) -> tuple[bool, str]:
     mysql_bin = _mysql_client_bin()
     if not mysql_bin:
         return False, "mysql_client_not_found"
-    cmd = [mysql_bin, "--batch", "--skip-column-names", "--protocol=socket", "-e", sql]
-    proc = _run(cmd, timeout_sec=timeout_sec)
-    if proc.returncode == 0:
-        return True, (proc.stdout or "").strip()
-    detail = (proc.stderr or proc.stdout or "").strip()
-    return False, detail or f"mysql_exec_failed_rc_{proc.returncode}"
+    candidates: list[dict[str, str]] = [{"label": "root_socket", "user": "", "password": "", "socket": ""}]
+    # Some hosts use password-protected root; fallback to distro-maintained DB admin creds.
+    debian_cnf = Path("/etc/mysql/debian.cnf")
+    if debian_cnf.exists() and debian_cnf.is_file():
+        try:
+            parser = configparser.RawConfigParser(interpolation=None)
+            parser.read(debian_cnf, encoding="utf-8")
+            sec = "client" if parser.has_section("client") else ""
+            user = parser.get(sec, "user", fallback="").strip() if sec else ""
+            password = parser.get(sec, "password", fallback="").strip() if sec else ""
+            socket = parser.get(sec, "socket", fallback="").strip() if sec else ""
+            if user:
+                candidates.append(
+                    {
+                        "label": "debian_cnf",
+                        "user": user,
+                        "password": password,
+                        "socket": socket,
+                    }
+                )
+        except Exception:
+            pass
+
+    errors: list[str] = []
+    for cand in candidates:
+        cmd = [mysql_bin, "--batch", "--skip-column-names", "--protocol=socket"]
+        user = str(cand.get("user", "")).strip()
+        password = str(cand.get("password", ""))
+        socket = str(cand.get("socket", "")).strip()
+        if socket:
+            cmd.extend(["--socket", socket])
+        if user:
+            cmd.extend(["-u", user])
+        if password:
+            cmd.append(f"-p{password}")
+        cmd.extend(["-e", sql])
+        proc = _run(cmd, timeout_sec=timeout_sec)
+        if proc.returncode == 0:
+            return True, (proc.stdout or "").strip()
+        detail = (proc.stderr or proc.stdout or "").strip() or f"mysql_exec_failed_rc_{proc.returncode}"
+        errors.append(f"{cand.get('label', 'unknown')}:{detail}")
+
+    return False, " | ".join(errors[:3])
 
 
 def _mysql_user_exists(user: str, host: str, *, timeout_sec: int = 12) -> tuple[bool | None, str]:
