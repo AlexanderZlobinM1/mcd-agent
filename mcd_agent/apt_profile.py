@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -394,7 +396,280 @@ def _run_mariadb_repo_setup(version: str, *, timeout_sec: int) -> tuple[bool, st
     return False, msg or f"mariadb_repo_setup:{v} failed"
 
 
-def collect_apt_state(*, timeout_sec: int = 45) -> dict[str, Any]:
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _zbx_marker_path(cfg: Any | None = None) -> Path:
+    if cfg is not None:
+        state_db = str(getattr(cfg, "state_db_path", "") or "").strip()
+        if state_db:
+            return Path(state_db).parent / "zabbix-mysql-bootstrap.json"
+    return Path("/opt/mcd/var/zabbix-mysql-bootstrap.json")
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _mysql_client_bin() -> str | None:
+    for name in ("mariadb", "mysql"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _sql_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "''")
+
+
+def _normalize_grants(raw: Any) -> list[str]:
+    default = ["REPLICATION CLIENT", "PROCESS", "SHOW DATABASES", "SHOW VIEW"]
+    if not isinstance(raw, list):
+        return default
+    out: list[str] = []
+    for item in raw:
+        s = str(item or "").strip().upper()
+        if not s:
+            continue
+        if not re.match(r"^[A-Z_ ]+$", s):
+            continue
+        out.append(s)
+    return out or default
+
+
+def _run_mysql_root_sql(sql: str, *, timeout_sec: int = 20) -> tuple[bool, str]:
+    mysql_bin = _mysql_client_bin()
+    if not mysql_bin:
+        return False, "mysql_client_not_found"
+    cmd = [mysql_bin, "--batch", "--skip-column-names", "--protocol=socket", "-e", sql]
+    proc = _run(cmd, timeout_sec=timeout_sec)
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip()
+    detail = (proc.stderr or proc.stdout or "").strip()
+    return False, detail or f"mysql_exec_failed_rc_{proc.returncode}"
+
+
+def _mysql_user_exists(user: str, host: str, *, timeout_sec: int = 12) -> tuple[bool | None, str]:
+    sql = (
+        "SELECT 1 FROM mysql.user "
+        f"WHERE User='{_sql_escape(user)}' AND Host='{_sql_escape(host)}' LIMIT 1;"
+    )
+    ok, detail = _run_mysql_root_sql(sql, timeout_sec=timeout_sec)
+    if not ok:
+        return None, detail
+    exists = any(x.strip() == "1" for x in (detail or "").splitlines())
+    return exists, ""
+
+
+def collect_zabbix_mysql_monitor_state(*, cfg: Any | None = None) -> dict[str, Any]:
+    marker_path = _zbx_marker_path(cfg)
+    marker = _read_json(marker_path)
+    out = {
+        "status": str(marker.get("last_status", "unknown") or "unknown"),
+        "applied": bool(marker.get("applied", False)),
+        "user": str(marker.get("user", "zbx_monitor") or "zbx_monitor"),
+        "host": str(marker.get("host", "127.0.0.1") or "127.0.0.1"),
+        "attempted_at_utc": str(marker.get("attempted_at_utc", "") or ""),
+        "applied_at_utc": str(marker.get("applied_at_utc", "") or ""),
+        "last_error": str(marker.get("last_error", "") or ""),
+        "marker_path": str(marker_path),
+    }
+    return out
+
+
+def ensure_zabbix_mysql_monitor_user(
+    profile: dict[str, Any] | None,
+    *,
+    cfg: Any | None = None,
+    force: bool = False,
+    timeout_sec: int = 20,
+) -> dict[str, Any]:
+    prof = profile if isinstance(profile, dict) else {}
+    enabled = _bool(prof.get("zabbix_mysql_monitor_enabled"), True)
+    user = str(prof.get("zabbix_mysql_monitor_user", "zbx_monitor") or "zbx_monitor").strip() or "zbx_monitor"
+    host = str(prof.get("zabbix_mysql_monitor_host", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1"
+    password = str(prof.get("zabbix_mysql_monitor_password", "zbx_monitor") or "zbx_monitor")
+    grants = _normalize_grants(prof.get("zabbix_mysql_monitor_grants"))
+    apply_once = _bool(prof.get("zabbix_mysql_monitor_apply_once"), True)
+    marker_path = _zbx_marker_path(cfg)
+    marker = _read_json(marker_path)
+
+    if not enabled:
+        result = {
+            "status": "disabled",
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+            "reason": "zabbix_mysql_monitor_disabled",
+        }
+        marker.update(
+            {
+                "last_status": "disabled",
+                "user": user,
+                "host": host,
+                "attempted_at_utc": _now_utc_iso(),
+                "last_error": "",
+            }
+        )
+        _write_json(marker_path, marker)
+        return result
+
+    if apply_once and not force and bool(marker.get("applied", False)):
+        return {
+            "status": "noop",
+            "reason": "already_applied_once",
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+            "applied_at_utc": str(marker.get("applied_at_utc", "") or ""),
+        }
+
+    exists_before, exists_err = _mysql_user_exists(user, host, timeout_sec=max(5, int(timeout_sec)))
+    if exists_before is True:
+        marker.update(
+            {
+                "last_status": "already_present",
+                "applied": True,
+                "user": user,
+                "host": host,
+                "attempted_at_utc": _now_utc_iso(),
+                "applied_at_utc": str(marker.get("applied_at_utc") or _now_utc_iso()),
+                "last_error": "",
+            }
+        )
+        _write_json(marker_path, marker)
+        return {
+            "status": "already_present",
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+            "user_exists_before": True,
+            "user_exists_after": True,
+        }
+    if exists_before is None:
+        marker.update(
+            {
+                "last_status": "error",
+                "applied": bool(marker.get("applied", False)),
+                "user": user,
+                "host": host,
+                "attempted_at_utc": _now_utc_iso(),
+                "last_error": str(exists_err or "mysql_user_probe_failed"),
+            }
+        )
+        _write_json(marker_path, marker)
+        return {
+            "status": "error",
+            "reason": str(exists_err or "mysql_user_probe_failed"),
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+        }
+
+    if apply_once and not force and bool(marker.get("attempted_once", False)):
+        return {
+            "status": "skipped",
+            "reason": "already_attempted_once",
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+            "last_status": str(marker.get("last_status", "") or ""),
+            "last_error": str(marker.get("last_error", "") or ""),
+        }
+
+    grants_sql = ", ".join(grants)
+    sql = "\n".join(
+        [
+            f"CREATE USER IF NOT EXISTS '{_sql_escape(user)}'@'{_sql_escape(host)}' IDENTIFIED BY '{_sql_escape(password)}';",
+            f"GRANT {grants_sql} ON *.* TO '{_sql_escape(user)}'@'{_sql_escape(host)}';",
+            "FLUSH PRIVILEGES;",
+        ]
+    )
+    ok, detail = _run_mysql_root_sql(sql, timeout_sec=max(8, int(timeout_sec)))
+    attempted_at = _now_utc_iso()
+    if not ok:
+        marker.update(
+            {
+                "last_status": "error",
+                "applied": bool(marker.get("applied", False)),
+                "user": user,
+                "host": host,
+                "attempted_at_utc": attempted_at,
+                "attempted_once": bool(apply_once) or bool(marker.get("attempted_once", False)),
+                "last_error": str(detail or "mysql_exec_failed"),
+            }
+        )
+        _write_json(marker_path, marker)
+        return {
+            "status": "error",
+            "reason": str(detail or "mysql_exec_failed"),
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+        }
+
+    exists_after, verify_err = _mysql_user_exists(user, host, timeout_sec=max(5, int(timeout_sec)))
+    if exists_after is not True:
+        reason = str(verify_err or "mysql_user_not_visible_after_apply")
+        marker.update(
+            {
+                "last_status": "error",
+                "applied": False,
+                "user": user,
+                "host": host,
+                "attempted_at_utc": attempted_at,
+                "attempted_once": bool(apply_once) or bool(marker.get("attempted_once", False)),
+                "last_error": reason,
+            }
+        )
+        _write_json(marker_path, marker)
+        return {
+            "status": "error",
+            "reason": reason,
+            "user": user,
+            "host": host,
+            "marker_path": str(marker_path),
+        }
+
+    marker.update(
+        {
+            "last_status": "applied",
+            "applied": True,
+            "user": user,
+            "host": host,
+            "attempted_at_utc": attempted_at,
+            "applied_at_utc": _now_utc_iso(),
+            "attempted_once": bool(apply_once) or bool(marker.get("attempted_once", False)),
+            "last_error": "",
+        }
+    )
+    _write_json(marker_path, marker)
+    return {
+        "status": "applied",
+        "user": user,
+        "host": host,
+        "marker_path": str(marker_path),
+        "user_exists_before": False,
+        "user_exists_after": True,
+        "grants": grants,
+    }
+
+
+def collect_apt_state(*, timeout_sec: int = 45, cfg: Any | None = None) -> dict[str, Any]:
     pending_info, pending_err = _pending_updates(timeout_sec=max(10, int(timeout_sec)))
     pending = int(pending_info.get("pending_updates", 0) or 0)
     pending_total = int(pending_info.get("pending_total", pending) or pending)
@@ -435,14 +710,21 @@ def collect_apt_state(*, timeout_sec: int = 45) -> dict[str, Any]:
         "phasing_packages": list(pending_info.get("phasing_packages", []) or [])[:200],
         "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "zabbix_mysql_monitor": collect_zabbix_mysql_monitor_state(cfg=cfg),
     }
 
 
-def apply_apt_profile(profile: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+def apply_apt_profile(
+    profile: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    cfg: Any | None = None,
+    force_zabbix_bootstrap: bool = False,
+) -> dict[str, Any]:
     if profile is None:
         profile = {}
     if dry_run:
-        current = collect_apt_state(timeout_sec=25)
+        current = collect_apt_state(timeout_sec=25, cfg=cfg)
         return {
             "status": "planned",
             "actions": [
@@ -451,6 +733,7 @@ def apply_apt_profile(profile: dict[str, Any], *, dry_run: bool = False) -> dict
                 "repair_repos_on_error",
                 "apt_update",
                 "optional_package_ops",
+                "zabbix_mysql_monitor_bootstrap",
             ],
             "current": current,
         }
@@ -570,7 +853,22 @@ def apply_apt_profile(profile: dict[str, Any], *, dry_run: bool = False) -> dict
         else:
             errors.append((p.stderr or p.stdout or "apt dist-upgrade failed").strip())
 
-    state = collect_apt_state(timeout_sec=45)
+    zbx_result = ensure_zabbix_mysql_monitor_user(
+        profile,
+        cfg=cfg,
+        force=bool(force_zabbix_bootstrap),
+        timeout_sec=max(8, int(refresh_timeout_sec)),
+    )
+    zbx_status = str(zbx_result.get("status", "") or "").strip().lower()
+    if zbx_status in {"applied", "already_present", "noop", "disabled", "skipped"}:
+        actions.append(f"zabbix_mysql_monitor:{zbx_status}")
+    elif zbx_status == "error":
+        errors.append(f"zabbix_mysql_monitor:{str(zbx_result.get('reason', 'unknown_error'))}")
+    else:
+        actions.append(f"zabbix_mysql_monitor:{zbx_status or 'unknown'}")
+
+    state = collect_apt_state(timeout_sec=45, cfg=cfg)
+    state["zabbix_mysql_monitor"] = zbx_result
     if errors:
         # Preserve explicit action errors together with state-derived errors.
         merged = list(errors)

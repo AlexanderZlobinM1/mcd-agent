@@ -1279,7 +1279,7 @@ class MCCStatePusher:
             and (now_ts - self.latest_apt_state_ts) < interval
         ):
             return dict(self.latest_apt_state)
-        payload = collect_apt_state(timeout_sec=30)
+        payload = collect_apt_state(timeout_sec=30, cfg=self.cfg)
         self.latest_apt_state = payload
         self.latest_apt_state_ts = now_ts
         self.latest_apt_probe_key = probe_key

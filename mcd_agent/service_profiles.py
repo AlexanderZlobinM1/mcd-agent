@@ -562,5 +562,5 @@ def service_profiles_apply_once(
     else:
         if os.geteuid() != 0:
             raise RuntimeError("service-profile apply requires root")
-        applied = apply_apt_profile(profile, dry_run=dry_run)
+        applied = apply_apt_profile(profile, dry_run=dry_run, cfg=cfg)
     return {"status": "ok", "fetch": fetched, "apply": applied}

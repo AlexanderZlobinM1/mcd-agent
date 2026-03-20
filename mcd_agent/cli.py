@@ -25,6 +25,7 @@ from mcd_agent.backup import (
     backup_run,
     backup_status,
 )
+from mcd_agent.apt_profile import collect_apt_state, ensure_zabbix_mysql_monitor_user
 from mcd_agent.config import load_config
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
@@ -1207,6 +1208,12 @@ def _build_parser() -> argparse.ArgumentParser:
     svc.add_argument("--dry-run", action="store_true")
     svc.add_argument("--json", action="store_true")
 
+    zbx = sub.add_parser("zabbix", help="Zabbix helper operations")
+    zbx.add_argument("--config", default=default_cfg)
+    zbx.add_argument("op", choices=["status", "bootstrap-mysql-user"], nargs="?", default="status")
+    zbx.add_argument("--force", action="store_true", help="Force rerun even if one-time marker exists")
+    zbx.add_argument("--json", action="store_true")
+
     ro = sub.add_parser("runtime-overrides", help="Runtime overrides sync with MCC")
     ro.add_argument("--config", default=default_cfg)
     ro.add_argument("op", choices=["show", "fetch", "push", "trigger", "status"], nargs="?", default="show")
@@ -1650,6 +1657,35 @@ def main() -> int:
         if ok and not bool(args.dry_run):
             _push_state_after_change(cfg, f"service-profile-{comp}-apply")
         return 0 if ok else 1
+
+    if args.cmd == "zabbix":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        op = str(args.op or "status").strip().lower()
+        if op == "status":
+            payload = collect_apt_state(timeout_sec=25, cfg=cfg)
+            zbx_state = payload.get("zabbix_mysql_monitor") if isinstance(payload, dict) else {}
+            out = {"status": "ok", "zabbix_mysql_monitor": zbx_state}
+            print(json.dumps(out, ensure_ascii=True, indent=2))
+            return 0
+
+        fetched = fetch_service_profile(cfg, "apt")
+        profile = fetched.get("profile") if isinstance(fetched, dict) else None
+        if not isinstance(profile, dict):
+            profile = {}
+        res = ensure_zabbix_mysql_monitor_user(profile, cfg=cfg, force=bool(args.force), timeout_sec=20)
+        out = {
+            "status": "ok" if str(res.get("status", "")).strip().lower() in {"applied", "already_present", "noop", "skipped", "disabled"} else "error",
+            "fetch_status": str(fetched.get("status", "n/a")) if isinstance(fetched, dict) else "n/a",
+            "result": res,
+        }
+        print(json.dumps(out, ensure_ascii=True, indent=2))
+        if out["status"] == "ok":
+            _push_state_after_change(cfg, "zabbix-bootstrap-mysql-user")
+            return 0
+        return 1
 
     if args.cmd == "runtime-overrides":
         cfg = load_config(args.config)

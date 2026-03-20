@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.8.44 - 2026-03-20
+- Added: one-time Zabbix MySQL monitor bootstrap in APT service-profile flow.
+  - Agent can now create/grant `zbx_monitor@127.0.0.1` idempotently with marker tracking.
+  - SQL is applied once by default (`zabbix_mysql_monitor_apply_once=true`) and does not loop every hour.
+  - Result is persisted in marker file (`/opt/mcd/var/zabbix-mysql-bootstrap.json`, or state-dir-relative path).
+- Added: dedicated CLI helper:
+  - `mcd-cli zabbix status`
+  - `mcd-cli zabbix bootstrap-mysql-user [--force]`
+- Changed: `apt_state` payload now includes `zabbix_mysql_monitor` state block for MCC visibility.
+- Changed: APT profile apply accepts agent config context and includes zabbix bootstrap status in apply result.
+
 ## 0.8.43 - 2026-03-20
 - Fixed: service-profile auto-apply is now idempotent for unchanged payloads.
   - `php_fpm` apply returns `noop` and does not run reload/restart when managed files are unchanged.

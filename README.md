@@ -179,9 +179,12 @@ Manual command behavior:
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component mysql`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml fetch --component apt --json`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component apt --dry-run`
+- `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml status --json`
+- `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml bootstrap-mysql-user`
 
 Notes:
 - `php_fpm` apply now includes both FPM pool/opcache/redis tuning and global PHP ini baseline (`98-mcd-php.ini` for FPM/CLI).
+- APT profile includes one-time Zabbix DB monitor bootstrap (`zbx_monitor@127.0.0.1`) with marker tracking and manual override via `mcd-cli zabbix bootstrap-mysql-user --force`.
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`
