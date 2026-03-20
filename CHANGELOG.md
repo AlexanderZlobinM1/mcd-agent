@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.8.42 - 2026-03-20
+- Added: backup storage free-space snapshot on backup completion.
+  - `backup.run` now captures storage usage (`total/used/free/used_pct`) at the end of a successful backup run.
+  - Snapshot is persisted in backup state and backup marker metadata for MCC ingest.
+- Added: backup push payload fields for storage snapshot telemetry:
+  - `last_storage_checked_at`
+  - `last_storage_total_bytes`
+  - `last_storage_used_bytes`
+  - `last_storage_free_bytes`
+  - `last_storage_used_pct`
+- Purpose: enable MCC dashboard backup free-space semaphore based on real backup-target usage, without continuous polling.
+
 ## 0.8.41 - 2026-03-19
 - Added: new self-update policy/channel target `cluster` for controlled rollout streams.
   - Agent policy resolver now accepts `cluster` alongside `approved/test/lts/off`.

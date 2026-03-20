@@ -146,6 +146,24 @@ def _verify_dump_dir(path: Path) -> tuple[bool, str, int]:
     return True, "ok", total
 
 
+def _storage_usage(path: Path) -> dict[str, Any] | None:
+    try:
+        du = shutil.disk_usage(path)
+    except Exception:
+        return None
+    total = int(getattr(du, "total", 0) or 0)
+    used = int(getattr(du, "used", 0) or 0)
+    free = int(getattr(du, "free", 0) or 0)
+    used_pct = (float(used) / float(total) * 100.0) if total > 0 else 0.0
+    return {
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+        "used_pct": round(used_pct, 2),
+        "checked_at": _utc_now_iso(),
+    }
+
+
 def _archive_files(cfg: AgentConfig, out_dir: Path) -> None:
     if not cfg.backup_archive_enabled:
         return
@@ -813,6 +831,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").strip().lower() == "ok":
                 duration = int(time.monotonic() - start_monotonic)
+                storage_usage = _storage_usage(mount_path)
                 existing_bytes: int | None
                 try:
                     existing_bytes = int(marker.get("bytes_written")) if marker.get("bytes_written") is not None else None
@@ -840,6 +859,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 )
                 if existing_bytes is not None:
                     success_state["last_bytes_written"] = existing_bytes
+                if isinstance(storage_usage, dict):
+                    success_state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
+                    success_state["last_storage_used_bytes"] = int(storage_usage.get("used_bytes") or 0)
+                    success_state["last_storage_free_bytes"] = int(storage_usage.get("free_bytes") or 0)
+                    success_state["last_storage_used_pct"] = float(storage_usage.get("used_pct") or 0.0)
+                    success_state["last_storage_checked_at"] = str(storage_usage.get("checked_at") or "")
                 _json_write(state_path, success_state)
                 return BackupResult(
                     ok=True,
@@ -885,6 +910,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
         bytes_written = total_bytes
 
         os.replace(tmp_dir, final_dir)
+        storage_usage = _storage_usage(mount_path)
         marker = {
             "status": "ok",
             "ts_utc": _utc_now_iso(),
@@ -896,6 +922,14 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "dumped_instances": dumped,
             "mydumper_threads": cfg.backup_mydumper_threads,
         }
+        if isinstance(storage_usage, dict):
+            marker["storage"] = {
+                "total_bytes": int(storage_usage.get("total_bytes") or 0),
+                "used_bytes": int(storage_usage.get("used_bytes") or 0),
+                "free_bytes": int(storage_usage.get("free_bytes") or 0),
+                "used_pct": float(storage_usage.get("used_pct") or 0.0),
+                "checked_at": str(storage_usage.get("checked_at") or ""),
+            }
         _write_marker(final_dir, marker)
 
         duration = int(time.monotonic() - start_monotonic)
@@ -920,6 +954,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 "history": history,
             }
         )
+        if isinstance(storage_usage, dict):
+            success_state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
+            success_state["last_storage_used_bytes"] = int(storage_usage.get("used_bytes") or 0)
+            success_state["last_storage_free_bytes"] = int(storage_usage.get("free_bytes") or 0)
+            success_state["last_storage_used_pct"] = float(storage_usage.get("used_pct") or 0.0)
+            success_state["last_storage_checked_at"] = str(storage_usage.get("checked_at") or "")
         _json_write(state_path, success_state)
         return BackupResult(
             ok=True,
@@ -1112,6 +1152,11 @@ def backup_state_for_push(config: AgentConfig) -> dict[str, Any]:
         "last_restore_status": st.get("last_restore_status"),
         "last_restore_error": st.get("last_restore_error"),
         "last_restore_path": st.get("last_restore_path"),
+        "last_storage_checked_at": st.get("last_storage_checked_at"),
+        "last_storage_total_bytes": st.get("last_storage_total_bytes"),
+        "last_storage_used_bytes": st.get("last_storage_used_bytes"),
+        "last_storage_free_bytes": st.get("last_storage_free_bytes"),
+        "last_storage_used_pct": st.get("last_storage_used_pct"),
     }
 
 
