@@ -435,6 +435,16 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
         if _write_file(_SYSCTL_PATH, sysctl_content):
             changed.append(str(_SYSCTL_PATH))
 
+        if not changed:
+            return {
+                "status": "noop",
+                "php_version": php_ver,
+                "php_fpm_bin": php_bin,
+                "service_name": service_name,
+                "pool": pool_name,
+                "changed_files": [],
+            }
+
         proc_t = subprocess.run([php_bin, "-tt"], capture_output=True, text=True)
         if proc_t.returncode != 0:
             raise RuntimeError((proc_t.stderr or proc_t.stdout or "php-fpm -tt failed").strip())
@@ -494,6 +504,15 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
     try:
         if _write_file(dropin, content):
             changed.append(str(dropin))
+
+        if not changed:
+            return {
+                "status": "noop",
+                "engine": engine,
+                "service_name": service_name,
+                "changed_files": [],
+            }
+
         proc_reload = subprocess.run(["systemctl", "reload", service_name], capture_output=True, text=True)
         if proc_reload.returncode != 0:
             proc_restart = subprocess.run(["systemctl", "restart", service_name], capture_output=True, text=True)

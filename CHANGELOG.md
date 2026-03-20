@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.43 - 2026-03-20
+- Fixed: service-profile auto-apply is now idempotent for unchanged payloads.
+  - `php_fpm` apply returns `noop` and does not run reload/restart when managed files are unchanged.
+  - `mysql` apply returns `noop` and does not run reload/restart when managed drop-in is unchanged.
+- Impact: prevents unnecessary hourly MariaDB restarts when `service_profiles_auto_apply=true` and profile content is unchanged.
+
 ## 0.8.42 - 2026-03-20
 - Added: backup storage free-space snapshot on backup completion.
   - `backup.run` now captures storage usage (`total/used/free/used_pct`) at the end of a successful backup run.
