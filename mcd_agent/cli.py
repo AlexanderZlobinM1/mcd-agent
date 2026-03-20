@@ -1665,7 +1665,7 @@ def main() -> int:
             print(f"NOTICE: {note}")
         op = str(args.op or "status").strip().lower()
         if op == "status":
-            payload = collect_apt_state(timeout_sec=25, cfg=cfg)
+            payload = collect_apt_state(timeout_sec=25, cfg=cfg, auto_bootstrap_zabbix=False)
             zbx_state = payload.get("zabbix_mysql_monitor") if isinstance(payload, dict) else {}
             out = {"status": "ok", "zabbix_mysql_monitor": zbx_state}
             print(json.dumps(out, ensure_ascii=True, indent=2))

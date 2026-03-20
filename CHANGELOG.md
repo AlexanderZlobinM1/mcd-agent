@@ -1,10 +1,11 @@
 # MCD Changelog
 
 ## 0.8.44 - 2026-03-20
-- Added: one-time Zabbix MySQL monitor bootstrap in APT service-profile flow.
+- Added: one-time Zabbix MySQL monitor bootstrap in agent APT workflow.
   - Agent can now create/grant `zbx_monitor@127.0.0.1` idempotently with marker tracking.
   - SQL is applied once by default (`zabbix_mysql_monitor_apply_once=true`) and does not loop every hour.
   - Result is persisted in marker file (`/opt/mcd/var/zabbix-mysql-bootstrap.json`, or state-dir-relative path).
+- Added: automatic one-shot bootstrap attempt in periodic `apt_state` collection (for new hosts), with manual retry via CLI.
 - Added: dedicated CLI helper:
   - `mcd-cli zabbix status`
   - `mcd-cli zabbix bootstrap-mysql-user [--force]`

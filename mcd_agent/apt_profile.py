@@ -568,6 +568,7 @@ def ensure_zabbix_mysql_monitor_user(
                 "user": user,
                 "host": host,
                 "attempted_at_utc": _now_utc_iso(),
+                "attempted_once": bool(apply_once) or bool(marker.get("attempted_once", False)),
                 "last_error": str(exists_err or "mysql_user_probe_failed"),
             }
         )
@@ -669,7 +670,12 @@ def ensure_zabbix_mysql_monitor_user(
     }
 
 
-def collect_apt_state(*, timeout_sec: int = 45, cfg: Any | None = None) -> dict[str, Any]:
+def collect_apt_state(
+    *,
+    timeout_sec: int = 45,
+    cfg: Any | None = None,
+    auto_bootstrap_zabbix: bool = True,
+) -> dict[str, Any]:
     pending_info, pending_err = _pending_updates(timeout_sec=max(10, int(timeout_sec)))
     pending = int(pending_info.get("pending_updates", 0) or 0)
     pending_total = int(pending_info.get("pending_total", pending) or pending)
@@ -695,6 +701,11 @@ def collect_apt_state(*, timeout_sec: int = 45, cfg: Any | None = None) -> dict[
         level = 2
     else:
         level = 5
+    zbx_payload = (
+        ensure_zabbix_mysql_monitor_user({}, cfg=cfg, force=False, timeout_sec=min(12, max(5, int(timeout_sec))))
+        if bool(auto_bootstrap_zabbix)
+        else collect_zabbix_mysql_monitor_state(cfg=cfg)
+    )
     return {
         "status": status,
         "level": level,
@@ -710,7 +721,7 @@ def collect_apt_state(*, timeout_sec: int = 45, cfg: Any | None = None) -> dict[
         "phasing_packages": list(pending_info.get("phasing_packages", []) or [])[:200],
         "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "zabbix_mysql_monitor": collect_zabbix_mysql_monitor_state(cfg=cfg),
+        "zabbix_mysql_monitor": zbx_payload,
     }
 
 
@@ -724,7 +735,7 @@ def apply_apt_profile(
     if profile is None:
         profile = {}
     if dry_run:
-        current = collect_apt_state(timeout_sec=25, cfg=cfg)
+        current = collect_apt_state(timeout_sec=25, cfg=cfg, auto_bootstrap_zabbix=False)
         return {
             "status": "planned",
             "actions": [
@@ -867,7 +878,7 @@ def apply_apt_profile(
     else:
         actions.append(f"zabbix_mysql_monitor:{zbx_status or 'unknown'}")
 
-    state = collect_apt_state(timeout_sec=45, cfg=cfg)
+    state = collect_apt_state(timeout_sec=45, cfg=cfg, auto_bootstrap_zabbix=False)
     state["zabbix_mysql_monitor"] = zbx_result
     if errors:
         # Preserve explicit action errors together with state-derived errors.
