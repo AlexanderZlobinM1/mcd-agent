@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.48 - 2026-03-21
+- Fixed: Zabbix MySQL bootstrap now also tries MCD runtime state DB credentials as an additional DB-admin source.
+  - Added `runtime_state` candidate in SQL execution path (`state_mysql_user/password/socket/host/port`).
+  - Existing admin source order remains: root socket -> `debian.cnf` -> runtime state credentials.
+  - Purpose: recover hosts where root socket and `debian.cnf` auth are unavailable but MCD has valid local DB credentials.
+
 ## 0.8.47 - 2026-03-21
 - Fixed: Zabbix MySQL bootstrap fallback now scans all `/etc/mysql/debian.cnf` sections (not only `[client]`) for DB admin credentials.
   - Agent now tries all unique `(user,password,socket)` combinations from defaults and named sections.
