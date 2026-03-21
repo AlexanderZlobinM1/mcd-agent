@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from typing import Any
 
@@ -171,6 +173,69 @@ def _resolved_mysql_unix_socket(cfg: AgentConfig, *, host: str | None, password:
         if os.path.exists(cand):
             return cand
     return None
+
+
+def _mysql_cli_bin() -> str | None:
+    for name in ("mariadb", "mysql"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _sql_escape_lit(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "''")
+
+
+def _sql_escape_ident(value: str) -> str:
+    return str(value).replace("`", "``")
+
+
+def _is_latin1_encode_error(exc: Exception) -> bool:
+    txt = str(exc or "").lower()
+    return "latin-1" in txt and "can't encode" in txt
+
+
+def _run_mysql_admin_sql_cli(
+    *,
+    sql: str,
+    admin_user: str,
+    admin_password: str,
+    admin_host: str,
+    admin_port: int,
+    admin_unix_socket: str | None,
+    timeout_sec: int = 20,
+) -> tuple[bool, str]:
+    mysql_bin = _mysql_cli_bin()
+    if not mysql_bin:
+        return False, "mysql_cli_not_found"
+
+    cmd: list[str] = [mysql_bin, "--batch", "--skip-column-names", "-u", str(admin_user or "").strip()]
+    if admin_unix_socket:
+        cmd.extend(["--protocol=socket", "--socket", str(admin_unix_socket)])
+    else:
+        cmd.extend(["--protocol=tcp", "-h", str(admin_host or "").strip() or "localhost", "-P", str(int(admin_port or 3306))])
+    cmd.extend(["-e", sql])
+
+    env = dict(os.environ)
+    if str(admin_password or "") != "":
+        env["MYSQL_PWD"] = str(admin_password)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=max(5, int(timeout_sec)),
+            env=env,
+        )
+    except Exception as e:
+        return False, str(e)
+
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip()
+    return False, ((proc.stderr or proc.stdout) or "").strip() or f"mysql_cli_failed_rc_{proc.returncode}"
 
 
 def _safe_db_name(raw: str | None) -> str:
@@ -426,14 +491,30 @@ def create_state_database_with_admin(
     if not (rt_host or rt_socket):
         return False, "runtime host/socket is required"
 
-    def _esc(v: str) -> str:
-        return v.replace("`", "``").replace("'", "''")
-
     try:
         admin_pwd = str(admin_password or "")
         admin_sock = str(admin_unix_socket or "").strip() or _resolved_mysql_unix_socket(
             cfg, host=host, password=admin_pwd
         )
+        db_ident = _sql_escape_ident(db_name)
+        rt_user_lit = _sql_escape_lit(rt_user)
+        rt_pwd_lit = _sql_escape_lit(rt_pwd)
+        admin_sql_statements: list[str] = [
+            f"CREATE DATABASE IF NOT EXISTS `{db_ident}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        ]
+        for host_pat in ("localhost", "127.0.0.1"):
+            hp_lit = _sql_escape_lit(host_pat)
+            admin_sql_statements.extend(
+                [
+                    f"CREATE USER IF NOT EXISTS '{rt_user_lit}'@'{hp_lit}' IDENTIFIED BY '{rt_pwd_lit}'",
+                    f"ALTER USER '{rt_user_lit}'@'{hp_lit}' IDENTIFIED BY '{rt_pwd_lit}'",
+                    f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX "
+                    f"ON `{db_ident}`.* TO '{rt_user_lit}'@'{hp_lit}'",
+                ]
+            )
+        admin_sql_statements.append("FLUSH PRIVILEGES")
+        admin_sql = ";\n".join(admin_sql_statements) + ";"
+
         admin_kwargs: dict[str, Any] = {
             "user": user,
             "password": admin_pwd,
@@ -449,26 +530,29 @@ def create_state_database_with_admin(
         else:
             admin_kwargs["host"] = host
             admin_kwargs["port"] = port
-        with pymysql.connect(**admin_kwargs) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"CREATE DATABASE IF NOT EXISTS `{_esc(db_name)}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        admin_phase_err: Exception | None = None
+        try:
+            with pymysql.connect(**admin_kwargs) as conn:
+                with conn.cursor() as cur:
+                    for stmt in admin_sql_statements:
+                        cur.execute(stmt)
+        except Exception as e:
+            admin_phase_err = e
+        if admin_phase_err is not None:
+            if _is_latin1_encode_error(admin_phase_err):
+                ok, cli_msg = _run_mysql_admin_sql_cli(
+                    sql=admin_sql,
+                    admin_user=user,
+                    admin_password=admin_pwd,
+                    admin_host=host,
+                    admin_port=port,
+                    admin_unix_socket=admin_sock or None,
+                    timeout_sec=max(5, int(getattr(cfg, "state_mysql_write_timeout_sec", 15) or 15)),
                 )
-                # Dedicated runtime account with minimal DB-local privileges.
-                for host_pat in ("localhost", "127.0.0.1"):
-                    cur.execute(
-                        f"CREATE USER IF NOT EXISTS '{_esc(rt_user)}'@'{_esc(host_pat)}' IDENTIFIED BY %s",
-                        (rt_pwd,),
-                    )
-                    cur.execute(
-                        f"ALTER USER '{_esc(rt_user)}'@'{_esc(host_pat)}' IDENTIFIED BY %s",
-                        (rt_pwd,),
-                    )
-                    cur.execute(
-                        f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX "
-                        f"ON `{_esc(db_name)}`.* TO '{_esc(rt_user)}'@'{_esc(host_pat)}'"
-                    )
-                cur.execute("FLUSH PRIVILEGES")
+                if not ok:
+                    return False, f"admin_sql_utf8_fallback_failed: {cli_msg}"
+            else:
+                return False, str(admin_phase_err)
 
         # Validate runtime account can use new DB and initialize schema.
         runtime_kwargs: dict[str, Any] = {

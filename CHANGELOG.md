@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.49 - 2026-03-21
+- Fixed: State DB bootstrap now handles non-ASCII DB admin passwords in `Environment -> Bootstrap State DB`.
+  - Added UTF-safe fallback path: when PyMySQL admin phase fails with `latin-1` encode error, agent executes the same bootstrap SQL through local `mariadb/mysql` CLI.
+  - Scope: `create_state_database_with_admin` only; runtime user/schema validation remains unchanged.
+  - Result: hosts with valid root/admin password containing non-latin characters can initialize `mysql_hybrid` state backend without false auth failures.
+
 ## 0.8.48 - 2026-03-21
 - Fixed: Zabbix MySQL bootstrap now also tries MCD runtime state DB credentials as an additional DB-admin source.
   - Added `runtime_state` candidate in SQL execution path (`state_mysql_user/password/socket/host/port`).
