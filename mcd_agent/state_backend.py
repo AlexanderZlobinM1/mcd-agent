@@ -175,6 +175,15 @@ def _resolved_mysql_unix_socket(cfg: AgentConfig, *, host: str | None, password:
     return None
 
 
+def _resolved_local_unix_socket_auto(host: str | None) -> str | None:
+    if not _is_local_mysql_host(host):
+        return None
+    for cand in _LOCAL_SOCKET_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def _mysql_cli_bin() -> str | None:
     for name in ("mariadb", "mysql"):
         path = shutil.which(name)
@@ -493,9 +502,12 @@ def create_state_database_with_admin(
 
     try:
         admin_pwd = str(admin_password or "")
-        admin_sock = str(admin_unix_socket or "").strip() or _resolved_mysql_unix_socket(
-            cfg, host=host, password=admin_pwd
-        )
+        admin_sock = str(admin_unix_socket or "").strip()
+        if not admin_sock:
+            # Admin bootstrap in "auto" mode should prefer local unix socket even with a non-empty password.
+            admin_sock = _resolved_local_unix_socket_auto(host) or _resolved_mysql_unix_socket(
+                cfg, host=host, password=admin_pwd
+            )
         db_ident = _sql_escape_ident(db_name)
         rt_user_lit = _sql_escape_lit(rt_user)
         rt_pwd_lit = _sql_escape_lit(rt_pwd)

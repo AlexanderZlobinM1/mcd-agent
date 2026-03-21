@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.50 - 2026-03-21
+- Fixed: `state-db init` / interactive "Bootstrap State DB" now prefers unix socket in `auto` mode for local admin host, even when admin password is non-empty.
+  - Root cause: auto socket resolution was gated by non-empty password and could fall back to TCP (`127.0.0.1`), causing `root@127.0.0.1` auth mismatch on hosts where root auth is socket/localhost-based.
+  - Result: on local hosts, bootstrap uses `/var/run/mysqld/mysqld.sock` (or `/run/mysqld/mysqld.sock`) by default unless socket is explicitly overridden.
+
 ## 0.8.49 - 2026-03-21
 - Fixed: State DB bootstrap now handles non-ASCII DB admin passwords in `Environment -> Bootstrap State DB`.
   - Added UTF-safe fallback path: when PyMySQL admin phase fails with `latin-1` encode error, agent executes the same bootstrap SQL through local `mariadb/mysql` CLI.
