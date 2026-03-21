@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.51 - 2026-03-21
+- Fixed: successful `state-db init` now persists state backend settings into the correct config section (`[state]`) instead of runtime section.
+  - Root cause: bootstrap wrote `state_*` keys via runtime upsert helper, which does not affect daemon state backend loading.
+  - Result: after bootstrap/reload, daemon keeps `mysql_hybrid` mode and MCC status no longer falls back to yellow `legacy`.
+
 ## 0.8.50 - 2026-03-21
 - Fixed: `state-db init` / interactive "Bootstrap State DB" now prefers unix socket in `auto` mode for local admin host, even when admin password is non-empty.
   - Root cause: auto socket resolution was gated by non-empty password and could fall back to TCP (`127.0.0.1`), causing `root@127.0.0.1` auth mismatch on hosts where root auth is socket/localhost-based.

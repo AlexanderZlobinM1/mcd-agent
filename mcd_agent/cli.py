@@ -164,15 +164,15 @@ def _toml_literal(value: object) -> str:
     return json.dumps("" if value is None else str(value), ensure_ascii=True)
 
 
-def _upsert_runtime_values(config_path: str, updates: dict[str, object]) -> str:
+def _upsert_section_values(config_path: str, section_name: str, updates: dict[str, object]) -> str:
     if not updates:
         return str(_resolve_mutable_config_path(config_path))
     p = _resolve_mutable_config_path(config_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     text = p.read_text(encoding="utf-8") if p.exists() else ""
-    runtime_lines = [f"{k} = {_toml_literal(v)}" for k, v in updates.items()]
-    section = "[runtime]\n" + "\n".join(runtime_lines) + "\n\n"
-    m = re.search(r"(?ms)^(\[runtime\]\s*\n)(.*?)(?=^\[|\Z)", text)
+    section_lines = [f"{k} = {_toml_literal(v)}" for k, v in updates.items()]
+    section = f"[{section_name}]\n" + "\n".join(section_lines) + "\n\n"
+    m = re.search(rf"(?ms)^(\[{re.escape(section_name)}\]\s*\n)(.*?)(?=^\[|\Z)", text)
     if not m:
         p.write_text(section + text, encoding="utf-8")
         return str(p)
@@ -187,7 +187,7 @@ def _upsert_runtime_values(config_path: str, updates: dict[str, object]) -> str:
         out_lines.append(raw)
     while out_lines and not out_lines[0].strip():
         out_lines.pop(0)
-    merged: list[str] = list(runtime_lines)
+    merged: list[str] = list(section_lines)
     if out_lines:
         merged.append("")
         merged.extend(out_lines)
@@ -195,6 +195,14 @@ def _upsert_runtime_values(config_path: str, updates: dict[str, object]) -> str:
     text2 = text[: m.start(2)] + new_body + text[m.end(2) :]
     p.write_text(text2, encoding="utf-8")
     return str(p)
+
+
+def _upsert_runtime_values(config_path: str, updates: dict[str, object]) -> str:
+    return _upsert_section_values(config_path, "runtime", updates)
+
+
+def _upsert_state_values(config_path: str, updates: dict[str, object]) -> str:
+    return _upsert_section_values(config_path, "state", updates)
 
 
 def _gen_state_runtime_password(length: int = 28) -> str:
@@ -227,6 +235,18 @@ def _state_runtime_bootstrap_defaults(cfg) -> dict[str, object]:
         "state_mysql_user": runtime_user,
         "state_mysql_password": _gen_state_runtime_password(),
         "state_mysql_unix_socket": runtime_socket,
+    }
+
+
+def _state_section_bootstrap_updates(runtime: dict[str, object]) -> dict[str, object]:
+    return {
+        "backend": str(runtime.get("state_backend") or "mysql_hybrid"),
+        "mysql_host": str(runtime.get("state_mysql_host") or "127.0.0.1"),
+        "mysql_port": int(runtime.get("state_mysql_port") or 3306),
+        "mysql_database": str(runtime.get("state_mysql_database") or "mcd_state"),
+        "mysql_user": str(runtime.get("state_mysql_user") or "mcd_state"),
+        "mysql_password": str(runtime.get("state_mysql_password") or ""),
+        "mysql_unix_socket": str(runtime.get("state_mysql_unix_socket") or ""),
     }
 
 
@@ -265,10 +285,8 @@ def _bootstrap_state_db_with_admin(
         "state_mysql_password": runtime["state_mysql_password"],
         "state_mysql_unix_socket": runtime["state_mysql_unix_socket"],
     }
-    persisted = _upsert_runtime_values(
-        cfg.config_file_path,
-        runtime_updates,
-    )
+    state_updates = _state_section_bootstrap_updates(runtime)
+    persisted = _upsert_state_values(cfg.config_file_path, state_updates)
     cfg2 = load_config(cfg.config_file_path)
     sync_msg = "mcc_runtime_sync=skipped"
     try:
