@@ -463,14 +463,24 @@ def _run_mysql_root_sql(sql: str, *, timeout_sec: int = 20) -> tuple[bool, str]:
         try:
             parser = configparser.RawConfigParser(interpolation=None)
             parser.read(debian_cnf, encoding="utf-8")
-            sec = "client" if parser.has_section("client") else ""
-            user = parser.get(sec, "user", fallback="").strip() if sec else ""
-            password = parser.get(sec, "password", fallback="").strip() if sec else ""
-            socket = parser.get(sec, "socket", fallback="").strip() if sec else ""
-            if user:
+            sections = [s for s in parser.sections()]
+            if "" not in sections:
+                sections.insert(0, "")
+            seen: set[tuple[str, str, str]] = set()
+            for sec in sections:
+                user = parser.get(sec, "user", fallback="").strip() if sec else parser.defaults().get("user", "").strip()
+                password = parser.get(sec, "password", fallback="").strip() if sec else parser.defaults().get("password", "").strip()
+                socket = parser.get(sec, "socket", fallback="").strip() if sec else parser.defaults().get("socket", "").strip()
+                if not user:
+                    continue
+                key = (user, password, socket)
+                if key in seen:
+                    continue
+                seen.add(key)
+                label = f"debian_cnf:{sec or 'defaults'}"
                 candidates.append(
                     {
-                        "label": "debian_cnf",
+                        "label": label,
                         "user": user,
                         "password": password,
                         "socket": socket,
@@ -499,6 +509,74 @@ def _run_mysql_root_sql(sql: str, *, timeout_sec: int = 20) -> tuple[bool, str]:
         errors.append(f"{cand.get('label', 'unknown')}:{detail}")
 
     return False, " | ".join(errors[:3])
+
+
+def _needs_validate_password_policy_workaround(detail: str) -> bool:
+    txt = str(detail or "").strip().lower()
+    if not txt:
+        return False
+    return (
+        "error 1819" in txt
+        or "does not satisfy the current policy requirements" in txt
+        or ("validate_password" in txt and "policy" in txt)
+    )
+
+
+def _mysql_get_validate_password_policy(*, timeout_sec: int = 12) -> tuple[bool, str, str]:
+    ok, detail = _run_mysql_root_sql("SHOW VARIABLES LIKE 'validate_password.policy';", timeout_sec=timeout_sec)
+    if not ok:
+        return False, "", str(detail or "validate_password_policy_probe_failed")
+    policy = ""
+    for raw in (detail or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s+", line)
+        if len(parts) >= 2 and parts[0].strip().lower() == "validate_password.policy":
+            policy = parts[1].strip()
+            break
+    if not policy:
+        return False, "", f"validate_password_policy_not_found:{(detail or '').strip()}"
+    return True, policy, ""
+
+
+def _run_sql_with_validate_password_policy_relax(sql: str, *, timeout_sec: int = 20) -> tuple[bool, str]:
+    policy_ok, previous_policy_raw, policy_err = _mysql_get_validate_password_policy(timeout_sec=max(5, int(timeout_sec)))
+    if not policy_ok:
+        return False, str(policy_err or "validate_password_policy_probe_failed")
+
+    previous_policy = str(previous_policy_raw or "").strip().upper() or "MEDIUM"
+    lowered = False
+    if previous_policy != "LOW":
+        ok_low, low_detail = _run_mysql_root_sql(
+            "SET GLOBAL validate_password.policy='LOW';",
+            timeout_sec=max(5, int(timeout_sec)),
+        )
+        if not ok_low:
+            return False, f"validate_password_policy_set_low_failed:{str(low_detail or '').strip()}"
+        lowered = True
+
+    ok_apply, apply_detail = _run_mysql_root_sql(sql, timeout_sec=max(8, int(timeout_sec)))
+
+    restore_warn = ""
+    if lowered:
+        ok_restore, restore_detail = _run_mysql_root_sql(
+            f"SET GLOBAL validate_password.policy='{_sql_escape(previous_policy)}';",
+            timeout_sec=max(5, int(timeout_sec)),
+        )
+        if not ok_restore:
+            restore_warn = f"validate_password_policy_restore_failed:{str(restore_detail or '').strip()}"
+
+    if not ok_apply:
+        reason = f"apply_failed_under_relaxed_policy:{str(apply_detail or '').strip()}"
+        if restore_warn:
+            reason = f"{reason} | {restore_warn}"
+        return False, reason
+
+    detail = str(apply_detail or "").strip()
+    if restore_warn:
+        detail = f"{detail} | {restore_warn}" if detail else restore_warn
+    return True, detail
 
 
 def _mysql_user_exists(user: str, host: str, *, timeout_sec: int = 12) -> tuple[bool | None, str]:
@@ -639,6 +717,15 @@ def ensure_zabbix_mysql_monitor_user(
         ]
     )
     ok, detail = _run_mysql_root_sql(sql, timeout_sec=max(8, int(timeout_sec)))
+    validate_password_policy_relaxed = False
+    if not ok and _needs_validate_password_policy_workaround(detail):
+        wrk_ok, wrk_detail = _run_sql_with_validate_password_policy_relax(sql, timeout_sec=max(8, int(timeout_sec)))
+        if wrk_ok:
+            ok = True
+            detail = wrk_detail
+            validate_password_policy_relaxed = True
+        else:
+            detail = f"{str(detail or '').strip()} | {str(wrk_detail or '').strip()}".strip(" |")
     attempted_at = _now_utc_iso()
     if not ok:
         marker.update(
@@ -705,6 +792,7 @@ def ensure_zabbix_mysql_monitor_user(
         "user_exists_before": False,
         "user_exists_after": True,
         "grants": grants,
+        "validate_password_policy_relaxed": bool(validate_password_policy_relaxed),
     }
 
 

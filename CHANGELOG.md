@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.8.47 - 2026-03-21
+- Fixed: Zabbix MySQL bootstrap fallback now scans all `/etc/mysql/debian.cnf` sections (not only `[client]`) for DB admin credentials.
+  - Agent now tries all unique `(user,password,socket)` combinations from defaults and named sections.
+  - Purpose: support hosts where valid maintenance/admin user is present outside `[client]` (for example `debian-sys-maint`).
+  - Result: fewer manual interventions on hosts with non-standard `debian.cnf` layouts.
+
+## 0.8.46 - 2026-03-21
+- Fixed: Zabbix MySQL bootstrap now handles hosts with strict MySQL password policy (`validate_password.policy=MEDIUM`).
+  - When bootstrap hits `ERROR 1819` for `zbx_monitor@127.0.0.1`, agent applies a safe temporary fallback:
+    1. reads current `validate_password.policy`,
+    2. temporarily switches policy to `LOW`,
+    3. creates/grants monitor user,
+    4. restores original policy value.
+  - Fallback is only used on policy-related bootstrap failures and keeps one-shot marker semantics intact.
+
 ## 0.8.45 - 2026-03-21
 - Fixed: Zabbix MySQL bootstrap now supports hosts where `root@localhost` requires password.
   - Added safe fallback DB admin credential source from `/etc/mysql/debian.cnf` (`[client]` section).
