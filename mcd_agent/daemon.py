@@ -1974,7 +1974,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         running.pop(key, None)
     popens: dict[str, subprocess.Popen[bytes]] = {}
 
-    installs = inventory.list_instances()
+    identity = resolve_agent_identity(config)
+    if bool(identity.get("clone_detected", False)):
+        try:
+            installs = inventory.refresh_from_discovery(config)
+            logging.info(
+                "template clone detected: source=%s local=%s; inventory rescan applied (%s instances)",
+                str(identity.get("source_host_name") or "-"),
+                str(identity.get("local_hostname") or "-"),
+                len(installs),
+            )
+        except Exception as e:
+            logging.warning("template clone inventory rescan failed; fallback to cached inventory: %s", e)
+            installs = inventory.list_instances()
+    else:
+        installs = inventory.list_instances()
     segment_prio_rings: dict[str, deque[int]] = {}
     segment_reg_rings: dict[str, deque[int]] = {}
     campaign_trigger_prio_rings: dict[str, deque[int]] = {}

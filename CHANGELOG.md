@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.52 - 2026-03-27
+- Fixed: template-clone startup now forces inventory autodiscovery rescan before daemon scheduling loop.
+  - Root cause: cloned hosts could inherit stale `instances` cache from template and keep old instance UID/name until manual `instances rescan`.
+  - Result: on clone detection, MCD refreshes local instance inventory immediately and reports the cloned host as a new node without stealing template instance identity in MCC.
+
 ## 0.8.51 - 2026-03-21
 - Fixed: successful `state-db init` now persists state backend settings into the correct config section (`[state]`) instead of runtime section.
   - Root cause: bootstrap wrote `state_*` keys via runtime upsert helper, which does not affect daemon state backend loading.
