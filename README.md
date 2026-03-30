@@ -273,6 +273,10 @@ Important:
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.
 - Retry and watchdog:
   - `runtime.task_retry_max`, `runtime.task_retry_delay_sec` control retries for concrete command execution.
+  - `runtime.task_retry_max` semantics:
+    - `1` = no retry (only initial attempt),
+    - `>1` = bounded retries (attempt cap),
+    - `0` or negative = unlimited immediate retries (with `task_retry_delay_sec` pause).
   - global default: `runtime.command_timeout_sec = 0` and `runtime.worker_watchdog_sec = 0` (long-running tasks are not killed by timeout).
   - `runtime.worker_stuck_policy = skip|restart` and `runtime.worker_stuck_restart_limit` control reaction on stuck processes.
   - `runtime.state_db_path` sets SQLite process-state storage path (default `/opt/mcd/var/mcd-state.db`).

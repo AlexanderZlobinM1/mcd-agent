@@ -1733,7 +1733,12 @@ def _respawn_task(
     popens: dict[str, subprocess.Popen[bytes]],
     task: RunningTask,
 ) -> bool:
-    if task.attempts >= max(1, config.task_retry_max):
+    # task_retry_max semantics:
+    # - <= 0 : unlimited retries
+    # - 1    : no retry (initial run only)
+    # - > 1  : bounded retries up to configured attempt cap
+    retry_max = int(config.task_retry_max)
+    if retry_max > 0 and task.attempts >= retry_max:
         return False
     try:
         args = task.command_str.split(_CMD_SEP)
@@ -1790,7 +1795,8 @@ def _monitor_running(
                 respawned = False
                 if rc != 0:
                     logging.warning("[%s] %s entity=%s failed rc=%s", task.root, task.task_type, task.entity_id, rc)
-                    if config.task_retry_max > 1:
+                    retry_enabled = (config.task_retry_max <= 0) or (config.task_retry_max > 1)
+                    if retry_enabled:
                         if config.task_retry_delay_sec > 0:
                             time.sleep(config.task_retry_delay_sec)
                         respawned = _respawn_task(config=config, store=store, running=running, popens=popens, task=task)

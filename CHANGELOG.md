@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.8.54 - 2026-03-30
+- Fixed: scheduler retry semantics now support explicit unlimited retries for failed tasks.
+  - `runtime.task_retry_max <= 0` means unlimited retries.
+  - `runtime.task_retry_max = 1` keeps no-retry behavior.
+  - `runtime.task_retry_max > 1` keeps bounded retry cap behavior.
+- Result: ring tasks no longer drop out after finite attempts when host policy requires continuous re-pick until success.
+
 ## 0.8.53 - 2026-03-27
 - Fixed: template clone detection fallback now persists and reuses source host identity from marker file when MCC host key is not configured.
   - Added: `/opt/mcd/var/template_identity.json` source marker handling in host identity resolver.
