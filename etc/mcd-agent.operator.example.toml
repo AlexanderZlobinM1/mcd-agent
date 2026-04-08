@@ -55,6 +55,30 @@ segment_regular_parallel_idle = 1
 segment_priority_parallel_throttled = 0
 # Segment parallel slots for regular ring when throttled.
 segment_regular_parallel_throttled = 1
+# SQL ring for simple segments (direct DB rebuild; excluded from regular/priority rings).
+segment_sql_ring_enabled = false
+# Max SQL segment rebuilds per scheduler tick.
+segment_sql_ring_max_per_tick = 1
+# Minimum time between starts of the same SQL-managed segment, sec.
+segment_sql_min_repeat_sec = 3600
+# Persistent SQL-ring lock heartbeat interval, sec.
+segment_sql_lock_heartbeat_sec = 15
+# Orphan policy for stale SQL-ring locks.
+# - manual        : never reclaim automatically
+# - reclaim_stale : reclaim lock after orphan timeout
+segment_sql_orphan_policy = "reclaim_stale"
+# Consider SQL-ring lock stale after this many seconds without heartbeat.
+segment_sql_orphan_after_sec = 900
+# Allow page_hits-based SQL segments only in quiet window.
+segment_sql_page_hits_quiet_only = false
+# Quiet window start hour for page_hits-based SQL segments.
+segment_sql_page_hits_quiet_hour = 2
+# Quiet window length in minutes for page_hits-based SQL segments.
+segment_sql_page_hits_quiet_window_min = 180
+# JSON map/list of SQL segment rules.
+# Rule format (must return `lead_id` column):
+# segment_sql_ring_rules = { "188" = { select_sql = "SELECT l.id AS lead_id FROM {prefix}leads l WHERE l.email IS NOT NULL AND l.email <> ''", depends_on = [] } }
+segment_sql_ring_rules = {}
 # During throttle run only whitelist segments.
 segment_throttle_whitelist_only = false
 # Allowed whitelist segment parallel slots during whitelist-only throttle.
@@ -104,7 +128,13 @@ mautic6_core_patch_version_min = ""
 mautic6_core_patch_version_max = ""
 # If local version is unknown, apply patch by default.
 mautic6_core_patch_apply_if_version_unknown = true
+# Page-hit cascade patch policy:
+# - required : daemon auto-applies page-hit cascade guard
+# - off      : do not apply automatically
+pagehit_cascade_patch_policy = "required"
 
 # Note:
 # - segment_cycles_per_tick and segment_kill_* are system-level parameters
 #   and are configured in mcd-agent.system.example.toml.
+# - DB watchdog runtime policy is configured via `runtime.db_watchdog` JSON map
+#   (recommended from MCC host-runtime overrides).

@@ -199,6 +199,16 @@ class AgentConfig:
     segment_full_scan_interval_sec: int
     segment_priority_parallel_throttled: int
     segment_regular_parallel_throttled: int
+    segment_sql_ring_enabled: bool
+    segment_sql_ring_max_per_tick: int
+    segment_sql_min_repeat_sec: int
+    segment_sql_lock_heartbeat_sec: int
+    segment_sql_orphan_policy: str
+    segment_sql_orphan_after_sec: int
+    segment_sql_page_hits_quiet_only: bool
+    segment_sql_page_hits_quiet_hour: int
+    segment_sql_page_hits_quiet_window_min: int
+    segment_sql_ring_rules: dict[str, Any]
     segment_kill_mode: str
     segment_kill_grace_sec: int
     campaign_priority_parallel: int
@@ -232,6 +242,7 @@ class AgentConfig:
     fs_permissions_guard_paths: list[str]
     fs_permissions_guard_fix_console_exec: bool
     fs_permissions_guard_console_relpath: str
+    db_watchdog: dict[str, Any]
     segment_batch_limit: int
     campaign_batch_limit: int
     campaign_limit: int
@@ -346,6 +357,11 @@ class AgentConfig:
     mcd_update_policy: str
     mcd_update_allow_test_build: bool
     mcd_update_wait_retry_sec: int
+    mcd_update_cleanup_enabled: bool
+    mcd_update_cleanup_interval_sec: int
+    mcd_update_keep_archives: int
+    mcd_update_keep_preupdate_backups: int
+    mcd_update_artifacts_max_age_days: int
     mcd_config_history_limit: int
     service_profiles_enabled: bool
     service_profiles_auto_apply: bool
@@ -355,6 +371,7 @@ class AgentConfig:
     mautic6_core_patch_version_min: str | None
     mautic6_core_patch_version_max: str | None
     mautic6_core_patch_apply_if_version_unknown: bool
+    pagehit_cascade_patch_policy: str
     profile_name: str
     ring_mode: str
     disable_throttle: bool
@@ -366,6 +383,8 @@ class AgentConfig:
     campaign_update_regular_parallel: int
     campaign_trigger_priority_parallel: int
     campaign_trigger_regular_parallel: int
+    campaign_trigger_min_repeat_sec: int
+    campaign_rebuild_min_repeat_sec: int
 
 
 def _apply_profile(cfg: AgentConfig) -> AgentConfig:
@@ -547,6 +566,21 @@ def _normalize_int_list(value: object) -> list[int]:
         except ValueError:
             continue
     return out
+
+
+def _normalize_json_dict(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _normalize_backup_dump_timeout(value: object) -> int:
@@ -1005,6 +1039,16 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_cycles_per_tick": "segment_cycles_per_tick",
     "segment_priority_parallel_throttled": "segment_priority_parallel_throttled",
     "segment_regular_parallel_throttled": "segment_regular_parallel_throttled",
+    "segment_sql_ring_enabled": "segment_sql_ring_enabled",
+    "segment_sql_ring_max_per_tick": "segment_sql_ring_max_per_tick",
+    "segment_sql_min_repeat_sec": "segment_sql_min_repeat_sec",
+    "segment_sql_lock_heartbeat_sec": "segment_sql_lock_heartbeat_sec",
+    "segment_sql_orphan_policy": "segment_sql_orphan_policy",
+    "segment_sql_orphan_after_sec": "segment_sql_orphan_after_sec",
+    "segment_sql_page_hits_quiet_only": "segment_sql_page_hits_quiet_only",
+    "segment_sql_page_hits_quiet_hour": "segment_sql_page_hits_quiet_hour",
+    "segment_sql_page_hits_quiet_window_min": "segment_sql_page_hits_quiet_window_min",
+    "segment_sql_ring_rules": "segment_sql_ring_rules",
     "segment_kill_mode": "segment_kill_mode",
     "segment_kill_grace_sec": "segment_kill_grace_sec",
     "campaign_priority_parallel": "campaign_priority_parallel",
@@ -1016,6 +1060,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "campaign_update_regular_parallel": "campaign_update_regular_parallel",
     "campaign_trigger_priority_parallel": "campaign_trigger_priority_parallel",
     "campaign_trigger_regular_parallel": "campaign_trigger_regular_parallel",
+    "campaign_trigger_min_repeat_sec": "campaign_trigger_min_repeat_sec",
+    "campaign_rebuild_min_repeat_sec": "campaign_rebuild_min_repeat_sec",
     "enable_campaign_rebuild": "enable_campaign_rebuild",
     "campaign_rebuild_poll_interval_sec": "campaign_rebuild_poll_interval_sec",
     "campaign_rebuild_max_cycles_per_tick": "campaign_rebuild_max_cycles_per_tick",
@@ -1042,6 +1088,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "fs_permissions_guard_paths": "fs_permissions_guard_paths",
     "fs_permissions_guard_fix_console_exec": "fs_permissions_guard_fix_console_exec",
     "fs_permissions_guard_console_relpath": "fs_permissions_guard_console_relpath",
+    "db_watchdog": "db_watchdog",
     "segment_batch_limit": "segment_batch_limit",
     "campaign_batch_limit": "campaign_batch_limit",
     "campaign_limit": "campaign_limit",
@@ -1057,6 +1104,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_policy": "mcd_update_policy",
     "mcd_update_allow_test_build": "mcd_update_allow_test_build",
     "mcd_update_wait_retry_sec": "mcd_update_wait_retry_sec",
+    "mcd_update_cleanup_enabled": "mcd_update_cleanup_enabled",
+    "mcd_update_cleanup_interval_sec": "mcd_update_cleanup_interval_sec",
+    "mcd_update_keep_archives": "mcd_update_keep_archives",
+    "mcd_update_keep_preupdate_backups": "mcd_update_keep_preupdate_backups",
+    "mcd_update_artifacts_max_age_days": "mcd_update_artifacts_max_age_days",
     "mcd_config_history_limit": "mcd_config_history_limit",
     "plugins_repo_base_url": "plugins_repo_base_url",
     "plugins_repo_fallback_ip": "plugins_repo_fallback_ip",
@@ -1095,6 +1147,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mautic6_core_patch_version_min": "mautic6_core_patch_version_min",
     "mautic6_core_patch_version_max": "mautic6_core_patch_version_max",
     "mautic6_core_patch_apply_if_version_unknown": "mautic6_core_patch_apply_if_version_unknown",
+    "pagehit_cascade_patch_policy": "pagehit_cascade_patch_policy",
     "ring_mode": "ring_mode",
     "disable_throttle": "disable_throttle",
     "disable_whitelist": "disable_whitelist",
@@ -1136,6 +1189,8 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
                 updates[attr] = _normalize_int_list(raw_value)
             else:
                 updates[attr] = _normalize_list(raw_value)
+        elif isinstance(current, dict):
+            updates[attr] = dict(raw_value) if isinstance(raw_value, dict) else dict(current)
         elif current is None:
             updates[attr] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
         else:
@@ -1371,6 +1426,11 @@ def _load_config_inner(path: str) -> AgentConfig:
     campaign_update_regular_parallel = int(runtime.get("campaign_update_regular_parallel", campaign_regular_parallel))
     campaign_trigger_priority_parallel = int(runtime.get("campaign_trigger_priority_parallel", campaign_priority_parallel))
     campaign_trigger_regular_parallel = int(runtime.get("campaign_trigger_regular_parallel", campaign_regular_parallel))
+    campaign_trigger_min_repeat_sec = int(runtime.get("campaign_trigger_min_repeat_sec", 10))
+    campaign_rebuild_min_repeat_sec = int(runtime.get("campaign_rebuild_min_repeat_sec", 15))
+    segment_sql_orphan_policy = str(runtime.get("segment_sql_orphan_policy", "reclaim_stale")).strip().lower() or "reclaim_stale"
+    if segment_sql_orphan_policy not in {"manual", "reclaim_stale"}:
+        segment_sql_orphan_policy = "reclaim_stale"
     mcd_update_policy = str(runtime.get("mcd_update_policy", "")).strip().lower()
     if not mcd_update_policy:
         # Backward compatibility: old channel names.
@@ -1395,12 +1455,18 @@ def _load_config_inner(path: str) -> AgentConfig:
     m6_patch_min = str(runtime.get("mautic6_core_patch_version_min", "")).strip() or None
     m6_patch_max = str(runtime.get("mautic6_core_patch_version_max", "")).strip() or None
     m6_patch_unknown = bool(runtime.get("mautic6_core_patch_apply_if_version_unknown", True))
+    pagehit_patch_policy = str(runtime.get("pagehit_cascade_patch_policy", "required")).strip().lower() or "required"
+    if pagehit_patch_policy not in {"required", "off"}:
+        pagehit_patch_policy = "required"
 
     cleanup_mode = str(runtime.get("contacts_cleanup_mode", "email_and_mobile")).strip().lower()
     if cleanup_mode in {"email_only", "email"}:
         cleanup_mode = "email_only"
     else:
         cleanup_mode = "email_and_mobile"
+    db_watchdog_cfg = runtime.get("db_watchdog", {})
+    if not isinstance(db_watchdog_cfg, dict):
+        db_watchdog_cfg = {}
     fs_guard_paths = normalize_guard_paths(runtime.get("fs_permissions_guard_paths", default_guard_paths()))
 
     cfg = AgentConfig(
@@ -1486,6 +1552,19 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_cycles_per_tick=int(runtime.get("segment_cycles_per_tick", 1)),
         segment_priority_parallel_throttled=int(runtime.get("segment_priority_parallel_throttled", 2)),
         segment_regular_parallel_throttled=int(runtime.get("segment_regular_parallel_throttled", 0)),
+        segment_sql_ring_enabled=bool(runtime.get("segment_sql_ring_enabled", False)),
+        segment_sql_ring_max_per_tick=int(runtime.get("segment_sql_ring_max_per_tick", 1)),
+        segment_sql_min_repeat_sec=max(0, int(runtime.get("segment_sql_min_repeat_sec", 3600) or 3600)),
+        segment_sql_lock_heartbeat_sec=max(5, int(runtime.get("segment_sql_lock_heartbeat_sec", 15) or 15)),
+        segment_sql_orphan_policy=segment_sql_orphan_policy,
+        segment_sql_orphan_after_sec=max(30, int(runtime.get("segment_sql_orphan_after_sec", 900) or 900)),
+        segment_sql_page_hits_quiet_only=bool(runtime.get("segment_sql_page_hits_quiet_only", False)),
+        segment_sql_page_hits_quiet_hour=max(0, min(23, int(runtime.get("segment_sql_page_hits_quiet_hour", 2) or 2))),
+        segment_sql_page_hits_quiet_window_min=max(
+            1,
+            min(720, int(runtime.get("segment_sql_page_hits_quiet_window_min", 180) or 180)),
+        ),
+        segment_sql_ring_rules=_normalize_json_dict(runtime.get("segment_sql_ring_rules", {})),
         segment_kill_mode=str(runtime.get("segment_kill_mode", "graceful")),
         segment_kill_grace_sec=int(runtime.get("segment_kill_grace_sec", 10)),
         campaign_priority_parallel=campaign_priority_parallel,
@@ -1522,6 +1601,7 @@ def _load_config_inner(path: str) -> AgentConfig:
             runtime.get("fs_permissions_guard_console_relpath", "bin/console")
         ).strip()
         or "bin/console",
+        db_watchdog=dict(db_watchdog_cfg),
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),
         campaign_batch_limit=int(runtime.get("campaign_batch_limit", 1000)),
         campaign_limit=int(runtime.get("campaign_limit", 60000)),
@@ -1561,22 +1641,16 @@ def _load_config_inner(path: str) -> AgentConfig:
             sql.get(
                 "campaign_weights",
                 "SELECT c.id, UNIX_TIMESTAMP(COALESCE(c.publish_up, c.date_added)) AS publish_ts, "
-                "COALESCE(p.pending_cnt, 0) AS pending_cnt, "
-                "COALESCE(r.recent_cnt, 0) AS recent_activity "
+                "COALESCE(w.pending_cnt, 0) AS pending_cnt, "
+                "COALESCE(w.recent_cnt, 0) AS recent_activity "
                 "FROM {prefix}campaigns c "
                 "LEFT JOIN ("
-                "  SELECT campaign_id, COUNT(*) AS pending_cnt "
+                "  SELECT campaign_id, "
+                "         SUM(CASE WHEN manually_removed = 0 AND date_last_exited IS NULL THEN 1 ELSE 0 END) AS pending_cnt, "
+                "         SUM(CASE WHEN manually_removed = 0 AND date_added >= '{window_start_utc_24h}' THEN 1 ELSE 0 END) AS recent_cnt "
                 "  FROM {prefix}campaign_leads "
-                "  WHERE manually_removed = 0 AND date_last_exited IS NULL "
                 "  GROUP BY campaign_id"
-                ") p ON p.campaign_id = c.id "
-                "LEFT JOIN ("
-                "  SELECT campaign_id, COUNT(*) AS recent_cnt "
-                "  FROM {prefix}campaign_leads "
-                "  WHERE manually_removed = 0 "
-                "    AND date_added >= '{window_start_utc_24h}' "
-                "  GROUP BY campaign_id"
-                ") r ON r.campaign_id = c.id "
+                ") w ON w.campaign_id = c.id "
                 "WHERE c.is_published = 1 "
                 "AND (c.deleted IS NULL) ",
             )
@@ -1747,6 +1821,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcd_update_policy=mcd_update_policy,
         mcd_update_allow_test_build=bool(runtime.get("mcd_update_allow_test_build", False)),
         mcd_update_wait_retry_sec=int(runtime.get("mcd_update_wait_retry_sec", 60)),
+        mcd_update_cleanup_enabled=bool(runtime.get("mcd_update_cleanup_enabled", True)),
+        mcd_update_cleanup_interval_sec=int(runtime.get("mcd_update_cleanup_interval_sec", 86_400)),
+        mcd_update_keep_archives=int(runtime.get("mcd_update_keep_archives", 3)),
+        mcd_update_keep_preupdate_backups=int(runtime.get("mcd_update_keep_preupdate_backups", 3)),
+        mcd_update_artifacts_max_age_days=int(runtime.get("mcd_update_artifacts_max_age_days", 30)),
         mcd_config_history_limit=int(runtime.get("mcd_config_history_limit", 10)),
         service_profiles_enabled=bool(runtime.get("service_profiles_enabled", True)),
         service_profiles_auto_apply=bool(runtime.get("service_profiles_auto_apply", False)),
@@ -1756,6 +1835,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         mautic6_core_patch_version_min=m6_patch_min,
         mautic6_core_patch_version_max=m6_patch_max,
         mautic6_core_patch_apply_if_version_unknown=m6_patch_unknown,
+        pagehit_cascade_patch_policy=pagehit_patch_policy,
         profile_name=profile_name,
         ring_mode=ring_mode,
         disable_throttle=disable_throttle,
@@ -1767,6 +1847,8 @@ def _load_config_inner(path: str) -> AgentConfig:
         campaign_update_regular_parallel=campaign_update_regular_parallel,
         campaign_trigger_priority_parallel=campaign_trigger_priority_parallel,
         campaign_trigger_regular_parallel=campaign_trigger_regular_parallel,
+        campaign_trigger_min_repeat_sec=max(0, campaign_trigger_min_repeat_sec),
+        campaign_rebuild_min_repeat_sec=max(0, campaign_rebuild_min_repeat_sec),
     )
     if cfg.disable_whitelist:
         cfg = replace(cfg, segment_whitelist=[], segment_whitelist_file=None, campaign_whitelist=[], campaign_whitelist_file=None)

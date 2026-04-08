@@ -187,7 +187,6 @@ class MauticDB:
         started = time.monotonic()
 
         with self._connect() as conn:
-            conn.autocommit(False)
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -207,6 +206,7 @@ class MauticDB:
                     row = cur.fetchone()
                     selected_count = int((row or {}).get("cnt") or 0)
 
+                    conn.autocommit(False)
                     cur.execute(f"DELETE FROM `{table_segment_links}` WHERE `leadlist_id`=%s", (sid,))
                     deleted_count = int(cur.rowcount or 0)
                     cur.execute(
@@ -241,7 +241,6 @@ class MauticDB:
                         "WHERE `id`=%s",
                         (elapsed_sec, sid),
                     )
-                    cur.execute(f"DROP TEMPORARY TABLE IF EXISTS `{temp_table}`")
                 conn.commit()
             except Exception:
                 try:
@@ -252,6 +251,11 @@ class MauticDB:
             finally:
                 try:
                     conn.autocommit(True)
+                except Exception:
+                    pass
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"DROP TEMPORARY TABLE IF EXISTS `{temp_table}`")
                 except Exception:
                     pass
 

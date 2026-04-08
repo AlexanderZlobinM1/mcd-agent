@@ -1,5 +1,33 @@
 # MCD Changelog
 
+## 0.8.75 - 2026-04-08
+- Fixed: SQL segment technical ring is now persistent and restart-safe.
+  - Added persistent state/lock per `root + segment_id` in state backend (`runtime_sync`) with owner, heartbeat and finish metadata.
+  - Prevents the same SQL-managed segment from being started twice after daemon restart/self-update while previous run is still considered active.
+  - New runtime keys:
+    - `segment_sql_min_repeat_sec` (default `3600`)
+    - `segment_sql_lock_heartbeat_sec` (default `15`)
+    - `segment_sql_orphan_policy` (`manual` or `reclaim_stale`)
+    - `segment_sql_orphan_after_sec` (default `900`)
+- Fixed: SQL-managed segments are rate-limited and do not restart more often than once per hour by default.
+- Fixed: direct DB rebuild for SQL-managed segments no longer keeps long `page_hits` scans inside one write transaction.
+  - Heavy `SELECT DISTINCT ...` now runs before transaction start.
+  - Transaction scope now contains only:
+    - segment membership delete
+    - membership insert
+    - `lead_lists` metadata update
+- Fixed: manual `segment` launch requests are skipped when the same segment is already running in SQL technical ring.
+- Added: optional quiet-window protection for `page_hits`-based SQL segments.
+  - New runtime keys:
+    - `segment_sql_page_hits_quiet_only`
+    - `segment_sql_page_hits_quiet_hour`
+    - `segment_sql_page_hits_quiet_window_min`
+- Added: automatic Mautic page-hit cascade patch guard.
+  - If page-hit save fails, MCD patch now prevents dispatch of `PageHitNotification` for missing hit rows.
+  - If handler receives invalid/missing hit payload, patched handler logs warning and exits cleanly instead of causing `TypeError` / `EntityManager is closed` noise.
+  - New runtime key:
+    - `pagehit_cascade_patch_policy`
+
 ## 0.8.74 - 2026-04-08
 - Fixed: SQL segment technical ring now marks rebuilt segments as ready in Mautic UI/state.
   - Root cause: SQL rebuild wrote `date_modified = NOW()` together with `last_built_date = NOW()`, while Mautic treats a segment as still needing rebuild when `date_modified >= last_built_date`.

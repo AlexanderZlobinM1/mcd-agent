@@ -32,6 +32,28 @@ command_timeout_sec = 0
 worker_watchdog_sec = 0
 # Segment planner cycles per dispatch tick.
 segment_cycles_per_tick = 4
+# SQL ring for simple segments (direct DB rebuild; excluded from Mautic segment rings).
+segment_sql_ring_enabled = false
+# Max SQL segment rebuilds per scheduler tick.
+segment_sql_ring_max_per_tick = 1
+# Minimum time between starts of the same SQL-managed segment, sec.
+segment_sql_min_repeat_sec = 3600
+# Persistent SQL-ring lock heartbeat interval, sec.
+segment_sql_lock_heartbeat_sec = 15
+# Orphan policy for stale SQL-ring locks:
+# - manual        : never reclaim automatically
+# - reclaim_stale : reclaim when heartbeat is older than orphan_after_sec
+segment_sql_orphan_policy = "reclaim_stale"
+# Consider running SQL-ring lock stale after this many seconds without heartbeat.
+segment_sql_orphan_after_sec = 900
+# Restrict page_hits-based SQL segments to quiet window only.
+segment_sql_page_hits_quiet_only = false
+# Quiet window start hour for page_hits-based SQL segments.
+segment_sql_page_hits_quiet_hour = 2
+# Quiet window length in minutes for page_hits-based SQL segments.
+segment_sql_page_hits_quiet_window_min = 180
+# SQL ring rules (runtime-dynamic JSON map/list; each rule must return `lead_id`).
+segment_sql_ring_rules = {}
 # How to stop throttled segment workers: graceful|kill.
 segment_kill_mode = "graceful"
 # Grace period in seconds before hard kill when graceful stop is used.
@@ -100,16 +122,27 @@ mcd_auto_update_enabled = true
 mcd_update_check_interval_sec = 3600
 # Legacy channel alias (kept for backward compatibility).
 mcd_update_channel = "approved"
-# Update policy: off|lts|approved|test.
+# Update policy: off|lts|approved|test|cluster.
 # - off      : never auto-update
 # - lts      : only latest build flagged lts
 # - approved : latest approved build (default)
 # - test     : latest test build
+# - cluster  : latest cluster build
 mcd_update_policy = "approved"
 # Force test build selection regardless of update policy.
 mcd_update_allow_test_build = false
 # Retry delay after MCC says "wait for free update slot".
 mcd_update_wait_retry_sec = 60
+# Enable self-update artifacts cleanup (`/opt/mcd/var/updates`, preupdate tar backups).
+mcd_update_cleanup_enabled = true
+# How often to run cleanup policy, sec.
+mcd_update_cleanup_interval_sec = 86400
+# Keep this number of latest downloaded agent archives (`mcd-agent-*.tar.gz`).
+mcd_update_keep_archives = 3
+# Keep this number of latest preupdate source backups (`mcd-src-preupdate-*.tgz`).
+mcd_update_keep_preupdate_backups = 3
+# Remove older self-update artifacts even if keep-count not exceeded.
+mcd_update_artifacts_max_age_days = 30
 # Number of local config history snapshots stored by MCD.
 mcd_config_history_limit = 10
 # Retention for delivered profile events in local SQLite outbound queue.
@@ -151,6 +184,11 @@ mautic6_core_patch_version_max = ""
 # - true  => apply patch anyway
 # - false => skip patch until version is known
 mautic6_core_patch_apply_if_version_unknown = true
+
+# Page-hit cascade patch policy:
+# - required : keep page-hit cascade patch applied automatically
+# - off      : do not patch automatically
+pagehit_cascade_patch_policy = "required"
 
 # Enable campaign rebuild worker.
 enable_campaign_rebuild = false
@@ -218,16 +256,24 @@ fs_permissions_guard_fix_console_exec = true
 # Console path relative to instance root.
 fs_permissions_guard_console_relpath = "bin/console"
 
+# DB watchdog (observe-first skeleton).
+# Collects processlist telemetry and rule-hit stats; no KILL actions are executed while observe_only=true.
+# Rules are runtime-dynamic and can be supplied from MCC via host-runtime JSON.
+# Merge model:
+# - global_rules: default/global rule set
+# - host_rules  : per-host override map/list; matching host patch overrides defaults by rule id
+db_watchdog = { enabled = false, interval_sec = 300, observe_only = true, processlist_limit = 500, sample_limit = 25, long_query_sec = 900, orphan_query_sec = 1200, global_rules = [], host_rules = {} }
+
 [sql]
 # Queue metric for throttling decision (must return one numeric value).
 mail_queue_count = "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE status = 'pending'"
 
 # Segment source ids (published).
-segments_due = "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id"
+segments_due = "SELECT ll.id FROM {prefix}lead_lists ll WHERE ll.is_published = 1 AND (  ll.last_built_date IS NULL   OR ll.last_built_date < '{window_start_utc_24h}'   OR COALESCE(ll.date_modified, ll.date_added) > COALESCE(ll.last_built_date, '1970-01-01 00:00:00')   OR EXISTS (    SELECT 1     FROM {prefix}lead_lists_leads lll     WHERE lll.leadlist_id = ll.id       AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date)     LIMIT 1  )  OR EXISTS (    SELECT 1     FROM {prefix}lead_lists_leads lll     INNER JOIN {prefix}leads l ON l.id = lll.lead_id     WHERE lll.leadlist_id = ll.id       AND lll.manually_removed = 0       AND (        ll.last_built_date IS NULL         OR COALESCE(l.date_modified, l.date_added) > ll.last_built_date      )     LIMIT 1  )) ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 # Campaign source ids (published only; window checks are intentionally ignored).
 # Note: for Mautic 4 the agent auto-removes `c.deleted` predicate at runtime
 # because some M4 schemas do not have this column.
-campaigns_due = "SELECT c.id FROM {prefix}campaigns c WHERE c.is_published = 1 AND (c.deleted IS NULL) ORDER BY c.id"
+campaigns_due = "SELECT c.id FROM {prefix}campaigns c WHERE c.is_published = 1 AND (c.deleted IS NULL) AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') ORDER BY c.id"
 
 # Segment weight source rows.
 segment_weights = "SELECT ll.id, UNIX_TIMESTAMP(ll.date_added) AS created_ts, UNIX_TIMESTAMP(ll.date_modified) AS modified_ts, UNIX_TIMESTAMP(ll.last_built_date) AS built_ts, COALESCE(a.recent_cnt, 0) AS recent_activity FROM {prefix}lead_lists ll LEFT JOIN (SELECT leadlist_id, COUNT(*) AS recent_cnt FROM {prefix}lead_lists_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY leadlist_id) a ON a.leadlist_id = ll.id WHERE ll.is_published = 1"
