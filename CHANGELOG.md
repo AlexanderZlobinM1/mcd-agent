@@ -1,5 +1,138 @@
 # MCD Changelog
 
+## 0.8.74 - 2026-04-08
+- Fixed: SQL segment technical ring now marks rebuilt segments as ready in Mautic UI/state.
+  - Root cause: SQL rebuild wrote `date_modified = NOW()` together with `last_built_date = NOW()`, while Mautic treats a segment as still needing rebuild when `date_modified >= last_built_date`.
+  - Now: SQL rebuild clears stale checkout markers and guarantees `last_built_date` is newer than the effective `date_modified`.
+  - Result: SQL-ring segments no longer stay visually stuck in "needs rebuild" after successful direct DB rebuild.
+
+## 0.8.73 - 2026-04-08
+- Changed: increased agent MySQL socket timeouts for DB-backed operations (`read_timeout`/`write_timeout` -> `1800s`).
+  - Purpose: prevent false `Lost connection to MySQL server during query (timed out)` on long SQL segment-ring rebuilds.
+  - Impact: SQL technical ring can complete heavy `page_hits`-based rebuild queries instead of failing on client timeout.
+
+## 0.8.72 - 2026-04-08
+- Added: SQL segment technical ring for direct DB rebuild of selected segments.
+  - New runtime keys:
+    - `segment_sql_ring_enabled`
+    - `segment_sql_ring_max_per_tick`
+    - `segment_sql_ring_rules`
+  - SQL-ring segments are excluded from standard Mautic segment rings (`priority`/`regular`).
+  - Dependency order is respected (`depends_on`): prerequisites are rebuilt before dependent segment.
+  - After SQL rebuild, segment metadata is updated in Mautic (`date_modified`, `last_built_date`, `last_built_time`) so UI shows current rebuild state.
+
+## 0.8.71 - 2026-04-03
+- Changed: interactive `Environment` menu now uses one dynamic IPv6 toggle item instead of three separate entries.
+  - Before: `IPv6 Status`, `Disable IPv6`, `Enable IPv6`.
+  - Now: one toggle item that switches label by current state (`Enable IPv6` when disabled, `Disable IPv6` when enabled).
+  - `State Backend Status` and conditional `Bootstrap State DB` remain available in the same menu.
+
+## 0.8.67 - 2026-04-03
+- Fixed: `maintenance on` / scheduler pause flag now actually blocks all new daemon dispatch launches.
+  - Root cause: daemon dispatch loop ignored `scheduler_pause_flag_path` and continued scheduling.
+  - Now: when pause flag exists, daemon skips all new launches (auto rings + manual request dispatch), while running tasks continue until completion/explicit kill.
+  - Effect: `mcd-cli maintenance on --kill-orphans` behaves as expected and no new segment/campaign tasks are started afterward.
+
+## 0.8.66 - 2026-04-01
+- Fixed: removed per-cycle heavy `campaign_weights` SQL call when campaign weights are already cached.
+  - Before: daemon still executed heavy aggregate weight query every planning tick, even without recalculation need.
+  - Now: heavy query runs only on real weight recalc (`ids set changed` or cache expired).
+- Fixed: latest-priority campaign selection no longer depends on running heavy query every cycle.
+  - If no fresh weight rows are fetched in current tick, daemon uses id-based latest fallback immediately.
+- Optimized: default `sql.campaign_weights` now uses one aggregated subquery over `{prefix}campaign_leads` with conditional sums (pending + recent),
+  instead of two separate grouped subqueries.
+  - Effect: lower DB load and fewer SQL timeout spikes under high campaign pressure.
+
+## 0.8.65 - 2026-04-01
+- Added: self-update artifacts retention policy for `/opt/mcd` (automatic cleanup).
+  - New runtime keys:
+    - `mcd_update_cleanup_enabled` (default `true`)
+    - `mcd_update_cleanup_interval_sec` (default `86400`)
+    - `mcd_update_keep_archives` (default `3`)
+    - `mcd_update_keep_preupdate_backups` (default `3`)
+    - `mcd_update_artifacts_max_age_days` (default `30`)
+  - Cleanup scope:
+    - `/opt/mcd/var/updates/mcd-agent-*.tar.gz`
+    - `/opt/mcd/var/backup/mcd-src-preupdate-*.tgz`
+    - stale staging dirs `/opt/mcd/var/updates/src.next-*` and `src.prev-*`
+  - Effect: old versions from earliest history are pruned automatically while keeping rollback window.
+
+## 0.8.64 - 2026-04-01
+- Fixed: campaign priority fallback when `campaign_weights` SQL times out on overloaded DB.
+  - If weight query fails, latest priority campaigns are now selected by ID fallback (`newest first`) instead of empty latest-set.
+  - Prevents newly published campaigns from being starved by old ring tails under DB timeout pressure.
+- Changed: campaign ring ordering now prefers newer campaign IDs on equal weight.
+  - Impact: fresh campaigns are rebuilt/triggered earlier during heavy load conditions.
+
+## 0.8.63 - 2026-04-01
+- Fixed: plugin install sanitization now removes macOS archive artifacts (`._*`, `__MACOSX`) before deploy.
+  - Root cause: AppleDouble files in dev plugin archives caused PHP class redeclaration and `500` on plugin load.
+- Fixed: dev/stable exclusive plugin apply now always force-removes counterpart before install (deterministic one-of behavior).
+  - Applies to: `SalesSnapBundle` <-> `SalesSnapBundleDev`, `AmazonSesBundle` <-> `AmazonSesBundleDev`.
+- Fixed: plugin status/list now respects canonical-path dev alias state metadata and does not show both variants as installed simultaneously.
+- Fixed: legacy `/etc/php/*/(fpm|cli)/conf.d/98-mcd-php.ini` cleanup hardening in service profile apply.
+  - Cleanup now runs across all installed PHP versions.
+  - Legacy baseline file is no longer restored during rollback paths.
+
+## 0.8.62 - 2026-04-01
+- Fixed: dev plugin aliases now install into canonical stable plugin directories.
+  - `SalesSnapBundleDev` installs to `plugins/SalesSnapBundle`.
+  - `AmazonSesBundleDev` installs to `plugins/AmazonSesBundle`.
+- Result: dev/stable remain separate choices in MCD plugin catalog, but runtime bundle paths stay unchanged and compatible with Mautic internals.
+- Added: post-install alias cleanup for dev entries, so only canonical plugin directory remains on disk (no split path drift between dev and stable).
+
+## 0.8.60 - 2026-04-01
+- Fixed: plugin bundle name validation now accepts `*BundleDev` variants in addition to standard `*Bundle`.
+  - Root cause: strict validator filtered out dev bundles from manifest view in `mcd-cli plugins`.
+  - Impact: `AmazonSesBundleDev` / `SalesSnapBundleDev` now appear in interactive and CLI plugin lists.
+
+## 0.8.59 - 2026-04-01
+- Added: mutual exclusion guard for stable/dev plugin variants in MCD plugin manager.
+  - Covered pairs: `AmazonSesBundle` <-> `AmazonSesBundleDev`, `SalesSnapBundle` <-> `SalesSnapBundleDev`.
+  - In one apply action, selecting both sides now fails fast with clear conflict error.
+  - When applying one side and opposite side is already installed, MCD auto-removes conflicting installed counterpart before apply.
+- Result: prevents dual-install drift and removes operator error path in both interactive and CLI plugin flows.
+
+## 0.8.58 - 2026-03-31
+- Fixed: `mcd-cli interactive` now triggers immediate MCC state push after successful local changes, same as non-interactive commands.
+  - Added immediate push after interactive plugin apply (`Plugins` menu).
+  - Added immediate push after interactive Mautic upgrade.
+  - Added immediate push after interactive instance inventory changes (rescan/add/remove).
+  - Added immediate push after interactive `env ipv6` toggle.
+  - Added immediate push after interactive backup run/prune actions.
+- Result: MCC cache reflects MCD-initiated runtime changes without waiting for periodic sync.
+
+## 0.8.57 - 2026-03-31
+- Changed: removed managed global PHP baseline file (`98-mcd-php.ini`) from `php_fpm` service-profile apply.
+  - Agent no longer writes `/etc/php/*/(fpm|cli)/conf.d/98-mcd-php.ini`.
+  - On apply, existing legacy `98-mcd-php.ini` files are removed automatically (both FPM and CLI).
+  - Purpose: prevent global CLI/FPM side effects from centrally enforced php.ini baseline.
+
+## 0.8.56 - 2026-03-30
+- Fixed: local MySQL connection fallback in agent DB layer (`MauticDB`) for plugin `pre_sql` and all DB-backed scheduler operations.
+  - Added local connection variants: configured host, `localhost`, `127.0.0.1`, and common unix sockets.
+  - Purpose: eliminate false auth failures like `Access denied for user ...@127.0.0.1` when DB grants are valid for `...@localhost`.
+  - Impact: plugin apply flow (`pre_sql`) and other agent DB reads/writes now work on mixed local auth layouts without manual grant surgery.
+
+## 0.8.55 - 2026-03-30
+- Added: DB watchdog skeleton (observe-first) with runtime-dynamic policy.
+  - New runtime key: `runtime.db_watchdog` (JSON map).
+  - Supports global rules + host overrides with host precedence by rule `id`.
+  - Designed for phased rollout: telemetry collection first, actions can be enabled later.
+- Added: processlist telemetry collection per instance root (no kill actions while `observe_only=true`).
+  - Metrics include metadata-lock waits, long queries, orphan candidates, and rule-hit counters.
+  - Slow query samples are truncated and shipped for diagnostics.
+- Added: MCC signal integration for DB watchdog telemetry.
+  - Pushed via `signals.totals`:
+    - `db_watchdog_samples`
+    - `db_watchdog_errors`
+    - `db_watchdog_metadata_lock_waits`
+    - `db_watchdog_long_queries`
+    - `db_watchdog_orphan_candidates`
+    - `db_watchdog_rule_hits`
+  - Event samples pushed via `signals.details.db_watchdog_recent`.
+  - Signal history now stores compact `db_watchdog_events` snapshots for 3-day trend analysis.
+
 ## 0.8.54 - 2026-03-30
 - Fixed: scheduler retry semantics now support explicit unlimited retries for failed tasks.
   - `runtime.task_retry_max <= 0` means unlimited retries.
