@@ -59,12 +59,21 @@ _CMD_SEP = "\x1f"
 _M4_CAMPAIGN_DELETED_CLAUSE_RE = re.compile(r"\s+AND\s*\(?\s*c\.deleted\s+IS\s+NULL\s*\)?", re.IGNORECASE)
 _SEGMENT_STALE_PRIORITY_SEC = 24 * 3600
 _SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
+_DB_DISPATCH_PAUSE_SEC = 120
+_DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD = 50
+_DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _SQL_SEGMENTS_ALL_PUBLISHED = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
     "WHERE ll.is_published = 1 "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
+
+_DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
+    r"(too many connections|lost connection to mysql|mysql server has gone away|"
+    r"lock wait timeout|deadlock found|metadata lock|\(1040,|\(1205,|\(1213,|\(2006,|\(2013,)",
+    re.IGNORECASE,
 )
 
 
@@ -911,6 +920,55 @@ def _campaign_sql_for_major(query_template: str, mautic_major: int | None) -> st
     if patched == query_template:
         return query_template
     return re.sub(r"\s{2,}", " ", patched).strip()
+
+
+def _is_db_dispatch_pause_error(exc: Exception) -> bool:
+    return bool(_DB_DISPATCH_PAUSE_ERROR_RE.search(str(exc or "")))
+
+
+def _mark_db_dispatch_pause(
+    *,
+    root: str,
+    reason: str,
+    now_ts: float,
+    pause_until: dict[str, float],
+    pause_reasons: dict[str, str],
+    pause_sec: int = _DB_DISPATCH_PAUSE_SEC,
+) -> None:
+    until = now_ts + float(max(30, int(pause_sec)))
+    prev_until = float(pause_until.get(root, 0.0))
+    prev_reason = pause_reasons.get(root, "")
+    pause_until[root] = max(prev_until, until)
+    pause_reasons[root] = reason
+    if prev_until <= now_ts or prev_reason != reason:
+        logging.warning(
+            "[%s] db dispatch circuit-breaker active for %ss: %s",
+            root,
+            int(max(30, int(pause_sec))),
+            reason,
+        )
+
+
+def _clear_campaign_rings(
+    *,
+    root: str,
+    trigger_prio_rings: dict[str, deque[int]],
+    trigger_reg_rings: dict[str, deque[int]],
+    rebuild_prio_rings: dict[str, deque[int]],
+    rebuild_reg_rings: dict[str, deque[int]],
+    trigger_prio_sets: dict[str, set[int]],
+    trigger_reg_sets: dict[str, set[int]],
+    rebuild_prio_sets: dict[str, set[int]],
+    rebuild_reg_sets: dict[str, set[int]],
+) -> None:
+    trigger_prio_rings[root] = deque()
+    trigger_reg_rings[root] = deque()
+    rebuild_prio_rings[root] = deque()
+    rebuild_reg_rings[root] = deque()
+    trigger_prio_sets[root] = set()
+    trigger_reg_sets[root] = set()
+    rebuild_prio_sets[root] = set()
+    rebuild_reg_sets[root] = set()
 
 
 def _fill_from_ring(
@@ -2550,8 +2608,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     campaign_rebuild_reg_rings: dict[str, deque[int]] = {}
     segment_prio_sets: dict[str, set[int]] = {}
     segment_reg_sets: dict[str, set[int]] = {}
-    campaign_prio_sets: dict[str, set[int]] = {}
-    campaign_reg_sets: dict[str, set[int]] = {}
+    campaign_trigger_prio_sets: dict[str, set[int]] = {}
+    campaign_trigger_reg_sets: dict[str, set[int]] = {}
+    campaign_rebuild_prio_sets: dict[str, set[int]] = {}
+    campaign_rebuild_reg_sets: dict[str, set[int]] = {}
     campaign_round_robin: dict[str, int] = {}
     campaign_chain_pending_trigger: dict[str, int] = {}
     segment_resume_rings: dict[str, deque[int]] = {}
@@ -2570,6 +2630,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_outbound_events_prune_ts = 0.0
     last_custom_cache_cleanup_ts = 0.0
     last_launch_guard_prune_ts = 0.0
+    db_dispatch_pause_until: dict[str, float] = {}
+    db_dispatch_pause_reasons: dict[str, str] = {}
     jobs_last_run: dict[tuple[str, str], float] = {}
     last_backup_schedule_ts = 0.0
     last_backup_schedule_day = ""
@@ -2946,12 +3008,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 )
 
                 segment_ids: list[int] | None = None
-                campaign_ids: list[int] | None = None
+                campaign_trigger_ids: list[int] | None = None
+                campaign_rebuild_ids: list[int] | None = None
                 if now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
                     try:
                         import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
                     except Exception as e:
                         logging.warning("[%s] import query failed: %s", root, e)
+                        if _is_db_dispatch_pause_error(e):
+                            _mark_db_dispatch_pause(
+                                root=root,
+                                reason=f"import planning db error: {e}",
+                                now_ts=now,
+                                pause_until=db_dispatch_pause_until,
+                                pause_reasons=db_dispatch_pause_reasons,
+                            )
                         import_pending_cache[root] = 0
                     last_import_poll_ts[root] = now
                 import_pending_now = max(0, int(import_pending_cache.get(root, 0)))
@@ -2983,15 +3054,52 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
                 except Exception as e:
                     logging.warning("[%s] segment query failed: %s", root, e)
+                    if _is_db_dispatch_pause_error(e):
+                        _mark_db_dispatch_pause(
+                            root=root,
+                            reason=f"segment planning db error: {e}",
+                            now_ts=now,
+                            pause_until=db_dispatch_pause_until,
+                            pause_reasons=db_dispatch_pause_reasons,
+                        )
 
+                campaign_query_error: Exception | None = None
                 try:
-                    campaigns_due_sql = _campaign_sql_for_major(config.sql_campaigns_due, inst.mautic_major)
-                    campaign_ids = db.fetch_ids(campaigns_due_sql, limit=5000, context=sql_ctx)
+                    campaign_triggers_due_sql = _campaign_sql_for_major(
+                        config.sql_campaign_triggers_due,
+                        inst.mautic_major,
+                    )
+                    campaign_trigger_ids = db.fetch_ids(campaign_triggers_due_sql, limit=5000, context=sql_ctx)
                 except Exception as e:
-                    logging.warning("[%s] campaign query failed: %s", root, e)
-                if campaign_ids is not None and (config.profile_name or "").strip().lower() == "tiny":
+                    campaign_query_error = e
+                    logging.warning("[%s] campaign trigger query failed: %s", root, e)
+                if config.enable_campaign_rebuild:
+                    try:
+                        campaign_rebuilds_due_sql = _campaign_sql_for_major(
+                            config.sql_campaign_rebuilds_due,
+                            inst.mautic_major,
+                        )
+                        campaign_rebuild_ids = db.fetch_ids(campaign_rebuilds_due_sql, limit=5000, context=sql_ctx)
+                    except Exception as e:
+                        campaign_query_error = e
+                        logging.warning("[%s] campaign rebuild query failed: %s", root, e)
+                else:
+                    campaign_rebuild_ids = []
+
+                if campaign_query_error is not None and _is_db_dispatch_pause_error(campaign_query_error):
+                    _mark_db_dispatch_pause(
+                        root=root,
+                        reason=f"campaign planning db error: {campaign_query_error}",
+                        now_ts=now,
+                        pause_until=db_dispatch_pause_until,
+                        pause_reasons=db_dispatch_pause_reasons,
+                    )
+
+                if campaign_trigger_ids is not None and (config.profile_name or "").strip().lower() == "tiny":
                     # Tiny mode: newest published campaigns first.
-                    campaign_ids = sorted(list(dict.fromkeys(campaign_ids)), reverse=True)
+                    campaign_trigger_ids = sorted(list(dict.fromkeys(campaign_trigger_ids)), reverse=True)
+                if campaign_rebuild_ids is not None and (config.profile_name or "").strip().lower() == "tiny":
+                    campaign_rebuild_ids = sorted(list(dict.fromkeys(campaign_rebuild_ids)), reverse=True)
 
                 if segment_ids is not None:
                     standard_segment_ids = list(dict.fromkeys(segment_ids))
@@ -3053,11 +3161,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 else:
                     logging.warning("[%s] segment planning skipped: preserving previous segment rings", root)
 
-                if campaign_ids is not None:
+                if campaign_trigger_ids is not None and campaign_rebuild_ids is not None:
+                    campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids))
+                    campaign_rebuild_ids = list(dict.fromkeys(campaign_rebuild_ids))
+                    campaign_all_ids = list(dict.fromkeys(campaign_trigger_ids + campaign_rebuild_ids))
                     camp_w = store.get_weights("campaign", root, config.weights_recalc_interval_sec)
                     campaign_weight_rows: list[dict[str, object]] = []
                     campaign_weight_query_failed = False
-                    if _needs_weight_recalc(campaign_ids, camp_w):
+                    if _needs_weight_recalc(campaign_all_ids, camp_w):
                         try:
                             campaign_weights_sql = _campaign_sql_for_major(config.sql_campaign_weights, inst.mautic_major)
                             campaign_weight_rows = db.fetch_rows(campaign_weights_sql, limit=5000, context=sql_ctx)
@@ -3065,37 +3176,61 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             logging.warning("[%s] campaign weight query failed: %s", root, e)
                             campaign_weight_query_failed = True
                             campaign_weight_rows = []
-                        camp_w = _campaign_weights(campaign_ids, campaign_weight_rows, campaign_whitelist, now_ts)
+                        camp_w = _campaign_weights(campaign_all_ids, campaign_weight_rows, campaign_whitelist, now_ts)
                         store.put_weights("campaign", root, camp_w)
                     latest_priority_ids = _latest_campaign_ids(campaign_weight_rows, config.campaign_latest_priority_count)
                     if not latest_priority_ids:
                         # If weights are cached (no recalc) or weight query failed,
                         # keep newest published campaigns in priority lane using
                         # id-based fallback without issuing extra heavy SQL.
-                        latest_priority_ids = _latest_campaign_ids_from_ids(campaign_ids, config.campaign_latest_priority_count)
+                        latest_priority_ids = _latest_campaign_ids_from_ids(campaign_all_ids, config.campaign_latest_priority_count)
                     if campaign_weight_query_failed:
                         logging.info("[%s] campaign latest-priority fallback to id order", root)
 
-                    camp_prio, camp_reg = _split_campaign_circles(
-                        campaign_ids,
+                    trg_prio, trg_reg = _split_campaign_circles(
+                        campaign_trigger_ids,
+                        camp_w,
+                        campaign_whitelist,
+                        config.campaign_priority_size,
+                        latest_priority_ids,
+                    )
+                    reb_prio, reb_reg = _split_campaign_circles(
+                        campaign_rebuild_ids,
                         camp_w,
                         campaign_whitelist,
                         config.campaign_priority_size,
                         latest_priority_ids,
                     )
                     if config.ring_mode == "single":
-                        camp_prio, camp_reg = [], list(dict.fromkeys(campaign_ids))
-                    if not _partition_complete(campaign_ids, camp_prio, camp_reg):
-                        logging.warning("[%s] invalid campaign partition, forcing single ring", root)
-                        camp_prio, camp_reg = [], sorted(list(dict.fromkeys(campaign_ids)))
-                    campaign_trigger_prio_rings[root] = _reconcile_ring(campaign_trigger_prio_rings.get(root), camp_prio)
-                    campaign_trigger_reg_rings[root] = _reconcile_ring(campaign_trigger_reg_rings.get(root), camp_reg)
-                    campaign_rebuild_prio_rings[root] = _reconcile_ring(campaign_rebuild_prio_rings.get(root), camp_prio)
-                    campaign_rebuild_reg_rings[root] = _reconcile_ring(campaign_rebuild_reg_rings.get(root), camp_reg)
-                    campaign_prio_sets[root] = set(camp_prio)
-                    campaign_reg_sets[root] = set(camp_reg)
+                        trg_prio, trg_reg = [], list(dict.fromkeys(campaign_trigger_ids))
+                        reb_prio, reb_reg = [], list(dict.fromkeys(campaign_rebuild_ids))
+                    if not _partition_complete(campaign_trigger_ids, trg_prio, trg_reg):
+                        logging.warning("[%s] invalid campaign trigger partition, forcing single ring", root)
+                        trg_prio, trg_reg = [], sorted(list(dict.fromkeys(campaign_trigger_ids)))
+                    if not _partition_complete(campaign_rebuild_ids, reb_prio, reb_reg):
+                        logging.warning("[%s] invalid campaign rebuild partition, forcing single ring", root)
+                        reb_prio, reb_reg = [], sorted(list(dict.fromkeys(campaign_rebuild_ids)))
+                    campaign_trigger_prio_rings[root] = _reconcile_ring(campaign_trigger_prio_rings.get(root), trg_prio)
+                    campaign_trigger_reg_rings[root] = _reconcile_ring(campaign_trigger_reg_rings.get(root), trg_reg)
+                    campaign_rebuild_prio_rings[root] = _reconcile_ring(campaign_rebuild_prio_rings.get(root), reb_prio)
+                    campaign_rebuild_reg_rings[root] = _reconcile_ring(campaign_rebuild_reg_rings.get(root), reb_reg)
+                    campaign_trigger_prio_sets[root] = set(trg_prio)
+                    campaign_trigger_reg_sets[root] = set(trg_reg)
+                    campaign_rebuild_prio_sets[root] = set(reb_prio)
+                    campaign_rebuild_reg_sets[root] = set(reb_reg)
                 else:
-                    logging.warning("[%s] campaign planning skipped: preserving previous campaign rings", root)
+                    _clear_campaign_rings(
+                        root=root,
+                        trigger_prio_rings=campaign_trigger_prio_rings,
+                        trigger_reg_rings=campaign_trigger_reg_rings,
+                        rebuild_prio_rings=campaign_rebuild_prio_rings,
+                        rebuild_reg_rings=campaign_rebuild_reg_rings,
+                        trigger_prio_sets=campaign_trigger_prio_sets,
+                        trigger_reg_sets=campaign_trigger_reg_sets,
+                        rebuild_prio_sets=campaign_rebuild_prio_sets,
+                        rebuild_reg_sets=campaign_rebuild_reg_sets,
+                    )
+                    logging.warning("[%s] campaign planning skipped: campaign rings cleared", root)
 
                 # Use freshly planned rings/sets in the same tick.
                 # Without rebinding, dispatch operates on previous-cycle objects
@@ -3108,8 +3243,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 reb_reg_ring = campaign_rebuild_reg_rings.setdefault(root, deque())
                 seg_prio_set = segment_prio_sets.setdefault(root, set(seg_prio_ring))
                 seg_reg_set = segment_reg_sets.setdefault(root, set(seg_reg_ring))
-                camp_prio_set = campaign_prio_sets.setdefault(root, set(trg_prio_ring) | set(reb_prio_ring))
-                camp_reg_set = campaign_reg_sets.setdefault(root, set(trg_reg_ring) | set(reb_reg_ring))
+                trg_prio_set = campaign_trigger_prio_sets.setdefault(root, set(trg_prio_ring))
+                trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set(trg_reg_ring))
+                reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set(reb_prio_ring))
+                reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set(reb_reg_ring))
 
                 q_samples = queue_samples.setdefault(root, deque())
                 if config.disable_throttle:
@@ -3119,6 +3256,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         queue_count = db.fetch_count(config.sql_mail_queue_count, context=sql_ctx)
                     except Exception as e:
                         logging.warning("[%s] mail queue query failed: %s", root, e)
+                        if _is_db_dispatch_pause_error(e):
+                            _mark_db_dispatch_pause(
+                                root=root,
+                                reason=f"mail queue db error: {e}",
+                                now_ts=now,
+                                pause_until=db_dispatch_pause_until,
+                                pause_reasons=db_dispatch_pause_reasons,
+                            )
                         queue_count = 0
                     q_samples.append((now, queue_count))
                     throttled[root] = _compute_throttle_active(
@@ -3251,6 +3396,34 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 long_q,
                                 orphans,
                                 rule_hits,
+                            )
+                        long_q_threshold = int(
+                            db_watchdog_cfg.get(
+                                "long_queries_pause_threshold",
+                                _DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD,
+                            )
+                            or 0
+                        )
+                        lock_threshold = int(
+                            db_watchdog_cfg.get(
+                                "metadata_lock_waits_pause_threshold",
+                                _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD,
+                            )
+                            or 0
+                        )
+                        if (long_q_threshold > 0 and long_q >= long_q_threshold) or (
+                            lock_threshold > 0 and lock_waits >= lock_threshold
+                        ):
+                            _mark_db_dispatch_pause(
+                                root=root,
+                                reason=(
+                                    "db_watchdog overload: "
+                                    f"metadata_lock_waits={lock_waits} long_queries={long_q}"
+                                ),
+                                now_ts=now,
+                                pause_until=db_dispatch_pause_until,
+                                pause_reasons=db_dispatch_pause_reasons,
+                                pause_sec=int(db_watchdog_cfg.get("dispatch_pause_sec", _DB_DISPATCH_PAUSE_SEC) or _DB_DISPATCH_PAUSE_SEC),
                             )
                     else:
                         logging.warning("[%s] db_watchdog collect skipped/error: %s", root, snap.get("reason", "-"))
@@ -3430,11 +3603,24 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             reb_reg_ring = campaign_rebuild_reg_rings.setdefault(root, deque())
             seg_prio_set = segment_prio_sets.setdefault(root, set())
             seg_reg_set = segment_reg_sets.setdefault(root, set())
-            camp_prio_set = campaign_prio_sets.setdefault(root, set())
-            camp_reg_set = campaign_reg_sets.setdefault(root, set())
+            trg_prio_set = campaign_trigger_prio_sets.setdefault(root, set())
+            trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set())
+            reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set())
+            reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set())
 
             if dispatch_pause:
                 continue
+            db_pause_until = float(db_dispatch_pause_until.get(root, 0.0))
+            if db_pause_until > now:
+                continue
+            if db_pause_until > 0:
+                logging.info(
+                    "[%s] db dispatch circuit-breaker released: %s",
+                    root,
+                    db_dispatch_pause_reasons.get(root, "-"),
+                )
+                db_dispatch_pause_until.pop(root, None)
+                db_dispatch_pause_reasons.pop(root, None)
 
             _dispatch_manual_requests_for_root(
                 config=config,
@@ -3829,7 +4015,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 root=root,
                 task_type="campaign_trigger",
                 running=running,
-                ring_entities=camp_prio_set,
+                ring_entities=trg_prio_set,
                 config=config,
                 store=store,
                 popens=popens,
@@ -3850,7 +4036,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 root=root,
                 task_type="campaign_trigger",
                 running=running,
-                ring_entities=camp_reg_set,
+                ring_entities=trg_reg_set,
                 config=config,
                 store=store,
                 popens=popens,
@@ -3875,7 +4061,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         root=root,
                         task_type="campaign_trigger",
                         running=running,
-                        ring_entities=camp_reg_set,
+                        ring_entities=trg_reg_set,
                         config=config,
                         store=store,
                         popens=popens,
@@ -3897,7 +4083,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         root=root,
                         task_type="campaign_trigger",
                         running=running,
-                        ring_entities=camp_prio_set,
+                        ring_entities=trg_prio_set,
                         config=config,
                         store=store,
                         popens=popens,
@@ -3929,7 +4115,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     root=root,
                     task_type="campaign_rebuild",
                     running=running,
-                    ring_entities=camp_prio_set,
+                    ring_entities=reb_prio_set,
                     config=config,
                     store=store,
                     popens=popens,
@@ -3948,7 +4134,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     root=root,
                     task_type="campaign_rebuild",
                     running=running,
-                    ring_entities=camp_reg_set,
+                    ring_entities=reb_reg_set,
                     config=config,
                     store=store,
                     popens=popens,
@@ -3971,7 +4157,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             root=root,
                             task_type="campaign_rebuild",
                             running=running,
-                            ring_entities=camp_reg_set,
+                            ring_entities=reb_reg_set,
                             config=config,
                             store=store,
                             popens=popens,
@@ -3992,7 +4178,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             root=root,
                             task_type="campaign_rebuild",
                             running=running,
-                            ring_entities=camp_prio_set,
+                            ring_entities=reb_prio_set,
                             config=config,
                             store=store,
                             popens=popens,

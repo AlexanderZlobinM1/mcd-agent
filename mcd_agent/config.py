@@ -70,6 +70,14 @@ _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED_DESC = (
     "WHERE c.is_published = 1 "
     "ORDER BY c.id DESC"
 )
+_LEGACY_SQL_CAMPAIGNS_DUE_PUBLISHED_WINDOW = (
+    "SELECT c.id FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "ORDER BY c.id"
+)
 _DEFAULT_SQL_SEGMENTS_DUE = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
@@ -100,14 +108,105 @@ _DEFAULT_SQL_SEGMENTS_DUE = (
     ") "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
-_DEFAULT_SQL_CAMPAIGNS_DUE = (
-    "SELECT c.id FROM {prefix}campaigns c "
+_DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
+    "SELECT DISTINCT q.id "
+    "FROM ("
+    "  SELECT c.id "
+    "  FROM {prefix}campaigns c "
+    "  WHERE c.is_published = 1 "
+    "  AND (c.deleted IS NULL) "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}campaign_lead_event_log el "
+    "    WHERE el.campaign_id = c.id "
+    "      AND el.is_scheduled = 1 "
+    "      AND el.date_triggered IS NULL "
+    "      AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_utc}') "
+    "    LIMIT 1"
+    "  ) "
+    "  UNION "
+    "  SELECT c.id "
+    "  FROM {prefix}campaigns c "
+    "  INNER JOIN {prefix}campaign_leads cl "
+    "    ON cl.campaign_id = c.id "
+    "   AND cl.manually_removed = 0 "
+    "   AND cl.date_last_exited IS NULL "
+    "   AND cl.date_added >= '{window_start_utc_24h}' "
     "WHERE c.is_published = 1 "
     "AND (c.deleted IS NULL) "
     "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
     "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "AND NOT EXISTS ("
+    "  SELECT 1 "
+    "  FROM {prefix}campaign_lead_event_log el2 "
+    "  WHERE el2.campaign_id = cl.campaign_id "
+    "    AND el2.lead_id = cl.lead_id "
+    "    AND el2.rotation <=> cl.rotation "
+    "    LIMIT 1"
+    "  )"
+    ") q "
+    "ORDER BY q.id"
+)
+_DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
+    "SELECT DISTINCT c.id "
+    "FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.deleted IS NULL) "
+    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "AND EXISTS ("
+    "  SELECT 1 "
+    "  FROM {prefix}campaign_leadlist_xref cx0 "
+    "  WHERE cx0.campaign_id = c.id "
+    "  LIMIT 1"
+    ") "
+    "AND ("
+    "  EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}campaign_leadlist_xref cx "
+    "    INNER JOIN {prefix}lead_lists_leads lll "
+    "      ON lll.leadlist_id = cx.leadlist_id "
+    "     AND lll.manually_removed = 0 "
+    "    LEFT JOIN {prefix}campaign_leads cl "
+    "      ON cl.campaign_id = c.id "
+    "     AND cl.lead_id = lll.lead_id "
+    "     AND cl.manually_removed = 0 "
+    "     AND cl.date_last_exited IS NULL "
+    "    WHERE cx.campaign_id = c.id "
+    "      AND cl.lead_id IS NULL "
+    "    LIMIT 1"
+    "  ) "
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}campaign_leads cl "
+    "    WHERE cl.campaign_id = c.id "
+    "      AND cl.manually_removed = 0 "
+    "      AND cl.date_last_exited IS NULL "
+    "      AND NOT EXISTS ("
+    "        SELECT 1 "
+    "        FROM {prefix}campaign_leadlist_xref cx2 "
+    "        INNER JOIN {prefix}lead_lists_leads lll2 "
+    "          ON lll2.leadlist_id = cx2.leadlist_id "
+    "         AND lll2.lead_id = cl.lead_id "
+    "         AND lll2.manually_removed = 0 "
+    "        WHERE cx2.campaign_id = c.id "
+    "        LIMIT 1"
+    "      ) "
+    "    LIMIT 1"
+    "  )"
+    ") "
     "ORDER BY c.id"
 )
+_DEFAULT_SQL_CAMPAIGNS_DUE = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
+_LEGACY_CAMPAIGNS_DUE_SQLS = {
+    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT,
+    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT_DESC,
+    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED,
+    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED_DESC,
+    _LEGACY_SQL_CAMPAIGNS_DUE_PUBLISHED_WINDOW,
+}
 _DEFAULT_SQL_SEGMENTS_ALL_PUBLISHED = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
@@ -255,6 +354,8 @@ class AgentConfig:
     sql_segments_due: str
     sql_segment_weights: str
     sql_campaigns_due: str
+    sql_campaign_triggers_due: str
+    sql_campaign_rebuilds_due: str
     sql_campaign_weights: str
     sql_import_pending_count: str
     cmd_segment_update_template: str
@@ -593,6 +694,28 @@ def _normalize_backup_dump_timeout(value: object) -> int:
     return raw if raw > 0 else 10_800
 
 
+def _is_legacy_campaigns_due_sql(value: object) -> bool:
+    return str(value or "").strip() in _LEGACY_CAMPAIGNS_DUE_SQLS
+
+
+def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
+    explicit = sql_section.get("campaign_triggers_due")
+    if explicit is not None:
+        return str(explicit)
+    legacy = sql_section.get("campaigns_due")
+    if legacy is not None and not _is_legacy_campaigns_due_sql(legacy):
+        # Preserve intentional custom SQL while migrating known all-published defaults.
+        return str(legacy)
+    return _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
+
+
+def _campaign_rebuilds_due_sql(sql_section: dict[str, Any]) -> str:
+    explicit = sql_section.get("campaign_rebuilds_due")
+    if explicit is not None:
+        return str(explicit)
+    return _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for k, v in override.items():
@@ -768,13 +891,8 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
                 _DEFAULT_SQL_SEGMENTS_DUE,
             ),
             "campaigns_due": (
-                {
-                    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT,
-                    _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT_DESC,
-                    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED,
-                    _LEGACY_SQL_CAMPAIGNS_DUE_NO_DELETED_DESC,
-                },
-                _DEFAULT_SQL_CAMPAIGNS_DUE,
+                _LEGACY_CAMPAIGNS_DUE_SQLS,
+                _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
             ),
         },
     )
@@ -1634,9 +1752,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         sql_campaigns_due=str(
             sql.get(
                 "campaigns_due",
-                _DEFAULT_SQL_CAMPAIGNS_DUE,
+                _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
             )
         ),
+        sql_campaign_triggers_due=_campaign_triggers_due_sql(sql),
+        sql_campaign_rebuilds_due=_campaign_rebuilds_due_sql(sql),
         sql_campaign_weights=str(
             sql.get(
                 "campaign_weights",

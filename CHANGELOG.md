@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.8.76 - 2026-04-10
+- Fixed: campaign trigger and rebuild rings no longer use the same broad “all published campaigns” SQL.
+  - `campaign_triggers_due` now selects campaigns with real due scheduled events or newly-added campaign contacts not yet initialized in event log.
+  - `campaign_rebuilds_due` now selects campaigns whose source segment membership differs from `campaign_leads`.
+  - Legacy `campaigns_due` all-published defaults are auto-migrated/ignored for the new split planner, while intentional custom SQL remains supported.
+- Fixed: campaign planning failures no longer preserve stale campaign rings.
+  - On planning failure, trigger/rebuild rings are cleared instead of repeatedly launching old entities.
+- Added: DB dispatch circuit-breaker for scheduler safety.
+  - MySQL overload/errors such as `Too many connections`, lost connection, lock wait timeout, deadlock, and metadata-lock overload pause new dispatch briefly per root.
+  - DB watchdog observations can also pause dispatch when long-query or metadata-lock thresholds are exceeded.
+
 ## 0.8.75 - 2026-04-08
 - Fixed: SQL segment technical ring is now persistent and restart-safe.
   - Added persistent state/lock per `root + segment_id` in state backend (`runtime_sync`) with owner, heartbeat and finish metadata.
