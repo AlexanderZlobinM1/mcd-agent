@@ -33,7 +33,13 @@ _C_GREEN = "\033[32m"
 _C_YELLOW = "\033[33m"
 _C_RED = "\033[31m"
 _C_GRAY = "\033[90m"
-_BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle$")
+_BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle(?:Dev)?$")
+_EXCLUSIVE_BUNDLE_PAIRS: dict[str, str] = {
+    "AmazonSesBundle": "AmazonSesBundleDev",
+    "AmazonSesBundleDev": "AmazonSesBundle",
+    "SalesSnapBundle": "SalesSnapBundleDev",
+    "SalesSnapBundleDev": "SalesSnapBundle",
+}
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -43,6 +49,18 @@ def _is_valid_bundle_name(name: str) -> bool:
     if n.lower() in {"plugin", "plugins"}:
         return False
     return bool(_BUNDLE_NAME_RE.match(n))
+
+
+def _install_bundle_for_manifest_bundle(bundle: str) -> str:
+    """
+    Resolve filesystem install directory for a manifest bundle key.
+    Dev aliases are installed into canonical bundle directory so runtime
+    bundle paths remain stable.
+    """
+    b = str(bundle or "").strip()
+    if b in _EXCLUSIVE_BUNDLE_PAIRS and b.endswith("Dev"):
+        return _EXCLUSIVE_BUNDLE_PAIRS[b]
+    return b
 
 
 def _color(status: str, no_color: bool) -> str:
@@ -306,6 +324,83 @@ def _normalize_action(raw: str) -> str | None:
     return mapping.get(v)
 
 
+def _exclusive_counterparts(bundle: str, item: dict[str, Any] | None = None) -> set[str]:
+    """
+    Returns bundles that are mutually exclusive with `bundle`.
+    Supports hardcoded pairs and optional manifest field `replaces: []`.
+    """
+    out: set[str] = set()
+    bundle_name = str(bundle or "").strip()
+    if not bundle_name:
+        return out
+
+    direct = _EXCLUSIVE_BUNDLE_PAIRS.get(bundle_name)
+    if direct:
+        out.add(direct)
+    for left, right in _EXCLUSIVE_BUNDLE_PAIRS.items():
+        if right == bundle_name:
+            out.add(left)
+
+    if isinstance(item, dict):
+        repl = item.get("replaces")
+        if isinstance(repl, list):
+            for x in repl:
+                name = str(x or "").strip()
+                if name and _is_valid_bundle_name(name):
+                    out.add(name)
+
+    out.discard(bundle_name)
+    return out
+
+
+def _validate_selected_exclusive_conflicts(selected: list[dict[str, Any]]) -> None:
+    selected_set = {str(row.get("bundle", "")).strip() for row in selected if str(row.get("bundle", "")).strip()}
+    for row in selected:
+        bundle = str(row.get("bundle", "")).strip()
+        item = row.get("item")
+        item_dict = item if isinstance(item, dict) else None
+        conflicts = sorted(selected_set.intersection(_exclusive_counterparts(bundle, item_dict)))
+        if conflicts:
+            raise RuntimeError(
+                f"exclusive plugins selected together: {bundle} and {', '.join(conflicts)}"
+            )
+
+
+def _auto_remove_conflicting_installed_bundles(
+    selected: list[dict[str, Any]],
+    plugins_dir: Path,
+) -> list[str]:
+    """
+    Return conflicting bundle keys that must be removed before applying `selected`.
+    We intentionally do this unconditionally (even if paths are currently absent)
+    to enforce deterministic "one-of" behavior for dev/stable variants.
+    """
+    _ = plugins_dir  # kept for call-site compatibility
+    selected_set = {str(row.get("bundle", "")).strip() for row in selected if str(row.get("bundle", "")).strip()}
+    remove: set[str] = set()
+    for row in selected:
+        bundle = str(row.get("bundle", "")).strip()
+        item = row.get("item")
+        item_dict = item if isinstance(item, dict) else None
+        for conflict in _exclusive_counterparts(bundle, item_dict):
+            if conflict in selected_set:
+                continue
+            remove.add(conflict)
+    return sorted(remove, key=lambda x: x.lower())
+
+
+def _remove_plugin_path(path: Path) -> bool:
+    if not (path.exists() or path.is_symlink()):
+        return False
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return True
+    if path.is_dir():
+        shutil.rmtree(path)
+        return True
+    return False
+
+
 def _extract_version_from_php_text(text: str) -> str:
     m = re.search(r"['\"]version['\"]\s*=>\s*['\"]([^'\"]+)['\"]", text, flags=re.IGNORECASE)
     if m and m.group(1).strip():
@@ -356,9 +451,16 @@ def _has_php_file_fast(root: Path, limit_files: int = 50000) -> bool:
     return False
 
 
-def _plugin_status(plugins_dir: Path, plugin: dict[str, Any], state_filename: str) -> tuple[str, str, str]:
+def _plugin_status(
+    plugins_dir: Path,
+    plugin: dict[str, Any],
+    state_filename: str,
+    *,
+    install_bundle: str | None = None,
+) -> tuple[str, str, str]:
     bundle = str(plugin.get("bundle", "")).strip()
-    pdir = plugins_dir / bundle
+    install_name = str(install_bundle or "").strip() or bundle
+    pdir = plugins_dir / install_name
     if not pdir.exists():
         return "MISSING", "not installed", "-"
 
@@ -384,6 +486,15 @@ def _plugin_status(plugins_dir: Path, plugin: dict[str, Any], state_filename: st
         except Exception:
             return "BROKEN", "invalid state metadata", installed_version
 
+    # Canonical-path dev/stable aliases share one install directory.
+    # Respect the last installed bundle from state file so UI/CLI won't
+    # show both variants as simultaneously installed.
+    if state is not None:
+        recorded_bundle = str(state.get("bundle", "")).strip()
+        if recorded_bundle and recorded_bundle != bundle:
+            if recorded_bundle in _exclusive_counterparts(bundle, plugin):
+                return "MISSING", f"counterpart installed={recorded_bundle}", "-"
+
     if installed_version == expected_version:
         if state is None:
             return "OK", "version match", installed_version
@@ -400,9 +511,34 @@ def _extract_package(archive_path: Path, staging: Path) -> None:
     if lower.endswith(".zip"):
         with zipfile.ZipFile(archive_path, "r") as zf:
             zf.extractall(staging)
+    else:
+        with tarfile.open(archive_path, "r:*") as tf:
+            tf.extractall(staging)
+    _cleanup_macos_archive_artifacts(staging)
+
+
+def _cleanup_macos_archive_artifacts(root: Path) -> None:
+    """
+    Remove macOS metadata artifacts (AppleDouble/._* and __MACOSX) that can
+    introduce duplicate PHP classes and crash cache:clear.
+    """
+    if not root.exists():
         return
-    with tarfile.open(archive_path, "r:*") as tf:
-        tf.extractall(staging)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        cur = Path(dirpath)
+        for d in list(dirnames):
+            if d == "__MACOSX":
+                try:
+                    shutil.rmtree(cur / d, ignore_errors=True)
+                except Exception:
+                    pass
+                dirnames.remove(d)
+        for fn in filenames:
+            if fn.startswith("._"):
+                try:
+                    (cur / fn).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 def _find_bundle_root(staging: Path, bundle: str) -> Path:
@@ -545,6 +681,36 @@ def _run_manifest_sql_fixes(install, selected_rows: list[dict[str, Any]]) -> Non
                 logging.info("[%s] pre_sql %s affected=%s", install.root, bundle, affected)
             except Exception as e:
                 raise RuntimeError(f"pre_sql failed for {bundle}: {e}") from e
+
+
+def _cleanup_conflicting_plugin_rows(install, selected_rows: list[dict[str, Any]]) -> None:
+    if not install.db:
+        return
+    selected_set = {
+        str(row.get("bundle", "")).strip()
+        for row in selected_rows
+        if str(row.get("bundle", "")).strip()
+    }
+    conflicts: set[str] = set()
+    for row in selected_rows:
+        bundle = str(row.get("bundle", "")).strip()
+        item = row.get("item")
+        item_dict = item if isinstance(item, dict) else None
+        for other in _exclusive_counterparts(bundle, item_dict):
+            if other and other not in selected_set:
+                conflicts.add(other)
+    if not conflicts:
+        return
+    escaped = []
+    for b in sorted(conflicts):
+        escaped.append("'" + b.replace("'", "''") + "'")
+    sql = f"DELETE FROM {{prefix}}plugins WHERE bundle IN ({', '.join(escaped)})"
+    try:
+        db = MauticDB(install.db)
+        affected = db.execute_sql_template(sql)
+        logging.info("[%s] plugin conflict rows cleanup affected=%s bundles=%s", install.root, affected, ",".join(sorted(conflicts)))
+    except Exception as e:
+        logging.warning("[%s] plugin conflict rows cleanup failed: %s", install.root, e)
 
 
 def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]) -> None:
@@ -712,6 +878,7 @@ def run_plugins_interactive(
                 {
                     "idx": selectable_idx,
                     "bundle": bundle,
+                    "install_bundle": bundle,
                     "status": "-",
                     "reason": "local only (not in server manifest)",
                     "installed_version": installed_version,
@@ -723,11 +890,18 @@ def run_plugins_interactive(
             selectable_idx += 1
             continue
 
-        status, reason, installed_version = _plugin_status(plugins_dir, item, config.plugins_state_filename)
+        install_bundle = _install_bundle_for_manifest_bundle(bundle)
+        status, reason, installed_version = _plugin_status(
+            plugins_dir,
+            item,
+            config.plugins_state_filename,
+            install_bundle=install_bundle,
+        )
         rows.append(
             {
                 "idx": selectable_idx,
                 "bundle": bundle,
+                "install_bundle": install_bundle,
                 "status": status,
                 "reason": reason,
                 "installed_version": installed_version,
@@ -795,6 +969,8 @@ def run_plugins_interactive(
         )
     print("")
 
+    selected: list[dict[str, Any]] = []
+    auto_remove_bundles: list[str] = []
     while True:
         if action is None:
             print("Action:")
@@ -834,9 +1010,29 @@ def run_plugins_interactive(
             print("Selected indexes are not actionable, try again")
             continue
 
+        try:
+            _validate_selected_exclusive_conflicts(selected)
+        except RuntimeError as e:
+            print(f"Selection error: {e}")
+            if not sys.stdin.isatty():
+                return 1
+            print("Back to action selection")
+            continue
+
+        auto_remove_bundles = []
+        if chosen_action != "remove":
+            auto_remove_bundles = _auto_remove_conflicting_installed_bundles(
+                selected,
+                plugins_dir,
+            )
+
         print("Selected:")
         for row in selected:
             print(f"- {row['bundle']} [{row['status']}]")
+        if auto_remove_bundles:
+            print("Will auto-remove conflicting installed bundle(s):")
+            for b in auto_remove_bundles:
+                print(f"- {b}")
         if not yes:
             confirm = _ask("Apply selected plugins? [y/N]: ").strip().lower()
             if confirm not in {"y", "yes"}:
@@ -847,21 +1043,40 @@ def run_plugins_interactive(
     action = chosen_action
 
     changed = False
+    if action != "remove" and auto_remove_bundles:
+        for conflict_bundle in auto_remove_bundles:
+            conflict_install = _install_bundle_for_manifest_bundle(conflict_bundle)
+            removed_paths: list[str] = []
+            for name in sorted({conflict_bundle, conflict_install}):
+                pdir = _resolve_plugins_dir(install_root, create=False) / name
+                if _remove_plugin_path(pdir):
+                    removed_paths.append(name)
+            if removed_paths:
+                changed = True
+                logging.info(
+                    "[%s] plugin %s auto-removed due to mutually exclusive selection (paths=%s)",
+                    install_root,
+                    conflict_bundle,
+                    ",".join(removed_paths),
+                )
+                print(f"Auto-removed conflicting plugin: {conflict_bundle} ({', '.join(removed_paths)})")
+
     for row in selected:
         item = row["item"]
         bundle = row["bundle"]
+        install_bundle = str(row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle))
         if action != "remove" and not isinstance(item, dict):
             logging.info("[%s] plugin %s not in server manifest, skip for action=%s", install_root, bundle, action)
             continue
         status = row["status"]
         if action == "remove":
-            pdir = _resolve_plugins_dir(install_root, create=False) / bundle
+            pdir = _resolve_plugins_dir(install_root, create=False) / install_bundle
             if pdir.exists():
                 shutil.rmtree(pdir)
                 changed = True
-                logging.info("[%s] plugin %s removed", install_root, bundle)
+                logging.info("[%s] plugin %s removed (path=%s)", install_root, bundle, install_bundle)
             else:
-                logging.info("[%s] plugin %s already absent", install_root, bundle)
+                logging.info("[%s] plugin %s already absent (path=%s)", install_root, bundle, install_bundle)
             continue
 
         assert isinstance(item, dict)
@@ -887,7 +1102,7 @@ def run_plugins_interactive(
 
         _install_or_replace_plugin(
             root=install_root,
-            bundle=bundle,
+            bundle=install_bundle,
             package_url=package_url,
             token=config.mcc_token,
             fallback_ip=fallback_ip,
@@ -900,11 +1115,23 @@ def run_plugins_interactive(
                 "source": package_url,
             },
         )
+        if install_bundle != bundle:
+            alias_path = _resolve_plugins_dir(install_root, create=False) / bundle
+            if alias_path.exists() or alias_path.is_symlink():
+                try:
+                    if alias_path.is_symlink() or alias_path.is_file():
+                        alias_path.unlink()
+                    elif alias_path.is_dir():
+                        shutil.rmtree(alias_path)
+                    logging.info("[%s] removed alias plugin path=%s (installed as %s)", install_root, bundle, install_bundle)
+                except Exception as e:
+                    logging.warning("[%s] failed to cleanup alias plugin path=%s: %s", install_root, bundle, e)
         changed = True
-        logging.info("[%s] plugin %s applied action=%s", install_root, bundle, action)
+        logging.info("[%s] plugin %s applied action=%s path=%s", install_root, bundle, action, install_bundle)
 
     if changed:
         _run_manifest_sql_fixes(install, selected)
+        _cleanup_conflicting_plugin_rows(install, selected)
         _apply_hostnet_mautic4_tx_patch(install, selected)
         _run_post_steps(config, install)
         print("Plugins applied and post-steps completed")

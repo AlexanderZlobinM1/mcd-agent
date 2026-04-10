@@ -219,6 +219,23 @@ def _is_mysql_auth_error(msg: str) -> bool:
     )
 
 
+def _ipv6_disabled_now() -> bool | None:
+    st = ipv6_status()
+    keys = (
+        "net.ipv6.conf.all.disable_ipv6",
+        "net.ipv6.conf.default.disable_ipv6",
+        "net.ipv6.conf.lo.disable_ipv6",
+    )
+    vals = [str(st.get(k, "?")).strip() for k in keys]
+    if any(v == "?" or v == "" for v in vals):
+        return None
+    if all(v == "1" for v in vals):
+        return True
+    if all(v == "0" for v in vals):
+        return False
+    return None
+
+
 def _state_runtime_bootstrap_defaults(cfg) -> dict[str, object]:
     runtime_user = str(cfg.state_mysql_user or "").strip()
     if not runtime_user or runtime_user.lower() == "root":
@@ -824,7 +841,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                 print("Select active instance first")
                 continue
             try:
-                run_plugins_interactive(
+                rc = run_plugins_interactive(
                     config=cfg,
                     root=active_root,
                     selection=None,
@@ -832,6 +849,8 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     no_color=bool(no_color),
                     yes=False,
                 )
+                if rc == 0:
+                    _push_state_after_change(cfg, "plugins-interactive")
             except Exception as e:
                 print(f"Plugins error: {e}")
                 msg = str(e).lower()
@@ -843,7 +862,9 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                 print("Select active instance first")
                 continue
             try:
-                run_upgrade_interactive(cfg, active_root)
+                rc = run_upgrade_interactive(cfg, active_root)
+                if rc == 0:
+                    _push_state_after_change(cfg, "mautic-upgrade-interactive")
             except Exception as e:
                 print(f"Upgrade error: {e}")
             continue
@@ -875,6 +896,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     try:
                         count = inv.rescan(cfg)
                         print(f"Rescan complete: {count} instances")
+                        _push_state_after_change(cfg, "instances-rescan-interactive")
                     except Exception as e:
                         print(f"Rescan error: {e}")
                     continue
@@ -910,6 +932,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                             db_table_prefix=db_prefix,
                         )
                         print("Manual instance saved")
+                        _push_state_after_change(cfg, "instances-add-interactive")
                     except Exception as e:
                         print(f"Save manual instance error: {e}")
                     continue
@@ -920,6 +943,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                             if active_root == name:
                                 active_root = None
                             print("Removed")
+                            _push_state_after_change(cfg, "instances-remove-interactive")
                         else:
                             print("Not found")
                     except Exception as e:
@@ -965,33 +989,31 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
             while True:
                 st_backend = _state_backend_status_payload(cfg)
                 show_create_state_db = _state_db_missing_only(cfg, st_backend)
+                ipv6_disabled = _ipv6_disabled_now()
+                ipv6_toggle_to_disabled = not bool(ipv6_disabled)
+                ipv6_toggle_label = "Disable IPv6" if ipv6_toggle_to_disabled else "Enable IPv6"
+                ipv6_state_label = "disabled" if ipv6_disabled is True else ("enabled" if ipv6_disabled is False else "unknown")
                 print("")
                 print("Environment")
-                print("1. IPv6 Status")
-                print("2. Disable IPv6")
-                print("3. Enable IPv6")
-                print("4. State Backend Status")
+                print(f"IPv6 state: {ipv6_state_label}")
+                print(f"1. {ipv6_toggle_label}")
+                print("2. State Backend Status")
                 if show_create_state_db:
-                    print("5. Bootstrap State DB (root password)")
+                    print("3. Bootstrap State DB (root password)")
                 print("0. Back")
                 c3 = _ask("Select option: ").strip()
                 if c3 == "1":
-                    st = ipv6_status()
-                    for k, v in st.items():
-                        print(f"{k}={v}")
+                    for line in set_ipv6_disabled(ipv6_toggle_to_disabled):
+                        print(line)
+                    _push_state_after_change(
+                        cfg,
+                        "env-ipv6-disable-interactive" if ipv6_toggle_to_disabled else "env-ipv6-enable-interactive",
+                    )
                     continue
                 if c3 == "2":
-                    for line in set_ipv6_disabled(True):
-                        print(line)
-                    continue
-                if c3 == "3":
-                    for line in set_ipv6_disabled(False):
-                        print(line)
-                    continue
-                if c3 == "4":
                     _print_state_backend_status(cfg)
                     continue
-                if c3 == "5" and show_create_state_db:
+                if c3 == "3" and show_create_state_db:
                     host_default = str(cfg.state_mysql_host or "localhost")
                     port_default = int(cfg.state_mysql_port or 3306)
                     admin_host = (_ask(f"DB admin host [{host_default}]: ").strip() or host_default)
@@ -1049,6 +1071,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                         print(res.message)
                         if res.state_path:
                             print(f"state={res.state_path}")
+                        _push_state_after_change(cfg, "backup-run-interactive")
                     except Exception as e:
                         print(f"Backup run error: {e}")
                     continue
@@ -1063,6 +1086,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     try:
                         res = backup_prune(cfg, active_root)
                         print(res.message)
+                        _push_state_after_change(cfg, "backup-prune-interactive")
                     except Exception as e:
                         print(f"Backup prune error: {e}")
                     continue

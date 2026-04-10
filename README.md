@@ -71,6 +71,8 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   - MCD performs update locally (download/stage/atomic source switch/restart) and reports result back to MCC.
   - apply path does not run `pip install`; host update is source-switch only.
   - MCC limits concurrent update sessions (`10` by default); extra nodes receive wait/retry signal.
+  - MCD auto-cleans old self-update artifacts (`/opt/mcd/var/updates` archives + `/opt/mcd/var/backup/mcd-src-preupdate-*`) by retention policy.
+    - default: keep last `3` archives and `3` preupdate backups, max age `30` days, cleanup once per day.
   - MCD keeps local config history (`10` snapshots by default).
 - MCC-driven dynamic service profiles:
   - service profile payload is stored on MCC and can be changed without MCD release rebuild.
@@ -183,7 +185,7 @@ Manual command behavior:
 - `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml bootstrap-mysql-user`
 
 Notes:
-- `php_fpm` apply now includes both FPM pool/opcache/redis tuning and global PHP ini baseline (`98-mcd-php.ini` for FPM/CLI).
+- `php_fpm` apply includes FPM pool/opcache/redis tuning. Global managed `98-mcd-php.ini` baseline is no longer used; legacy files are removed on apply if present.
 - APT profile includes one-time Zabbix DB monitor bootstrap (`zbx_monitor@127.0.0.1`) with marker tracking and manual override via `mcd-cli zabbix bootstrap-mysql-user --force`.
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
@@ -267,6 +269,11 @@ Important:
   - `runtime.fs_permissions_guard_paths` defines relative instance paths to enforce (`var/cache`, `var/logs`, `var/spool`, `var/tmp`, media/config paths).
   - `runtime.fs_permissions_guard_fix_console_exec` forces `bin/console` executable bit (`chmod ug+x`) and runtime owner.
   - `runtime.fs_permissions_guard_console_relpath` allows custom console location (default `bin/console`).
+  - `runtime.db_watchdog` adds DB processlist watchdog policy (observe-first):
+    - `enabled`, `interval_sec`, `observe_only`, `processlist_limit`, `sample_limit`
+    - `global_rules` for shared defaults
+    - `host_rules` for host-specific overrides (host patch overrides global rules by rule `id`)
+    - telemetry is pushed to MCC in `signals.totals` and `signals.details.db_watchdog_recent` (no kill action while `observe_only=true`)
   - guard runs in all profiles, including `passive` (planning-only mode still keeps filesystem ownership healthy).
 - Runtime tuning for large campaigns:
   - `runtime.campaign_limit` controls per-run trigger batch size.

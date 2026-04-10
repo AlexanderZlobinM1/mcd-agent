@@ -11,6 +11,33 @@ from mcd_agent.localphp import parse_local_php
 from mcd_agent.models import DBConfig, MauticInstall
 
 
+_TEMPLATE_DOMAIN_RE = re.compile(r"^default[0-9a-z-]*\.sales-snap\.(com|ru)$", flags=re.IGNORECASE)
+
+
+def _is_template_domain(host: str | None) -> bool:
+    v = str(host or "").strip().lower()
+    if not v:
+        return False
+    return bool(_TEMPLATE_DOMAIN_RE.match(v))
+
+
+def _domain_preference_score(host: str | None) -> int:
+    v = str(host or "").strip().lower()
+    if not v:
+        return -1000
+    score = 0
+    if v not in {"_", "localhost"}:
+        score += 20
+    if "*" not in v:
+        score += 10
+    if _is_template_domain(v):
+        score -= 60
+    else:
+        score += 40
+    score += v.count(".")
+    return score
+
+
 def _find_console_path(root: str, explicit: str | None = None) -> str | None:
     if explicit:
         candidate = Path(explicit)
@@ -208,7 +235,11 @@ def _web_vhosts_from_server_configs() -> list[tuple[str, str | None]]:
                 out.extend(_parse_apache_vhosts(p))
     dedup: dict[str, str | None] = {}
     for root, dom in out:
-        if root not in dedup or (dom and not dedup[root]):
+        if root not in dedup:
+            dedup[root] = dom
+            continue
+        prev = dedup[root]
+        if _domain_preference_score(dom) > _domain_preference_score(prev):
             dedup[root] = dom
     return [(k, v) for k, v in sorted(dedup.items(), key=lambda x: x[0])]
 
@@ -294,6 +325,11 @@ def discover_mautic(
         vhost_domain = vhost_map.get(root)
         config_domain = _domain_from_local_php(local_php)
         domain = config_domain or vhost_domain
+        if config_domain and vhost_domain and config_domain != vhost_domain:
+            # Template clones often keep stale site_url (default*.sales-snap.*)
+            # until app-level post-clone tuning runs. Prefer real vhost domain.
+            if _is_template_domain(config_domain) and not _is_template_domain(vhost_domain):
+                domain = vhost_domain
         name = domain or (Path(resolved_root).name or "mautic")
         installs.append(
             MauticInstall(

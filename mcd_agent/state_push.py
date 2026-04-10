@@ -1187,6 +1187,16 @@ class MCCStatePusher:
         # remains correct and stable across daemon restarts.
         self._fs_permissions_fix_pending = 0
         self._fs_permissions_events_pending: list[dict[str, Any]] = []
+        # DB watchdog observe deltas.
+        self._db_watchdog_pending: dict[str, int] = {
+            "samples": 0,
+            "errors": 0,
+            "metadata_lock_waits": 0,
+            "long_queries": 0,
+            "orphan_candidates": 0,
+            "rule_hits": 0,
+        }
+        self._db_watchdog_events_pending: list[dict[str, Any]] = []
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -1232,6 +1242,68 @@ class MCCStatePusher:
         if n <= 0 and not events:
             return
 
+    def add_db_watchdog_observation(self, payload: dict[str, Any], *, now_ts: float | None = None) -> None:
+        if not isinstance(payload, dict):
+            return
+        self._db_watchdog_pending["samples"] = int(self._db_watchdog_pending.get("samples", 0) or 0) + 1
+        status = str(payload.get("status", "")).strip().lower()
+        if status != "ok":
+            self._db_watchdog_pending["errors"] = int(self._db_watchdog_pending.get("errors", 0) or 0) + 1
+            reason = str(payload.get("reason", "")).strip() or f"status:{status or 'unknown'}"
+            self._db_watchdog_events_pending.append(
+                {
+                    "ts": datetime.fromtimestamp(float(now_ts if now_ts is not None else time.time()), tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                    "root": str(payload.get("root", "")).strip(),
+                    "status": status or "error",
+                    "reason": reason,
+                }
+            )
+            self._db_watchdog_events_pending = self._db_watchdog_events_pending[-200:]
+            return
+
+        pl = payload.get("processlist")
+        pl_map = pl if isinstance(pl, dict) else {}
+        rule = payload.get("rules")
+        rule_map = rule if isinstance(rule, dict) else {}
+        lock_waits = int(pl_map.get("metadata_lock_waits", 0) or 0)
+        long_q = int(pl_map.get("long_queries", 0) or 0)
+        orphans = int(pl_map.get("orphan_candidates", 0) or 0)
+        rule_hits = int(rule_map.get("hit_total", 0) or 0)
+        self._db_watchdog_pending["metadata_lock_waits"] = int(
+            self._db_watchdog_pending.get("metadata_lock_waits", 0) or 0
+        ) + lock_waits
+        self._db_watchdog_pending["long_queries"] = int(self._db_watchdog_pending.get("long_queries", 0) or 0) + long_q
+        self._db_watchdog_pending["orphan_candidates"] = int(
+            self._db_watchdog_pending.get("orphan_candidates", 0) or 0
+        ) + orphans
+        self._db_watchdog_pending["rule_hits"] = int(self._db_watchdog_pending.get("rule_hits", 0) or 0) + rule_hits
+        top = pl_map.get("top_slowest")
+        top_rows = top if isinstance(top, list) else []
+        first = top_rows[0] if top_rows and isinstance(top_rows[0], dict) else {}
+        self._db_watchdog_events_pending.append(
+            {
+                "ts": str(payload.get("checked_at_utc", "")).strip()
+                or datetime.fromtimestamp(float(now_ts if now_ts is not None else time.time()), tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "root": str(payload.get("root", "")).strip(),
+                "status": "ok",
+                "total": int(pl_map.get("total", 0) or 0),
+                "queries": int(pl_map.get("queries", 0) or 0),
+                "metadata_lock_waits": lock_waits,
+                "long_queries": long_q,
+                "orphan_candidates": orphans,
+                "rule_hits": rule_hits,
+                "max_query_time_sec": int(pl_map.get("max_query_time_sec", 0) or 0),
+                "top_pid": int(first.get("pid", 0) or 0) if isinstance(first, dict) else 0,
+                "top_time_sec": int(first.get("time_sec", 0) or 0) if isinstance(first, dict) else 0,
+                "top_state": str(first.get("state", "")).strip() if isinstance(first, dict) else "",
+            }
+        )
+        self._db_watchdog_events_pending = self._db_watchdog_events_pending[-200:]
+
     def _signals_payload(self) -> dict[str, Any]:
         base = self.latest_signals if isinstance(self.latest_signals, dict) else {}
         out = dict(base)
@@ -1239,12 +1311,35 @@ class MCCStatePusher:
         totals = dict(totals_raw) if isinstance(totals_raw, dict) else {}
         pending = int(self._fs_permissions_fix_pending or 0)
         totals["fs_permissions_fix"] = int(totals.get("fs_permissions_fix", 0) or 0) + pending
+        totals["db_watchdog_samples"] = int(totals.get("db_watchdog_samples", 0) or 0) + int(
+            self._db_watchdog_pending.get("samples", 0) or 0
+        )
+        totals["db_watchdog_errors"] = int(totals.get("db_watchdog_errors", 0) or 0) + int(
+            self._db_watchdog_pending.get("errors", 0) or 0
+        )
+        totals["db_watchdog_metadata_lock_waits"] = int(
+            totals.get("db_watchdog_metadata_lock_waits", 0) or 0
+        ) + int(self._db_watchdog_pending.get("metadata_lock_waits", 0) or 0)
+        totals["db_watchdog_long_queries"] = int(totals.get("db_watchdog_long_queries", 0) or 0) + int(
+            self._db_watchdog_pending.get("long_queries", 0) or 0
+        )
+        totals["db_watchdog_orphan_candidates"] = int(
+            totals.get("db_watchdog_orphan_candidates", 0) or 0
+        ) + int(self._db_watchdog_pending.get("orphan_candidates", 0) or 0)
+        totals["db_watchdog_rule_hits"] = int(totals.get("db_watchdog_rule_hits", 0) or 0) + int(
+            self._db_watchdog_pending.get("rule_hits", 0) or 0
+        )
         out["totals"] = totals
         out["fs_permissions_fix_pending"] = pending
         if self._fs_permissions_events_pending:
             details_raw = out.get("details")
             details = dict(details_raw) if isinstance(details_raw, dict) else {}
             details["fs_permissions_fix_recent"] = self._fs_permissions_events_pending[-50:]
+            out["details"] = details
+        if self._db_watchdog_events_pending:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["db_watchdog_recent"] = self._db_watchdog_events_pending[-50:]
             out["details"] = details
         return out
 
@@ -1329,6 +1424,15 @@ class MCCStatePusher:
         self.last_hash = _hash_payload(payload_no_ts)
         self._fs_permissions_fix_pending = 0
         self._fs_permissions_events_pending = []
+        self._db_watchdog_pending = {
+            "samples": 0,
+            "errors": 0,
+            "metadata_lock_waits": 0,
+            "long_queries": 0,
+            "orphan_candidates": 0,
+            "rule_hits": 0,
+        }
+        self._db_watchdog_events_pending = []
 
     def _store_state_snapshot(self, payload: dict[str, Any], now_ts: float) -> None:
         payload_hash = _hash_payload(payload)

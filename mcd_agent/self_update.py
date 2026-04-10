@@ -280,6 +280,158 @@ def _restart_service_async() -> None:
     )
 
 
+def _acquire_update_lock(cfg: AgentConfig, *, blocking: bool) -> Any | None:
+    lock_p = _lock_path(cfg)
+    lock_p.parent.mkdir(parents=True, exist_ok=True)
+    lock_f = lock_p.open("w", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            op = fcntl.LOCK_EX
+            if not blocking:
+                op |= fcntl.LOCK_NB
+            fcntl.flock(lock_f.fileno(), op)
+        return lock_f
+    except Exception:
+        try:
+            lock_f.close()
+        except Exception:
+            pass
+        return None
+
+
+def _release_update_lock(lock_f: Any | None) -> None:
+    if lock_f is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        lock_f.close()
+    except Exception:
+        pass
+
+
+def _safe_mtime(path: Path, fallback: int) -> int:
+    try:
+        return int(path.stat().st_mtime)
+    except Exception:
+        return fallback
+
+
+def _remove_path(path: Path) -> bool:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _prune_entries(paths: list[Path], *, keep_count: int, max_age_sec: int, now_s: int) -> int:
+    keep = max(0, int(keep_count))
+    age_limit = max(86_400, int(max_age_sec))
+    ordered = sorted(paths, key=lambda p: _safe_mtime(p, now_s), reverse=True)
+    removed = 0
+    for idx, p in enumerate(ordered):
+        age_sec = max(0, now_s - _safe_mtime(p, now_s))
+        if idx < keep and age_sec <= age_limit:
+            continue
+        if _remove_path(p):
+            removed += 1
+    return removed
+
+
+def _cleanup_update_artifacts(cfg: AgentConfig, *, now_s: int | None = None) -> dict[str, int]:
+    now = int(time.time()) if now_s is None else int(now_s)
+    install_dir = Path("/opt/mcd")
+    updates_dir = install_dir / "var" / "updates"
+    backup_dir = install_dir / "var" / "backup"
+
+    keep_archives = max(0, int(cfg.mcd_update_keep_archives))
+    keep_preupdate = max(0, int(cfg.mcd_update_keep_preupdate_backups))
+    max_age_days = max(1, int(cfg.mcd_update_artifacts_max_age_days))
+    max_age_sec = max_age_days * 86_400
+
+    removed = {"archives": 0, "preupdate_backups": 0, "stale_dirs": 0}
+
+    if updates_dir.exists():
+        archives = [
+            p
+            for p in updates_dir.iterdir()
+            if p.is_file()
+            and p.name.startswith("mcd-agent-")
+            and (p.name.endswith(".tar.gz") or p.name.endswith(".tgz") or p.name.endswith(".tar"))
+        ]
+        removed["archives"] = _prune_entries(archives, keep_count=keep_archives, max_age_sec=max_age_sec, now_s=now)
+
+        stale_stage_dirs = [
+            p
+            for p in updates_dir.iterdir()
+            if p.is_dir() and (p.name.startswith("src.next-") or p.name.startswith("src.prev-"))
+        ]
+        for p in stale_stage_dirs:
+            # Keep very fresh staging dirs to avoid racing with non-MCD tooling.
+            age_sec = max(0, now - _safe_mtime(p, now))
+            if age_sec < 3600:
+                continue
+            if _remove_path(p):
+                removed["stale_dirs"] += 1
+
+    if backup_dir.exists():
+        preupdate_backups = [
+            p for p in backup_dir.iterdir() if p.is_file() and p.name.startswith("mcd-src-preupdate-") and p.name.endswith(".tgz")
+        ]
+        removed["preupdate_backups"] = _prune_entries(
+            preupdate_backups,
+            keep_count=keep_preupdate,
+            max_age_sec=max_age_sec,
+            now_s=now,
+        )
+
+    if any(v > 0 for v in removed.values()):
+        logging.info(
+            "MCD self-update cleanup: removed archives=%s preupdate_backups=%s stale_dirs=%s",
+            removed["archives"],
+            removed["preupdate_backups"],
+            removed["stale_dirs"],
+        )
+    return removed
+
+
+def _maybe_run_update_cleanup(cfg: AgentConfig, state: dict[str, Any], *, now_s: int) -> bool:
+    if not bool(cfg.mcd_update_cleanup_enabled):
+        return False
+    interval_sec = max(300, int(cfg.mcd_update_cleanup_interval_sec or 86_400))
+    next_cleanup_ts = int(state.get("next_cleanup_ts", 0) or 0)
+    if now_s < next_cleanup_ts:
+        return False
+
+    lock_f = _acquire_update_lock(cfg, blocking=False)
+    if lock_f is None:
+        state["last_cleanup_status"] = "deferred_lock"
+        state["next_cleanup_ts"] = now_s + min(300, interval_sec)
+        return True
+    try:
+        removed = _cleanup_update_artifacts(cfg, now_s=now_s)
+        state["last_cleanup_ts"] = now_s
+        state["last_cleanup_status"] = "ok"
+        state["last_cleanup_removed"] = removed
+        state["next_cleanup_ts"] = now_s + interval_sec
+        return True
+    except Exception as e:
+        state["last_cleanup_ts"] = now_s
+        state["last_cleanup_status"] = f"failed:{e}"
+        state["next_cleanup_ts"] = now_s + interval_sec
+        logging.warning("MCD self-update cleanup failed: %s", e)
+        return True
+    finally:
+        _release_update_lock(lock_f)
+
+
 def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     status = str(plan.get("status", "")).strip().lower()
     if status != "update":
@@ -301,13 +453,8 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     backup_dir.mkdir(parents=True, exist_ok=True)
     updates_dir.mkdir(parents=True, exist_ok=True)
 
-    lock_p = _lock_path(cfg)
-    lock_p.parent.mkdir(parents=True, exist_ok=True)
-    lock_f = lock_p.open("w", encoding="utf-8")
-    try:
-        if fcntl is not None:
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
+    lock_f = _acquire_update_lock(cfg, blocking=False)
+    if lock_f is None:
         session_id = str(plan.get("session_id", "")).strip()
         if session_id:
             release_session(
@@ -317,7 +464,6 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 result_message="another update is already running",
                 new_version=__version__,
             )
-        lock_f.close()
         return False, "another update is already running"
 
     now_s = int(time.time())
@@ -369,6 +515,14 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 "last_session_id": session_id,
             }
         )
+        if bool(cfg.mcd_update_cleanup_enabled):
+            try:
+                state["last_cleanup_removed"] = _cleanup_update_artifacts(cfg, now_s=now_s)
+                state["last_cleanup_ts"] = now_s
+                state["last_cleanup_status"] = "ok"
+                state["next_cleanup_ts"] = now_s + max(300, int(cfg.mcd_update_cleanup_interval_sec or 86_400))
+            except Exception as ce:
+                state["last_cleanup_status"] = f"failed:{ce}"
         _write_state(cfg, state)
         try:
             if old_src_dir is not None and old_src_dir.exists():
@@ -413,22 +567,28 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 "last_session_id": session_id,
             }
         )
+        if bool(cfg.mcd_update_cleanup_enabled):
+            try:
+                state["last_cleanup_removed"] = _cleanup_update_artifacts(cfg, now_s=now_s)
+                state["last_cleanup_ts"] = now_s
+                state["last_cleanup_status"] = "ok"
+                state["next_cleanup_ts"] = now_s + max(300, int(cfg.mcd_update_cleanup_interval_sec or 86_400))
+            except Exception as ce:
+                state["last_cleanup_status"] = f"failed:{ce}"
         _write_state(cfg, state)
         return False, msg
     finally:
-        try:
-            if fcntl is not None:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        lock_f.close()
+        _release_update_lock(lock_f)
 
 
 def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | None, int]:
     state = _read_state(cfg)
     now_s = int(time.time())
+    cleanup_state_changed = _maybe_run_update_cleanup(cfg, state, now_s=now_s)
     next_allowed = int(state.get("next_check_ts", 0) or 0)
     if not force and now_s < next_allowed:
+        if cleanup_state_changed:
+            _write_state(cfg, state)
         return None, max(1, next_allowed - now_s)
 
     if cfg.backup_enabled:
