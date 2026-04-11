@@ -1,5 +1,26 @@
 # MCD Changelog
 
+## 0.8.78 - 2026-04-11
+- Added: automatic `symfony/amazon-mailer` dependency preflight for SES SNS plugin pair.
+  - Trigger bundles:
+    - `AmazonSnsCallbackBundle`
+    - `MauticAmazonSesBundle`
+  - Applied in:
+    - plugin install/update/reinstall flow (`mcd-cli plugins`)
+    - Mautic version upgrade flow (`mcd-cli mautic-upgrade`)
+- Behavior:
+  - If `symfony/amazon-mailer` is already installed, no action is taken.
+  - If missing:
+    - For zip installs, MCD ensures Node.js 20 runtime and then runs `composer require symfony/amazon-mailer`.
+    - For composer installs, MCD runs `composer require symfony/amazon-mailer` (without Node runtime migration step).
+  - After dependency install, MCD runs `cache:clear`.
+
+## 0.8.77 - 2026-04-11
+- Added: new mutually exclusive SES webhook pair in plugin resolver.
+  - `MauticAmazonSesBundle` <-> `AmazonSnsCallbackBundle`.
+  - Installing either one now force-removes the competing implementation before apply.
+  - Works together with manifest-level `replaces` for deterministic one-of behavior.
+
 ## 0.8.76 - 2026-04-10
 - Fixed: campaign trigger and rebuild rings no longer use the same broad “all published campaigns” SQL.
   - `campaign_triggers_due` now selects campaigns with real due scheduled events or newly-added campaign contacts not yet initialized in event log.

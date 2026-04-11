@@ -21,6 +21,7 @@ import urllib.request
 import zipfile
 
 from mcd_agent import __version__
+from mcd_agent.amazon_mailer_dep import ensure_amazon_mailer_for_bundles
 from mcd_agent.config import AgentConfig
 from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
@@ -37,6 +38,8 @@ _BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle(?:Dev)?$")
 _EXCLUSIVE_BUNDLE_PAIRS: dict[str, str] = {
     "AmazonSesBundle": "AmazonSesBundleDev",
     "AmazonSesBundleDev": "AmazonSesBundle",
+    "MauticAmazonSesBundle": "AmazonSnsCallbackBundle",
+    "AmazonSnsCallbackBundle": "MauticAmazonSesBundle",
     "SalesSnapBundle": "SalesSnapBundleDev",
     "SalesSnapBundleDev": "SalesSnapBundle",
 }
@@ -1099,6 +1102,14 @@ def run_plugins_interactive(
         if not should_apply:
             logging.info("[%s] plugin %s skip action=%s status=%s", install_root, bundle, action, status)
             continue
+
+        ensure_amazon_mailer_for_bundles(
+            config=config,
+            root=install_root,
+            console_path=install.console_path,
+            bundles={bundle},
+            reason="plugins-apply",
+        )
 
         _install_or_replace_plugin(
             root=install_root,

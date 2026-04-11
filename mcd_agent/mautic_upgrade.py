@@ -14,6 +14,7 @@ import urllib.request
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.amazon_mailer_dep import ensure_amazon_mailer_for_bundles, installed_required_bundles
 from mcd_agent.localphp import parse_local_php
 
 
@@ -476,6 +477,14 @@ def run_upgrade_apply(
 
     if with_system_upgrade:
         _apply_system_upgrade(current, target)
+
+    ensure_amazon_mailer_for_bundles(
+        config=config,
+        root=install_root,
+        console_path=console,
+        bundles=installed_required_bundles(install_root),
+        reason="mautic-upgrade",
+    )
 
     print(f"Upgrade completed: {current} -> {target}")
     return 0
