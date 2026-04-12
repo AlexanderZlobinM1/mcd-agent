@@ -3164,6 +3164,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if campaign_trigger_ids is not None and campaign_rebuild_ids is not None:
                     campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids))
                     campaign_rebuild_ids = list(dict.fromkeys(campaign_rebuild_ids))
+                    if (config.profile_name or "").strip().lower() == "tiny" and campaign_rebuild_ids:
+                        # Tiny chain uses trigger ring as source for rebuild->trigger sequence.
+                        # Include rebuild-due campaigns into trigger source to avoid missing
+                        # campaigns that currently have no scheduled events yet but require rebuild.
+                        campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids + campaign_rebuild_ids))
                     campaign_all_ids = list(dict.fromkeys(campaign_trigger_ids + campaign_rebuild_ids))
                     camp_w = store.get_weights("campaign", root, config.weights_recalc_interval_sec)
                     campaign_weight_rows: list[dict[str, object]] = []
@@ -3935,11 +3940,19 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         if _is_running(running, root, "campaign_trigger", pending_trigger_id):
                             campaign_chain_pending_trigger.pop(root, None)
                     else:
-                        if trg_reg_ring:
+                        next_campaign_id = None
+                        if trg_prio_ring:
+                            next_campaign_id = trg_prio_ring[0]
+                            trg_prio_ring.rotate(-1)
+                        elif trg_reg_ring:
                             next_campaign_id = trg_reg_ring[0]
                             trg_reg_ring.rotate(-1)
-                        else:
-                            next_campaign_id = None
+                        elif reb_prio_ring:
+                            next_campaign_id = reb_prio_ring[0]
+                            reb_prio_ring.rotate(-1)
+                        elif reb_reg_ring:
+                            next_campaign_id = reb_reg_ring[0]
+                            reb_reg_ring.rotate(-1)
                         if next_campaign_id is not None:
                             _submit_if_slot(
                                 config=config,

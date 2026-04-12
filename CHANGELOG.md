@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.8.79 - 2026-04-12
+- Fixed: `tiny` campaign chain no longer drops rebuild-only campaigns.
+  - Root cause: dispatch source was `trigger` ring only, so campaigns that were due in `rebuild` ring but absent in `trigger` ring were skipped indefinitely.
+  - Now `tiny` planning merges rebuild-due IDs into trigger source set for chain scheduling.
+  - Dispatch fallback order in tiny chain is now:
+    - trigger priority
+    - trigger regular
+    - rebuild priority
+    - rebuild regular
+  - Result: published campaigns requiring rebuild are not missed and proceed through `rebuild -> trigger` chain without manual intervention.
+
 ## 0.8.78 - 2026-04-11
 - Added: automatic `symfony/amazon-mailer` dependency preflight for SES SNS plugin pair.
   - Trigger bundles:
