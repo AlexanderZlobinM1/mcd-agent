@@ -181,12 +181,22 @@ Manual command behavior:
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component mysql`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml fetch --component apt --json`
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml apply --component apt --dry-run`
+- `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml rescan --component apt`
 - `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml status --json`
 - `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml bootstrap-mysql-user`
 
 Notes:
 - `php_fpm` apply includes FPM pool/opcache/redis tuning. Global managed `98-mcd-php.ini` baseline is no longer used; legacy files are removed on apply if present.
 - APT profile includes one-time Zabbix DB monitor bootstrap (`zbx_monitor@127.0.0.1`) with marker tracking and manual override via `mcd-cli zabbix bootstrap-mysql-user --force`.
+- APT profile includes modular one-time repo profiles with local markers (`/opt/mcd/var/apt-repo-profiles.json`):
+  - `db_repo_profile` (auto-detect: MariaDB/Percona/MySQL families),
+  - `ondrej_php_profile`,
+  - `ondrej_nginx_profile`.
+  Automatic checks stop after successful apply/verify; use `service-profile rescan --component apt` for manual recheck/fix.
+- APT profile can also manage unattended-upgrades policy dynamically:
+  - `unattended_upgrade_mode=off|security|all`,
+  - `unattended_upgrade_schedule_cron` (host local cron),
+  - `unattended_upgrade_blacklist` (excluded package patterns).
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`

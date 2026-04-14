@@ -25,7 +25,11 @@ from mcd_agent.backup import (
     backup_run,
     backup_status,
 )
-from mcd_agent.apt_profile import collect_apt_state, ensure_zabbix_mysql_monitor_user
+from mcd_agent.apt_profile import (
+    clear_apt_repo_profile_markers,
+    collect_apt_state,
+    ensure_zabbix_mysql_monitor_user,
+)
 from mcd_agent.config import load_config
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
@@ -1245,7 +1249,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     svc = sub.add_parser("service-profile", help="Fetch/apply MCC-managed service profiles (hardware-aware)")
     svc.add_argument("--config", default=default_cfg)
-    svc.add_argument("op", choices=["fetch", "apply", "status"])
+    svc.add_argument("op", choices=["fetch", "apply", "status", "rescan"])
     svc.add_argument("--component", choices=["php_fpm", "php-fpm", "mysql", "apt"], default="php_fpm")
     svc.add_argument("--dry-run", action="store_true")
     svc.add_argument("--json", action="store_true")
@@ -1692,6 +1696,23 @@ def main() -> int:
             res = fetch_service_profile(cfg, comp)
             print(json.dumps(res, ensure_ascii=True, indent=2))
             return 0 if str(res.get("status", "")).strip().lower() == "ok" else 1
+        if args.op == "rescan":
+            if comp not in {"apt"}:
+                print(json.dumps({"status": "error", "reason": "rescan is supported only for --component apt"}, ensure_ascii=True))
+                return 2
+            cleared = clear_apt_repo_profile_markers(cfg=cfg)
+            res = service_profiles_apply_once(
+                cfg,
+                component=comp,
+                dry_run=bool(args.dry_run),
+                force_apt_repo_rescan=True,
+            )
+            out = {"status": str(res.get("status", "")).strip().lower() or "error", "cleared": cleared, "result": res}
+            print(json.dumps(out, ensure_ascii=True, indent=2))
+            ok = str(res.get("status", "")).strip().lower() == "ok"
+            if ok and not bool(args.dry_run):
+                _push_state_after_change(cfg, "service-profile-apt-rescan")
+            return 0 if ok else 1
         # apply
         res = service_profiles_apply_once(cfg, component=comp, dry_run=bool(args.dry_run))
         print(json.dumps(res, ensure_ascii=True, indent=2))

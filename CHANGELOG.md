@@ -1,5 +1,41 @@
 # MCD Changelog
 
+## 0.8.81 - 2026-04-12
+- Added: APT service-profile support for `unattended-upgrades` policy management via dynamic MCC/MCD parameters.
+  - New APT profile keys:
+    - `unattended_upgrade_mode`: `off|security|all`
+    - `unattended_upgrade_schedule_cron`: cron expression (host local time), e.g. `30 23 * * 0`
+    - `unattended_upgrade_blacklist`: package patterns excluded from unattended updates
+- Added: managed unattended-upgrades provisioning on hosts:
+  - `/etc/apt/apt.conf.d/52mcd-unattended-upgrades`
+  - `/etc/apt/apt.conf.d/20auto-upgrades`
+  - optional scheduled runner `/etc/cron.d/mcd-unattended-upgrades`
+- Behavior:
+  - `mode=all` enables unattended updates for all origins, honoring blacklist.
+  - `mode=security` keeps security-focused behavior and still applies blacklist.
+  - `mode=off` disables unattended updates and removes managed cron/config override files.
+- Added: `apt_state.unattended_upgrade` telemetry block for MCC visibility.
+
+## 0.8.80 - 2026-04-12
+- Added: modular one-time APT repo profiles with local marker persistence (`/opt/mcd/var/apt-repo-profiles.json`).
+  - New independent profile toggles (MCC dynamic payload keys):
+    - `db_repo_profile_enabled`, `db_repo_profile_apply_once`
+    - `ondrej_php_profile_enabled`, `ondrej_php_profile_apply_once`
+    - `ondrej_nginx_profile_enabled`, `ondrej_nginx_profile_apply_once`
+- Added: DB stack auto-detection for repo profile decisions.
+  - Detects and handles:
+    - `mysql 8.0` -> no repo changes (one-time skip marker)
+    - `mysql 8.4` -> ensure official MySQL repo (one-time)
+    - `mariadb 11.4` -> ensure official MariaDB 11.4 repo (one-time)
+    - `percona server 8.0` -> ensure official Percona PS repo (one-time)
+    - `percona xtradb cluster 8.0` -> ensure official Percona PXC repo (one-time)
+- Changed: APT repair flow now separates one-time profile enforcement from legacy “repair on apt error” behavior.
+  - If modular profile is enabled for a repo family, repetitive per-cycle repair attempts are suppressed.
+- Added: manual repo-profile rescan command:
+  - `mcd-cli service-profile rescan --component apt`
+  - Clears local repo profile marker and re-runs APT profile apply immediately.
+- Added: `apt_state.repo_profiles` payload for MCC visibility of marker path and per-profile status.
+
 ## 0.8.79 - 2026-04-12
 - Fixed: `tiny` campaign chain no longer drops rebuild-only campaigns.
   - Root cause: dispatch source was `trigger` ring only, so campaigns that were due in `rebuild` ring but absent in `trigger` ring were skipped indefinitely.

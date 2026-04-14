@@ -397,6 +397,60 @@ def _run_mariadb_repo_setup(version: str, *, timeout_sec: int) -> tuple[bool, st
     return False, msg or f"mariadb_repo_setup:{v} failed"
 
 
+def _run_percona_repo_setup(target: str, *, timeout_sec: int) -> tuple[bool, str]:
+    ch = str(target or "").strip().lower()
+    if ch not in {"ps80", "pxc80"}:
+        return False, f"percona_repo_setup:unsupported_target:{ch or '-'}"
+    script = (
+        "set -euo pipefail; "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "deb='/tmp/percona-release_latest.generic_all.deb'; "
+        "if ! command -v percona-release >/dev/null 2>&1; then "
+        "curl -fsSL -o \"$deb\" https://repo.percona.com/apt/percona-release_latest.generic_all.deb; "
+        "dpkg -i \"$deb\" >/dev/null 2>&1 || apt-get install -y \"$deb\" >/dev/null 2>&1; "
+        "fi; "
+        "percona-release disable all >/dev/null 2>&1 || true; "
+        f"percona-release setup -y {ch}"
+    )
+    p = subprocess.run(
+        ["bash", "-lc", script],
+        capture_output=True,
+        text=True,
+        timeout=max(30, int(timeout_sec)),
+        env={**os.environ, "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C", "LANG": "C"},
+    )
+    if p.returncode == 0:
+        return True, f"percona_repo_setup:{ch}"
+    msg = (p.stderr or p.stdout or "").strip()
+    return False, msg or f"percona_repo_setup:{ch} failed"
+
+
+def _run_mysql84_repo_setup(*, timeout_sec: int) -> tuple[bool, str]:
+    script = (
+        "set -euo pipefail; "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "if grep -Rqs 'repo.mysql.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then exit 0; fi; "
+        "apt-get update -qq >/dev/null 2>&1 || true; "
+        "apt-get install -y wget gnupg lsb-release >/dev/null 2>&1 || true; "
+        "deb='/tmp/mysql-apt-config_0.8.33-1_all.deb'; "
+        "wget -qO \"$deb\" https://dev.mysql.com/get/mysql-apt-config_0.8.33-1_all.deb; "
+        "echo 'mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts' | debconf-set-selections || true; "
+        "echo 'mysql-apt-config mysql-apt-config/select-product select Ok' | debconf-set-selections || true; "
+        "dpkg -i \"$deb\" >/dev/null 2>&1 || apt-get install -y \"$deb\" >/dev/null 2>&1"
+    )
+    p = subprocess.run(
+        ["bash", "-lc", script],
+        capture_output=True,
+        text=True,
+        timeout=max(45, int(timeout_sec)),
+        env={**os.environ, "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C", "LANG": "C"},
+    )
+    if p.returncode == 0:
+        return True, "mysql_repo_setup:8.4"
+    msg = (p.stderr or p.stdout or "").strip()
+    return False, msg or "mysql_repo_setup:8.4 failed"
+
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -423,6 +477,486 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _apt_repo_marker_path(cfg: Any | None = None) -> Path:
+    if cfg is not None:
+        state_db = str(getattr(cfg, "state_db_path", "") or "").strip()
+        if state_db:
+            return Path(state_db).parent / "apt-repo-profiles.json"
+    return Path("/opt/mcd/var/apt-repo-profiles.json")
+
+
+def collect_apt_repo_profiles_state(*, cfg: Any | None = None) -> dict[str, Any]:
+    marker_path = _apt_repo_marker_path(cfg)
+    marker = _read_json(marker_path)
+    profiles = marker.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    return {
+        "marker_path": str(marker_path),
+        "updated_at_utc": str(marker.get("updated_at_utc", "") or ""),
+        "profiles": profiles,
+    }
+
+
+def clear_apt_repo_profile_markers(*, cfg: Any | None = None) -> dict[str, Any]:
+    marker_path = _apt_repo_marker_path(cfg)
+    previous = _read_json(marker_path)
+    prev_profiles = previous.get("profiles")
+    prev_count = len(prev_profiles) if isinstance(prev_profiles, dict) else 0
+    removed = False
+    try:
+        if marker_path.exists():
+            marker_path.unlink()
+            removed = True
+    except Exception:
+        removed = False
+    return {
+        "status": "ok",
+        "removed": bool(removed),
+        "profiles_count_before": int(prev_count),
+        "marker_path": str(marker_path),
+    }
+
+
+def _all_source_files() -> list[Path]:
+    files: list[Path] = [Path("/etc/apt/sources.list")]
+    files.extend(sorted(Path("/etc/apt/sources.list.d").glob("*")))
+    return [p for p in files if p.exists() and p.is_file()]
+
+
+def _all_sources_text_lower() -> str:
+    chunks: list[str] = []
+    for p in _all_source_files():
+        try:
+            chunks.append(p.read_text(encoding="utf-8", errors="ignore").lower())
+        except Exception:
+            continue
+    return "\n".join(chunks)
+
+
+def _has_source_markers(markers: list[str]) -> bool:
+    checks = [str(x).strip().lower() for x in markers if str(x).strip()]
+    if not checks:
+        return False
+    txt = _all_sources_text_lower()
+    return any(x in txt for x in checks)
+
+
+def _dpkg_installed_versions(*, timeout_sec: int = 20) -> dict[str, str]:
+    proc = _run(
+        ["dpkg-query", "-W", "-f=${Package}\t${Status}\t${Version}\n"],
+        timeout_sec=max(10, int(timeout_sec)),
+    )
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) < 3:
+            continue
+        pkg = str(parts[0]).strip().lower()
+        status = str(parts[1]).strip().lower()
+        ver = str(parts[2]).strip()
+        if not pkg or "install ok installed" not in status:
+            continue
+        out[pkg] = ver
+    return out
+
+
+def _version_mm(raw: str) -> str:
+    m = re.search(r"(\d+)\.(\d+)", str(raw or ""))
+    if not m:
+        return ""
+    return f"{m.group(1)}.{m.group(2)}"
+
+
+def _detect_db_repo_target(*, timeout_sec: int = 20) -> dict[str, str]:
+    installed = _dpkg_installed_versions(timeout_sec=timeout_sec)
+    if not installed:
+        return {
+            "profile": "none",
+            "action": "none",
+            "reason": "dpkg_query_failed_or_empty",
+        }
+
+    # Priority order: PXC -> Percona Server -> MariaDB -> MySQL
+    for pkg, ver in installed.items():
+        if pkg.startswith("percona-xtradb-cluster-server"):
+            mm = _version_mm(ver)
+            if mm == "8.0" or not mm:
+                return {"profile": "percona_cluster_8_0", "action": "ensure", "reason": "detected_percona_cluster", "package": pkg, "version": ver}
+            return {"profile": "none", "action": "none", "reason": f"unsupported_percona_cluster_{mm or 'unknown'}", "package": pkg, "version": ver}
+
+    for pkg, ver in installed.items():
+        if pkg.startswith("percona-server-server"):
+            mm = _version_mm(ver)
+            if mm == "8.0" or not mm:
+                return {"profile": "percona_server_8_0", "action": "ensure", "reason": "detected_percona_server", "package": pkg, "version": ver}
+            return {"profile": "none", "action": "none", "reason": f"unsupported_percona_server_{mm or 'unknown'}", "package": pkg, "version": ver}
+
+    for pkg, ver in installed.items():
+        if pkg == "mariadb-server" or pkg.startswith("mariadb-server-"):
+            mm = _version_mm(ver)
+            if mm == "11.4":
+                return {"profile": "mariadb_11_4", "action": "ensure", "reason": "detected_mariadb_11_4", "package": pkg, "version": ver}
+            return {"profile": "none", "action": "none", "reason": f"mariadb_{mm or 'unknown'}_no_profile", "package": pkg, "version": ver}
+
+    for pkg, ver in installed.items():
+        if pkg in {"mysql-server", "mysql-community-server"} or pkg.startswith("mysql-server-"):
+            mm = _version_mm(ver)
+            if mm == "8.0":
+                return {"profile": "mysql_8_0", "action": "skip", "reason": "mysql_8_0_repo_unchanged", "package": pkg, "version": ver}
+            if mm == "8.4":
+                return {"profile": "mysql_8_4", "action": "ensure", "reason": "detected_mysql_8_4", "package": pkg, "version": ver}
+            return {"profile": "none", "action": "none", "reason": f"mysql_{mm or 'unknown'}_no_profile", "package": pkg, "version": ver}
+
+    return {"profile": "none", "action": "none", "reason": "db_stack_not_detected"}
+
+
+def _repo_profile_present(profile_key: str) -> bool:
+    key = str(profile_key or "").strip().lower()
+    txt = _all_sources_text_lower()
+    if key == "mariadb_11_4":
+        for raw_line in txt.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not any(x in line for x in ("r.mariadb.com", "deb.mariadb.org", "mariadb.com", "dlm.mariadb.com")):
+                continue
+            if "11.4" in line or "mariadb-11.4" in line:
+                return True
+        return False
+    if key == "percona_server_8_0":
+        return ("repo.percona.com" in txt) and ("ps80" in txt or "ps-80" in txt)
+    if key == "percona_cluster_8_0":
+        return ("repo.percona.com" in txt) and ("pxc80" in txt or "pxc-80" in txt)
+    if key == "mysql_8_4":
+        return ("repo.mysql.com" in txt) and ("mysql-8.4" in txt or "mysql-8.4-lts" in txt)
+    if key == "mysql_8_0":
+        return True
+    return False
+
+
+def _apply_repo_profiles(
+    profile: dict[str, Any],
+    *,
+    cfg: Any | None = None,
+    timeout_sec: int = 180,
+    force_rescan: bool = False,
+) -> tuple[list[str], list[str]]:
+    actions: list[str] = []
+    errors: list[str] = []
+    marker_path = _apt_repo_marker_path(cfg)
+    marker = _read_json(marker_path)
+    profiles = marker.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        marker["profiles"] = profiles
+
+    now = _now_utc_iso()
+
+    def _mark(
+        key: str,
+        *,
+        status: str,
+        applied: bool,
+        reason: str = "",
+        detected: dict[str, str] | None = None,
+        attempted_once: bool | None = None,
+    ) -> None:
+        row = profiles.get(key)
+        if not isinstance(row, dict):
+            row = {}
+        row["last_status"] = str(status or "")
+        row["applied"] = bool(applied)
+        row["checked_at_utc"] = now
+        row["last_error"] = "" if applied else str(reason or "")
+        if bool(applied):
+            row["applied_at_utc"] = now
+        if attempted_once is None:
+            row["attempted_once"] = bool(row.get("attempted_once", False)) or bool(applied)
+        else:
+            row["attempted_once"] = bool(attempted_once)
+        if isinstance(detected, dict):
+            row["detected"] = detected
+        profiles[key] = row
+
+    # DB repo profile (auto-detected by installed DB stack).
+    db_enabled = _bool(profile.get("db_repo_profile_enabled", profile.get("mariadb_repo_setup_enabled")), True)
+    db_once = _bool(profile.get("db_repo_profile_apply_once"), True)
+    db_row = profiles.get("db_repo") if isinstance(profiles.get("db_repo"), dict) else {}
+    if not db_enabled:
+        actions.append("db_repo_profile:disabled")
+    elif db_once and bool(db_row.get("applied", False)) and not force_rescan:
+        actions.append("db_repo_profile:skip_once")
+    else:
+        detected = _detect_db_repo_target(timeout_sec=max(10, int(timeout_sec)))
+        det_profile = str(detected.get("profile", "none") or "none")
+        det_action = str(detected.get("action", "none") or "none")
+        if det_action in {"none", "skip"}:
+            _mark("db_repo", status="skipped", applied=True, reason=str(detected.get("reason", "")), detected=detected)
+            actions.append(f"db_repo_profile:skipped:{det_profile}")
+        else:
+            if _repo_profile_present(det_profile):
+                _mark("db_repo", status="already_present", applied=True, detected=detected)
+                actions.append(f"db_repo_profile:already_present:{det_profile}")
+            else:
+                ok = False
+                msg = f"unsupported_repo_profile:{det_profile}"
+                if det_profile == "mariadb_11_4":
+                    ok, msg = _run_mariadb_repo_setup(
+                        str(profile.get("mariadb_repo_setup_version", "mariadb-11.4")),
+                        timeout_sec=max(30, int(timeout_sec)),
+                    )
+                elif det_profile == "percona_server_8_0":
+                    ok, msg = _run_percona_repo_setup("ps80", timeout_sec=max(30, int(timeout_sec)))
+                elif det_profile == "percona_cluster_8_0":
+                    ok, msg = _run_percona_repo_setup("pxc80", timeout_sec=max(30, int(timeout_sec)))
+                elif det_profile == "mysql_8_4":
+                    ok, msg = _run_mysql84_repo_setup(timeout_sec=max(45, int(timeout_sec)))
+                if ok:
+                    _mark("db_repo", status="applied", applied=True, detected=detected)
+                    actions.append(f"db_repo_profile:applied:{det_profile}")
+                    actions.append(msg)
+                else:
+                    _mark("db_repo", status="error", applied=False, reason=msg, detected=detected, attempted_once=False)
+                    errors.append(f"db_repo_profile:{msg}")
+
+    # Ondrej PHP repo profile (independent one-time profile).
+    php_enabled = _bool(profile.get("ondrej_php_profile_enabled", profile.get("ensure_ondrej_php_ppa")), True)
+    php_once = _bool(profile.get("ondrej_php_profile_apply_once"), True)
+    php_row = profiles.get("ondrej_php") if isinstance(profiles.get("ondrej_php"), dict) else {}
+    if not php_enabled:
+        actions.append("ondrej_php_profile:disabled")
+    elif php_once and bool(php_row.get("applied", False)) and not force_rescan:
+        actions.append("ondrej_php_profile:skip_once")
+    else:
+        if _has_ppa_marker("ondrej/php"):
+            _mark("ondrej_php", status="already_present", applied=True)
+            actions.append("ondrej_php_profile:already_present")
+        else:
+            ok, msg = _ensure_ppa("ondrej/php", timeout_sec=max(20, int(timeout_sec)))
+            if ok:
+                _mark("ondrej_php", status="applied", applied=True)
+                actions.append("ondrej_php_profile:applied")
+                actions.append(msg)
+            else:
+                _mark("ondrej_php", status="error", applied=False, reason=msg, attempted_once=False)
+                errors.append(f"ondrej_php_profile:{msg}")
+
+    # Ondrej nginx repo profile (independent one-time profile).
+    nginx_enabled = _bool(profile.get("ondrej_nginx_profile_enabled", profile.get("ensure_ondrej_nginx_ppa")), False)
+    nginx_once = _bool(profile.get("ondrej_nginx_profile_apply_once"), True)
+    nginx_row = profiles.get("ondrej_nginx") if isinstance(profiles.get("ondrej_nginx"), dict) else {}
+    if not nginx_enabled:
+        actions.append("ondrej_nginx_profile:disabled")
+    elif nginx_once and bool(nginx_row.get("applied", False)) and not force_rescan:
+        actions.append("ondrej_nginx_profile:skip_once")
+    else:
+        if _has_ppa_marker("ondrej/nginx"):
+            _mark("ondrej_nginx", status="already_present", applied=True)
+            actions.append("ondrej_nginx_profile:already_present")
+        else:
+            ok, msg = _ensure_ppa("ondrej/nginx", timeout_sec=max(20, int(timeout_sec)))
+            if ok:
+                _mark("ondrej_nginx", status="applied", applied=True)
+                actions.append("ondrej_nginx_profile:applied")
+                actions.append(msg)
+            else:
+                _mark("ondrej_nginx", status="error", applied=False, reason=msg, attempted_once=False)
+                errors.append(f"ondrej_nginx_profile:{msg}")
+
+    marker["updated_at_utc"] = now
+    _write_json(marker_path, marker)
+    return actions, errors
+
+
+def _normalize_unattended_blacklist(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        items = [str(x or "").strip() for x in raw]
+    else:
+        text = str(raw or "").strip()
+        items = [x.strip() for x in text.split(",")] if text else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not item:
+            continue
+        if not re.match(r"^[A-Za-z0-9+_.:*?-]+$", item):
+            continue
+        if item in seen:
+            continue
+        out.append(item)
+        seen.add(item)
+    return out
+
+
+def _validate_cron_expr(expr: str) -> bool:
+    raw = str(expr or "").strip()
+    if not raw:
+        return False
+    parts = raw.split()
+    if len(parts) != 5:
+        return False
+    token_re = re.compile(r"^[0-9*/,\-]+$")
+    if not all(token_re.match(x) for x in parts):
+        return False
+    return True
+
+
+def _write_if_changed(path: Path, content: str) -> bool:
+    prev = ""
+    try:
+        if path.exists():
+            prev = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        prev = ""
+    if prev == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def _apply_unattended_upgrades(profile: dict[str, Any], *, timeout_sec: int = 180) -> tuple[list[str], list[str], list[str]]:
+    actions: list[str] = []
+    errors: list[str] = []
+    changed: list[str] = []
+
+    mode = str(profile.get("unattended_upgrade_mode", "off") or "off").strip().lower()
+    if mode not in {"off", "security", "all"}:
+        mode = "off"
+    schedule = str(profile.get("unattended_upgrade_schedule_cron", "") or "").strip()
+    if mode != "off" and not schedule:
+        schedule = "30 23 * * 0"
+    if schedule and not _validate_cron_expr(schedule):
+        errors.append(f"unattended_upgrade_invalid_schedule:{schedule}")
+        schedule = ""
+
+    blacklist = _normalize_unattended_blacklist(
+        profile.get(
+            "unattended_upgrade_blacklist",
+            ["mysql", "mariadb", "percona", "php", "nginx", "haproxy"],
+        )
+    )
+
+    conf_auto = Path("/etc/apt/apt.conf.d/20auto-upgrades")
+    conf_u = Path("/etc/apt/apt.conf.d/52mcd-unattended-upgrades")
+    cron_file = Path("/etc/cron.d/mcd-unattended-upgrades")
+
+    if mode == "off":
+        auto_txt = (
+            "// managed by mcd apt profile\n"
+            "APT::Periodic::Update-Package-Lists \"0\";\n"
+            "APT::Periodic::Unattended-Upgrade \"0\";\n"
+            "APT::Periodic::Download-Upgradeable-Packages \"0\";\n"
+        )
+        if _write_if_changed(conf_auto, auto_txt):
+            changed.append(str(conf_auto))
+        if conf_u.exists():
+            try:
+                conf_u.unlink()
+                changed.append(str(conf_u))
+            except Exception as e:
+                errors.append(f"unattended_upgrade_remove_conf_failed:{e}")
+        if cron_file.exists():
+            try:
+                cron_file.unlink()
+                changed.append(str(cron_file))
+            except Exception as e:
+                errors.append(f"unattended_upgrade_remove_cron_failed:{e}")
+        actions.append("unattended_upgrade:off")
+        return actions, errors, changed
+
+    p_install = _run(["apt-get", "install", "-y", "unattended-upgrades"], timeout_sec=max(30, int(timeout_sec)))
+    if p_install.returncode != 0:
+        errors.append((p_install.stderr or p_install.stdout or "install unattended-upgrades failed").strip())
+        actions.append("unattended_upgrade:package_install_failed")
+        return actions, errors, changed
+
+    u_lines: list[str] = [
+        "// managed by mcd apt profile",
+        'Unattended-Upgrade::MinimalSteps "true";',
+        'Unattended-Upgrade::Remove-Unused-Dependencies "true";',
+        'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";',
+        'Unattended-Upgrade::Automatic-Reboot "false";',
+    ]
+    if mode == "all":
+        u_lines.extend(
+            [
+                "Unattended-Upgrade::Origins-Pattern {",
+                '  "origin=*";',
+                "};",
+            ]
+        )
+    if blacklist:
+        u_lines.append("Unattended-Upgrade::Package-Blacklist {")
+        for item in blacklist:
+            u_lines.append(f'  "{item}";')
+        u_lines.append("};")
+    u_txt = "\n".join(u_lines).rstrip("\n") + "\n"
+    if _write_if_changed(conf_u, u_txt):
+        changed.append(str(conf_u))
+
+    if schedule:
+        auto_txt = (
+            "// managed by mcd apt profile (cron-scheduled)\n"
+            "APT::Periodic::Update-Package-Lists \"0\";\n"
+            "APT::Periodic::Unattended-Upgrade \"0\";\n"
+            "APT::Periodic::Download-Upgradeable-Packages \"0\";\n"
+        )
+        cron_txt = (
+            "# managed by mcd apt profile\n"
+            f"{schedule} root /usr/bin/flock -n /run/mcd-unattended-upgrades.lock "
+            "/bin/bash -lc '/usr/bin/apt-get update -qq && /usr/bin/unattended-upgrade -v' "
+            ">> /var/log/unattended-upgrades/mcd-cron.log 2>&1\n"
+        )
+        if _write_if_changed(conf_auto, auto_txt):
+            changed.append(str(conf_auto))
+        if _write_if_changed(cron_file, cron_txt):
+            changed.append(str(cron_file))
+        actions.append(f"unattended_upgrade:scheduled:{schedule}")
+    else:
+        auto_txt = (
+            "// managed by mcd apt profile (apt periodic)\n"
+            "APT::Periodic::Update-Package-Lists \"1\";\n"
+            "APT::Periodic::Unattended-Upgrade \"1\";\n"
+            "APT::Periodic::Download-Upgradeable-Packages \"1\";\n"
+        )
+        if _write_if_changed(conf_auto, auto_txt):
+            changed.append(str(conf_auto))
+        if cron_file.exists():
+            try:
+                cron_file.unlink()
+                changed.append(str(cron_file))
+            except Exception as e:
+                errors.append(f"unattended_upgrade_remove_cron_failed:{e}")
+        actions.append("unattended_upgrade:apt_periodic")
+
+    actions.append(f"unattended_upgrade:mode={mode}")
+    return actions, errors, changed
+
+
+def collect_unattended_upgrade_state() -> dict[str, Any]:
+    conf_auto = Path("/etc/apt/apt.conf.d/20auto-upgrades")
+    conf_u = Path("/etc/apt/apt.conf.d/52mcd-unattended-upgrades")
+    cron_file = Path("/etc/cron.d/mcd-unattended-upgrades")
+    state = {
+        "managed_conf_present": bool(conf_u.exists()),
+        "cron_present": bool(cron_file.exists()),
+        "auto_upgrades_present": bool(conf_auto.exists()),
+    }
+    if conf_auto.exists():
+        try:
+            txt = conf_auto.read_text(encoding="utf-8", errors="ignore")
+            state["auto_mode"] = "enabled" if '"1"' in txt else "disabled"
+        except Exception:
+            state["auto_mode"] = "unknown"
+    else:
+        state["auto_mode"] = "missing"
+    return state
 
 
 def _mysql_client_bin() -> str | None:
@@ -929,6 +1463,8 @@ def collect_apt_state(
         "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "zabbix_mysql_monitor": zbx_payload,
+        "repo_profiles": collect_apt_repo_profiles_state(cfg=cfg),
+        "unattended_upgrade": collect_unattended_upgrade_state(),
     }
 
 
@@ -938,6 +1474,7 @@ def apply_apt_profile(
     dry_run: bool = False,
     cfg: Any | None = None,
     force_zabbix_bootstrap: bool = False,
+    force_repo_rescan: bool = False,
 ) -> dict[str, Any]:
     if profile is None:
         profile = {}
@@ -948,6 +1485,8 @@ def apply_apt_profile(
             "actions": [
                 "remove_third_party_sources",
                 "dedupe_list_sources",
+                "repo_profiles",
+                "unattended_upgrades",
                 "repair_repos_on_error",
                 "apt_update",
                 "optional_package_ops",
@@ -970,6 +1509,9 @@ def apply_apt_profile(
     ensure_php_ppa = _bool(profile.get("ensure_ondrej_php_ppa"), False)
     ensure_nginx_ppa = _bool(profile.get("ensure_ondrej_nginx_ppa"), False)
     ensure_apache_ppa = _bool(profile.get("ensure_ondrej_apache_ppa"), False)
+    db_repo_profile_enabled = _bool(profile.get("db_repo_profile_enabled", mariadb_repair), True)
+    ondrej_php_profile_enabled = _bool(profile.get("ondrej_php_profile_enabled", ensure_php_ppa), True)
+    ondrej_nginx_profile_enabled = _bool(profile.get("ondrej_nginx_profile_enabled", ensure_nginx_ppa), False)
     upgrade_mode = str(profile.get("upgrade_mode", "none")).strip().lower() or "none"
     packages_present = [str(x).strip() for x in list(profile.get("packages_present", []) or []) if str(x).strip()]
     packages_absent = [str(x).strip() for x in list(profile.get("packages_absent", []) or []) if str(x).strip()]
@@ -989,6 +1531,21 @@ def apply_apt_profile(
         for f in list(dedupe.get("changed_files", []) or []):
             changed.append(str(f))
 
+    repo_actions, repo_errors = _apply_repo_profiles(
+        profile,
+        cfg=cfg,
+        timeout_sec=max(30, int(refresh_timeout_sec)),
+        force_rescan=bool(force_repo_rescan),
+    )
+    actions.extend(repo_actions)
+    errors.extend(repo_errors)
+    unattended_actions, unattended_errors, unattended_changed = _apply_unattended_upgrades(
+        profile, timeout_sec=max(30, int(refresh_timeout_sec))
+    )
+    actions.extend(unattended_actions)
+    errors.extend(unattended_errors)
+    changed.extend(unattended_changed)
+
     def _run_update() -> list[str]:
         if not refresh_cache:
             return []
@@ -1006,7 +1563,7 @@ def apply_apt_profile(
     if repair_on_error and update_errors:
         fixed_any = False
         txt = "\n".join(update_errors).lower()
-        if mariadb_repair and ("mariadb" in txt or "r.mariadb.com" in txt):
+        if (not db_repo_profile_enabled) and mariadb_repair and ("mariadb" in txt or "r.mariadb.com" in txt):
             ok, msg = _run_mariadb_repo_setup(mariadb_version, timeout_sec=refresh_timeout_sec)
             actions.append(msg)
             if ok:
@@ -1014,14 +1571,14 @@ def apply_apt_profile(
             else:
                 errors.append(msg)
 
-        if ensure_php_ppa and ("ondrej" in txt or "php" in txt) and not _has_ppa_marker("ondrej/php"):
+        if (not ondrej_php_profile_enabled) and ensure_php_ppa and ("ondrej" in txt or "php" in txt) and not _has_ppa_marker("ondrej/php"):
             ok, msg = _ensure_ppa("ondrej/php", timeout_sec=refresh_timeout_sec)
             actions.append(msg)
             if ok:
                 fixed_any = True
             else:
                 errors.append(msg)
-        if ensure_nginx_ppa and ("ondrej" in txt or "nginx" in txt) and not _has_ppa_marker("ondrej/nginx"):
+        if (not ondrej_nginx_profile_enabled) and ensure_nginx_ppa and ("ondrej" in txt or "nginx" in txt) and not _has_ppa_marker("ondrej/nginx"):
             ok, msg = _ensure_ppa("ondrej/nginx", timeout_sec=refresh_timeout_sec)
             actions.append(msg)
             if ok:

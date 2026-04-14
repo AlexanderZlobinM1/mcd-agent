@@ -540,6 +540,7 @@ def service_profiles_apply_once(
     *,
     component: str = "php_fpm",
     dry_run: bool = False,
+    force_apt_repo_rescan: bool = False,
 ) -> dict[str, Any]:
     comp = (component or "php_fpm").strip().lower().replace("-", "_")
     if comp not in {"php_fpm", "mysql", "apt"}:
@@ -558,5 +559,10 @@ def service_profiles_apply_once(
     else:
         if os.geteuid() != 0:
             raise RuntimeError("service-profile apply requires root")
-        applied = apply_apt_profile(profile, dry_run=dry_run, cfg=cfg)
+        applied = apply_apt_profile(
+            profile,
+            dry_run=dry_run,
+            cfg=cfg,
+            force_repo_rescan=bool(force_apt_repo_rescan),
+        )
     return {"status": "ok", "fetch": fetched, "apply": applied}
