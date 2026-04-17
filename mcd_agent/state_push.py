@@ -50,6 +50,8 @@ _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/run/mysqld/mysqld.sock",
 )
 _PROFILE_EVENT_EMPTY_UNTIL: dict[str, float] = {}
+_MYSQL_WARN_THROTTLE: dict[str, dict[str, Any]] = {}
+_MYSQL_WARN_THROTTLE_SEC = 300
 
 
 def _profile_event_cache_key(cfg: AgentConfig) -> str:
@@ -61,6 +63,36 @@ def _profile_event_cache_key(cfg: AgentConfig) -> str:
             str(getattr(cfg, "state_mysql_database", "") or "").strip(),
         ]
     )
+
+
+def _normalize_mysql_warning(msg: str) -> str:
+    raw = str(msg or "").strip()
+    if raw.startswith("mysql_backoff_active:"):
+        parts = raw.split(":", 2)
+        if len(parts) >= 3:
+            # Ignore dynamic retry countdown in warning de-duplication key.
+            return f"mysql_backoff_active:{parts[2]}"
+        return "mysql_backoff_active"
+    return raw
+
+
+def _should_log_mysql_warning(
+    cfg: AgentConfig,
+    *,
+    bucket: str,
+    msg: str,
+    min_interval_sec: int = _MYSQL_WARN_THROTTLE_SEC,
+) -> bool:
+    key = f"{_profile_event_cache_key(cfg)}|{bucket}"
+    now_ts = time.time()
+    norm = _normalize_mysql_warning(msg)
+    row = _MYSQL_WARN_THROTTLE.get(key, {})
+    last_ts = float(row.get("ts") or 0.0)
+    last_norm = str(row.get("norm") or "")
+    if last_norm == norm and (now_ts - last_ts) < max(30, int(min_interval_sec or 300)):
+        return False
+    _MYSQL_WARN_THROTTLE[key] = {"ts": now_ts, "norm": norm}
+    return True
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -193,7 +225,8 @@ def queue_profile_event(
         created_at=now_ts,
     )
     if not mysql_ok and mysql_msg not in {"mysql_state_disabled"}:
-        logging.warning("outbound_events mysql queue failed, fallback to sqlite: %s", mysql_msg)
+        if _should_log_mysql_warning(cfg, bucket="queue", msg=mysql_msg):
+            logging.warning("outbound_events mysql queue failed, fallback to sqlite: %s", mysql_msg)
     if not mysql_ok:
         conn = _state_conn(cfg)
         try:
@@ -227,7 +260,8 @@ def read_pending_profile_event(cfg: AgentConfig) -> dict[str, Any] | None:
         _PROFILE_EVENT_EMPTY_UNTIL.pop(cache_key, None)
         return raw_mysql
     if mysql_msg not in {"mysql_state_disabled", "empty"}:
-        logging.warning("outbound_events mysql read failed, fallback to sqlite: %s", mysql_msg)
+        if _should_log_mysql_warning(cfg, bucket="read", msg=mysql_msg):
+            logging.warning("outbound_events mysql read failed, fallback to sqlite: %s", mysql_msg)
 
     conn = _state_conn(cfg)
     try:
@@ -286,7 +320,8 @@ def clear_pending_profile_event(
         error=error,
     )
     if not mysql_ok and mysql_msg not in {"mysql_state_disabled"}:
-        logging.warning("outbound_events mysql mark failed, fallback sqlite only: %s", mysql_msg)
+        if _should_log_mysql_warning(cfg, bucket="mark", msg=mysql_msg):
+            logging.warning("outbound_events mysql mark failed, fallback sqlite only: %s", mysql_msg)
 
     conn = _state_conn(cfg)
     now_ts = time.time()
@@ -323,7 +358,8 @@ def prune_sent_profile_events(cfg: AgentConfig, *, keep_days: int = 14) -> int:
         cutoff_ts=cutoff,
     )
     if mysql_msg not in {"ok", "mysql_state_disabled"}:
-        logging.warning("outbound_events mysql prune failed, sqlite only: %s", mysql_msg)
+        if _should_log_mysql_warning(cfg, bucket="prune", msg=mysql_msg):
+            logging.warning("outbound_events mysql prune failed, sqlite only: %s", mysql_msg)
 
     conn = _state_conn(cfg)
     try:
@@ -1452,7 +1488,8 @@ class MCCStatePusher:
             self._last_snapshot_hash = payload_hash
             self._last_snapshot_ts = now_ts
         elif msg not in {"mysql_state_disabled", "snapshot_disabled"}:
-            logging.warning("state snapshot mysql upsert failed: %s", msg)
+            if _should_log_mysql_warning(self.cfg, bucket="snapshot", msg=msg):
+                logging.warning("state snapshot mysql upsert failed: %s", msg)
 
     def build_payload(
         self,

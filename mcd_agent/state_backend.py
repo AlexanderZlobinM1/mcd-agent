@@ -27,6 +27,7 @@ _MYSQL_BACKOFF_BASE_SEC = 15
 _MYSQL_BACKOFF_MAX_SEC = 900
 _MYSQL_BACKOFF_READONLY_SEC = 600
 _MYSQL_BACKOFF_TOOMANY_SEC = 120
+_MYSQL_BACKOFF_AUTH_SEC = 300
 
 
 def _backoff_key(cfg: AgentConfig) -> str:
@@ -68,8 +69,10 @@ def _mysql_backoff_status(cfg: AgentConfig) -> tuple[bool, dict[str, Any] | None
     until_ts = float(row.get("until_ts") or 0.0)
     now = time.time()
     if until_ts <= now:
-        _MYSQL_BACKOFF.pop(key, None)
-        return False, None
+        out = dict(row)
+        out["retry_after_sec"] = 0
+        out["retry_after_utc"] = _utc_from_ts(until_ts) if until_ts > 0 else ""
+        return False, out
     out = dict(row)
     out["retry_after_sec"] = int(max(1, until_ts - now))
     out["retry_after_utc"] = _utc_from_ts(until_ts)
@@ -93,6 +96,8 @@ def _mysql_backoff_set(cfg: AgentConfig, err: Exception | str) -> None:
         base = _MYSQL_BACKOFF_READONLY_SEC
     elif code == 1040:
         base = _MYSQL_BACKOFF_TOOMANY_SEC
+    elif code in {1045, 1698}:
+        base = _MYSQL_BACKOFF_AUTH_SEC
     delay = min(_MYSQL_BACKOFF_MAX_SEC, int(base * (2 ** max(0, failures - 1))))
     until_ts = time.time() + float(delay)
     _MYSQL_BACKOFF[key] = {
