@@ -1,5 +1,40 @@
 # MCD Changelog
 
+## 0.8.85 - 2026-04-17
+- Changed: `mcd-cli mautic-upgrade apply` now runs a mandatory pre-upgrade permissions preflight.
+  - Reuses MCD filesystem permission guard logic before any upgrade steps.
+  - If permission repair fails, upgrade is stopped with explicit error.
+- Added: post-upgrade sender dependency restore based on active sender config in `local.php`.
+  - Detects `ses+api`/`mautic+ses+api` and ensures `symfony/amazon-mailer`.
+  - Detects `sendgrid+api` and ensures `symfony/sendgrid-mailer:*`.
+  - For zip installs, normalizes Node.js runtime to v20 before composer require (same preflight path used for existing SES dependency fix).
+  - Runs `cache:clear` after dependency restore.
+- Outcome: zip upgrades are resilient to missing API mailer packages after update, and upgrade failures from broken permissions are prevented earlier.
+
+## 0.8.84 - 2026-04-15
+- Added: new non-interactive cache command:
+  - `mcd-cli cache:hard`
+  - behavior: safe hard cleanup of `var/cache/prod` (delete + recreate via permission guard).
+- Changed: interactive `Cache -> Hard Clear` now uses the same `cache:hard` implementation path.
+- Outcome: MCC can run hard cache cleanup via standard MCD command API (no direct host-side shell logic outside MCD).
+
+## 0.8.83 - 2026-04-14
+- Fixed: `mcd-cli exec --command cache:clear|cache:warmup` now has built-in permission self-heal flow.
+  - first run: executes cache command normally;
+  - on `Permission denied`: runs MCD filesystem permissions repair (`www-data` ownership/writability + `bin/console` exec bit);
+  - retries the same cache command automatically.
+- Added: cache self-heal output marker `MCD_WARNING_CACHE_PERMISSIONS_REPAIRED` so MCC can show warning completion instead of plain success.
+- Behavior: command exits `0` after successful retry, while preserving warning diagnostics in output.
+
+## 0.8.82 - 2026-04-14
+- Added: `mcd-cli exec` supports cache operations:
+  - `cache:clear`
+  - `cache:warmup`
+- Added: shorthand commands:
+  - `mcd-cli cache:clear`
+  - `mcd-cli cache:warmup`
+- Changed: MCC instance operations can now delegate cache actions through MCD only, aligning with orchestrator-only MCC model (no direct MCC execution of Mautic/PHP commands on hosts).
+
 ## 0.8.81 - 2026-04-12
 - Added: APT service-profile support for `unattended-upgrades` policy management via dynamic MCC/MCD parameters.
   - New APT profile keys:

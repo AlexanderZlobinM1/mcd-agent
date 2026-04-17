@@ -675,17 +675,38 @@ def _run_cache_menu(cfg, root: str | None) -> int:
             print(out or f"cache:warmup rc={rc}")
             continue
         if choice == "3":
-            prod_dir = Path(target_root) / "var" / "cache" / "prod"
-            proc = subprocess.run(["rm", "-rf", str(prod_dir)], capture_output=True, text=True)
-            if proc.returncode != 0:
-                print((proc.stderr or proc.stdout or "").strip() or f"rm -rf failed rc={proc.returncode}")
-                continue
-            ok2, msg2 = _prepare_cache_permissions(cfg, target_root)
-            print(msg2)
-            if ok2:
-                print("Hard cache cleanup done.")
+            rc, out = _run_cache_hard_clear(cfg, target_root)
+            print(out or f"cache:hard rc={rc}")
             continue
         print("Unknown option")
+
+
+def _run_cache_hard_clear(cfg, root: str) -> tuple[int, str]:
+    target_root = str(root or "").strip()
+    if not target_root:
+        return 2, "Active instance is required."
+    ok, msg = _prepare_cache_permissions(cfg, target_root)
+    lines: list[str] = [msg] if msg else []
+    if not ok:
+        lines.append("Cache permissions check failed. Stop.")
+        return 1, "\n".join([x for x in lines if x])
+
+    prod_dir = Path(target_root) / "var" / "cache" / "prod"
+    proc = subprocess.run(["rm", "-rf", str(prod_dir)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"rm -rf failed rc={proc.returncode}"
+        lines.append(err)
+        return int(proc.returncode or 1), "\n".join([x for x in lines if x])
+    lines.append(f"OK   rm -rf {prod_dir}")
+
+    ok2, msg2 = _prepare_cache_permissions(cfg, target_root)
+    if msg2:
+        lines.append(msg2)
+    if not ok2:
+        lines.append("Hard cache cleanup partially completed: permissions repair failed.")
+        return 1, "\n".join([x for x in lines if x])
+    lines.append("Hard cache cleanup done.")
+    return 0, "\n".join([x for x in lines if x])
 
 
 def _run_mautic6_patch_menu(cfg, root: str | None) -> int:
@@ -1145,6 +1166,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "campaigns:update",
             "campaigns:trigger",
             "import",
+            "cache:clear",
+            "cache:warmup",
         ],
     )
     exec_cmd.add_argument("--instance-id", type=int)
@@ -1178,6 +1201,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sh_imp = sub.add_parser("import", help="Shorthand for exec --command import")
     _add_shorthand_exec_args(sh_imp, with_instance_id=False)
+
+    sh_cc = sub.add_parser("cache:clear", help="Shorthand for exec --command cache:clear")
+    _add_shorthand_exec_args(sh_cc, with_instance_id=False)
+
+    sh_cw = sub.add_parser("cache:warmup", help="Shorthand for exec --command cache:warmup")
+    _add_shorthand_exec_args(sh_cw, with_instance_id=False)
+
+    sh_ch = sub.add_parser("cache:hard", help="Hard clear cache directory (delete/recreate var/cache/prod)")
+    _add_shorthand_exec_args(sh_ch, with_instance_id=False)
 
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
@@ -1473,6 +1505,8 @@ def main() -> int:
         "campaigns:update",
         "campaigns:trigger",
         "import",
+        "cache:clear",
+        "cache:warmup",
     }
     if args.cmd in shorthand:
         cfg = load_config(args.config)
@@ -1493,6 +1527,21 @@ def main() -> int:
             timeout_sec=args.timeout,
             run_as_user=args.run_as_user,
         )
+        if output:
+            print(output)
+        return rc
+
+    if args.cmd == "cache:hard":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            root = _select_root_for_ops(cfg, args.root)
+        except Exception as e:
+            print(str(e))
+            return 2
+        rc, output = _run_cache_hard_clear(cfg, root)
         if output:
             print(output)
         return rc

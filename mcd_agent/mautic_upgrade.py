@@ -14,7 +14,12 @@ import urllib.request
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
-from mcd_agent.amazon_mailer_dep import ensure_amazon_mailer_for_bundles, installed_required_bundles
+from mcd_agent.amazon_mailer_dep import (
+    ensure_amazon_mailer_for_bundles,
+    ensure_mailer_packages_for_sender_config,
+    installed_required_bundles,
+)
+from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 
 
@@ -415,6 +420,34 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     _run([php_bin, console_path, "doctrine:migration:migrate", "--no-interaction"], cwd=project_root, as_www_data=True)
 
 
+def _pre_upgrade_permissions_check(config: AgentConfig, root: str) -> None:
+    user = str(config.mautic_run_as_user or "www-data").strip() or "www-data"
+    res = ensure_instance_permissions(
+        root=root,
+        run_as_user=user,
+        guard_paths=list(config.fs_permissions_guard_paths or []),
+        fix_console_exec=bool(config.fs_permissions_guard_fix_console_exec),
+        console_relpath=str(config.fs_permissions_guard_console_relpath or "bin/console"),
+    )
+    if res.errors:
+        raise RuntimeError(
+            "Pre-upgrade permissions check failed: " + "; ".join(str(x) for x in res.errors if str(x).strip())
+        )
+    repaired = len(res.repaired_paths)
+    console_fixed = bool(res.console_exec_fixed)
+    logging.info(
+        "[%s] pre-upgrade permissions check: repaired_paths=%s console_exec_fixed=%s missing_paths=%s",
+        root,
+        repaired,
+        console_fixed,
+        len(res.missing_paths),
+    )
+    print(
+        "Permissions pre-check: ok"
+        + (f" (repaired_paths={repaired}" + (", console_exec_fixed=1" if console_fixed else "") + ")" if (repaired or console_fixed) else "")
+    )
+
+
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     install_root, console = _pick_install(config, root)
     current = _read_current_version(install_root, console, config.php_bin)
@@ -460,6 +493,9 @@ def run_upgrade_apply(
             print("Cancelled")
             return 0
 
+    # Mandatory preflight: align permissions before any upgrade action.
+    _pre_upgrade_permissions_check(config, install_root)
+
     if do_backup:
         b = _backup_install(install_root)
         print(f"Backup created: {b}")
@@ -477,6 +513,15 @@ def run_upgrade_apply(
 
     if with_system_upgrade:
         _apply_system_upgrade(current, target)
+
+    # Restore transport dependencies for API senders after upgrade
+    # (especially relevant for zip installs where update flow may drop composer deps).
+    ensure_mailer_packages_for_sender_config(
+        config=config,
+        root=install_root,
+        console_path=console,
+        reason="mautic-upgrade-sender-restore",
+    )
 
     ensure_amazon_mailer_for_bundles(
         config=config,

@@ -18,6 +18,7 @@ AMAZON_MAILER_REQUIRED_BUNDLES: set[str] = {
 }
 
 AMAZON_MAILER_PACKAGE = "symfony/amazon-mailer"
+SENDGRID_MAILER_PACKAGE = "symfony/sendgrid-mailer:*"
 
 
 def _run(
@@ -115,6 +116,67 @@ def _normalize_console_path(project_root: str, console_path: str) -> str:
     return str(Path(project_root) / console_path)
 
 
+def _read_php_array_string(cfg_text: str, key: str) -> str:
+    pat = re.compile(rf"['\"]{re.escape(key)}['\"]\s*=>\s*['\"]([^'\"]*)['\"]", re.IGNORECASE)
+    m = pat.search(cfg_text or "")
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip()
+
+
+def _parse_mailer_config(root: str) -> dict[str, str]:
+    project_root = _resolve_project_root(root)
+    candidates = [
+        Path(root) / "config" / "local.php",
+        Path(root) / "app" / "config" / "local.php",
+        Path(root) / "docroot" / "config" / "local.php",
+        Path(project_root) / "config" / "local.php",
+        Path(project_root) / "app" / "config" / "local.php",
+        Path(project_root) / "docroot" / "config" / "local.php",
+    ]
+    seen: set[str] = set()
+    for p in candidates:
+        ps = str(p)
+        if ps in seen:
+            continue
+        seen.add(ps)
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        return {
+            "mailer_dsn": _read_php_array_string(txt, "mailer_dsn"),
+            "mailer_transport": _read_php_array_string(txt, "mailer_transport"),
+            "mail_transport": _read_php_array_string(txt, "mail_transport"),
+            "email_transport": _read_php_array_string(txt, "email_transport"),
+        }
+    return {}
+
+
+def _required_mailer_packages_from_config(root: str) -> set[str]:
+    cfg = _parse_mailer_config(root)
+    dsn = str(cfg.get("mailer_dsn", "") or "").strip().lower()
+    transport = (
+        str(cfg.get("mailer_transport", "") or "").strip().lower()
+        or str(cfg.get("mail_transport", "") or "").strip().lower()
+        or str(cfg.get("email_transport", "") or "").strip().lower()
+    )
+    out: set[str] = set()
+    if (
+        "mautic+ses+api://" in dsn
+        or "ses+api://" in dsn
+        or "amazonaws.com" in dsn
+        or "amazon" in transport
+        or "ses" in transport
+    ):
+        out.add(AMAZON_MAILER_PACKAGE)
+    if "sendgrid+" in dsn or "sendgrid" in transport:
+        out.add(SENDGRID_MAILER_PACKAGE)
+    return out
+
+
 def installed_required_bundles(root: str) -> set[str]:
     out: set[str] = set()
     candidates = [
@@ -177,3 +239,50 @@ def ensure_amazon_mailer_for_bundles(
     )
     return True
 
+
+def ensure_mailer_packages_for_sender_config(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    reason: str,
+) -> bool:
+    required = _required_mailer_packages_from_config(root)
+    if not required:
+        return False
+
+    install_type = detect_install_type(root)
+    project_root = _resolve_project_root(root)
+    composer_bin = _resolve_composer_bin()
+
+    missing = sorted([pkg for pkg in required if not _composer_has_package(project_root, composer_bin, pkg)])
+    if not missing:
+        logging.info("[%s] sender mailer packages already satisfied (%s)", root, reason)
+        return False
+
+    # For zip installs we normalize Node.js runtime before composer require.
+    if install_type == "zip":
+        _ensure_node20()
+
+    for pkg in missing:
+        _run(
+            [composer_bin, "require", pkg, "--no-interaction"],
+            cwd=project_root,
+            as_www_data=True,
+            timeout_sec=max(int(config.command_timeout_sec or 900), 900),
+        )
+
+    console_abs = _normalize_console_path(project_root, console_path)
+    _run(
+        [config.php_bin, console_abs, "cache:clear"],
+        cwd=project_root,
+        as_www_data=True,
+        timeout_sec=max(int(config.command_timeout_sec or 900), 600),
+    )
+    logging.info(
+        "[%s] sender mailer packages installed=%s (%s)",
+        root,
+        ",".join(missing),
+        reason,
+    )
+    return True
