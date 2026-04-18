@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.89 - 2026-04-18
+- Added: new manual command `mcd-cli permissions:fix` for explicit instance filesystem-permissions repair.
+  - Uses the same MCD guard engine as daemon/pre-upgrade checks.
+  - Pushes state immediately after successful run.
+- Changed: `mcd-cli import` shorthand now supports `-i/--instance-id`.
+- Changed: executor now passes instance id to `mautic:import` when provided.
+- Outcome: MCC instance operations can run import by ID or full import without ID and can trigger explicit permissions fix via MCD-only orchestration path.
+
 ## 0.8.88 - 2026-04-18
 - Fixed: config section upsert now preserves valid TOML section boundaries when updating existing sections.
   - Root cause: in edge cases, writing `[runtime]` keys could concatenate the last key line with the next section header (e.g. `... = 15[sql]`).
