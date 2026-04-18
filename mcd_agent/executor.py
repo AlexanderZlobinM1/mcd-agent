@@ -82,7 +82,7 @@ def build_mautic_exec_args(
         raise ValueError(f"Unsupported command: {command}")
 
     template = SUPPORTED_COMMANDS[command]
-    if command in {"campaign:trigger", "segments:update", "campaign:rebuild", "campaigns:update", "campaigns:trigger"} and instance_id is not None:
+    if command in {"campaign:trigger", "segments:update", "campaign:rebuild", "campaigns:update", "campaigns:trigger", "import"} and instance_id is not None:
         template += f" -i {instance_id}"
     return render_mautic_command(
         php_bin=php_bin,

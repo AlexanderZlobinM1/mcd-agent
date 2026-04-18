@@ -42,6 +42,7 @@ from mcd_agent.executor import (
     execute_mautic_command,
     execute_mautic_command_template,
 )
+from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
 from mcd_agent.mautic6_core_patch import (
@@ -558,6 +559,41 @@ def _prepare_cache_permissions(cfg, root: str) -> tuple[bool, str]:
         return False, "\n".join(lines)
     lines.append(f"OK   writable by {user}: {prod_dir}")
     return True, "\n".join(lines)
+
+
+def _run_permissions_fix(cfg, root: str, run_as_user: str | None = None) -> tuple[int, str]:
+    user = str(run_as_user or cfg.mautic_run_as_user or "www-data").strip() or "www-data"
+    try:
+        res = ensure_instance_permissions(
+            root=root,
+            run_as_user=user,
+            guard_paths=list(cfg.fs_permissions_guard_paths or []),
+            fix_console_exec=bool(cfg.fs_permissions_guard_fix_console_exec),
+            console_relpath=str(cfg.fs_permissions_guard_console_relpath or "bin/console"),
+        )
+    except Exception as e:
+        return 1, f"permissions fix failed: {e}"
+
+    lines: list[str] = []
+    lines.append(f"root={root}")
+    lines.append(f"user={user}")
+    lines.append(
+        "checked_paths={checked} repaired_paths={repaired} console_exec_fixed={console_fix} missing_paths={missing}".format(
+            checked=len(res.checked_paths),
+            repaired=len(res.repaired_paths),
+            console_fix=1 if res.console_exec_fixed else 0,
+            missing=len(res.missing_paths),
+        )
+    )
+    if res.repaired_paths:
+        lines.append("repaired: " + ", ".join(str(x) for x in res.repaired_paths))
+    if res.missing_paths:
+        lines.append("missing: " + ", ".join(str(x) for x in res.missing_paths))
+    if res.errors:
+        lines.append("errors: " + "; ".join(str(x) for x in res.errors))
+    if not res.repaired_paths and not res.console_exec_fixed and not res.errors:
+        lines.append("status: no changes needed")
+    return (1 if res.errors else 0), "\n".join(lines)
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -1200,7 +1236,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_shorthand_exec_args(sh_ctr, with_instance_id=True)
 
     sh_imp = sub.add_parser("import", help="Shorthand for exec --command import")
-    _add_shorthand_exec_args(sh_imp, with_instance_id=False)
+    _add_shorthand_exec_args(sh_imp, with_instance_id=True)
 
     sh_cc = sub.add_parser("cache:clear", help="Shorthand for exec --command cache:clear")
     _add_shorthand_exec_args(sh_cc, with_instance_id=False)
@@ -1210,6 +1246,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sh_ch = sub.add_parser("cache:hard", help="Hard clear cache directory (delete/recreate var/cache/prod)")
     _add_shorthand_exec_args(sh_ch, with_instance_id=False)
+
+    pfix = sub.add_parser("permissions:fix", help="Repair instance filesystem permissions for Mautic runtime")
+    pfix.add_argument("--config", default=default_cfg)
+    pfix.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
+    pfix.add_argument("--run-as-user", help="Target runtime user (defaults to config mautic_run_as_user)")
 
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
@@ -1544,6 +1585,23 @@ def main() -> int:
         rc, output = _run_cache_hard_clear(cfg, root)
         if output:
             print(output)
+        return rc
+
+    if args.cmd == "permissions:fix":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            root = _select_root_for_ops(cfg, args.root)
+        except Exception as e:
+            print(str(e))
+            return 2
+        rc, output = _run_permissions_fix(cfg, root, getattr(args, "run_as_user", None))
+        if output:
+            print(output)
+        if rc == 0:
+            _push_state_after_change(cfg, "permissions-fix")
         return rc
 
     if args.cmd == "exec":
