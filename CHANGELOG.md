@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.88 - 2026-04-18
+- Fixed: config section upsert now preserves valid TOML section boundaries when updating existing sections.
+  - Root cause: in edge cases, writing `[runtime]` keys could concatenate the last key line with the next section header (e.g. `... = 15[sql]`).
+  - `upsert_section_values()` now ensures a newline boundary before the following section when needed.
+- Outcome: stable runtime/profile sync updates no longer risk malformed `mcd.toml`.
+
 ## 0.8.87 - 2026-04-18
 - Added: bidirectional backup-config sync between text config and state profile for stable backup settings.
   - MCC/runtime-applied stable backup runtime keys are now persisted into mutable config file `[runtime]`.
