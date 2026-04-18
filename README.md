@@ -123,28 +123,26 @@ Why this layout:
 - host custom behavior stays in `/opt/mcd/etc/mcd.local.toml` and is not overwritten by code update.
 
 ## Commands
-Install deps first:
-- `python3 -m pip install -r requirements.txt`
+Production CLI (recommended):
+- `mcd-cli` (no args -> interactive menu)
+- `mcd-cli health`
+- `mcd-cli discover`
+- `mcd-cli run`
+- `mcd-cli run-once`
+- `mcd-cli segments:update -i 5`
+- `mcd-cli campaigns:trigger -i 83`
+- `mcd-cli import`
+- `mcd-cli plugins`
+- `mcd-cli mautic-upgrade` (interactive)
+- `mcd-cli mautic-upgrade check`
+- `mcd-cli mautic-upgrade apply --mode zip --backup --yes`
+- `mcd-cli backup profile-show --json`
+- `cat backup-profile.json | mcd-cli backup profile-set --profile-json-stdin`
+- `mcd-cli backup profile-set --profile-json-file /root/backup-profile.json`
 
-Then:
-- `python -m mcd_agent health`
-- `python -m mcd_agent discover --config ./etc/mcd-agent.example.toml`
-- `python -m mcd_agent exec --config ./etc/mcd-agent.example.toml --root /var/www/instance --command campaign:trigger --instance-id 1`
-- `python -m mcd_agent segments:update -i 5`
-- `python -m mcd_agent campaign:trigger -i 83`
-- `python -m mcd_agent import`
-- `python -m mcd_agent run --config ./etc/mcd-agent.example.toml`
-- `python -m mcd_agent run-once --config ./etc/mcd-agent.example.toml`
-- `python -m mcd_agent tune-segments --config ./etc/mcd-agent.example.toml --max-parallel 4`
-- `python -m mcd_agent tune-segments --config ./etc/mcd-agent.example.toml --max-parallel 4 --apply --apply-priority`
-- `python -m mcd_agent plugins --config ./etc/mcd-agent.example.toml`
-- `python -m mcd_agent plugins --config ./etc/mcd-agent.example.toml --list-available`
-- `python -m mcd_agent plugins --config ./etc/mcd-agent.example.toml --list-installed`
-- `python -m mcd_agent plugins --config ./etc/mcd-agent.example.toml --select "1-3 6 10" --yes`
-- `python -m mcd_agent plugins --config ./etc/mcd-agent.example.toml --action remove --select "4 8" --yes`
-- `python -m mcd_agent mautic-upgrade --config ./etc/mcd-agent.example.toml check`
-- `python -m mcd_agent mautic-upgrade --config ./etc/mcd-agent.example.toml` (interactive)
-- `python -m mcd_agent mautic-upgrade --config ./etc/mcd-agent.example.toml apply --mode zip --backup --yes`
+Source/dev equivalent (same command surface):
+- `python -m mcd_agent <same args as mcd-cli>`
+- `python3 -m pip install -r requirements.txt` (only when running from source tree)
 - `python -m mcd_agent interactive --config ./etc/mcd-agent.example.toml`
   - interactive menu uses one active instance for operational actions
   - use `Select Active Instance` to switch target without restarting CLI
@@ -152,9 +150,7 @@ Then:
   - `Soft Clear` (`cache:clear`)
   - `Warmup` (`cache:warmup`)
   - `Hard Clear` (delete `var/cache/prod`)
-- `mcd-cli` (wrapper):
-  - no args -> interactive menu
-  - with args -> same commands as `python -m mcd_agent`
+- `mcd-cli` wrapper notes:
   - `plugin` alias is supported for `plugins`
   - help aliases supported: `mcd-cli /?`, `mcd-cli instances /?`, `mcd-cli plugins /?`
 
@@ -223,6 +219,34 @@ Notes:
 - `python -m mcd_agent backup --config ./etc/mcd-agent.example.toml profile-show`
 - `cat backup-profile.json | python -m mcd_agent backup --config ./etc/mcd-agent.example.toml profile-set --profile-json-stdin`
 - `python -m mcd_agent backup --config ./etc/mcd-agent.example.toml profile-set --profile-json-file ./backup-profile.json`
+
+Same operations via wrapper (`mcd-cli`):
+- `mcd-cli runtime-overrides show`
+- `mcd-cli runtime-overrides fetch --json`
+- `mcd-cli runtime-overrides push --json`
+- `mcd-cli runtime-overrides trigger`
+- `mcd-cli state-db status --json`
+- `printf 'ROOT_DB_PASSWORD' | mcd-cli state-db init --admin-user root --admin-password-stdin --admin-unix-socket /var/run/mysqld/mysqld.sock --json`
+- `mcd-cli maintenance status`
+- `mcd-cli maintenance on --kill-orphans --grace-sec 10`
+- `mcd-cli maintenance off`
+- `mcd-cli instances rescan`
+- `mcd-cli instances add --name m1 --root /var/www/m1 --console-path /var/www/m1/bin/console`
+- `mcd-cli instances remove --name m1`
+- `mcd-cli reload-config`
+- `mcd-cli time-check`
+- `mcd-cli profile status`
+- `mcd-cli profile tiny --yes`
+- `mcd-cli profile passive --yes`
+- `mcd-cli uninstall --yes`
+- `mcd-cli backup run`
+- `mcd-cli backup status --json`
+- `mcd-cli backup history --json`
+- `mcd-cli backup prune`
+- `mcd-cli backup restore --date 2026-03-01`
+- `mcd-cli backup profile-show`
+- `cat backup-profile.json | mcd-cli backup profile-set --profile-json-stdin`
+- `mcd-cli backup profile-set --profile-json-file /root/backup-profile.json`
 
 ## Profile Model
 - State is profile-based (`[profile].name`).
@@ -357,6 +381,12 @@ Important:
   - backup profile credentials can be set without shell-history exposure:
     - `backup profile-set --profile-json-stdin`
     - `backup profile-set --profile-json-file`
+  - where credentials/settings are stored:
+    - authoritative runtime backup profile is in local MCD state DB (`state_db_path`) table `backup_profile` as encrypted payload (`payload_enc`);
+    - this is why scheduler/backup can run even if some `backup.*` keys are absent in text config;
+    - explicit stable backup sections are synchronized with mutable config (`/opt/mcd/etc/mcd.toml`):
+      - DB -> config on `backup profile-set` / MCC-applied backup profile changes;
+      - config -> DB by daemon periodic sync (for manual operator edits in config file).
   - secret refs/config keys:
     - `[backup.secrets].key_path`
     - `[backup.storage].password_ref`
