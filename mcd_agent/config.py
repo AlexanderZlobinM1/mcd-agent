@@ -786,6 +786,68 @@ def _resolve_mutable_config_path(path: str) -> Path:
     return p
 
 
+def resolve_mutable_config_path(path: str) -> Path:
+    return _resolve_mutable_config_path(path)
+
+
+def _toml_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
+    return json.dumps("" if value is None else str(value), ensure_ascii=True)
+
+
+def upsert_section_values(config_path: str, section_name: str, updates: dict[str, object]) -> tuple[str, bool]:
+    """
+    Upsert plain key-value entries in mutable config section and return
+    (mutable_path, changed).
+    """
+    p = _resolve_mutable_config_path(config_path)
+    if not updates:
+        return str(p), False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    section_lines = [f"{k} = {_toml_literal(v)}" for k, v in updates.items()]
+    section = f"[{section_name}]\n" + "\n".join(section_lines) + "\n\n"
+    m = re.search(rf"(?ms)^(\[{re.escape(section_name)}\]\s*\n)(.*?)(?=^\[|\Z)", text)
+    if not m:
+        text2 = section + text
+        if text2 == text:
+            return str(p), False
+        p.write_text(text2, encoding="utf-8")
+        return str(p), True
+    body = m.group(2)
+    key_set = set(updates.keys())
+    out_lines: list[str] = []
+    key_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    for raw in body.splitlines():
+        km = key_re.match(raw)
+        if km and km.group(1) in key_set:
+            continue
+        out_lines.append(raw)
+    while out_lines and not out_lines[0].strip():
+        out_lines.pop(0)
+    merged: list[str] = list(section_lines)
+    if out_lines:
+        merged.append("")
+        merged.extend(out_lines)
+    new_body = "\n".join(merged).rstrip("\n")
+    text2 = text[: m.start(2)] + new_body + text[m.end(2) :]
+    if text2 == text:
+        return str(p), False
+    p.write_text(text2, encoding="utf-8")
+    return str(p), True
+
+
+def upsert_runtime_values(config_path: str, updates: dict[str, object]) -> tuple[str, bool]:
+    return upsert_section_values(config_path, "runtime", updates)
+
+
 def _remove_section_keys_text(text: str, section: str, keys: set[str]) -> tuple[str, int]:
     if not keys:
         return text, 0

@@ -15,7 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mcd_agent.config import AgentConfig
+try:
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - py3.10 compatibility
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from mcd_agent.config import AgentConfig, resolve_mutable_config_path, upsert_section_values
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.models import DBConfig, MauticInstall
 from mcd_agent.secret_store import SecretStore
@@ -308,7 +313,122 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def backup_profile_set(cfg: AgentConfig, payload: dict[str, Any], *, merge: bool = True) -> dict[str, Any]:
+def _profile_storage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    src = payload.get("storage")
+    if not isinstance(src, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("host", "user", "remote_path", "key_file", "password"):
+        if key in src:
+            out[key] = str(src.get(key) or "").strip() if key != "password" else str(src.get(key) or "")
+    if "port" in src:
+        try:
+            out["port"] = int(src.get("port")) if src.get("port") is not None else 22
+        except Exception:
+            pass
+    return out
+
+
+def _profile_mysql_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    src = payload.get("mysql")
+    if not isinstance(src, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("host", "user", "password", "database"):
+        if key in src:
+            out[key] = str(src.get(key) or "").strip() if key != "password" else str(src.get(key) or "")
+    if "port" in src:
+        try:
+            out["port"] = int(src.get("port")) if src.get("port") is not None else 3306
+        except Exception:
+            pass
+    return out
+
+
+def _profile_archive_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    src = payload.get("archive")
+    if not isinstance(src, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if "enabled" in src:
+        out["enabled"] = bool(src.get("enabled"))
+    if "name" in src:
+        out["name"] = str(src.get("name") or "").strip()
+    if "paths" in src:
+        raw = src.get("paths")
+        if isinstance(raw, list):
+            out["paths"] = [str(x).strip() for x in raw if str(x).strip()]
+    return out
+
+
+def _sync_profile_payload_to_config(cfg: AgentConfig, payload: dict[str, Any]) -> bool:
+    changed = False
+    storage = _profile_storage_payload(payload)
+    if storage:
+        _, c = upsert_section_values(cfg.config_file_path, "backup.storage", storage)
+        changed = changed or c
+    mysql = _profile_mysql_payload(payload)
+    if mysql:
+        _, c = upsert_section_values(cfg.config_file_path, "backup.mysql", mysql)
+        changed = changed or c
+    archive = _profile_archive_payload(payload)
+    if archive:
+        _, c = upsert_section_values(cfg.config_file_path, "backup.archive", archive)
+        changed = changed or c
+    return changed
+
+
+def _config_profile_payload(cfg: AgentConfig) -> dict[str, Any]:
+    """
+    Read explicit backup profile fragments from mutable config file.
+    Only sections present in text config are returned.
+    """
+    p = resolve_mutable_config_path(cfg.config_file_path)
+    if not p.exists():
+        return {}
+    try:
+        raw = tomllib.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    backup = raw.get("backup")
+    if not isinstance(backup, dict):
+        return {}
+    out: dict[str, Any] = {}
+    storage = _profile_storage_payload({"storage": backup.get("storage", {})})
+    if storage:
+        out["storage"] = storage
+    mysql = _profile_mysql_payload({"mysql": backup.get("mysql", {})})
+    if mysql:
+        out["mysql"] = mysql
+    archive = _profile_archive_payload({"archive": backup.get("archive", {})})
+    if archive:
+        out["archive"] = archive
+    return out
+
+
+def backup_profile_sync_from_config(cfg: AgentConfig) -> dict[str, Any]:
+    """
+    Sync explicit [backup.*] values from mutable text config into profile DB.
+    This keeps hidden runtime profile in DB aligned with operator edits.
+    """
+    from_cfg = _config_profile_payload(cfg)
+    if not from_cfg:
+        return {"status": "skipped", "reason": "no_backup_profile_sections"}
+    current = backup_profile_get(cfg)
+    merged = _deep_merge(current, from_cfg)
+    if merged == current:
+        return {"status": "ok", "changed": False, "keys": []}
+    backup_profile_set(cfg, from_cfg, merge=True, sync_config=False)
+    return {"status": "ok", "changed": True, "keys": sorted(from_cfg.keys())}
+
+
+def backup_profile_set(
+    cfg: AgentConfig,
+    payload: dict[str, Any],
+    *,
+    merge: bool = True,
+    sync_config: bool = True,
+) -> dict[str, Any]:
     current = backup_profile_get(cfg) if merge else {}
     merged = _deep_merge(current, payload)
     token = _profile_crypto(cfg).encrypt(json.dumps(merged, ensure_ascii=True, separators=(",", ":")))
@@ -325,6 +445,12 @@ def backup_profile_set(cfg: AgentConfig, payload: dict[str, Any], *, merge: bool
         con.commit()
     finally:
         con.close()
+    if sync_config:
+        try:
+            _sync_profile_payload_to_config(cfg, merged)
+        except Exception:
+            # Non-fatal: profile DB is authoritative for backup runtime.
+            pass
     return merged
 
 

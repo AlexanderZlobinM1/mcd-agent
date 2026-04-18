@@ -16,8 +16,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from mcd_agent.config import AgentConfig, check_profile_drift_with_mcc, load_config, recover_config_from_mcc
-from mcd_agent.backup import backup_lock_active, backup_run, backup_status
+from mcd_agent.config import (
+    AgentConfig,
+    check_profile_drift_with_mcc,
+    load_config,
+    recover_config_from_mcc,
+    runtime_effective_map,
+    upsert_runtime_values,
+)
+from mcd_agent.backup import backup_lock_active, backup_profile_sync_from_config, backup_run, backup_status
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
@@ -70,6 +77,25 @@ _SQL_SEGMENTS_ALL_PUBLISHED = (
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
 
+_BACKUP_STABLE_RUNTIME_KEYS = {
+    "backup_enabled",
+    "backup_dump_timeout_sec",
+    "backup_schedule_enabled",
+    "backup_schedule_interval_sec",
+    "backup_schedule_quiet_hour",
+    "backup_schedule_quiet_window_min",
+    "backup_schedule_pre_pause_sec",
+    "backup_mydumper_threads",
+    "backup_mydumper_long_query_guard",
+    "backup_mydumper_kill_long_queries",
+    "backup_mydumper_extra_args",
+    "backup_mydumper_use_nice",
+    "backup_mydumper_nice_level",
+    "backup_mydumper_use_ionice",
+    "backup_mydumper_ionice_class",
+    "backup_mydumper_ionice_level",
+}
+
 _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
     r"(too many connections|lost connection to mysql|mysql server has gone away|"
     r"lock wait timeout|deadlock found|metadata lock|\(1040,|\(1205,|\(1213,|\(2006,|\(2013,)",
@@ -89,6 +115,29 @@ def _to_int(value: object) -> int | None:
         return int(str(value).strip())
     except Exception:
         return None
+
+
+def _persist_stable_backup_runtime_to_config(config: AgentConfig, applied_keys: list[str]) -> None:
+    stable_keys = sorted(set(applied_keys) & _BACKUP_STABLE_RUNTIME_KEYS)
+    if not stable_keys:
+        return
+    eff_runtime = runtime_effective_map(config)
+    updates: dict[str, object] = {}
+    for key in stable_keys:
+        if key in eff_runtime:
+            updates[key] = eff_runtime[key]
+    if not updates:
+        return
+    try:
+        path, changed = upsert_runtime_values(config.config_file_path, updates)
+        if changed:
+            logging.info(
+                "runtime-overrides persisted to config (%s): keys=%s",
+                path,
+                ",".join(stable_keys),
+            )
+    except Exception as e:
+        logging.warning("runtime-overrides persist to config failed: %s", e)
 
 
 def _to_int_list(value: object) -> list[int]:
@@ -2642,6 +2691,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_update_check_at = 0.0
     update_deferred_by_backup = False
     next_service_profile_apply_at = 0.0
+    next_backup_profile_sync_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     runtime_overrides_sync_requested = False
     # Always perform an initial runtime-overrides sync after daemon start/restart.
@@ -2735,6 +2785,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "runtime-overrides synced from MCC: no effective change (keys=%s)",
                             ",".join(applied_keys) if applied_keys else "-",
                         )
+                    _persist_stable_backup_runtime_to_config(next_cfg if isinstance(next_cfg, AgentConfig) else config, applied_keys)
                     last_runtime_overrides_fp = fp
                     store.put_runtime_sync(
                         "active_runtime",
@@ -2759,6 +2810,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 last_runtime_overrides_error = reason
                 next_runtime_overrides_poll_at = now + max(30, poll_interval)
             runtime_overrides_sync_requested = False
+
+        if now >= next_backup_profile_sync_at:
+            try:
+                sync_res = backup_profile_sync_from_config(config)
+                if bool(sync_res.get("changed")):
+                    keys_raw = sync_res.get("keys")
+                    keys = keys_raw if isinstance(keys_raw, list) else []
+                    logging.info(
+                        "backup-profile synced from config to state DB: keys=%s",
+                        ",".join(str(x) for x in keys) if keys else "-",
+                    )
+            except Exception as e:
+                logging.warning("backup-profile sync from config failed: %s", e)
+            next_backup_profile_sync_at = now + 60.0
 
         if config.tasks_compact_enabled:
             quiet_hour = max(0, min(23, int(config.tasks_compact_quiet_hour)))
