@@ -1511,6 +1511,7 @@ class MCCStatePusher:
                     "name": i.name,
                     "root": i.root,
                     "source": i.source,
+                    "domains": list(i.domains or ([] if not i.primary_domain else [i.primary_domain])),
                     "mautic_major": i.mautic_major,
                     "mautic_version": _collect_mautic_version(i.root, self.cfg.php_bin),
                     "install_type": detect_install_type(i.root),

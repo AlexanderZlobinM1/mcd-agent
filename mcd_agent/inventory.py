@@ -58,6 +58,7 @@ class InstanceInventory:
               name TEXT NOT NULL,
               root TEXT NOT NULL UNIQUE,
               primary_domain TEXT,
+              domains_json TEXT,
               console_path TEXT NOT NULL,
               local_php_path TEXT,
               mautic_timezone TEXT,
@@ -85,6 +86,8 @@ class InstanceInventory:
             self.conn.execute("ALTER TABLE instances ADD COLUMN instance_uid TEXT")
         if "primary_domain" not in names:
             self.conn.execute("ALTER TABLE instances ADD COLUMN primary_domain TEXT")
+        if "domains_json" not in names:
+            self.conn.execute("ALTER TABLE instances ADD COLUMN domains_json TEXT")
         # Migration from legacy schema where name was PRIMARY KEY.
         if name_is_pk:
             self._migrate_instances_legacy_pk_name()
@@ -136,6 +139,7 @@ class InstanceInventory:
               name TEXT NOT NULL,
               root TEXT NOT NULL UNIQUE,
               primary_domain TEXT,
+              domains_json TEXT,
               console_path TEXT NOT NULL,
               local_php_path TEXT,
               mautic_timezone TEXT,
@@ -154,11 +158,11 @@ class InstanceInventory:
         self.conn.execute(
             """
             INSERT OR REPLACE INTO instances(
-              instance_uid, name, root, primary_domain, console_path, local_php_path, mautic_timezone, mautic_major, source,
+              instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
             )
             SELECT
-              NULL, name, root, NULL, console_path, local_php_path, mautic_timezone, mautic_major, source,
+              NULL, name, root, NULL, NULL, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
             FROM instances_legacy
             ORDER BY updated_at ASC
@@ -182,14 +186,15 @@ class InstanceInventory:
         self.conn.execute(
             """
             INSERT INTO instances(
-              instance_uid, name, root, primary_domain, console_path, local_php_path, mautic_timezone, mautic_major, source,
+              instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(root) DO UPDATE SET
               instance_uid=excluded.instance_uid,
               name=excluded.name,
               root=excluded.root,
               primary_domain=excluded.primary_domain,
+              domains_json=excluded.domains_json,
               console_path=excluded.console_path,
               local_php_path=excluded.local_php_path,
               mautic_timezone=excluded.mautic_timezone,
@@ -208,6 +213,7 @@ class InstanceInventory:
                 inst.name,
                 inst.root,
                 inst.primary_domain,
+                json.dumps(list(inst.domains or []), ensure_ascii=False) if (inst.domains or []) else None,
                 inst.console_path,
                 inst.local_php_path,
                 inst.mautic_timezone,
@@ -251,6 +257,11 @@ class InstanceInventory:
                     db=db,
                     source=str(r["source"]),
                     markers=[],
+                    domains=(
+                        [str(x).strip().lower() for x in json.loads(str(r["domains_json"] or "[]")) if str(x).strip()]
+                        if str(r["domains_json"] or "").strip()
+                        else ([str(r["primary_domain"]).strip().lower()] if r["primary_domain"] else [])
+                    ),
                 )
             )
         return out

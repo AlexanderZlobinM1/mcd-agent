@@ -24,6 +24,7 @@ class MauticInstall:
     db: DBConfig | None = None
     source: str = "autodiscovery"
     markers: list[str] = field(default_factory=list)
+    domains: list[str] = field(default_factory=list)
 
     def safe_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -37,6 +38,7 @@ class MauticInstall:
             "mautic_major": self.mautic_major,
             "source": self.source,
             "markers": self.markers,
+            "domains": list(self.domains or []),
         }
         if self.db:
             payload["db"] = {

@@ -1638,7 +1638,13 @@ def main() -> int:
                 print("No instances")
                 return 0
             for i in rows:
-                print(f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}")
+                domains = [str(x).strip() for x in (i.domains or []) if str(x).strip()]
+                if not domains and i.primary_domain:
+                    domains = [str(i.primary_domain).strip()]
+                domains_cell = ",".join(domains)
+                print(
+                    f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}\tdomains={domains_cell}"
+                )
             return 0
         if args.op == "rescan":
             count = inv.rescan(cfg)

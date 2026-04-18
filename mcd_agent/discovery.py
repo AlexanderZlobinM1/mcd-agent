@@ -163,21 +163,30 @@ def _domain_from_local_php(local_php_path: str | None) -> str | None:
     return host
 
 
-def _pick_domain(names: list[str]) -> str | None:
-    if not names:
-        return None
+def _normalize_domains(names: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
     for n in names:
-        v = n.strip().lower()
+        v = str(n or "").strip().lower()
         if not v or v in {"_", "localhost"}:
             continue
         if "*" in v:
             continue
-        return v
-    return names[0].strip().lower() if names else None
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    out.sort(key=lambda x: (-_domain_preference_score(x), x))
+    return out
 
 
-def _parse_nginx_vhosts(path: Path) -> list[tuple[str, str | None]]:
-    out: list[tuple[str, str | None]] = []
+def _pick_domain(names: list[str]) -> str | None:
+    domains = _normalize_domains(names)
+    return domains[0] if domains else None
+
+
+def _parse_nginx_vhosts(path: Path) -> list[tuple[str, list[str]]]:
+    out: list[tuple[str, list[str]]] = []
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -189,15 +198,15 @@ def _parse_nginx_vhosts(path: Path) -> list[tuple[str, str | None]]:
         names: list[str] = []
         for raw in names_raw:
             names.extend([x for x in raw.split() if x.strip()])
-        dom = _pick_domain(names)
+        domains = _normalize_domains(names)
         for r in roots:
             if r.startswith("/"):
-                out.append((r, dom))
+                out.append((r, domains))
     return out
 
 
-def _parse_apache_vhosts(path: Path) -> list[tuple[str, str | None]]:
-    out: list[tuple[str, str | None]] = []
+def _parse_apache_vhosts(path: Path) -> list[tuple[str, list[str]]]:
+    out: list[tuple[str, list[str]]] = []
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -217,12 +226,12 @@ def _parse_apache_vhosts(path: Path) -> list[tuple[str, str | None]]:
             names.extend([x for x in sn.group(1).split() if x.strip()])
         for raw in sa:
             names.extend([x for x in raw.split() if x.strip()])
-        out.append((root, _pick_domain(names)))
+        out.append((root, _normalize_domains(names)))
     return out
 
 
-def _web_vhosts_from_server_configs() -> list[tuple[str, str | None]]:
-    out: list[tuple[str, str | None]] = []
+def _web_vhosts_from_server_configs() -> dict[str, list[str]]:
+    out: list[tuple[str, list[str]]] = []
     nd = Path("/etc/nginx/sites-enabled")
     ad = Path("/etc/apache2/sites-enabled")
     if nd.exists():
@@ -233,15 +242,17 @@ def _web_vhosts_from_server_configs() -> list[tuple[str, str | None]]:
         for p in ad.glob("*"):
             if p.is_file() or p.is_symlink():
                 out.extend(_parse_apache_vhosts(p))
-    dedup: dict[str, str | None] = {}
-    for root, dom in out:
-        if root not in dedup:
-            dedup[root] = dom
-            continue
-        prev = dedup[root]
-        if _domain_preference_score(dom) > _domain_preference_score(prev):
-            dedup[root] = dom
-    return [(k, v) for k, v in sorted(dedup.items(), key=lambda x: x[0])]
+    dedup: dict[str, set[str]] = {}
+    for root, domains in out:
+        cur = dedup.setdefault(root, set())
+        for d in domains or []:
+            dv = str(d or "").strip().lower()
+            if dv:
+                cur.add(dv)
+    mapped: dict[str, list[str]] = {}
+    for root in sorted(dedup.keys()):
+        mapped[root] = _normalize_domains(list(dedup[root]))
+    return mapped
 
 
 def _detect_mautic_local_php(root: str) -> str | None:
@@ -302,8 +313,7 @@ def discover_mautic(
 ) -> list[MauticInstall]:
     installs: list[MauticInstall] = []
     allowed = set(supported_mautic_majors or [4, 5, 6, 7])
-    vhosts = _web_vhosts_from_server_configs()
-    vhost_map = {root: domain for root, domain in vhosts}
+    vhost_map = _web_vhosts_from_server_configs()
     configured_roots = list(vhost_map.keys())
     fallback_roots = [r for r in (roots or []) if r not in vhost_map]
     all_roots = configured_roots + fallback_roots
@@ -322,7 +332,8 @@ def discover_mautic(
         major = _detect_mautic_major(resolved_root, local_php)
         if major is not None and major not in allowed:
             continue
-        vhost_domain = vhost_map.get(root)
+        vhost_domains = list(vhost_map.get(root, []) or [])
+        vhost_domain = vhost_domains[0] if vhost_domains else None
         config_domain = _domain_from_local_php(local_php)
         domain = config_domain or vhost_domain
         if config_domain and vhost_domain and config_domain != vhost_domain:
@@ -330,6 +341,12 @@ def discover_mautic(
             # until app-level post-clone tuning runs. Prefer real vhost domain.
             if _is_template_domain(config_domain) and not _is_template_domain(vhost_domain):
                 domain = vhost_domain
+        domains: list[str] = list(vhost_domains)
+        if domain and domain not in domains:
+            domains.insert(0, domain)
+        domains = _normalize_domains(domains)
+        if domain and domain in domains and domains[0] != domain:
+            domains = [domain] + [x for x in domains if x != domain]
         name = domain or (Path(resolved_root).name or "mautic")
         installs.append(
             MauticInstall(
@@ -344,6 +361,7 @@ def discover_mautic(
                 db=_build_db(local_php),
                 source="autodiscovery",
                 markers=[marker, "app/config/local.php|config/local.php", "sites-enabled"] + path_markers,
+                domains=domains,
             )
         )
 
@@ -371,6 +389,7 @@ def discover_mautic(
                 db=_build_db(local_php_path, item),
                 source="manual",
                 markers=["manual-instance"],
+                domains=[],
             )
         )
 
