@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.8.87 - 2026-04-18
+- Added: bidirectional backup-config sync between text config and state profile for stable backup settings.
+  - MCC/runtime-applied stable backup runtime keys are now persisted into mutable config file `[runtime]`.
+  - `backup profile-set` now mirrors profile sections into text config:
+    - `[backup.storage]`
+    - `[backup.mysql]`
+    - `[backup.archive]`
+  - Daemon now polls mutable config and syncs explicit `[backup.*]` edits back into backup profile state DB.
+- Scope guard:
+  - only stable backup settings are persisted to text config;
+  - high-frequency dynamic scheduler/runtime noise remains out of text config.
+- Outcome: operators can edit backup settings from either side (MCC or text config) without hidden drift between daemon-effective state and visible config.
+
 ## 0.8.86 - 2026-04-18
 - Fixed: campaign scheduler fallback for trigger lane in dual-ring modes (`mini`/`midi`/`maxi`/`hiload`).
   - If `campaign_triggers_due` returns empty but `campaign_rebuilds_due` is non-empty, MCD now seeds trigger ring from rebuild-due IDs.
