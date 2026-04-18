@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.86 - 2026-04-18
+- Fixed: campaign scheduler fallback for trigger lane in dual-ring modes (`mini`/`midi`/`maxi`/`hiload`).
+  - If `campaign_triggers_due` returns empty but `campaign_rebuilds_due` is non-empty, MCD now seeds trigger ring from rebuild-due IDs.
+  - Prevents rebuild-only loops where published campaigns are repeatedly rebuilt but never triggered automatically.
+  - Adds explicit warning log marker:
+    - `campaign trigger fallback active: trigger_due=0, reuse rebuild_due=<N>`
+- Outcome: newly published campaigns on rebuild-heavy hosts auto-start without requiring manual `mautic:campaigns:trigger` from console.
+
 ## 0.8.85 - 2026-04-17
 - Changed: `mcd-cli mautic-upgrade apply` now runs a mandatory pre-upgrade permissions preflight.
   - Reuses MCD filesystem permission guard logic before any upgrade steps.

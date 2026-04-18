@@ -3164,6 +3164,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if campaign_trigger_ids is not None and campaign_rebuild_ids is not None:
                     campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids))
                     campaign_rebuild_ids = list(dict.fromkeys(campaign_rebuild_ids))
+                    if not campaign_trigger_ids and campaign_rebuild_ids:
+                        # Safety fallback: if trigger selector yields empty set while
+                        # rebuild selector is non-empty, keep trigger lane alive by
+                        # reusing rebuild source IDs. This prevents "rebuild-only"
+                        # loops where published campaigns never get trigger pass
+                        # without manual console run.
+                        campaign_trigger_ids = list(campaign_rebuild_ids)
+                        logging.warning(
+                            "[%s] campaign trigger fallback active: trigger_due=0, reuse rebuild_due=%s",
+                            root,
+                            len(campaign_rebuild_ids),
+                        )
                     if (config.profile_name or "").strip().lower() == "tiny" and campaign_rebuild_ids:
                         # Tiny chain uses trigger ring as source for rebuild->trigger sequence.
                         # Include rebuild-due campaigns into trigger source to avoid missing
