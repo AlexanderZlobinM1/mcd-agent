@@ -32,6 +32,7 @@ from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
+from mcd_agent.maintenance_mode import collect_maintenance_state
 from mcd_agent.runtime_overrides import local_runtime_overrides
 from mcd_agent.state_backend import (
     mark_outbound_event_mysql,
@@ -1538,6 +1539,7 @@ class MCCStatePusher:
             },
             "profile": (profile_name or "").strip().lower(),
             "runtime_overrides": local_runtime_overrides(self.cfg),
+            "maintenance_state": collect_maintenance_state(self.cfg),
             "config_state": {
                 "path": self.cfg.config_file_path,
                 "schema_version": int(self.cfg.config_schema_version),

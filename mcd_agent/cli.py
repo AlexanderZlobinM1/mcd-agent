@@ -50,6 +50,7 @@ from mcd_agent.mautic6_core_patch import (
     patch_status as mautic6_patch_status,
     revert_m6_plugin_update_metadata_patch,
 )
+from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.runtime_overrides import (
@@ -1346,6 +1347,11 @@ def _build_parser() -> argparse.ArgumentParser:
     scheduler.add_argument("--verbose", action="store_true", help="Show tracked running task details on status")
     scheduler.add_argument("--json", action="store_true")
 
+    apt_upg = sub.add_parser("apt-upgrade", help="Run apt update + dist-upgrade preserving local config files")
+    apt_upg.add_argument("--config", default=default_cfg)
+    apt_upg.add_argument("--yes", action="store_true", help="Do not ask confirmation")
+    apt_upg.add_argument("--json", action="store_true")
+
     sdb = sub.add_parser("state-db", help="State DB status/bootstrap for legacy->mysql_hybrid migration")
     sdb.add_argument("--config", default=default_cfg)
     sdb.add_argument("op", choices=["status", "init"], nargs="?", default="status")
@@ -1375,6 +1381,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=10,
         help="SIGTERM grace period before SIGKILL for stopped processes",
     )
+    maintenance.add_argument(
+        "--stop-cron",
+        action="store_true",
+        help="Also stop cron service while maintenance mode is enabled (restored on maintenance off)",
+    )
+    maintenance.add_argument("--json", action="store_true")
 
     profile = sub.add_parser("profile", help="Switch MCD profile (single source of state)")
     profile.add_argument("--config", default=default_cfg)
@@ -1946,6 +1958,73 @@ def main() -> int:
                 )
         return 0
 
+    if args.cmd == "apt-upgrade":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if not bool(args.yes):
+            ans = _ask(
+                "Run apt-get update && apt-get dist-upgrade -y with keep-local-config behavior? [y/N]: "
+            ).strip().lower()
+            if ans not in {"y", "yes"}:
+                if bool(args.json):
+                    print(json.dumps({"status": "cancelled"}, ensure_ascii=True, indent=2))
+                else:
+                    print("cancelled")
+                return 1
+        env = dict(os.environ)
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        cmd_update = ["apt-get", "update"]
+        cmd_upgrade = [
+            "apt-get",
+            "dist-upgrade",
+            "-y",
+            "-o",
+            "Dpkg::Options::=--force-confdef",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+        ]
+        started = time.time()
+        p_update = subprocess.run(cmd_update, capture_output=True, text=True, env=env)
+        update_stdout = p_update.stdout or ""
+        update_stderr = p_update.stderr or ""
+        if update_stdout:
+            print(update_stdout, end="")
+        if update_stderr:
+            print(update_stderr, end="", file=sys.stderr)
+        p_upgrade = None
+        if p_update.returncode == 0:
+            p_upgrade = subprocess.run(cmd_upgrade, capture_output=True, text=True, env=env)
+            up_stdout = p_upgrade.stdout or ""
+            up_stderr = p_upgrade.stderr or ""
+            if up_stdout:
+                print(up_stdout, end="")
+            if up_stderr:
+                print(up_stderr, end="", file=sys.stderr)
+        duration = int(max(0, time.time() - started))
+        update_rc = int(p_update.returncode)
+        upgrade_rc = int(p_upgrade.returncode) if p_upgrade is not None else None
+        ok = update_rc == 0 and (upgrade_rc in {0, None})
+        payload = {
+            "status": ("ok" if ok else "error"),
+            "update_rc": update_rc,
+            "upgrade_rc": upgrade_rc,
+            "duration_sec": duration,
+            "dpkg_conf_policy": "force-confdef + force-confold",
+        }
+        if bool(args.json):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(
+                "apt_upgrade={status} update_rc={update_rc} upgrade_rc={upgrade_rc} duration_sec={duration_sec} conf=force-confold".format(
+                    **payload
+                )
+            )
+        if ok:
+            _push_state_after_change(cfg, "apt-upgrade")
+        return 0 if ok else 1
+
     if args.cmd == "state-db":
         cfg = load_config(args.config)
         note = maybe_notify_update(cfg)
@@ -2017,41 +2096,90 @@ def main() -> int:
             print(f"NOTICE: {note}")
         flag = Path(cfg.scheduler_pause_flag_path)
         flag.parent.mkdir(parents=True, exist_ok=True)
+        maintenance_state = collect_maintenance_state(cfg)
 
         if args.op == "off":
             if flag.exists():
                 flag.unlink()
+            cron_restore = restore_cron_service_if_needed(cfg)
             tracked = _tracked_running_tasks(cfg)
+            tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
             consoles = _list_mautic_console_processes()
-            print(
-                "maintenance=off "
-                f"paused={str(flag.exists()).lower()} "
-                f"tracked_running={len(tracked)} "
-                f"mautic_console_total={len(consoles)}"
-            )
-            return 0
+            orphan_count = sum(1 for pid, _ in consoles if pid not in tracked_pids)
+            maintenance_state = collect_maintenance_state(cfg)
+            payload = {
+                "status": "ok" if bool(cron_restore.get("ok", True)) else "error",
+                "mode": str(maintenance_state.get("mode", "off")),
+                "paused": bool(maintenance_state.get("paused", False)),
+                "active": bool(maintenance_state.get("active", False)),
+                "cron_stopped": bool(maintenance_state.get("cron_stopped", False)),
+                "cron_service_name": str(maintenance_state.get("cron_service_name", "") or ""),
+                "cron_service_active": maintenance_state.get("cron_service_active"),
+                "tracked_running": len(tracked),
+                "mautic_console_total": len(consoles),
+                "orphan_console": orphan_count,
+                "cron_restore": cron_restore,
+            }
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(
+                    "maintenance=off paused={paused} cron_stopped={cron_stopped} cron_active={cron_active} "
+                    "cron_unit={cron_unit} tracked_running={tracked} mautic_console_total={total} orphan_console={orphans}".format(
+                        paused=str(payload["paused"]).lower(),
+                        cron_stopped=str(payload["cron_stopped"]).lower(),
+                        cron_active=str(payload.get("cron_service_active")),
+                        cron_unit=(payload.get("cron_service_name") or "-"),
+                        tracked=payload["tracked_running"],
+                        total=payload["mautic_console_total"],
+                        orphans=payload["orphan_console"],
+                    )
+                )
+                if not bool(cron_restore.get("ok", True)):
+                    print(f"WARN cron restore failed: {str(cron_restore.get('message', '') or '').strip()}")
+            _push_state_after_change(cfg, "maintenance-off")
+            return 0 if bool(cron_restore.get("ok", True)) else 1
 
         if args.op == "status":
             tracked = _tracked_running_tasks(cfg)
             tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
             consoles = _list_mautic_console_processes()
             orphan_count = sum(1 for pid, _ in consoles if pid not in tracked_pids)
-            print(
-                "maintenance={mode} paused={paused} tracked_running={tracked} "
-                "mautic_console_total={total} orphan_console={orphans}".format(
-                    mode="on" if flag.exists() else "off",
-                    paused=str(flag.exists()).lower(),
-                    tracked=len(tracked),
-                    total=len(consoles),
-                    orphans=orphan_count,
+            payload = {
+                "status": "ok",
+                "mode": str(maintenance_state.get("mode", "off")),
+                "paused": bool(maintenance_state.get("paused", False)),
+                "active": bool(maintenance_state.get("active", False)),
+                "cron_stopped": bool(maintenance_state.get("cron_stopped", False)),
+                "cron_service_name": str(maintenance_state.get("cron_service_name", "") or ""),
+                "cron_service_active": maintenance_state.get("cron_service_active"),
+                "tracked_running": len(tracked),
+                "mautic_console_total": len(consoles),
+                "orphan_console": orphan_count,
+            }
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(
+                    "maintenance={mode} paused={paused} cron_stopped={cron_stopped} cron_active={cron_active} "
+                    "cron_unit={cron_unit} tracked_running={tracked} mautic_console_total={total} orphan_console={orphans}".format(
+                        mode=payload["mode"],
+                        paused=str(payload["paused"]).lower(),
+                        cron_stopped=str(payload["cron_stopped"]).lower(),
+                        cron_active=str(payload.get("cron_service_active")),
+                        cron_unit=(payload.get("cron_service_name") or "-"),
+                        tracked=payload["tracked_running"],
+                        total=payload["mautic_console_total"],
+                        orphans=payload["orphan_console"],
+                    )
                 )
-            )
             return 0
 
         # op == "on"
         flag.write_text("paused\n", encoding="utf-8")
         stop_count = 0
         failed_count = 0
+        cron_stop = {"ok": True, "requested": False, "unit": "", "cron_stopped": False, "message": ""}
 
         if not bool(args.no_kill_running):
             tracked = _tracked_running_tasks(cfg)
@@ -2085,18 +2213,45 @@ def main() -> int:
                         failed_count += 1
                         print(f"WARN orphan stop failed: pid={pid} result={res} cmd={cmd}")
 
+        if bool(args.stop_cron):
+            cron_stop = stop_cron_service(cfg)
+            if not bool(cron_stop.get("ok", False)):
+                print(f"WARN cron stop failed: {str(cron_stop.get('message', '') or '').strip()}")
+
         tracked_after = _tracked_running_tasks(cfg)
         consoles_after = _list_mautic_console_processes()
-        print(
-            "maintenance=on paused=true stopped={stopped} stop_failed={failed} "
-            "tracked_running={tracked} mautic_console_total={total}".format(
-                stopped=stop_count,
-                failed=failed_count,
-                tracked=len(tracked_after),
-                total=len(consoles_after),
+        maintenance_state = collect_maintenance_state(cfg)
+        payload = {
+            "status": "ok" if bool(cron_stop.get("ok", True)) else "error",
+            "mode": str(maintenance_state.get("mode", "on")),
+            "paused": bool(maintenance_state.get("paused", True)),
+            "active": bool(maintenance_state.get("active", True)),
+            "cron_stopped": bool(maintenance_state.get("cron_stopped", False)),
+            "cron_service_name": str(maintenance_state.get("cron_service_name", "") or ""),
+            "cron_service_active": maintenance_state.get("cron_service_active"),
+            "stopped": stop_count,
+            "stop_failed": failed_count,
+            "tracked_running": len(tracked_after),
+            "mautic_console_total": len(consoles_after),
+            "cron_stop": cron_stop,
+        }
+        if bool(args.json):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(
+                "maintenance=on paused=true cron_stopped={cron_stopped} cron_active={cron_active} cron_unit={cron_unit} "
+                "stopped={stopped} stop_failed={failed} tracked_running={tracked} mautic_console_total={total}".format(
+                    cron_stopped=str(payload["cron_stopped"]).lower(),
+                    cron_active=str(payload.get("cron_service_active")),
+                    cron_unit=(payload.get("cron_service_name") or "-"),
+                    stopped=payload["stopped"],
+                    failed=payload["stop_failed"],
+                    tracked=payload["tracked_running"],
+                    total=payload["mautic_console_total"],
+                )
             )
-        )
-        return 0
+        _push_state_after_change(cfg, "maintenance-on")
+        return 0 if bool(cron_stop.get("ok", True)) else 1
 
     if args.cmd == "time-check":
         cfg = load_config(args.config)

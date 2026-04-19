@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.8.90 - 2026-04-19
+- Added: `mcd-cli apt-upgrade` command for host-side package update flow.
+  - Runs `apt-get update` + `apt-get dist-upgrade -y`.
+  - Preserves local config files via dpkg `--force-confdef` + `--force-confold`.
+- Changed: `mcd-cli maintenance` supports host cron control.
+  - New option: `--stop-cron` on enable.
+  - `maintenance off` restores cron only if MCD stopped it earlier.
+  - JSON output now includes maintenance + cron state.
+- Added: immediate maintenance-state push to MCC after `maintenance` and `apt-upgrade` actions.
+- Added: shared maintenance-state collector for daemon/CLI/MCC cache integration.
+- Outcome: host operations from MCC are executed locally by MCD and reported back immediately.
+
 ## 0.8.89 - 2026-04-18
 - Added: new manual command `mcd-cli permissions:fix` for explicit instance filesystem-permissions repair.
   - Uses the same MCD guard engine as daemon/pre-upgrade checks.
