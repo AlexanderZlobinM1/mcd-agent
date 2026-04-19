@@ -2662,7 +2662,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     campaign_rebuild_prio_sets: dict[str, set[int]] = {}
     campaign_rebuild_reg_sets: dict[str, set[int]] = {}
     campaign_round_robin: dict[str, int] = {}
-    campaign_chain_pending_trigger: dict[str, int] = {}
     segment_resume_rings: dict[str, deque[int]] = {}
     queue_samples: dict[str, deque[tuple[float, int]]] = {}
     throttled: dict[str, bool] = {}
@@ -3229,23 +3228,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if campaign_trigger_ids is not None and campaign_rebuild_ids is not None:
                     campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids))
                     campaign_rebuild_ids = list(dict.fromkeys(campaign_rebuild_ids))
-                    if not campaign_trigger_ids and campaign_rebuild_ids:
-                        # Safety fallback: if trigger selector yields empty set while
-                        # rebuild selector is non-empty, keep trigger lane alive by
-                        # reusing rebuild source IDs. This prevents "rebuild-only"
-                        # loops where published campaigns never get trigger pass
-                        # without manual console run.
-                        campaign_trigger_ids = list(campaign_rebuild_ids)
-                        logging.warning(
-                            "[%s] campaign trigger fallback active: trigger_due=0, reuse rebuild_due=%s",
-                            root,
-                            len(campaign_rebuild_ids),
-                        )
-                    if (config.profile_name or "").strip().lower() == "tiny" and campaign_rebuild_ids:
-                        # Tiny chain uses trigger ring as source for rebuild->trigger sequence.
-                        # Include rebuild-due campaigns into trigger source to avoid missing
-                        # campaigns that currently have no scheduled events yet but require rebuild.
-                        campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids + campaign_rebuild_ids))
                     campaign_all_ids = list(dict.fromkeys(campaign_trigger_ids + campaign_rebuild_ids))
                     camp_w = store.get_weights("campaign", root, config.weights_recalc_interval_sec)
                     campaign_weight_rows: list[dict[str, object]] = []
@@ -3987,26 +3969,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             # This avoids duplicate campaign pre-processing passes.
             if (config.profile_name or "").strip().lower() == "tiny":
                 if _running_campaign_total(running, root) == 0:
-                    active_campaigns = set(trg_reg_ring) | set(trg_prio_ring) | set(reb_reg_ring) | set(reb_prio_ring)
-                    pending_trigger_id = campaign_chain_pending_trigger.get(root)
-                    if pending_trigger_id is not None and pending_trigger_id not in active_campaigns:
-                        pending_trigger_id = None
-                        campaign_chain_pending_trigger.pop(root, None)
+                    next_trigger_id = None
+                    if trg_prio_ring:
+                        next_trigger_id = trg_prio_ring[0]
+                        trg_prio_ring.rotate(-1)
+                    elif trg_reg_ring:
+                        next_trigger_id = trg_reg_ring[0]
+                        trg_reg_ring.rotate(-1)
 
-                    if pending_trigger_id is not None:
+                    if next_trigger_id is not None:
                         _submit_if_slot(
                             config=config,
                             store=store,
                             running=running,
                             root=root,
                             task_type="campaign_trigger",
-                            entity_id=pending_trigger_id,
+                            entity_id=next_trigger_id,
                             args=render_mautic_command(
                                 php_bin=config.php_bin,
                                 run_as_user=config.mautic_run_as_user,
                                 root=root,
                                 template=config.cmd_campaign_trigger_template,
-                                id=pending_trigger_id,
+                                id=next_trigger_id,
                                 campaign_limit=config.campaign_limit,
                                 batch_limit=config.campaign_batch_limit,
                             ),
@@ -4014,17 +3998,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             max_parallel_for_type=1,
                             popens=popens,
                         )
-                        if _is_running(running, root, "campaign_trigger", pending_trigger_id):
-                            campaign_chain_pending_trigger.pop(root, None)
                     else:
                         next_campaign_id = None
-                        if trg_prio_ring:
-                            next_campaign_id = trg_prio_ring[0]
-                            trg_prio_ring.rotate(-1)
-                        elif trg_reg_ring:
-                            next_campaign_id = trg_reg_ring[0]
-                            trg_reg_ring.rotate(-1)
-                        elif reb_prio_ring:
+                        if reb_prio_ring:
                             next_campaign_id = reb_prio_ring[0]
                             reb_prio_ring.rotate(-1)
                         elif reb_reg_ring:
@@ -4049,9 +4025,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 max_parallel_for_type=1,
                                 popens=popens,
                             )
-                            if _is_running(running, root, "campaign_rebuild", next_campaign_id):
-                                campaign_chain_pending_trigger[root] = next_campaign_id
-            # Tiny mode has a single campaign worker with rebuild->trigger chain per id.
+            # Tiny mode has a single campaign worker:
+            # - trigger-due campaigns first
+            # - then rebuild-due campaigns
             # Import polling must stay independent from campaign slot occupancy.
             if (config.profile_name or "").strip().lower() == "tiny":
                 if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:

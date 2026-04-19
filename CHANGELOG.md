@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.8.91 - 2026-04-19
+
+- Fixed tiny campaign scheduler:
+  - removed rebuild-due -> trigger-lane fallback that could launch long useless trigger passes,
+  - removed unconditional same-id rebuild->trigger chaining,
+  - tiny profile now runs one campaign worker with actual trigger-due campaigns first, then rebuild-due campaigns.
+- Fixed campaign trigger SQL time handling:
+  - `campaign_lead_event_log.trigger_date` is now compared against instance local time (`now_local`) instead of UTC,
+  - recent `campaign_leads.date_added` windows now use local 24h window for trigger detection and campaign weight recency.
+
 ## 0.8.90 - 2026-04-19
 - Added: `mcd-cli apt-upgrade` command for host-side package update flow.
   - Runs `apt-get update` + `apt-get dist-upgrade -y`.
