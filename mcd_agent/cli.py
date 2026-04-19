@@ -907,6 +907,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     config=cfg,
                     root=active_root,
                     selection=None,
+                    bundles=None,
                     action=None,
                     no_color=bool(no_color),
                     yes=False,
@@ -1269,10 +1270,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Action mode for selected plugins",
         )
         p.add_argument("--select", help="Selection expression, e.g. '1-3 6 10'")
+        p.add_argument("--bundle", action="append", help="Select plugin by bundle name (repeatable)")
         p.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
         p.add_argument("--no-color", action="store_true")
         p.add_argument("--list-available", action="store_true", help="Show plugins available in server manifest")
         p.add_argument("--list-installed", action="store_true", help="Show plugins currently installed on host")
+        p.add_argument("--catalog-json", action="store_true", help="Print plugin catalog/status as JSON")
 
     plugins = sub.add_parser("plugins", help="Interactive plugin sync/install from MCC repo")
     _add_plugins_args(plugins)
@@ -1648,17 +1651,19 @@ def main() -> int:
     if args.cmd in {"plugins", "plugin"}:
         cfg = load_config(args.config)
         note = maybe_notify_update(cfg)
-        if note:
+        if note and not bool(args.catalog_json):
             print(f"NOTICE: {note}")
         rc = run_plugins_interactive(
             config=cfg,
             root=args.root,
             selection=args.select,
+            bundles=list(args.bundle or []),
             action=args.action,
             no_color=bool(args.no_color),
             yes=bool(args.yes),
             list_available=bool(args.list_available),
             list_installed=bool(args.list_installed),
+            catalog_json=bool(args.catalog_json),
         )
         if rc == 0:
             _push_state_after_change(cfg, "plugins")

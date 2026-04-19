@@ -440,6 +440,108 @@ def _resolve_plugins_dir(root: str, create: bool = False) -> Path:
     return candidates[0]
 
 
+def _build_plugin_rows(
+    *,
+    config: AgentConfig,
+    install,
+) -> tuple[str, str | None, str, list[dict[str, Any]]]:
+    install_root = install.root
+    major = install.mautic_major or 6
+    base = _repo_base_url(config)
+    manifest_url = base + config.plugins_manifest_path_template.format(major=major)
+    fallback_ip = _plugins_fallback_ip(config)
+    logging.info("plugins manifest: %s", manifest_url)
+    if fallback_ip:
+        logging.info("plugins manifest fallback_ip: %s", fallback_ip)
+    manifest = _fetch_json(
+        manifest_url,
+        config.mcc_token,
+        timeout_sec=12,
+        fallback_ip=fallback_ip,
+    )
+
+    plugins = manifest.get("plugins", [])
+    if not isinstance(plugins, list) or not plugins:
+        return manifest_url, fallback_ip, install_root, []
+
+    plugins_dir = _resolve_plugins_dir(install_root, create=True)
+    local_dirs = (
+        sorted(
+            [
+                x
+                for x in plugins_dir.iterdir()
+                if x.is_dir() and not x.name.startswith(".") and _is_valid_bundle_name(x.name)
+            ],
+            key=lambda p: p.name.lower(),
+        )
+        if plugins_dir.exists()
+        else []
+    )
+
+    manifest_by_bundle: dict[str, dict[str, Any]] = {}
+    for item in plugins:
+        if not isinstance(item, dict):
+            continue
+        bundle = str(item.get("bundle", "")).strip()
+        if bundle and _is_valid_bundle_name(bundle):
+            manifest_by_bundle[bundle] = item
+
+    local_bundles = {d.name for d in local_dirs}
+    all_bundles = sorted(set(local_bundles) | set(manifest_by_bundle.keys()), key=lambda x: x.lower())
+
+    rows: list[dict[str, Any]] = []
+    selectable_idx = 1
+    for bundle in all_bundles:
+        item = manifest_by_bundle.get(bundle)
+        pdir = plugins_dir / bundle
+        installed_version = _read_installed_version(pdir) if pdir.exists() else "-"
+        if item is None:
+            rows.append(
+                {
+                    "idx": selectable_idx,
+                    "bundle": bundle,
+                    "install_bundle": bundle,
+                    "status": "-",
+                    "reason": "local only (not in server manifest)",
+                    "installed_version": installed_version,
+                    "server_version": "-",
+                    "package": "-",
+                    "item": None,
+                    "selectable": False,
+                    "exclusive_with": [],
+                }
+            )
+            selectable_idx += 1
+            continue
+
+        install_bundle = _install_bundle_for_manifest_bundle(bundle)
+        status, reason, installed_version = _plugin_status(
+            plugins_dir,
+            item,
+            config.plugins_state_filename,
+            install_bundle=install_bundle,
+        )
+        exclusive_with = sorted(_exclusive_counterparts(bundle, item))
+        rows.append(
+            {
+                "idx": selectable_idx,
+                "bundle": bundle,
+                "install_bundle": install_bundle,
+                "status": status,
+                "reason": reason,
+                "installed_version": installed_version,
+                "server_version": str(item.get("version", "")).strip() or "-",
+                "package": str(item.get("package", "")).strip(),
+                "item": item,
+                "selectable": True,
+                "exclusive_with": exclusive_with,
+            }
+        )
+        selectable_idx += 1
+
+    return manifest_url, fallback_ip, install_root, rows
+
+
 def _has_php_file_fast(root: Path, limit_files: int = 50000) -> bool:
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -784,11 +886,13 @@ def run_plugins_interactive(
     config: AgentConfig,
     root: str | None,
     selection: str | None,
+    bundles: list[str] | None = None,
     action: str | None,
     no_color: bool,
     yes: bool,
     list_available: bool = False,
     list_installed: bool = False,
+    catalog_json: bool = False,
 ) -> int:
     if (list_available or list_installed) and root is None:
         installs = discover_mautic(
@@ -808,11 +912,13 @@ def run_plugins_interactive(
                     config=config,
                     root=inst.root,
                     selection=selection,
+                    bundles=bundles,
                     action=action,
                     no_color=no_color,
                     yes=yes,
                     list_available=list_available,
                     list_installed=list_installed,
+                    catalog_json=catalog_json,
                 )
             except Exception as e:
                 rc = 1
@@ -820,104 +926,20 @@ def run_plugins_interactive(
         return rc
 
     install = _select_install_with_db(config, root)
-    install_root = install.root
     major = install.mautic_major or 6
-    base = _repo_base_url(config)
-    manifest_url = base + config.plugins_manifest_path_template.format(major=major)
-    fallback_ip = _plugins_fallback_ip(config)
-    logging.info("plugins manifest: %s", manifest_url)
-    if fallback_ip:
-        logging.info("plugins manifest fallback_ip: %s", fallback_ip)
-    print("Loading plugin manifest...")
+    if not catalog_json:
+        print("Loading plugin manifest...")
     try:
-        manifest = _fetch_json(
-            manifest_url,
-            config.mcc_token,
-            timeout_sec=12,
-            fallback_ip=fallback_ip,
-        )
+        manifest_url, fallback_ip, install_root, rows = _build_plugin_rows(config=config, install=install)
     except urllib.error.URLError as e:
         raise RuntimeError(f"Cannot fetch manifest (network/timeout): {e}") from e
-
-    plugins = manifest.get("plugins", [])
-    if not isinstance(plugins, list) or not plugins:
-        print("No plugins in manifest")
-        return 0
-
-    plugins_dir = _resolve_plugins_dir(install_root, create=True)
-    local_dirs = (
-        sorted(
-            [
-                x
-                for x in plugins_dir.iterdir()
-                if x.is_dir() and not x.name.startswith(".") and _is_valid_bundle_name(x.name)
-            ],
-            key=lambda p: p.name.lower(),
-        )
-        if plugins_dir.exists()
-        else []
-    )
-    manifest_dir = manifest_url.rsplit("/", 1)[0] + "/"
-
-    manifest_by_bundle: dict[str, dict[str, Any]] = {}
-    for item in plugins:
-        if not isinstance(item, dict):
-            continue
-        bundle = str(item.get("bundle", "")).strip()
-        if bundle and _is_valid_bundle_name(bundle):
-            manifest_by_bundle[bundle] = item
-
-    local_bundles = {d.name for d in local_dirs}
-    all_bundles = sorted(set(local_bundles) | set(manifest_by_bundle.keys()), key=lambda x: x.lower())
-
-    rows: list[dict[str, Any]] = []
-    selectable_idx = 1
-    for bundle in all_bundles:
-        item = manifest_by_bundle.get(bundle)
-        pdir = plugins_dir / bundle
-        installed_version = _read_installed_version(pdir) if pdir.exists() else "-"
-        if item is None:
-            rows.append(
-                {
-                    "idx": selectable_idx,
-                    "bundle": bundle,
-                    "install_bundle": bundle,
-                    "status": "-",
-                    "reason": "local only (not in server manifest)",
-                    "installed_version": installed_version,
-                    "server_version": "-",
-                    "package": "-",
-                    "item": None,
-                }
-            )
-            selectable_idx += 1
-            continue
-
-        install_bundle = _install_bundle_for_manifest_bundle(bundle)
-        status, reason, installed_version = _plugin_status(
-            plugins_dir,
-            item,
-            config.plugins_state_filename,
-            install_bundle=install_bundle,
-        )
-        rows.append(
-            {
-                "idx": selectable_idx,
-                "bundle": bundle,
-                "install_bundle": install_bundle,
-                "status": status,
-                "reason": reason,
-                "installed_version": installed_version,
-                "server_version": str(item.get("version", "")).strip() or "-",
-                "package": str(item.get("package", "")).strip(),
-                "item": item,
-            }
-        )
-        selectable_idx += 1
 
     if not rows:
         print("No plugin rows")
         return 0
+
+    manifest_dir = manifest_url.rsplit("/", 1)[0] + "/"
+    plugins_dir = _resolve_plugins_dir(install_root, create=True)
 
     idx_map: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -957,6 +979,38 @@ def run_plugins_interactive(
             print("(none)")
         return 0
 
+    if catalog_json:
+        payload_rows: list[dict[str, Any]] = []
+        for row in rows:
+            payload_rows.append(
+                {
+                    "idx": row.get("idx"),
+                    "bundle": str(row.get("bundle", "")).strip(),
+                    "install_bundle": str(row.get("install_bundle", "")).strip(),
+                    "status": str(row.get("status", "")).strip(),
+                    "reason": str(row.get("reason", "")).strip(),
+                    "installed_version": str(row.get("installed_version", "")).strip(),
+                    "server_version": str(row.get("server_version", "")).strip(),
+                    "selectable": bool(row.get("selectable", False)),
+                    "exclusive_with": list(row.get("exclusive_with", []) or []),
+                }
+            )
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "root": install_root,
+                    "mautic_major": major,
+                    "manifest_url": manifest_url,
+                    "fallback_ip": fallback_ip or "",
+                    "items": payload_rows,
+                },
+                ensure_ascii=True,
+                indent=2,
+            )
+        )
+        return 0
+
     print(f"Mautic root: {install_root}")
     print(f"Mautic major: {major}")
     print(f"Manifest: {manifest_url}")
@@ -991,24 +1045,40 @@ def run_plugins_interactive(
             return 0
         chosen_action = normalized
 
-        if selection is None:
+        if selection is None and not bundles:
             selection_in = _ask("Select plugins to apply (e.g. 1-3 6 10), empty=back: ").strip()
+        elif bundles:
+            selection_in = ""
         else:
             selection_in = selection.strip()
             selection = None
 
-        if not selection_in:
+        if not selection_in and not bundles:
             if not sys.stdin.isatty():
                 print("No selection provided in non-interactive mode, exit")
                 return 0
             print("Back to action selection")
             continue
 
-        indexes = _parse_selection(selection_in, max(idx_map.keys()) if idx_map else 0)
-        if not indexes:
-            print("No valid plugin indexes, try again")
-            continue
-        selected = [idx_map[i] for i in indexes if i in idx_map]
+        if bundles:
+            requested = {str(x or "").strip() for x in (bundles or []) if str(x or "").strip()}
+            if not requested:
+                print("No valid plugin bundle names, try again")
+                continue
+            selected = [
+                row for row in rows
+                if bool(row.get("selectable", False)) and str(row.get("bundle", "")).strip() in requested
+            ]
+            found = {str(row.get("bundle", "")).strip() for row in selected}
+            missing = sorted(requested - found)
+            if missing:
+                raise RuntimeError(f"plugin bundle(s) not found in manifest for this instance: {', '.join(missing)}")
+        else:
+            indexes = _parse_selection(selection_in, max(idx_map.keys()) if idx_map else 0)
+            if not indexes:
+                print("No valid plugin indexes, try again")
+                continue
+            selected = [idx_map[i] for i in indexes if i in idx_map]
         if not selected:
             print("Selected indexes are not actionable, try again")
             continue

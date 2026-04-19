@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.8.93 - 2026-04-19
+
+- Fixed plugin apply regression in the new MCC-driven plugin flow:
+  - restored `plugins_dir` resolution inside `run_plugins_interactive()`,
+  - non-interactive `plugins --bundle ...` calls from MCC now proceed past selection and conflict handling instead of failing with `NameError`.
+
+## 0.8.92 - 2026-04-19
+
+- Added plugin web-control support primitives for MCC:
+  - `mcd-cli plugins --catalog-json` now emits clean machine-readable JSON for a selected instance,
+  - `mcd-cli plugins --bundle <BundleName>` allows bundle-name based selection for non-interactive callers.
+- Fixed interactive CLI regression:
+  - the interactive hub now passes `bundles=None` explicitly when opening the plugin menu.
+- Changed plugin catalog mode:
+  - suppresses update notice/banner text so MCC can consume the catalog without stdout parsing failures.
+
 ## 0.8.91 - 2026-04-19
 
 - Fixed tiny campaign scheduler:
