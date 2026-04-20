@@ -28,6 +28,9 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   - MySQL/MariaDB critical patterns
   - php-fpm `max_children` pressure
   - web `5xx` spikes from service journal
+  - scheduler drift (`tracked running` vs real processes)
+  - stuck PHP console workers
+  - swap pressure level
 - DB-driven task polling and command execution:
   - segment updates by `id` (`mautic:segments:update -i <id>`)
   - campaigns update/trigger by `id`
@@ -193,6 +196,17 @@ Notes:
   - `unattended_upgrade_mode=off|security|all`,
   - `unattended_upgrade_schedule_cron` (host local cron),
   - `unattended_upgrade_blacklist` (excluded package patterns).
+- Additional runtime protection keys for scheduler/pressure handling:
+  - `scheduler_reconcile_interval_sec`
+  - `php_console_stuck_sec`
+  - `host_pressure_pause_enabled`
+  - `host_pressure_php_stuck_pause_threshold`
+  - `host_pressure_swap_level_pause_threshold`
+- `mcd-cli signals` now also reports:
+  - `scheduler_state_drift`
+  - `scheduler_duplicate_task_keys`
+  - `php_console_stuck`
+  - `swap_pressure_level`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`

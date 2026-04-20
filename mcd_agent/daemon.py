@@ -1673,6 +1673,29 @@ class TaskStore:
             "SELECT id, root, task_type, entity_id, pid, command_str FROM tasks WHERE state='running' ORDER BY id ASC"
         )
 
+    def has_running_task_key(self, task_key: str) -> bool:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(
+                        f"""
+                        SELECT 1 AS present
+                        FROM `{tasks_table}`
+                        WHERE host_name=%s AND state='running' AND task_key=%s
+                        LIMIT 1
+                        """,
+                        (self._node_id, str(task_key)),
+                    )
+                    return bool(rows)
+                except Exception:
+                    pass
+        row = self.conn.execute(
+            "SELECT 1 AS present FROM tasks WHERE state='running' AND task_key=? LIMIT 1",
+            (str(task_key),),
+        ).fetchone()
+        return bool(row)
+
     def get_weights(self, kind: str, root: str, max_age_sec: int) -> dict[int, float]:
         min_ts = time.time() - max(1, max_age_sec)
         out: dict[int, float] = {}
@@ -2340,6 +2363,8 @@ def _submit_if_slot(
     key = _task_key(root, task_type, entity_id)
     if key in running:
         return False
+    if store.has_running_task_key(key):
+        return False
     if manual_request_id is None and not _launch_allowed(config, root, task_type, entity_id):
         return False
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
@@ -2501,22 +2526,104 @@ def _monitor_running(
             logging.warning("[%s] %s entity=%s pid_lost=%s", task.root, task.task_type, task.entity_id, task.pid)
 
 
+def _running_task_from_row(row: dict[str, object]) -> RunningTask:
+    return RunningTask(
+        row_id=int(row["id"]),
+        root=str(row["root"]),
+        task_key=str(row["task_key"]),
+        task_type=str(row["task_type"]),
+        entity_id=int(row["entity_id"]) if row["entity_id"] is not None else None,
+        command_str=str(row["command_str"]),
+        timeout_sec=int(row["timeout_sec"]),
+        attempts=int(row["attempts"]),
+        started_at=float(row["started_at"]),
+        pid=int(row["pid"]),
+        manual_request_id=int(row["manual_request_id"]) if row["manual_request_id"] is not None else None,
+    )
+
+
+def _reconcile_running_state(
+    *,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+) -> dict[str, int]:
+    stats = {
+        "tracked_total": 0,
+        "kept": 0,
+        "adopted": 0,
+        "lost_pid": 0,
+        "lost_cmd": 0,
+        "duplicate": 0,
+    }
+    rows = store.running_rows()
+    stats["tracked_total"] = len(rows)
+    if not rows:
+        return stats
+
+    valid_by_key: dict[str, RunningTask] = {}
+    for row in rows:
+        task = _running_task_from_row(row)
+        if not _is_pid_alive(task.pid):
+            store.finish(task.row_id, state="lost", rc=None, note="pid_not_alive")
+            stats["lost_pid"] += 1
+            continue
+        if not _pid_matches_task_command(task.pid, task.command_str):
+            store.finish(task.row_id, state="lost", rc=None, note="pid_cmd_mismatch")
+            stats["lost_cmd"] += 1
+            continue
+
+        prev = valid_by_key.get(task.task_key)
+        if prev is None:
+            valid_by_key[task.task_key] = task
+            continue
+
+        keep = prev
+        current = running.get(task.task_key)
+        if current is not None:
+            if task.pid == current.pid:
+                keep = task
+            elif prev.pid == current.pid:
+                keep = prev
+            elif (task.started_at, task.row_id) >= (prev.started_at, prev.row_id):
+                keep = task
+        elif (task.started_at, task.row_id) >= (prev.started_at, prev.row_id):
+            keep = task
+
+        loser = prev if keep is task else task
+        store.finish(loser.row_id, state="lost", rc=None, note="duplicate_task_key")
+        stats["duplicate"] += 1
+        valid_by_key[task.task_key] = keep
+
+    for key, task in valid_by_key.items():
+        cur = running.get(key)
+        if cur is None:
+            running[key] = task
+            proc = popens.get(key)
+            if proc is not None and proc.pid != task.pid:
+                popens.pop(key, None)
+            stats["adopted"] += 1
+            continue
+        if (
+            cur.row_id != task.row_id
+            or cur.pid != task.pid
+            or cur.attempts != task.attempts
+            or abs(cur.started_at - task.started_at) > 0.001
+        ):
+            running[key] = task
+            proc = popens.get(key)
+            if proc is not None and proc.pid != task.pid:
+                popens.pop(key, None)
+            stats["adopted"] += 1
+        else:
+            stats["kept"] += 1
+    return stats
+
+
 def _load_orphans_from_store(store: TaskStore) -> dict[str, RunningTask]:
     out: dict[str, RunningTask] = {}
     for row in store.running_rows():
-        t = RunningTask(
-            row_id=int(row["id"]),
-            root=str(row["root"]),
-            task_key=str(row["task_key"]),
-            task_type=str(row["task_type"]),
-            entity_id=int(row["entity_id"]) if row["entity_id"] is not None else None,
-            command_str=str(row["command_str"]),
-            timeout_sec=int(row["timeout_sec"]),
-            attempts=int(row["attempts"]),
-            started_at=float(row["started_at"]),
-            pid=int(row["pid"]),
-            manual_request_id=int(row["manual_request_id"]) if row["manual_request_id"] is not None else None,
-        )
+        t = _running_task_from_row(row)
         out[t.task_key] = t
     return out
 
@@ -2621,13 +2728,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         logging.warning("Custom scripts manifest prefetch failed: %s", e)
 
     running = _load_orphans_from_store(store)
-    for key, task in list(running.items()):
-        if _is_pid_alive(task.pid) and _pid_matches_task_command(task.pid, task.command_str):
-            logging.info("[%s] adopted running task after restart: %s entity=%s pid=%s", task.root, task.task_type, task.entity_id, task.pid)
-            continue
-        note = "daemon_restart_pid_cmd_mismatch" if _is_pid_alive(task.pid) else "daemon_restart_pid_not_alive"
-        store.finish(task.row_id, state="lost", rc=None, note=note)
-        running.pop(key, None)
     popens: dict[str, subprocess.Popen[bytes]] = {}
 
     identity = resolve_agent_identity(config)
@@ -2678,6 +2778,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_outbound_events_prune_ts = 0.0
     last_custom_cache_cleanup_ts = 0.0
     last_launch_guard_prune_ts = 0.0
+    next_scheduler_reconcile_at = 0.0
     db_dispatch_pause_until: dict[str, float] = {}
     db_dispatch_pause_reasons: dict[str, str] = {}
     jobs_last_run: dict[tuple[str, str], float] = {}
@@ -2706,6 +2807,19 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     while True:
         _monitor_running(config=config, store=store, running=running, popens=popens)
         now = time.time()
+        if now >= next_scheduler_reconcile_at:
+            rec = _reconcile_running_state(store=store, running=running, popens=popens)
+            if any(int(rec.get(k, 0) or 0) > 0 for k in ("adopted", "lost_pid", "lost_cmd", "duplicate")):
+                logging.warning(
+                    "scheduler reconcile: tracked=%s kept=%s adopted=%s lost_pid=%s lost_cmd=%s duplicate=%s",
+                    int(rec.get("tracked_total", 0) or 0),
+                    int(rec.get("kept", 0) or 0),
+                    int(rec.get("adopted", 0) or 0),
+                    int(rec.get("lost_pid", 0) or 0),
+                    int(rec.get("lost_cmd", 0) or 0),
+                    int(rec.get("duplicate", 0) or 0),
+                )
+            next_scheduler_reconcile_at = now + max(15, int(config.scheduler_reconcile_interval_sec or 60))
         if now - last_launch_guard_prune_ts >= 300:
             _prune_entity_launch_guard(max_age_sec=3600, now_ts=now)
             last_launch_guard_prune_ts = now
@@ -2985,11 +3099,46 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
         if pusher.enabled() and should_poll_alert(now, pusher.last_alert_poll_ts, config.mcc_push_alert_poll_interval_sec):
             try:
-                signals_payload = collect_signals(window_min=config.mcc_push_alert_window_min)
+                signals_payload = collect_signals(window_min=config.mcc_push_alert_window_min, cfg=config)
                 pusher.set_signals(signals_payload, now)
             except Exception as e:
                 logging.warning("signals collect failed: %s", e)
             pusher.last_alert_poll_ts = now
+
+        if config.host_pressure_pause_enabled and installs:
+            sig = pusher.latest_signals if isinstance(pusher.latest_signals, dict) else {}
+            totals = sig.get("totals") if isinstance(sig.get("totals"), dict) else {}
+            php_stuck = int(totals.get("php_console_stuck", 0) or 0) if isinstance(totals, dict) else 0
+            swap_level = int(totals.get("swap_pressure_level", 0) or 0) if isinstance(totals, dict) else 0
+            pressure_reasons: list[str] = []
+            if (
+                config.host_pressure_php_stuck_pause_threshold > 0
+                and php_stuck >= int(config.host_pressure_php_stuck_pause_threshold or 0)
+            ):
+                pressure_reasons.append(f"php_console_stuck={php_stuck}")
+            if (
+                config.host_pressure_swap_level_pause_threshold > 0
+                and swap_level >= int(config.host_pressure_swap_level_pause_threshold or 0)
+            ):
+                pressure_reasons.append(f"swap_pressure_level={swap_level}")
+            if pressure_reasons:
+                pause_sec = int(
+                    effective_db_watchdog_config(config).get("dispatch_pause_sec", _DB_DISPATCH_PAUSE_SEC)
+                    or _DB_DISPATCH_PAUSE_SEC
+                )
+                reason = "host pressure: " + ", ".join(pressure_reasons)
+                for inst in installs:
+                    root = str(getattr(inst, "root", "") or "").strip()
+                    if not root:
+                        continue
+                    _mark_db_dispatch_pause(
+                        root=root,
+                        reason=reason,
+                        now_ts=now,
+                        pause_until=db_dispatch_pause_until,
+                        pause_reasons=db_dispatch_pause_reasons,
+                        pause_sec=pause_sec,
+                    )
 
         if now >= next_plan_refresh_at:
             installs = inventory.list_instances()

@@ -84,10 +84,22 @@ weights_recalc_interval_sec = 86400
 task_retry_max = 1
 # Delay before retry, sec.
 task_retry_delay_sec = 2
+# Periodic running-task reconcile interval, sec.
+# Used to clean stale tracked tasks and re-adopt valid live processes.
+scheduler_reconcile_interval_sec = 60
 # Action for stuck process: skip|restart.
 worker_stuck_policy = "skip"
 # Max restarts by watchdog for one task.
 worker_stuck_restart_limit = 1
+# Consider PHP console process "stuck" after this many seconds in host signals.
+php_console_stuck_sec = 1800
+# Enable temporary DB dispatch pause when host pressure signals cross threshold.
+host_pressure_pause_enabled = true
+# Minimum stuck PHP console count required to trigger host-pressure pause.
+host_pressure_php_stuck_pause_threshold = 8
+# Minimum swap pressure level required to trigger host-pressure pause.
+# 0=disabled, 1=warn, 2=critical
+host_pressure_swap_level_pause_threshold = 2
 # Max concurrent generic jobs (from [[jobs]]).
 jobs_max_workers = 2
 

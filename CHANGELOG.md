@@ -1,5 +1,38 @@
 # MCD Changelog
 
+## 0.8.95 - 2026-04-20
+
+- Fixed CLI regression in `mcd-cli signals`.
+  - Restored missing `--config` parser option after signals collector started loading runtime config explicitly.
+  - Result: `signals --json` works again both locally and through `MCC -> MCD host-run`.
+
+## 0.8.94 - 2026-04-20
+
+- Added scheduler-state reconcile to reduce stale running-task drift after restarts and orphaned task rows.
+  - Periodically validates tracked `running` rows against real host processes.
+  - Marks dead/mismatched rows as lost and collapses duplicate `task_key` rows.
+  - Re-adopts valid running tasks into daemon memory without waiting for restart.
+- Added stronger scheduler dedupe before spawn.
+  - New launches now refuse to start if the same `task_key` is already tracked as running in the persistent task store.
+  - Prevents duplicate `import`/segment/campaign launches caused by stale in-memory state boundaries.
+- Added new lightweight runtime pressure signals:
+  - `scheduler_state_drift`
+  - `scheduler_duplicate_task_keys`
+  - `php_console_stuck`
+  - `swap_pressure_level`
+- Added scheduler-aware host pressure pause.
+  - When stuck PHP console count and/or swap pressure crosses runtime thresholds, daemon sets a temporary DB dispatch pause instead of continuing to feed heavy rings.
+- Added new hot-applicable runtime controls:
+  - `scheduler_reconcile_interval_sec`
+  - `php_console_stuck_sec`
+  - `host_pressure_pause_enabled`
+  - `host_pressure_php_stuck_pause_threshold`
+  - `host_pressure_swap_level_pause_threshold`
+- Outcome:
+  - stale scheduler inflation is cleaned automatically,
+  - heavy hosts back off earlier under DB/memory pressure,
+  - MCC can now surface drift/pressure separately from generic MySQL/PHP/Web semaphores.
+
 ## 0.8.93 - 2026-04-19
 
 - Fixed plugin apply regression in the new MCC-driven plugin flow:

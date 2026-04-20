@@ -341,6 +341,11 @@ class AgentConfig:
     fs_permissions_guard_paths: list[str]
     fs_permissions_guard_fix_console_exec: bool
     fs_permissions_guard_console_relpath: str
+    scheduler_reconcile_interval_sec: int
+    php_console_stuck_sec: int
+    host_pressure_pause_enabled: bool
+    host_pressure_php_stuck_pause_threshold: int
+    host_pressure_swap_level_pause_threshold: int
     db_watchdog: dict[str, Any]
     segment_batch_limit: int
     campaign_batch_limit: int
@@ -1273,6 +1278,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "fs_permissions_guard_paths": "fs_permissions_guard_paths",
     "fs_permissions_guard_fix_console_exec": "fs_permissions_guard_fix_console_exec",
     "fs_permissions_guard_console_relpath": "fs_permissions_guard_console_relpath",
+    "scheduler_reconcile_interval_sec": "scheduler_reconcile_interval_sec",
+    "php_console_stuck_sec": "php_console_stuck_sec",
+    "host_pressure_pause_enabled": "host_pressure_pause_enabled",
+    "host_pressure_php_stuck_pause_threshold": "host_pressure_php_stuck_pause_threshold",
+    "host_pressure_swap_level_pause_threshold": "host_pressure_swap_level_pause_threshold",
     "db_watchdog": "db_watchdog",
     "segment_batch_limit": "segment_batch_limit",
     "campaign_batch_limit": "campaign_batch_limit",
@@ -1786,6 +1796,17 @@ def _load_config_inner(path: str) -> AgentConfig:
             runtime.get("fs_permissions_guard_console_relpath", "bin/console")
         ).strip()
         or "bin/console",
+        scheduler_reconcile_interval_sec=max(15, int(runtime.get("scheduler_reconcile_interval_sec", 60) or 60)),
+        php_console_stuck_sec=max(60, int(runtime.get("php_console_stuck_sec", 1800) or 1800)),
+        host_pressure_pause_enabled=bool(runtime.get("host_pressure_pause_enabled", True)),
+        host_pressure_php_stuck_pause_threshold=max(
+            0,
+            int(runtime.get("host_pressure_php_stuck_pause_threshold", 8) or 8),
+        ),
+        host_pressure_swap_level_pause_threshold=max(
+            0,
+            min(2, int(runtime.get("host_pressure_swap_level_pause_threshold", 2) or 2)),
+        ),
         db_watchdog=dict(db_watchdog_cfg),
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),
         campaign_batch_limit=int(runtime.get("campaign_batch_limit", 1000)),

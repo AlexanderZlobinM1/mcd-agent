@@ -1405,6 +1405,7 @@ def _build_parser() -> argparse.ArgumentParser:
     cfgchk.add_argument("--json", action="store_true")
 
     signals = sub.add_parser("signals", help="Collect lightweight critical host signals")
+    signals.add_argument("--config", default=default_cfg)
     signals.add_argument("--window-min", type=int, default=15)
     signals.add_argument("--json", action="store_true")
 
@@ -2306,7 +2307,8 @@ def main() -> int:
         return 0
 
     if args.cmd == "signals":
-        payload = collect_signals(window_min=int(args.window_min))
+        cfg = load_config(args.config)
+        payload = collect_signals(window_min=int(args.window_min), cfg=cfg)
         if args.json:
             print(format_signals_json(payload))
         else:
