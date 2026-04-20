@@ -1,5 +1,23 @@
 # MCD Changelog
 
+## 0.8.97 - 2026-04-20
+
+- Rebuilt the date-based campaign scheduler fix from the correct agent package path.
+  - Carries the `campaign_rebuilds_due` date-trigger fix from `0.8.96`.
+  - Ensures released source tree updates `mcd_agent/config.py` and `mcd_agent/__init__.py` consistently during self-update validation.
+- Outcome:
+  - test rollout validates the actual running agent code,
+  - date-based campaign auto-start fix is now delivered through a clean package.
+
+## 0.8.96 - 2026-04-20
+
+- Fixed campaign rebuild due-selection for date-based actions.
+  - `campaign_rebuilds_due` now also selects published campaigns whose date-triggered action time has already arrived and whose active `campaign_leads` still have no initialized event log.
+  - This closes the gap where contacts entered the campaign more than 24 hours earlier, so the trigger ring saw nothing and the rebuild ring never seeded the event log.
+- Outcome:
+  - date-based campaigns like `ananasMK` campaign `607` are picked up automatically at scheduled time,
+  - manual `campaign_rebuild` / `campaign_trigger` is no longer required just because leads were added before the recent 24h window.
+
 ## 0.8.95 - 2026-04-20
 
 - Fixed CLI regression in `mcd-cli signals`.
