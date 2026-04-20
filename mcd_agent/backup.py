@@ -893,19 +893,48 @@ def _read_backup_marker(backup_dir: Path) -> dict[str, Any]:
 
 def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
     cfg = _effective_cfg(config)
-    _validate_cfg(cfg)
-    instances = _list_instances(cfg)
-    db_instances = [x for x in instances if x.db]
-    if not db_instances:
-        raise RuntimeError("No instances with DB credentials found in inventory")
+    state_path = _state_path(cfg)
+    state = _json_read(state_path)
+    start_monotonic = time.monotonic()
+    started_ts = _utc_now_iso()
+    try:
+        _validate_cfg(cfg)
+        instances = _list_instances(cfg)
+        db_instances = [x for x in instances if x.db]
+        if not db_instances:
+            raise RuntimeError("No instances with DB credentials found in inventory")
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        fail_state = dict(state)
+        history = fail_state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history = [
+            {
+                "ts": started_ts,
+                "status": "failed",
+                "duration_sec": duration,
+                "error": str(e),
+            }
+        ] + history[:19]
+        fail_state.update(
+            {
+                "host_name": _host_name(cfg),
+                "selected_root": root or "",
+                "last_run_at": started_ts,
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "job": "backup.run",
+                "history": history,
+            }
+        )
+        _json_write(state_path, fail_state)
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
 
     host_name = _host_name(cfg)
     lock_path = _lock_path(cfg)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path = _state_path(cfg)
-    state = _json_read(state_path)
-    started_ts = _utc_now_iso()
-    start_monotonic = time.monotonic()
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
     remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, host_name)
     date_dir = _fmt_local_date()
@@ -1252,6 +1281,89 @@ def backup_restore(
             pass
 
 
+def backup_storage_probe(config: AgentConfig, root: str | None = None) -> dict[str, Any]:
+    _ = root
+    cfg = _effective_cfg(config)
+    state_path = _state_path(cfg)
+    state = _json_read(state_path)
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    lock_path = _lock_path(cfg)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    checked_at = _utc_now_iso()
+
+    try:
+        _validate_cfg(cfg)
+    except Exception as e:
+        state["last_storage_probe_at"] = checked_at
+        state["last_storage_probe_status"] = "failed"
+        state["last_storage_probe_error"] = str(e)
+        _json_write(state_path, state)
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": str(e),
+            "state_path": str(state_path),
+        }
+
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": "backup_lock_busy",
+                "state_path": str(state_path),
+            }
+
+        try:
+            _mount(cfg, mount_path)
+            storage_usage = _storage_usage(mount_path)
+            if not isinstance(storage_usage, dict):
+                raise RuntimeError("storage usage probe returned no data")
+            state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
+            state["last_storage_used_bytes"] = int(storage_usage.get("used_bytes") or 0)
+            state["last_storage_free_bytes"] = int(storage_usage.get("free_bytes") or 0)
+            state["last_storage_used_pct"] = float(storage_usage.get("used_pct") or 0.0)
+            state["last_storage_checked_at"] = str(storage_usage.get("checked_at") or checked_at)
+            state["last_storage_probe_at"] = checked_at
+            state["last_storage_probe_status"] = "ok"
+            state["last_storage_probe_error"] = ""
+            _json_write(state_path, state)
+            return {
+                "ok": True,
+                "status": "ok",
+                "state_path": str(state_path),
+                "checked_at": state["last_storage_checked_at"],
+            }
+        except Exception as e:
+            state["last_storage_probe_at"] = checked_at
+            state["last_storage_probe_status"] = "failed"
+            state["last_storage_probe_error"] = str(e)
+            _json_write(state_path, state)
+            return {
+                "ok": False,
+                "status": "failed",
+                "error": str(e),
+                "state_path": str(state_path),
+            }
+        finally:
+            try:
+                _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+            except Exception:
+                pass
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
+
+
 def backup_status(config: AgentConfig, root: str | None = None) -> dict[str, Any]:
     _ = root
     cfg = _effective_cfg(config)
@@ -1283,6 +1395,9 @@ def backup_state_for_push(config: AgentConfig) -> dict[str, Any]:
         "last_storage_used_bytes": st.get("last_storage_used_bytes"),
         "last_storage_free_bytes": st.get("last_storage_free_bytes"),
         "last_storage_used_pct": st.get("last_storage_used_pct"),
+        "last_storage_probe_at": st.get("last_storage_probe_at"),
+        "last_storage_probe_status": st.get("last_storage_probe_status"),
+        "last_storage_probe_error": st.get("last_storage_probe_error"),
     }
 
 

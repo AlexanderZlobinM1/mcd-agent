@@ -24,7 +24,13 @@ from mcd_agent.config import (
     runtime_effective_map,
     upsert_runtime_values,
 )
-from mcd_agent.backup import backup_lock_active, backup_profile_sync_from_config, backup_run, backup_status
+from mcd_agent.backup import (
+    backup_lock_active,
+    backup_profile_sync_from_config,
+    backup_run,
+    backup_status,
+    backup_storage_probe,
+)
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
@@ -2792,6 +2798,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     update_deferred_by_backup = False
     next_service_profile_apply_at = 0.0
     next_backup_profile_sync_at = 0.0
+    next_backup_storage_probe_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     runtime_overrides_sync_requested = False
     # Always perform an initial runtime-overrides sync after daemon start/restart.
@@ -2937,6 +2944,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             except Exception as e:
                 logging.warning("backup-profile sync from config failed: %s", e)
             next_backup_profile_sync_at = now + 60.0
+
+        if config.backup_enabled and now >= next_backup_storage_probe_at:
+            try:
+                probe_res = backup_storage_probe(config)
+                probe_status = str(probe_res.get("status", "")).strip().lower()
+                if probe_status == "ok":
+                    logging.info("backup storage probe ok")
+                elif probe_status == "failed":
+                    logging.warning("backup storage probe failed: %s", probe_res.get("error", "unknown"))
+                elif probe_status == "skipped":
+                    logging.info("backup storage probe skipped: %s", probe_res.get("reason", "-"))
+            except Exception as e:
+                logging.warning("backup storage probe failed: %s", e)
+            next_backup_storage_probe_at = now + 7200.0
 
         if config.tasks_compact_enabled:
             quiet_hour = max(0, min(23, int(config.tasks_compact_quiet_hour)))

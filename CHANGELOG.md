@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.8.99 - 2026-04-20
+
+- Fixed backup storage auth preservation in MCC-driven host backup settings.
+  - Host backup save now recovers missing storage auth from linked hosts when the selected storage comes from discovered/shared storage data.
+  - Remote `profile-set` is now applied with the merged storage payload, so existing password/key auth is not dropped during host-side backup storage rebinding.
+- Added lightweight periodic backup storage probing in the agent daemon.
+  - Every two hours, backup-enabled hosts now probe storage mount/auth non-destructively and push fresh storage status/usage back to MCC.
+  - Probe failures are recorded even when no full backup runs, which makes broken storage auth and mount errors visible earlier.
+- Fixed early backup preflight failures leaving stale success state behind.
+  - Validation/inventory errors now write a fresh failed backup state instead of silently keeping the previous `ok`.
+
 ## 0.8.98 - 2026-04-20
 
 - Added instance-level admin password reset command for MCC-driven rescue access.
