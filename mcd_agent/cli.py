@@ -30,6 +30,7 @@ from mcd_agent.apt_profile import (
     collect_apt_state,
     ensure_zabbix_mysql_monitor_user,
 )
+from mcd_agent.admin_user import reset_admin_password
 from mcd_agent.config import load_config
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
@@ -1254,6 +1255,16 @@ def _build_parser() -> argparse.ArgumentParser:
     pfix.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
     pfix.add_argument("--run-as-user", help="Target runtime user (defaults to config mautic_run_as_user)")
 
+    reset_admin = sub.add_parser("admin:reset-password", help="Reset/create admin Mautic user for one instance")
+    reset_admin.add_argument("--config", default=default_cfg)
+    reset_admin.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
+    reset_admin.add_argument("--username", required=True)
+    reset_admin.add_argument("--email", required=True)
+    reset_admin.add_argument("--first-name", required=True, dest="first_name")
+    reset_admin.add_argument("--last-name", required=True, dest="last_name")
+    reset_admin.add_argument("--password-hash", required=True, dest="password_hash")
+    reset_admin.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -1619,6 +1630,45 @@ def main() -> int:
         if rc == 0:
             _push_state_after_change(cfg, "permissions-fix")
         return rc
+
+    if args.cmd == "admin:reset-password":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            payload = reset_admin_password(
+                cfg,
+                root=args.root,
+                username=args.username,
+                email=args.email,
+                first_name=args.first_name,
+                last_name=args.last_name,
+                password_hash=args.password_hash,
+            )
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"admin reset password failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            user = payload.get("user") if isinstance(payload, dict) else {}
+            print(
+                "admin reset password ok: action={action} username={username} email={email} role_id={role_id} "
+                "root={root} db={db}".format(
+                    action=str(payload.get("action") or "ok"),
+                    username=str((user or {}).get("username") or ""),
+                    email=str((user or {}).get("email") or ""),
+                    role_id=int((user or {}).get("role_id") or 0),
+                    root=str(payload.get("root") or ""),
+                    db=str(payload.get("db_name") or ""),
+                )
+            )
+        _push_state_after_change(cfg, "admin-reset-password")
+        return 0
 
     if args.cmd == "exec":
         cfg = load_config(args.config)

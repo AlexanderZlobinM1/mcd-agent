@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.8.98 - 2026-04-20
+
+- Added instance-level admin password reset command for MCC-driven rescue access.
+  - New `mcd-cli admin:reset-password` resolves the target instance from inventory, uses the correct database/table prefix, and updates or creates the matching admin user.
+  - Duplicate username/email matches are collapsed before the final row is updated.
+  - Existing user timezone/locale are preserved on update; fresh rescue users default to `UTC` / `en_US`.
+- Outcome:
+  - MCC can now delegate password reset entirely through `MCC -> MCD`,
+  - no direct DB work is performed by MCC itself.
+
 ## 0.8.97 - 2026-04-20
 
 - Rebuilt the date-based campaign scheduler fix from the correct agent package path.
