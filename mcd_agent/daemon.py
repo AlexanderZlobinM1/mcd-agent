@@ -50,6 +50,7 @@ from mcd_agent.runtime_overrides import (
 )
 from mcd_agent.service_profiles import service_profiles_apply_once
 from mcd_agent.self_update import maybe_auto_update
+from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
 from mcd_agent.signals import collect_signals
 from mcd_agent.state_push import (
     MCCStatePusher,
@@ -1702,6 +1703,75 @@ class TaskStore:
         ).fetchone()
         return bool(row)
 
+    def recent_task_problem_counts(
+        self,
+        *,
+        root: str,
+        task_type: str,
+        since_sec: int,
+        states: tuple[str, ...] = ("failed", "timeout", "lost"),
+    ) -> dict[int, int]:
+        cutoff = time.time() - float(max(60, int(since_sec)))
+        wanted_states = tuple(str(s or "").strip().lower() for s in states if str(s or "").strip())
+        if not wanted_states:
+            return {}
+
+        out: dict[int, int] = {}
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    placeholders = ",".join(["%s"] * len(wanted_states))
+                    rows = self._mysql_query(
+                        f"""
+                        SELECT entity_id, COUNT(*) AS cnt
+                        FROM `{tasks_table}`
+                        WHERE host_name=%s
+                          AND root=%s
+                          AND task_type=%s
+                          AND entity_id IS NOT NULL
+                          AND state IN ({placeholders})
+                          AND COALESCE(finished_at, started_at) >= %s
+                        GROUP BY entity_id
+                        """,
+                        (self._node_id, str(root), str(task_type), *wanted_states, cutoff),
+                    )
+                    for row in rows:
+                        try:
+                            eid = int(row.get("entity_id") or 0)
+                            cnt = int(row.get("cnt") or 0)
+                        except Exception:
+                            continue
+                        if eid > 0 and cnt > 0:
+                            out[eid] = cnt
+                    return out
+                except Exception:
+                    pass
+
+        placeholders = ",".join(["?"] * len(wanted_states))
+        rows = self._sqlite_fetchall_dicts(
+            f"""
+            SELECT entity_id, COUNT(*) AS cnt
+            FROM tasks
+            WHERE root=?
+              AND task_type=?
+              AND entity_id IS NOT NULL
+              AND state IN ({placeholders})
+              AND COALESCE(finished_at, started_at) >= ?
+            GROUP BY entity_id
+            """,
+            (str(root), str(task_type), *wanted_states, cutoff),
+        )
+        for row in rows:
+            try:
+                eid = int(row.get("entity_id") or 0)
+                cnt = int(row.get("cnt") or 0)
+            except Exception:
+                continue
+            if eid > 0 and cnt > 0:
+                out[eid] = cnt
+        return out
+
     def get_weights(self, kind: str, root: str, max_age_sec: int) -> dict[int, float]:
         min_ts = time.time() - max(1, max_age_sec)
         out: dict[int, float] = {}
@@ -2755,6 +2825,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_sql_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
     segment_sql_active_sets: dict[str, set[int]] = {}
     segment_sql_done_sets: dict[str, set[int]] = {}
+    segment_sql_auto_signatures: dict[str, tuple[int, ...]] = {}
     segment_prio_rings: dict[str, deque[int]] = {}
     segment_reg_rings: dict[str, deque[int]] = {}
     campaign_trigger_prio_rings: dict[str, deque[int]] = {}
@@ -3237,9 +3308,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 sql_ring_enabled_for_root = bool(
                     config.segment_sql_ring_enabled and config.segment_mode != "classic_loop"
                 )
-                sql_rules_for_root: dict[int, SQLSegmentRule] = (
-                    dict(sql_segment_rules_cfg) if sql_ring_enabled_for_root else {}
-                )
+                sql_rules_for_root: dict[int, SQLSegmentRule] = {}
 
                 segment_ids: list[int] | None = None
                 campaign_trigger_ids: list[int] | None = None
@@ -3337,6 +3406,62 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                 if segment_ids is not None:
                     standard_segment_ids = list(dict.fromkeys(segment_ids))
+                    auto_sql_rules_for_root: dict[int, SQLSegmentRule] = {}
+                    if sql_ring_enabled_for_root and config.segment_sql_auto_enabled and standard_segment_ids:
+                        try:
+                            recent_problem_counts = store.recent_task_problem_counts(
+                                root=root,
+                                task_type="segment",
+                                since_sec=max(6 * 3600, int(config.tasks_history_keep_days or 1) * 86400),
+                            )
+                            segment_rows = db.fetch_segment_definitions(standard_segment_ids)
+                            for row in segment_rows:
+                                try:
+                                    sid = int(row.get("id") or 0)
+                                except Exception:
+                                    sid = 0
+                                if sid > 0:
+                                    row["problem_count"] = int(recent_problem_counts.get(sid, 0) or 0)
+                            detected_rules = detect_auto_sql_segment_rules(
+                                segment_rows,
+                                max_clauses=config.segment_sql_auto_max_clauses,
+                                problem_threshold=config.segment_sql_auto_problem_threshold,
+                            )
+                            auto_sql_rules_for_root = {
+                                sid: SQLSegmentRule(
+                                    segment_id=rule.segment_id,
+                                    select_sql=rule.select_sql,
+                                    depends_on=rule.depends_on,
+                                )
+                                for sid, rule in detected_rules.items()
+                            }
+                            auto_sig = tuple(sorted(auto_sql_rules_for_root))
+                            prev_auto_sig = segment_sql_auto_signatures.get(root, ())
+                            if auto_sig != prev_auto_sig:
+                                if auto_sig:
+                                    details = []
+                                    for sid in auto_sig[:20]:
+                                        meta: DetectedSQLSegmentRule | None = detected_rules.get(sid)
+                                        if meta is None:
+                                            continue
+                                        details.append(
+                                            f"{sid}({meta.reason};clauses={meta.clause_count})"
+                                        )
+                                    logging.info(
+                                        "[%s] segment_sql auto-managed ids=%s details=%s",
+                                        root,
+                                        ",".join(str(x) for x in auto_sig),
+                                        " | ".join(details) if details else "-",
+                                    )
+                                elif prev_auto_sig:
+                                    logging.info("[%s] segment_sql auto-managed ids cleared", root)
+                                segment_sql_auto_signatures[root] = auto_sig
+                        except Exception as e:
+                            logging.warning("[%s] segment_sql auto-detect failed: %s", root, e)
+
+                    if sql_ring_enabled_for_root:
+                        sql_rules_for_root = dict(auto_sql_rules_for_root)
+                        sql_rules_for_root.update(dict(sql_segment_rules_cfg))
                     if sql_ring_enabled_for_root and sql_rules_for_root:
                         sql_ring_plan = _plan_sql_segment_ring(standard_segment_ids, sql_rules_for_root)
                         active_sql_set = set(sql_ring_plan)

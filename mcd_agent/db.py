@@ -150,6 +150,29 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def fetch_segment_definitions(self, segment_ids: list[int]) -> list[dict[str, Any]]:
+        ids = list(dict.fromkeys(int(x) for x in segment_ids if int(x) > 0))
+        if not ids:
+            return []
+        prefix = str(self.cfg.table_prefix or "")
+        table_segments = self._safe_table(f"{prefix}lead_lists")
+        placeholders = ",".join(["%s"] * len(ids))
+        query = (
+            f"SELECT id, name, filters, checked_out, checked_out_by_user, "
+            f"date_modified, last_built_date "
+            f"FROM `{table_segments}` "
+            f"WHERE id IN ({placeholders})"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(ids))
+                rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
     def execute_sql_template(self, query_template: str, context: dict[str, str] | None = None) -> int:
         query = self._render_query(query_template, context=context)
         with self._connect() as conn:

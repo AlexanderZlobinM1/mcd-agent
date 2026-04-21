@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.8.100 - 2026-04-21
+
+- Added automatic SQL-ring detection for simple but heavy segments.
+  - The agent now inspects eligible segment filter definitions and auto-promotes directly translatable rules into the existing `segment_sql` ring.
+  - Initial supported auto-detection covers simple lead-field filters plus page-hit/url-title contains rules, which are the main starvation source on large hosts like `ananasmk`.
+  - Default clause budget was raised to `24` supported clauses so larger but still straightforward OR-based page-hit segments (for example `ananasmk` segment `93`) are still eligible for SQL handling.
+  - Auto-promoted segments are selected conservatively: only when they are SQL-translatable and show signs of being heavy/problematic (page_hits, checked_out, or repeated recent segment failures/timeouts).
+- Fixed SQL time window generation for `*_in_last_N_days` auto-managed segment rules.
+  - Generated SQL now uses the instance-local planning time (`{now_local}`) instead of `CURDATE()`, so the direct-DB rebuild matches Mautic's rolling time window semantics instead of snapping to midnight.
+- Fixed recent problem window length for auto-promotion heuristics.
+  - `tasks_history_keep_days` is now interpreted in real days (`* 86400`) instead of hours, so auto-detection sees the intended failure history before promoting a segment into the SQL ring.
+- Outcome:
+  - heavy, simple page-hit segments can be diverted away from the regular Mautic segment ring,
+  - regular segments stop being starved by the same repeatedly failing IDs,
+  - SQL-managed segments still update Mautic membership and rebuild metadata so the UI sees them as rebuilt.
+
 ## 0.8.99 - 2026-04-20
 
 - Fixed backup storage auth preservation in MCC-driven host backup settings.
