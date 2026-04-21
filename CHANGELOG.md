@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.103 - 2026-04-21
+
+- Fixed quiet-window handling for windows that cross midnight.
+  - `_in_daily_quiet_window()` now correctly treats windows like `23:00–08:00` as active on both sides of midnight instead of only on the start day.
+  - This directly affects orphan `page_hits` cleanup and SQL page-hit quiet-window rules, making overnight maintenance windows usable as configured.
+
 ## 0.8.102 - 2026-04-21
 
 - Added explicit backup guard for orphan `page_hits` cleanup.

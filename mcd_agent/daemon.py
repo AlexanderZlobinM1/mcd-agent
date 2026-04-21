@@ -306,9 +306,18 @@ def _segment_sql_rule_kind(rule: SQLSegmentRule) -> str:
 
 
 def _in_daily_quiet_window(now_local: datetime, quiet_hour: int, quiet_window_min: int) -> bool:
-    start = now_local.replace(hour=max(0, min(23, int(quiet_hour))), minute=0, second=0, microsecond=0)
-    end = start + timedelta(minutes=max(1, int(quiet_window_min)))
-    return start <= now_local < end
+    start_hour = max(0, min(23, int(quiet_hour)))
+    window_min = max(1, int(quiet_window_min))
+    start_today = now_local.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    end_today = start_today + timedelta(minutes=window_min)
+    if start_today <= now_local < end_today:
+        return True
+    if end_today.date() != start_today.date():
+        start_prev = start_today - timedelta(days=1)
+        end_prev = start_prev + timedelta(minutes=window_min)
+        if start_prev <= now_local < end_prev:
+            return True
+    return False
 
 
 def _segment_sql_try_acquire(
