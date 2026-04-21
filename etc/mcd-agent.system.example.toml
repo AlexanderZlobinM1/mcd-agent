@@ -228,6 +228,25 @@ contacts_cleanup_mode = "email_and_mobile"
 # Max rows deleted per cleanup run.
 contacts_cleanup_max_delete_per_run = 10000
 
+# Enable orphan page_hits cleanup task.
+enable_page_hits_orphan_cleanup = false
+# Minimum interval between orphan cleanup runs, sec.
+page_hits_orphan_cleanup_interval_sec = 3600
+# Quiet window start hour (instance timezone).
+page_hits_orphan_cleanup_quiet_hour = 2
+# Quiet window length in minutes.
+page_hits_orphan_cleanup_quiet_window_min = 180
+# Per-batch delete size for orphan page_hits.
+page_hits_orphan_cleanup_batch_size = 5000
+# Max delete batches per cleanup run.
+page_hits_orphan_cleanup_batches_per_run = 12
+# Sleep between orphan delete batches, sec.
+page_hits_orphan_cleanup_sleep_sec = 0.2
+# Keep recent orphan page_hits younger than this grace window, minutes.
+page_hits_orphan_cleanup_grace_min = 60
+# Max runtime budget of one orphan cleanup run, sec.
+page_hits_orphan_cleanup_max_run_sec = 180
+
 # Enable daily cache:clear task (MCD-managed, runtime-dynamic).
 enable_cache_clear = false
 # Minimum interval between cache:clear runs, sec.

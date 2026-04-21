@@ -362,6 +362,124 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def _table_has_index(self, table: str, index_name: str) -> bool:
+        query = f"SHOW INDEX FROM `{table}` WHERE Key_name=%s"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (str(index_name),))
+                row: Any = cur.fetchone()
+        return isinstance(row, dict) and bool(row)
+
+    def _page_hits_index_hint(self, table: str) -> str:
+        if self._table_has_index(table, "idx_mcd_ph_lead_date"):
+            return "FORCE INDEX (`idx_mcd_ph_lead_date`)"
+        return ""
+
+    def preview_orphan_page_hits_batch(
+        self,
+        *,
+        cutoff_utc: str,
+        batch_size: int,
+    ) -> dict[str, Any]:
+        table = self._safe_table(f"{self.cfg.table_prefix}page_hits")
+        limit = max(1, int(batch_size))
+        hint = self._page_hits_index_hint(table)
+        query = (
+            "SELECT "
+            " COUNT(*) AS preview_count, "
+            " MIN(batch.id) AS min_id, "
+            " MAX(batch.id) AS max_id, "
+            " MIN(batch.date_hit) AS min_date_hit, "
+            " MAX(batch.date_hit) AS max_date_hit "
+            "FROM ("
+            f" SELECT `id`, `date_hit` FROM `{table}` {hint} "
+            " WHERE `lead_id` IS NULL "
+            "   AND (`date_hit` IS NULL OR `date_hit` < %s) "
+            " ORDER BY `date_hit` ASC, `id` ASC "
+            " LIMIT %s"
+            ") batch"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (str(cutoff_utc), limit))
+                row: Any = cur.fetchone()
+        if not isinstance(row, dict):
+            return {
+                "preview_count": 0,
+                "min_id": None,
+                "max_id": None,
+                "min_date_hit": None,
+                "max_date_hit": None,
+            }
+        return {
+            "preview_count": int(row.get("preview_count") or 0),
+            "min_id": row.get("min_id"),
+            "max_id": row.get("max_id"),
+            "min_date_hit": row.get("min_date_hit"),
+            "max_date_hit": row.get("max_date_hit"),
+        }
+
+    def delete_orphan_page_hits(
+        self,
+        *,
+        cutoff_utc: str,
+        batch_size: int,
+        max_batches: int,
+        sleep_sec: float,
+        max_run_sec: int,
+    ) -> dict[str, Any]:
+        table = self._safe_table(f"{self.cfg.table_prefix}page_hits")
+        limit = max(1, int(batch_size))
+        batches_left = max(1, int(max_batches))
+        pause_sec = max(0.0, float(sleep_sec))
+        run_budget_sec = max(1, int(max_run_sec))
+        hint = self._page_hits_index_hint(table)
+        delete_sql = (
+            f"DELETE FROM `{table}` "
+            "WHERE `id` IN ("
+            "  SELECT doomed.id FROM ("
+            f"    SELECT `id` FROM `{table}` {hint} "
+            "    WHERE `lead_id` IS NULL "
+            "      AND (`date_hit` IS NULL OR `date_hit` < %s) "
+            "    ORDER BY `date_hit` ASC, `id` ASC "
+            "    LIMIT %s"
+            "  ) doomed"
+            ")"
+        )
+        started = time.monotonic()
+        total_deleted = 0
+        batches_run = 0
+        last_deleted = 0
+        stop_reason = "empty"
+        with self._connect() as conn:
+            while batches_run < batches_left:
+                elapsed = float(time.monotonic() - started)
+                if elapsed >= run_budget_sec:
+                    stop_reason = "max_run_sec"
+                    break
+                with conn.cursor() as cur:
+                    affected = int(cur.execute(delete_sql, (str(cutoff_utc), limit)) or 0)
+                last_deleted = affected
+                if affected <= 0:
+                    stop_reason = "empty"
+                    break
+                total_deleted += affected
+                batches_run += 1
+                if batches_run >= batches_left:
+                    stop_reason = "max_batches"
+                    break
+                if pause_sec > 0:
+                    time.sleep(pause_sec)
+        return {
+            "batches_run": batches_run,
+            "total_deleted": total_deleted,
+            "last_deleted": last_deleted,
+            "elapsed_sec": max(0.0, float(time.monotonic() - started)),
+            "stop_reason": stop_reason,
+            "cutoff_utc": str(cutoff_utc),
+            "batch_size": limit,
+        }
+
     def fetch_processlist(self, *, limit: int = 500) -> list[dict[str, Any]]:
         query = "SHOW FULL PROCESSLIST"
         with self._connect() as conn:

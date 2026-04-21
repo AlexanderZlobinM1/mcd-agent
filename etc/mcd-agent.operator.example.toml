@@ -75,6 +75,24 @@ segment_sql_page_hits_quiet_only = false
 segment_sql_page_hits_quiet_hour = 2
 # Quiet window length in minutes for page_hits-based SQL segments.
 segment_sql_page_hits_quiet_window_min = 180
+# Enable orphan page_hits cleanup ring.
+enable_page_hits_orphan_cleanup = false
+# Minimum interval between orphan cleanup runs, sec.
+page_hits_orphan_cleanup_interval_sec = 3600
+# Quiet window start hour (instance timezone).
+page_hits_orphan_cleanup_quiet_hour = 2
+# Quiet window length in minutes.
+page_hits_orphan_cleanup_quiet_window_min = 180
+# Per-batch delete size for orphan page_hits.
+page_hits_orphan_cleanup_batch_size = 5000
+# Max delete batches per cleanup run.
+page_hits_orphan_cleanup_batches_per_run = 12
+# Sleep between orphan delete batches, sec.
+page_hits_orphan_cleanup_sleep_sec = 0.2
+# Keep recent orphan page_hits younger than this grace window, minutes.
+page_hits_orphan_cleanup_grace_min = 60
+# Max runtime budget of one orphan cleanup run, sec.
+page_hits_orphan_cleanup_max_run_sec = 180
 # JSON map/list of SQL segment rules.
 # Rule format (must return `lead_id` column):
 # segment_sql_ring_rules = { "188" = { select_sql = "SELECT l.id AS lead_id FROM {prefix}leads l WHERE l.email IS NOT NULL AND l.email <> ''", depends_on = [] } }

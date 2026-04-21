@@ -1,5 +1,26 @@
 # MCD Changelog
 
+## 0.8.101 - 2026-04-21
+
+- Added built-in orphan `page_hits` cleanup housekeeping in the agent daemon.
+  - New runtime-configurable task can periodically remove `page_hits` rows where `lead_id IS NULL`, without relying on external scripts.
+  - Cleanup is gated by a quiet window, interval, grace period for recent rows, max runtime budget, and small batched deletes to stay safe on very large tables.
+  - The implementation avoids full-table `COUNT(*)` scans; each run only previews and deletes the next bounded candidate batch through indexed `lead_id/date_hit` selection when available.
+- Added new runtime knobs for orphan `page_hits` cleanup.
+  - `enable_page_hits_orphan_cleanup`
+  - `page_hits_orphan_cleanup_interval_sec`
+  - `page_hits_orphan_cleanup_quiet_hour`
+  - `page_hits_orphan_cleanup_quiet_window_min`
+  - `page_hits_orphan_cleanup_batch_size`
+  - `page_hits_orphan_cleanup_batches_per_run`
+  - `page_hits_orphan_cleanup_sleep_sec`
+  - `page_hits_orphan_cleanup_grace_min`
+  - `page_hits_orphan_cleanup_max_run_sec`
+- Outcome:
+  - hosts like `ananasmk` can keep trimming large orphan `page_hits` tails automatically during night windows,
+  - cleanup becomes a standard MCD capability instead of per-host shell glue,
+  - operators can enable and tune it globally or per-host through runtime config.
+
 ## 0.8.100 - 2026-04-21
 
 - Added automatic SQL-ring detection for simple but heavy segments.

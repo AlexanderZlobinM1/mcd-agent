@@ -353,6 +353,15 @@ class AgentConfig:
     contacts_cleanup_phone_field: str
     contacts_cleanup_mode: str
     contacts_cleanup_max_delete_per_run: int
+    enable_page_hits_orphan_cleanup: bool
+    page_hits_orphan_cleanup_interval_sec: int
+    page_hits_orphan_cleanup_quiet_hour: int
+    page_hits_orphan_cleanup_quiet_window_min: int
+    page_hits_orphan_cleanup_batch_size: int
+    page_hits_orphan_cleanup_batches_per_run: int
+    page_hits_orphan_cleanup_sleep_sec: float
+    page_hits_orphan_cleanup_grace_min: int
+    page_hits_orphan_cleanup_max_run_sec: int
     enable_cache_clear: bool
     cache_clear_interval_sec: int
     cache_clear_quiet_hour: int
@@ -1293,6 +1302,15 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "contacts_cleanup_phone_field": "contacts_cleanup_phone_field",
     "contacts_cleanup_mode": "contacts_cleanup_mode",
     "contacts_cleanup_max_delete_per_run": "contacts_cleanup_max_delete_per_run",
+    "enable_page_hits_orphan_cleanup": "enable_page_hits_orphan_cleanup",
+    "page_hits_orphan_cleanup_interval_sec": "page_hits_orphan_cleanup_interval_sec",
+    "page_hits_orphan_cleanup_quiet_hour": "page_hits_orphan_cleanup_quiet_hour",
+    "page_hits_orphan_cleanup_quiet_window_min": "page_hits_orphan_cleanup_quiet_window_min",
+    "page_hits_orphan_cleanup_batch_size": "page_hits_orphan_cleanup_batch_size",
+    "page_hits_orphan_cleanup_batches_per_run": "page_hits_orphan_cleanup_batches_per_run",
+    "page_hits_orphan_cleanup_sleep_sec": "page_hits_orphan_cleanup_sleep_sec",
+    "page_hits_orphan_cleanup_grace_min": "page_hits_orphan_cleanup_grace_min",
+    "page_hits_orphan_cleanup_max_run_sec": "page_hits_orphan_cleanup_max_run_sec",
     "enable_cache_clear": "enable_cache_clear",
     "cache_clear_interval_sec": "cache_clear_interval_sec",
     "cache_clear_quiet_hour": "cache_clear_quiet_hour",
@@ -1811,6 +1829,39 @@ def _load_config_inner(path: str) -> AgentConfig:
         contacts_cleanup_phone_field=str(runtime.get("contacts_cleanup_phone_field", "mobile")),
         contacts_cleanup_mode=cleanup_mode,
         contacts_cleanup_max_delete_per_run=int(runtime.get("contacts_cleanup_max_delete_per_run", 10000)),
+        enable_page_hits_orphan_cleanup=bool(runtime.get("enable_page_hits_orphan_cleanup", False)),
+        page_hits_orphan_cleanup_interval_sec=max(
+            60,
+            int(runtime.get("page_hits_orphan_cleanup_interval_sec", 3600) or 3600),
+        ),
+        page_hits_orphan_cleanup_quiet_hour=max(
+            0,
+            min(23, int(runtime.get("page_hits_orphan_cleanup_quiet_hour", 2) or 2)),
+        ),
+        page_hits_orphan_cleanup_quiet_window_min=max(
+            1,
+            min(720, int(runtime.get("page_hits_orphan_cleanup_quiet_window_min", 180) or 180)),
+        ),
+        page_hits_orphan_cleanup_batch_size=max(
+            100,
+            int(runtime.get("page_hits_orphan_cleanup_batch_size", 5000) or 5000),
+        ),
+        page_hits_orphan_cleanup_batches_per_run=max(
+            1,
+            int(runtime.get("page_hits_orphan_cleanup_batches_per_run", 12) or 12),
+        ),
+        page_hits_orphan_cleanup_sleep_sec=max(
+            0.0,
+            float(runtime.get("page_hits_orphan_cleanup_sleep_sec", 0.2) or 0.2),
+        ),
+        page_hits_orphan_cleanup_grace_min=max(
+            5,
+            int(runtime.get("page_hits_orphan_cleanup_grace_min", 60) or 60),
+        ),
+        page_hits_orphan_cleanup_max_run_sec=max(
+            30,
+            int(runtime.get("page_hits_orphan_cleanup_max_run_sec", 180) or 180),
+        ),
         enable_cache_clear=bool(runtime.get("enable_cache_clear", False)),
         cache_clear_interval_sec=int(runtime.get("cache_clear_interval_sec", 86_400)),
         cache_clear_quiet_hour=int(runtime.get("cache_clear_quiet_hour", 7)),

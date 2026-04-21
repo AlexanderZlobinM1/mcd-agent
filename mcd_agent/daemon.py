@@ -2847,6 +2847,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_last_full_scan_ts: dict[str, float] = {}
     segment_force_full_scan_until: dict[str, float] = {}
     last_cleanup_ts: dict[str, float] = {}
+    last_page_hits_orphan_cleanup_ts: dict[str, float] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
     last_fs_permissions_guard_ts: dict[str, float] = {}
@@ -4606,6 +4607,61 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     logging.warning("[%s] contacts_cleanup failed: %s", root, e)
                 last_cleanup_ts[root] = now
+
+            last_page_hits_cleanup = last_page_hits_orphan_cleanup_ts.get(root, 0.0)
+            page_hits_cleanup_interval = max(60, int(config.page_hits_orphan_cleanup_interval_sec or 3600))
+            page_hits_cleanup_in_quiet = _in_daily_quiet_window(
+                dt,
+                max(0, min(23, int(config.page_hits_orphan_cleanup_quiet_hour or 2))),
+                max(1, min(720, int(config.page_hits_orphan_cleanup_quiet_window_min or 180))),
+            )
+            if (
+                config.enable_page_hits_orphan_cleanup
+                and page_hits_cleanup_in_quiet
+                and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
+            ):
+                cutoff_utc = (
+                    now_utc - timedelta(minutes=max(5, int(config.page_hits_orphan_cleanup_grace_min or 60)))
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    preview = db.preview_orphan_page_hits_batch(
+                        cutoff_utc=cutoff_utc,
+                        batch_size=config.page_hits_orphan_cleanup_batch_size,
+                    )
+                    preview_count = int(preview.get("preview_count", 0) or 0)
+                    if preview_count > 0:
+                        logging.info(
+                            "[%s] page_hits_orphan_cleanup preview count=%s min_id=%s max_id=%s min_date_hit=%s max_date_hit=%s cutoff_utc=%s",
+                            root,
+                            preview_count,
+                            preview.get("min_id"),
+                            preview.get("max_id"),
+                            preview.get("min_date_hit"),
+                            preview.get("max_date_hit"),
+                            cutoff_utc,
+                        )
+                        result = db.delete_orphan_page_hits(
+                            cutoff_utc=cutoff_utc,
+                            batch_size=config.page_hits_orphan_cleanup_batch_size,
+                            max_batches=config.page_hits_orphan_cleanup_batches_per_run,
+                            sleep_sec=config.page_hits_orphan_cleanup_sleep_sec,
+                            max_run_sec=config.page_hits_orphan_cleanup_max_run_sec,
+                        )
+                        logging.info(
+                            "[%s] page_hits_orphan_cleanup ok batches=%s deleted=%s last_deleted=%s elapsed=%.2fs stop=%s cutoff_utc=%s",
+                            root,
+                            int(result.get("batches_run", 0) or 0),
+                            int(result.get("total_deleted", 0) or 0),
+                            int(result.get("last_deleted", 0) or 0),
+                            float(result.get("elapsed_sec", 0.0) or 0.0),
+                            str(result.get("stop_reason") or "-"),
+                            cutoff_utc,
+                        )
+                    else:
+                        logging.debug("[%s] page_hits_orphan_cleanup idle cutoff_utc=%s", root, cutoff_utc)
+                except Exception as e:
+                    logging.warning("[%s] page_hits_orphan_cleanup failed: %s", root, e)
+                last_page_hits_orphan_cleanup_ts[root] = now
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
