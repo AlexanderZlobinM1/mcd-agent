@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.102 - 2026-04-21
+
+- Added explicit backup guard for orphan `page_hits` cleanup.
+  - The new built-in orphan cleanup now skips its run while backup is running, while the pre-backup pause window is active, or while backup slot is still pending for the current local day.
+  - This prevents background `page_hits` batched deletes from competing with host backup IO and DB activity during backup windows.
+
 ## 0.8.101 - 2026-04-21
 
 - Added built-in orphan `page_hits` cleanup housekeeping in the agent daemon.

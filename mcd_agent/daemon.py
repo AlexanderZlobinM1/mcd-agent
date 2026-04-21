@@ -4615,9 +4615,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 max(0, min(23, int(config.page_hits_orphan_cleanup_quiet_hour or 2))),
                 max(1, min(720, int(config.page_hits_orphan_cleanup_quiet_window_min or 180))),
             )
+            page_hits_cleanup_backup_running = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(
+                config
+            )
+            page_hits_cleanup_backup_pause, page_hits_cleanup_backup_reason = _backup_dispatch_pause_state(
+                config,
+                backup_running=page_hits_cleanup_backup_running,
+                now_local=dt,
+            )
             if (
                 config.enable_page_hits_orphan_cleanup
                 and page_hits_cleanup_in_quiet
+                and not page_hits_cleanup_backup_pause
                 and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
             ):
                 cutoff_utc = (
@@ -4662,6 +4671,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     logging.warning("[%s] page_hits_orphan_cleanup failed: %s", root, e)
                 last_page_hits_orphan_cleanup_ts[root] = now
+            elif (
+                config.enable_page_hits_orphan_cleanup
+                and page_hits_cleanup_in_quiet
+                and page_hits_cleanup_backup_pause
+                and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
+            ):
+                logging.info(
+                    "[%s] page_hits_orphan_cleanup skipped: backup guard active (%s)",
+                    root,
+                    page_hits_cleanup_backup_reason or "backup_guard",
+                )
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
