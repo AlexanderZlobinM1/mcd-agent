@@ -1887,7 +1887,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         ),
         host_pressure_swap_level_pause_threshold=max(
             0,
-            min(2, int(runtime.get("host_pressure_swap_level_pause_threshold", 2) or 2)),
+            min(2, int(runtime.get("host_pressure_swap_level_pause_threshold", 0) or 0)),
         ),
         db_watchdog=dict(db_watchdog_cfg),
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),

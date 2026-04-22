@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.106 - 2026-04-22
+
+- Disabled swap-only global dispatch pausing by default.
+  - `host_pressure_swap_level_pause_threshold` now defaults to `0`, so elevated swap usage alone no longer freezes all MCD task lanes.
+  - `php_console_stuck` protection remains active, so genuinely wedged PHP console workloads can still pause dispatch when needed.
+- Outcome:
+  - campaign rebuild/trigger lanes keep running on hosts with persistent swap usage,
+  - MCD no longer silently starves daytime campaign automation just because swap pressure is high.
+
 ## 0.8.105 - 2026-04-22
 
 - Added plugin `display_name` support to the MCD plugin catalog.
