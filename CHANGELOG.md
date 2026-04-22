@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.105 - 2026-04-22
+
+- Added plugin `display_name` support to the MCD plugin catalog.
+  - `plugins --catalog-json` now carries human-readable `display_name` from the manifest when available.
+  - Instance plugin pickers in MCC can now present versioned variants like stable/dev/original with clean operator-facing labels while still selecting by bundle key under the hood.
+- Outcome:
+  - one plugin family can expose multiple nice names in the install UI,
+  - operators no longer need to parse raw bundle names to choose the right variant.
+
 ## 0.8.104 - 2026-04-22
 
 - Added manifest-level `install_bundle` support for plugin variants that share one real install directory.

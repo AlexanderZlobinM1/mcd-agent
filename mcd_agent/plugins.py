@@ -505,6 +505,7 @@ def _build_plugin_rows(
                 {
                     "idx": selectable_idx,
                     "bundle": bundle,
+                    "display_name": bundle,
                     "install_bundle": bundle,
                     "status": "-",
                     "reason": "local only (not in server manifest)",
@@ -531,6 +532,7 @@ def _build_plugin_rows(
             {
                 "idx": selectable_idx,
                 "bundle": bundle,
+                "display_name": str(item.get("display_name", "")).strip() or bundle,
                 "install_bundle": install_bundle,
                 "status": status,
                 "reason": reason,
@@ -991,6 +993,7 @@ def run_plugins_interactive(
                 {
                     "idx": row.get("idx"),
                     "bundle": str(row.get("bundle", "")).strip(),
+                    "display_name": str(row.get("display_name", "")).strip(),
                     "install_bundle": str(row.get("install_bundle", "")).strip(),
                     "status": str(row.get("status", "")).strip(),
                     "reason": str(row.get("reason", "")).strip(),
