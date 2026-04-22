@@ -30,7 +30,7 @@ from mcd_agent.apt_profile import (
     collect_apt_state,
     ensure_zabbix_mysql_monitor_user,
 )
-from mcd_agent.admin_user import reset_admin_password
+from mcd_agent.admin_user import clear_hostnet_auth_mfa, hostnet_auth_mfa_status, reset_admin_password
 from mcd_agent.config import load_config
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
@@ -1265,6 +1265,20 @@ def _build_parser() -> argparse.ArgumentParser:
     reset_admin.add_argument("--password-hash", required=True, dest="password_hash")
     reset_admin.add_argument("--json", action="store_true")
 
+    mfa_status = sub.add_parser("admin:mfa-status", help="Inspect HostnetAuth MFA state for one Mautic user")
+    mfa_status.add_argument("--config", default=default_cfg)
+    mfa_status.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
+    mfa_status.add_argument("--username", required=True)
+    mfa_status.add_argument("--email", required=True)
+    mfa_status.add_argument("--json", action="store_true")
+
+    mfa_clear = sub.add_parser("admin:mfa-clear", help="Clear HostnetAuth MFA state for one Mautic user")
+    mfa_clear.add_argument("--config", default=default_cfg)
+    mfa_clear.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
+    mfa_clear.add_argument("--username", required=True)
+    mfa_clear.add_argument("--email", required=True)
+    mfa_clear.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -1668,6 +1682,71 @@ def main() -> int:
                 )
             )
         _push_state_after_change(cfg, "admin-reset-password")
+        return 0
+
+    if args.cmd == "admin:mfa-status":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            payload = hostnet_auth_mfa_status(
+                cfg,
+                root=args.root,
+                username=args.username,
+                email=args.email,
+            )
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"admin mfa status failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(
+                "admin mfa status: applicable={applicable} active_mfa={active_mfa} trusted_browsers={tb} "
+                "plugin_installed={installed} plugin_published={published} root={root}".format(
+                    applicable=1 if bool(payload.get("applicable")) else 0,
+                    active_mfa=1 if bool(payload.get("active_mfa")) else 0,
+                    tb=int(payload.get("trusted_browser_count") or 0),
+                    installed=1 if bool(payload.get("plugin_installed")) else 0,
+                    published=1 if bool(payload.get("plugin_published")) else 0,
+                    root=str(payload.get("root") or ""),
+                )
+            )
+        return 0
+
+    if args.cmd == "admin:mfa-clear":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            payload = clear_hostnet_auth_mfa(
+                cfg,
+                root=args.root,
+                username=args.username,
+                email=args.email,
+            )
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"admin mfa clear failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(
+                "admin mfa clear: active_mfa={active_mfa} deleted_trusted_browsers={deleted} root={root}".format(
+                    active_mfa=1 if bool(payload.get("active_mfa")) else 0,
+                    deleted=int(payload.get("deleted_trusted_browsers") or 0),
+                    root=str(payload.get("root") or ""),
+                )
+            )
+        _push_state_after_change(cfg, "admin-mfa-clear")
         return 0
 
     if args.cmd == "exec":

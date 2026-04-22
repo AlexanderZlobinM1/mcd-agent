@@ -1,5 +1,37 @@
 # MCD Changelog
 
+## 0.8.111 - 2026-04-22
+
+- Reworked HostnetAuth MFA helper to avoid console security token dependencies on Mautic 6/7.
+  - The helper now loads the HostnetAuth integration object and retargets its per-user fields via reflection instead of trying to impersonate a user through Symfony security token storage.
+  - This keeps MFA status/clear compatible with Mautic 6/7 console containers where token services differ from older builds.
+
+## 0.8.110 - 2026-04-22
+
+- Fixed HostnetAuth MFA helper security token storage detection on Mautic 6/7 console containers.
+  - The helper now tries both `security.token_storage` and `security.untracked_token_storage` instead of requiring one public service id.
+  - This fixes live MFA status/clear actions on newer Mautic builds where the token storage service is private/aliased differently.
+
+## 0.8.109 - 2026-04-22
+
+- Fixed HostnetAuth MFA helper compatibility across Symfony security token variants.
+  - The helper now tries multiple supported authentication token constructor shapes instead of assuming one `UsernamePasswordToken` signature.
+  - This fixes live HostnetAuth MFA actions on instances where the older token constructor expects a different argument layout.
+
+## 0.8.108 - 2026-04-22
+
+- Fixed HostnetAuth MFA helper temp PHP script permissions.
+  - `admin:mfa-status` and `admin:mfa-clear` now make the generated helper script readable by the Mautic runtime user (`www-data`).
+  - This fixes live MCC instance MFA actions failing with `Could not open input file`.
+
+## 0.8.107 - 2026-04-22
+
+- Added HostnetAuth MFA self-service helpers for MCC-driven instance operations.
+  - New `mcd-cli admin:mfa-status` inspects whether the matching MCC user exists on the target instance and whether HostnetAuth MFA is currently active for that user.
+  - New `mcd-cli admin:mfa-clear` disables HostnetAuth MFA for that user and deletes remembered browser records.
+- Implementation detail:
+  - the helper boots the local Mautic runtime and applies the change through HostnetAuth's own integration APIs, instead of hard-coding brittle integration-setting table formats.
+
 ## 0.8.106 - 2026-04-22
 
 - Disabled swap-only global dispatch pausing by default.
