@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.104 - 2026-04-22
+
+- Added manifest-level `install_bundle` support for plugin variants that share one real install directory.
+  - MCD plugin catalog/apply now honors explicit manifest `install_bundle` instead of only the old hardcoded `*Dev -> canonical` alias rule.
+  - This allows multiple selectable repo variants of the same plugin family to install into the same runtime path without code duplication in the installer.
+- Outcome:
+  - repo can expose stable/dev/original variants of Amazon SES as separate choices,
+  - all mutually exclusive variants still install into the canonical `plugins/AmazonSesBundle` path.
+
 ## 0.8.103 - 2026-04-21
 
 - Fixed quiet-window handling for windows that cross midnight.

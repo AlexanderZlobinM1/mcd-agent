@@ -54,13 +54,18 @@ def _is_valid_bundle_name(name: str) -> bool:
     return bool(_BUNDLE_NAME_RE.match(n))
 
 
-def _install_bundle_for_manifest_bundle(bundle: str) -> str:
+def _install_bundle_for_manifest_bundle(bundle: str, item: dict[str, Any] | None = None) -> str:
     """
     Resolve filesystem install directory for a manifest bundle key.
-    Dev aliases are installed into canonical bundle directory so runtime
-    bundle paths remain stable.
+    Manifest may explicitly override the install directory with
+    `install_bundle`. Otherwise legacy Dev aliases are installed into the
+    canonical bundle directory so runtime bundle paths remain stable.
     """
     b = str(bundle or "").strip()
+    if isinstance(item, dict):
+        explicit = str(item.get("install_bundle", "")).strip()
+        if _is_valid_bundle_name(explicit):
+            return explicit
     if b in _EXCLUSIVE_BUNDLE_PAIRS and b.endswith("Dev"):
         return _EXCLUSIVE_BUNDLE_PAIRS[b]
     return b
@@ -514,7 +519,7 @@ def _build_plugin_rows(
             selectable_idx += 1
             continue
 
-        install_bundle = _install_bundle_for_manifest_bundle(bundle)
+        install_bundle = _install_bundle_for_manifest_bundle(bundle, item)
         status, reason, installed_version = _plugin_status(
             plugins_dir,
             item,
@@ -1116,9 +1121,19 @@ def run_plugins_interactive(
     action = chosen_action
 
     changed = False
+    rows_by_bundle = {
+        str(row.get("bundle", "")).strip(): row
+        for row in rows
+        if str(row.get("bundle", "")).strip()
+    }
     if action != "remove" and auto_remove_bundles:
         for conflict_bundle in auto_remove_bundles:
-            conflict_install = _install_bundle_for_manifest_bundle(conflict_bundle)
+            conflict_row = rows_by_bundle.get(conflict_bundle)
+            conflict_item = conflict_row.get("item") if isinstance(conflict_row, dict) else None
+            conflict_install = str(
+                (conflict_row or {}).get("install_bundle")
+                or _install_bundle_for_manifest_bundle(conflict_bundle, conflict_item if isinstance(conflict_item, dict) else None)
+            ).strip() or conflict_bundle
             removed_paths: list[str] = []
             for name in sorted({conflict_bundle, conflict_install}):
                 pdir = _resolve_plugins_dir(install_root, create=False) / name
@@ -1137,7 +1152,8 @@ def run_plugins_interactive(
     for row in selected:
         item = row["item"]
         bundle = row["bundle"]
-        install_bundle = str(row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle))
+        item_dict = item if isinstance(item, dict) else None
+        install_bundle = str(row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle, item_dict))
         if action != "remove" and not isinstance(item, dict):
             logging.info("[%s] plugin %s not in server manifest, skip for action=%s", install_root, bundle, action)
             continue
