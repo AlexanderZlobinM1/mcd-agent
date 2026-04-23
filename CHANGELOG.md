@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.113 - 2026-04-23
+
+- Added install type to `mcd-cli instances list`.
+  - Instance rows now include `install_type=composer|zip`.
+  - This lets MCC persist and display install type in instance properties without waiting for a later full state push.
+
 ## 0.8.112 - 2026-04-23
 
 - Fixed `mcd-cli instances rescan` crashing in inventory persistence.

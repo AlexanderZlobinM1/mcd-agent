@@ -45,6 +45,7 @@ from mcd_agent.executor import (
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
+from mcd_agent.install_type import detect_install_type
 from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
 from mcd_agent.mautic6_core_patch import (
     ensure_m6_plugin_update_metadata_patch,
@@ -1847,8 +1848,9 @@ def main() -> int:
                 if not domains and i.primary_domain:
                     domains = [str(i.primary_domain).strip()]
                 domains_cell = ",".join(domains)
+                install_type = detect_install_type(i.root)
                 print(
-                    f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}\tdomains={domains_cell}"
+                    f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}\tdomains={domains_cell}\tinstall_type={install_type}"
                 )
             return 0
         if args.op == "rescan":
