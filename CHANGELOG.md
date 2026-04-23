@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.112 - 2026-04-23
+
+- Fixed `mcd-cli instances rescan` crashing in inventory persistence.
+  - Added the missing `json` import in `inventory.py` so autodiscovered instances with domains are saved correctly during rescan.
+  - This restores real agent-side inventory rescans used by MCC when new instances are added to an existing host.
+
 ## 0.8.111 - 2026-04-22
 
 - Reworked HostnetAuth MFA helper to avoid console security token dependencies on Mautic 6/7.
