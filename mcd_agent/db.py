@@ -290,6 +290,69 @@ class MauticDB:
             "duration_sec": max(0.0, float(time.monotonic() - started)),
         }
 
+    def cleanup_stale_checked_out_locks(
+        self,
+        *,
+        cutoff_utc: str,
+        max_rows: int = 20,
+        skip_segment_ids: set[int] | None = None,
+        skip_campaign_ids: set[int] | None = None,
+    ) -> dict[str, Any]:
+        prefix = str(self.cfg.table_prefix or "")
+        table_segments = self._safe_table(f"{prefix}lead_lists")
+        table_campaigns = self._safe_table(f"{prefix}campaigns")
+        seg_limit = max(1, int(max_rows))
+        camp_limit = max(1, int(max_rows))
+        skip_segment_ids = {int(x) for x in (skip_segment_ids or set()) if int(x) > 0}
+        skip_campaign_ids = {int(x) for x in (skip_campaign_ids or set()) if int(x) > 0}
+
+        def _fetch_rows(table: str, limit: int) -> list[dict[str, Any]]:
+            query = (
+                f"SELECT id, name, checked_out, checked_out_by_user "
+                f"FROM `{table}` "
+                f"WHERE checked_out IS NOT NULL AND checked_out < %s "
+                f"ORDER BY checked_out ASC, id ASC "
+                f"LIMIT {limit}"
+            )
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (str(cutoff_utc),))
+                    rows = cur.fetchall()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    out.append(row)
+            return out
+
+        def _clear_rows(table: str, ids: list[int]) -> int:
+            if not ids:
+                return 0
+            placeholders = ",".join(["%s"] * len(ids))
+            query = (
+                f"UPDATE `{table}` "
+                "SET `checked_out`=NULL, `checked_out_by`=NULL, `checked_out_by_user`=NULL "
+                f"WHERE id IN ({placeholders})"
+            )
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, tuple(int(x) for x in ids))
+                    affected = int(cur.rowcount or 0)
+            return affected
+
+        stale_segments = [row for row in _fetch_rows(table_segments, seg_limit) if int(row.get("id") or 0) not in skip_segment_ids]
+        stale_campaigns = [row for row in _fetch_rows(table_campaigns, camp_limit) if int(row.get("id") or 0) not in skip_campaign_ids]
+
+        cleared_segments = _clear_rows(table_segments, [int(row.get("id") or 0) for row in stale_segments])
+        cleared_campaigns = _clear_rows(table_campaigns, [int(row.get("id") or 0) for row in stale_campaigns])
+
+        return {
+            "segments": stale_segments,
+            "campaigns": stale_campaigns,
+            "cleared_segments": int(cleared_segments),
+            "cleared_campaigns": int(cleared_campaigns),
+            "cutoff_utc": str(cutoff_utc),
+        }
+
     @staticmethod
     def _safe_ident(raw: str) -> str:
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", raw or ""):

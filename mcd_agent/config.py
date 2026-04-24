@@ -362,6 +362,12 @@ class AgentConfig:
     page_hits_orphan_cleanup_sleep_sec: float
     page_hits_orphan_cleanup_grace_min: int
     page_hits_orphan_cleanup_max_run_sec: int
+    enable_mautic_lock_cleanup: bool
+    mautic_lock_cleanup_interval_sec: int
+    mautic_lock_cleanup_quiet_hour: int
+    mautic_lock_cleanup_quiet_window_min: int
+    mautic_lock_cleanup_min_age_sec: int
+    mautic_lock_cleanup_max_rows_per_run: int
     enable_cache_clear: bool
     cache_clear_interval_sec: int
     cache_clear_quiet_hour: int
@@ -1311,6 +1317,12 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "page_hits_orphan_cleanup_sleep_sec": "page_hits_orphan_cleanup_sleep_sec",
     "page_hits_orphan_cleanup_grace_min": "page_hits_orphan_cleanup_grace_min",
     "page_hits_orphan_cleanup_max_run_sec": "page_hits_orphan_cleanup_max_run_sec",
+    "enable_mautic_lock_cleanup": "enable_mautic_lock_cleanup",
+    "mautic_lock_cleanup_interval_sec": "mautic_lock_cleanup_interval_sec",
+    "mautic_lock_cleanup_quiet_hour": "mautic_lock_cleanup_quiet_hour",
+    "mautic_lock_cleanup_quiet_window_min": "mautic_lock_cleanup_quiet_window_min",
+    "mautic_lock_cleanup_min_age_sec": "mautic_lock_cleanup_min_age_sec",
+    "mautic_lock_cleanup_max_rows_per_run": "mautic_lock_cleanup_max_rows_per_run",
     "enable_cache_clear": "enable_cache_clear",
     "cache_clear_interval_sec": "cache_clear_interval_sec",
     "cache_clear_quiet_hour": "cache_clear_quiet_hour",
@@ -1861,6 +1873,27 @@ def _load_config_inner(path: str) -> AgentConfig:
         page_hits_orphan_cleanup_max_run_sec=max(
             30,
             int(runtime.get("page_hits_orphan_cleanup_max_run_sec", 180) or 180),
+        ),
+        enable_mautic_lock_cleanup=bool(runtime.get("enable_mautic_lock_cleanup", True)),
+        mautic_lock_cleanup_interval_sec=max(
+            300,
+            int(runtime.get("mautic_lock_cleanup_interval_sec", 3600) or 3600),
+        ),
+        mautic_lock_cleanup_quiet_hour=max(
+            0,
+            min(23, int(runtime.get("mautic_lock_cleanup_quiet_hour", 3) or 3)),
+        ),
+        mautic_lock_cleanup_quiet_window_min=max(
+            1,
+            min(720, int(runtime.get("mautic_lock_cleanup_quiet_window_min", 180) or 180)),
+        ),
+        mautic_lock_cleanup_min_age_sec=max(
+            1800,
+            int(runtime.get("mautic_lock_cleanup_min_age_sec", 21600) or 21600),
+        ),
+        mautic_lock_cleanup_max_rows_per_run=max(
+            1,
+            int(runtime.get("mautic_lock_cleanup_max_rows_per_run", 20) or 20),
         ),
         enable_cache_clear=bool(runtime.get("enable_cache_clear", False)),
         cache_clear_interval_sec=int(runtime.get("cache_clear_interval_sec", 86_400)),

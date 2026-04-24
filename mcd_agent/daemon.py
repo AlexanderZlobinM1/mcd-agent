@@ -1297,6 +1297,74 @@ class TaskStore:
         except Exception:
             pass
 
+    def sync_sqlite_running_shadow(self) -> dict[str, int]:
+        """
+        Keep the local SQLite failover shadow aligned with MySQL running rows.
+
+        Signals and some local diagnostics read the SQLite shadow directly, so in
+        mysql_hybrid mode we periodically resync it from the authoritative MySQL
+        task table and drop orphaned/stale local rows.
+        """
+        stats = {"mysql_rows": 0, "sqlite_before": 0, "sqlite_after": 0, "replaced": 0}
+        if not self._mysql_mode:
+            return stats
+        tasks_table = self._mysql_tables.get("tasks", "")
+        if not tasks_table or not self._mysql_available():
+            return stats
+        try:
+            rows = self._mysql_query(
+                f"""
+                SELECT id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+                FROM `{tasks_table}`
+                WHERE host_name=%s AND state='running'
+                ORDER BY id ASC
+                """,
+                (self._node_id,),
+            )
+        except Exception:
+            return stats
+
+        try:
+            row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks").fetchone()
+            stats["sqlite_before"] = int(row["cnt"] if row else 0)
+            self.conn.execute("DELETE FROM tasks")
+            if rows:
+                self.conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO tasks(
+                      id, root, task_key, task_type, entity_id, command_str, pid, timeout_sec, attempts, manual_request_id, state, started_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    [
+                        (
+                            int(r.get("id") or 0),
+                            str(r.get("root") or ""),
+                            str(r.get("task_key") or ""),
+                            str(r.get("task_type") or ""),
+                            r.get("entity_id"),
+                            str(r.get("command_str") or ""),
+                            int(r.get("pid") or 0),
+                            int(r.get("timeout_sec") or 0),
+                            int(r.get("attempts") or 1),
+                            r.get("manual_request_id"),
+                            "running",
+                            float(r.get("started_at") or 0.0),
+                        )
+                        for r in rows
+                    ],
+                )
+            self.conn.commit()
+            row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks").fetchone()
+            stats["mysql_rows"] = len(rows)
+            stats["sqlite_after"] = int(row["cnt"] if row else 0)
+            stats["replaced"] = max(stats["sqlite_before"], stats["sqlite_after"])
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+        return stats
+
     def _migrate_sqlite_to_mysql_once(self) -> bool:
         if not self._mysql_mode:
             return False
@@ -2640,7 +2708,13 @@ def _reconcile_running_state(
         "lost_pid": 0,
         "lost_cmd": 0,
         "duplicate": 0,
+        "shadow_replaced": 0,
     }
+    try:
+        shadow = store.sync_sqlite_running_shadow()
+        stats["shadow_replaced"] = int(shadow.get("replaced", 0) or 0)
+    except Exception:
+        pass
     rows = store.running_rows()
     stats["tracked_total"] = len(rows)
     if not rows:
@@ -2856,6 +2930,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_last_full_scan_ts: dict[str, float] = {}
     segment_force_full_scan_until: dict[str, float] = {}
     last_cleanup_ts: dict[str, float] = {}
+    last_mautic_lock_cleanup_ts: dict[str, float] = {}
     last_page_hits_orphan_cleanup_ts: dict[str, float] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
@@ -2897,15 +2972,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         now = time.time()
         if now >= next_scheduler_reconcile_at:
             rec = _reconcile_running_state(store=store, running=running, popens=popens)
-            if any(int(rec.get(k, 0) or 0) > 0 for k in ("adopted", "lost_pid", "lost_cmd", "duplicate")):
+            if any(int(rec.get(k, 0) or 0) > 0 for k in ("adopted", "lost_pid", "lost_cmd", "duplicate", "shadow_replaced")):
                 logging.warning(
-                    "scheduler reconcile: tracked=%s kept=%s adopted=%s lost_pid=%s lost_cmd=%s duplicate=%s",
+                    "scheduler reconcile: tracked=%s kept=%s adopted=%s lost_pid=%s lost_cmd=%s duplicate=%s shadow_replaced=%s",
                     int(rec.get("tracked_total", 0) or 0),
                     int(rec.get("kept", 0) or 0),
                     int(rec.get("adopted", 0) or 0),
                     int(rec.get("lost_pid", 0) or 0),
                     int(rec.get("lost_cmd", 0) or 0),
                     int(rec.get("duplicate", 0) or 0),
+                    int(rec.get("shadow_replaced", 0) or 0),
                 )
             next_scheduler_reconcile_at = now + max(15, int(config.scheduler_reconcile_interval_sec or 60))
         if now - last_launch_guard_prune_ts >= 300:
@@ -4616,6 +4692,82 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     logging.warning("[%s] contacts_cleanup failed: %s", root, e)
                 last_cleanup_ts[root] = now
+
+            last_mautic_lock_cleanup = last_mautic_lock_cleanup_ts.get(root, 0.0)
+            mautic_lock_cleanup_interval = max(300, int(config.mautic_lock_cleanup_interval_sec or 3600))
+            mautic_lock_cleanup_in_quiet = _in_daily_quiet_window(
+                dt,
+                max(0, min(23, int(config.mautic_lock_cleanup_quiet_hour or 3))),
+                max(1, min(720, int(config.mautic_lock_cleanup_quiet_window_min or 180))),
+            )
+            mautic_lock_cleanup_backup_running = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(
+                config
+            )
+            mautic_lock_cleanup_backup_pause, mautic_lock_cleanup_backup_reason = _backup_dispatch_pause_state(
+                config,
+                backup_running=mautic_lock_cleanup_backup_running,
+                now_local=dt,
+            )
+            if (
+                config.enable_mautic_lock_cleanup
+                and mautic_lock_cleanup_in_quiet
+                and not mautic_lock_cleanup_backup_pause
+                and (last_mautic_lock_cleanup == 0.0 or now - last_mautic_lock_cleanup >= mautic_lock_cleanup_interval)
+            ):
+                cutoff_utc = (
+                    now_utc - timedelta(seconds=max(1800, int(config.mautic_lock_cleanup_min_age_sec or 21600)))
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                skip_segment_ids = {
+                    int(task.entity_id)
+                    for task in running.values()
+                    if task.root == root and task.entity_id is not None and task.task_type in {"segment", "segment_sql"}
+                }
+                skip_campaign_ids = {
+                    int(task.entity_id)
+                    for task in running.values()
+                    if task.root == root
+                    and task.entity_id is not None
+                    and task.task_type in {"campaign_update", "campaign_rebuild", "campaign_trigger"}
+                }
+                try:
+                    lock_res = db.cleanup_stale_checked_out_locks(
+                        cutoff_utc=cutoff_utc,
+                        max_rows=config.mautic_lock_cleanup_max_rows_per_run,
+                        skip_segment_ids=skip_segment_ids,
+                        skip_campaign_ids=skip_campaign_ids,
+                    )
+                    seg_rows = lock_res.get("segments") if isinstance(lock_res, dict) else []
+                    camp_rows = lock_res.get("campaigns") if isinstance(lock_res, dict) else []
+                    seg_rows = seg_rows if isinstance(seg_rows, list) else []
+                    camp_rows = camp_rows if isinstance(camp_rows, list) else []
+                    cleared_segments = int((lock_res or {}).get("cleared_segments", 0) or 0)
+                    cleared_campaigns = int((lock_res or {}).get("cleared_campaigns", 0) or 0)
+                    if cleared_segments > 0 or cleared_campaigns > 0:
+                        logging.warning(
+                            "[%s] mautic_lock_cleanup cleared segments=%s campaigns=%s cutoff_utc=%s segment_ids=%s campaign_ids=%s",
+                            root,
+                            cleared_segments,
+                            cleared_campaigns,
+                            cutoff_utc,
+                            ",".join(str(int(row.get("id") or 0)) for row in seg_rows if int(row.get("id") or 0) > 0) or "-",
+                            ",".join(str(int(row.get("id") or 0)) for row in camp_rows if int(row.get("id") or 0) > 0) or "-",
+                        )
+                    else:
+                        logging.debug("[%s] mautic_lock_cleanup idle cutoff_utc=%s", root, cutoff_utc)
+                except Exception as e:
+                    logging.warning("[%s] mautic_lock_cleanup failed: %s", root, e)
+                last_mautic_lock_cleanup_ts[root] = now
+            elif (
+                config.enable_mautic_lock_cleanup
+                and mautic_lock_cleanup_in_quiet
+                and mautic_lock_cleanup_backup_pause
+                and (last_mautic_lock_cleanup == 0.0 or now - last_mautic_lock_cleanup >= mautic_lock_cleanup_interval)
+            ):
+                logging.info(
+                    "[%s] mautic_lock_cleanup skipped: backup guard active (%s)",
+                    root,
+                    mautic_lock_cleanup_backup_reason or "backup_guard",
+                )
 
             last_page_hits_cleanup = last_page_hits_orphan_cleanup_ts.get(root, 0.0)
             page_hits_cleanup_interval = max(60, int(config.page_hits_orphan_cleanup_interval_sec or 3600))

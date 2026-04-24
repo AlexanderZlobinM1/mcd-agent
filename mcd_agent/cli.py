@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import getpass
 import json
 import logging
@@ -1280,6 +1280,13 @@ def _build_parser() -> argparse.ArgumentParser:
     mfa_clear.add_argument("--email", required=True)
     mfa_clear.add_argument("--json", action="store_true")
 
+    lock_cleanup = sub.add_parser("mautic-locks:cleanup", help="Clear stale Mautic checked_out locks")
+    lock_cleanup.add_argument("--config", default=default_cfg)
+    lock_cleanup.add_argument("--root", help="Mautic root or instance uid (optional: all local instances)")
+    lock_cleanup.add_argument("--min-age-sec", type=int, default=21600)
+    lock_cleanup.add_argument("--max-rows", type=int, default=20)
+    lock_cleanup.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -1748,6 +1755,82 @@ def main() -> int:
                 )
             )
         _push_state_after_change(cfg, "admin-mfa-clear")
+        return 0
+
+    if args.cmd == "mautic-locks:cleanup":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        inv = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inv, cfg)
+        installs = inv.list_instances()
+        target_root = str(getattr(args, "root", "") or "").strip()
+        if target_root:
+            installs = [i for i in installs if i.root == target_root or i.instance_uid == target_root]
+            if not installs:
+                msg = f"Mautic install not found for root: {target_root}"
+                if bool(getattr(args, "json", False)):
+                    print(json.dumps({"status": "error", "reason": msg}, ensure_ascii=True, indent=2))
+                else:
+                    print(msg)
+                return 2
+        cutoff_utc = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(1800, int(getattr(args, "min_age_sec", 21600) or 21600)))
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        results: list[dict[str, object]] = []
+        changed = 0
+        for inst in installs:
+            row: dict[str, object] = {
+                "root": inst.root,
+                "name": inst.name,
+                "instance_uid": inst.instance_uid,
+                "cutoff_utc": cutoff_utc,
+            }
+            if not inst.db:
+                row["status"] = "skipped"
+                row["reason"] = "missing_db_config"
+                results.append(row)
+                continue
+            try:
+                payload = MauticDB(inst.db).cleanup_stale_checked_out_locks(
+                    cutoff_utc=cutoff_utc,
+                    max_rows=max(1, int(getattr(args, "max_rows", 20) or 20)),
+                )
+                row["status"] = "ok"
+                row["segments"] = payload.get("segments", [])
+                row["campaigns"] = payload.get("campaigns", [])
+                row["cleared_segments"] = int(payload.get("cleared_segments", 0) or 0)
+                row["cleared_campaigns"] = int(payload.get("cleared_campaigns", 0) or 0)
+                changed += int(row["cleared_segments"]) + int(row["cleared_campaigns"])
+            except Exception as e:
+                row["status"] = "error"
+                row["reason"] = str(e)
+            results.append(row)
+        if changed > 0:
+            _push_state_after_change(cfg, "mautic-locks-cleanup")
+        if bool(getattr(args, "json", False)):
+            print(
+                json.dumps(
+                    {"status": "ok", "cutoff_utc": cutoff_utc, "results": results},
+                    ensure_ascii=True,
+                    indent=2,
+                    default=str,
+                )
+            )
+        else:
+            for row in results:
+                print(
+                    "root={root} status={status} cleared_segments={segments} cleared_campaigns={campaigns}".format(
+                        root=str(row.get("root") or ""),
+                        status=str(row.get("status") or "unknown"),
+                        segments=int(row.get("cleared_segments", 0) or 0),
+                        campaigns=int(row.get("cleared_campaigns", 0) or 0),
+                    )
+                )
+                if str(row.get("status") or "") == "error":
+                    print(f"  reason={str(row.get('reason') or '')}")
+            print(f"cutoff_utc={cutoff_utc}")
         return 0
 
     if args.cmd == "exec":

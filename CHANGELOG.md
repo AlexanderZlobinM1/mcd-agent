@@ -1676,6 +1676,14 @@
 - Added: environment operations for IPv6 (`mcd-cli env ipv6 status|disable|enable`) with persistent `/etc/sysctl.d/99-disable-ipv6.conf`.
 - Added: interactive menu section `Environment` with IPv6 status/disable/enable.
 
+## 0.8.115 - 2026-04-25
+- Fixed: `mcd-cli mautic-locks:cleanup --json` now serializes stale lock rows safely instead of crashing on datetime values.
+
+## 0.8.114 - 2026-04-25
+- Fixed: mysql-hybrid scheduler shadow now resyncs SQLite failover rows from the authoritative MySQL task table so stale phantom running tasks stop accumulating in host signals.
+- Added: automatic stale Mautic `checked_out` lock cleanup for segments/campaigns with conservative quiet-window, age, and backup-guard controls.
+- Added: `mcd-cli mautic-locks:cleanup` for safe one-shot cleanup of stale Mautic locks on one or all local instances.
+
 ## 0.2.7 - 2026-02-18
 - Added: stable short `instance_uid` for each Mautic instance (derived from install root).
 - Changed: `mcd-cli instances list` now prints `uid=...` for every instance.
