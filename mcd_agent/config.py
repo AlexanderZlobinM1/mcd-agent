@@ -1881,11 +1881,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         ),
         mautic_lock_cleanup_quiet_hour=max(
             0,
-            min(23, int(runtime.get("mautic_lock_cleanup_quiet_hour", 3) or 3)),
+            min(23, int(runtime.get("mautic_lock_cleanup_quiet_hour", 0) or 0)),
         ),
         mautic_lock_cleanup_quiet_window_min=max(
             1,
-            min(720, int(runtime.get("mautic_lock_cleanup_quiet_window_min", 180) or 180)),
+            min(1440, int(runtime.get("mautic_lock_cleanup_quiet_window_min", 1440) or 1440)),
         ),
         mautic_lock_cleanup_min_age_sec=max(
             1800,

@@ -663,7 +663,7 @@ def _external_running_tasks(cfg, tracked: list[dict[str, object]] | None = None)
     if not roots:
         return []
     try:
-        return list_external_runtime_task_summaries(roots, tracked_pids=tracked_pids)
+        return list_external_runtime_task_summaries(roots, tracked_tasks=tracked_rows, tracked_pids=tracked_pids)
     except Exception:
         return []
 

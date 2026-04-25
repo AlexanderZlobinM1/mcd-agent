@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.8.119 - 2026-04-25
+
+- Moved stale Mautic lock cleanup to a lightweight all-day hourly schedule by default.
+  - Default `mautic_lock_cleanup_interval_sec` remains `3600`, but the default quiet window is now effectively always open (`00:00–24:00`).
+  - Backup guard remains active, so cleanup still backs off while backup is running or its protected pre-window is active.
+  - This keeps old `checked_out` segment/campaign locks from accumulating during the day without turning the task into a heavy maintenance job.
+- Tightened external console task detection.
+  - Child `php` processes of already tracked MCD jobs are no longer counted as external manual work.
+  - This keeps scheduler slot accounting correct on busy hosts and preserves the intended “manual jobs occupy real slots” behavior only for jobs truly started outside MCD.
+
 ## 0.8.117 - 2026-04-25
 
 - Counted real manual Mautic console jobs in the same concurrency budget as MCD-managed jobs.

@@ -2414,6 +2414,7 @@ def _extract_mautic_task_entity_id(args: list[str], start_idx: int) -> int | Non
 def list_external_runtime_task_summaries(
     known_roots: list[str] | set[str],
     *,
+    tracked_tasks: list[dict[str, object]] | None = None,
     tracked_pids: set[int] | None = None,
     timeout_sec: int = 4,
 ) -> list[dict[str, object]]:
@@ -2439,6 +2440,14 @@ def list_external_runtime_task_summaries(
         return []
 
     tracked = {int(x) for x in (tracked_pids or set()) if int(x) > 0}
+    tracked_keys: set[tuple[str, str, int | None]] = set()
+    for row in tracked_tasks or []:
+        tracked_root = str(row.get("root") or "").strip()
+        tracked_type = str(row.get("task_type") or "").strip()
+        tracked_entity = row.get("entity_id")
+        tracked_entity_id = int(tracked_entity) if tracked_entity is not None else None
+        if tracked_root and tracked_type:
+            tracked_keys.add((tracked_root, tracked_type, tracked_entity_id))
     rows: list[dict[str, object]] = []
     seen_pids: set[int] = set()
     now_ts = time.time()
@@ -2499,6 +2508,8 @@ def list_external_runtime_task_summaries(
             continue
 
         entity_id = _extract_mautic_task_entity_id(cmdline_args, command_idx + 1)
+        if (root, task_type, entity_id) in tracked_keys:
+            continue
         rows.append(
             {
                 "root": root,
@@ -2530,7 +2541,16 @@ def _sync_external_running_tasks(
     stats = {"observed": 0, "adopted": 0, "updated": 0, "released": 0}
     roots = [str(getattr(inst, "root", "") or "").strip() for inst in installs]
     internal_pids = {int(t.pid) for t in running.values() if not bool(getattr(t, "external", False)) and int(t.pid or 0) > 0}
-    observed_rows = list_external_runtime_task_summaries(roots, tracked_pids=internal_pids)
+    internal_tasks = [
+        {
+            "root": t.root,
+            "task_type": t.task_type,
+            "entity_id": t.entity_id,
+        }
+        for t in running.values()
+        if not bool(getattr(t, "external", False))
+    ]
+    observed_rows = list_external_runtime_task_summaries(roots, tracked_tasks=internal_tasks, tracked_pids=internal_pids)
     stats["observed"] = len(observed_rows)
     observed_by_key: dict[str, RunningTask] = {}
     for row in observed_rows:
@@ -4984,8 +5004,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             mautic_lock_cleanup_interval = max(300, int(config.mautic_lock_cleanup_interval_sec or 3600))
             mautic_lock_cleanup_in_quiet = _in_daily_quiet_window(
                 dt,
-                max(0, min(23, int(config.mautic_lock_cleanup_quiet_hour or 3))),
-                max(1, min(720, int(config.mautic_lock_cleanup_quiet_window_min or 180))),
+                max(0, min(23, int(config.mautic_lock_cleanup_quiet_hour or 0))),
+                max(1, min(1440, int(config.mautic_lock_cleanup_quiet_window_min or 1440))),
             )
             mautic_lock_cleanup_backup_running = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(
                 config
