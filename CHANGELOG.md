@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.8.117 - 2026-04-25
+
+- Counted real manual Mautic console jobs in the same concurrency budget as MCD-managed jobs.
+  - The daemon now observes live external `mautic:segments:update`, `mautic:campaigns:rebuild/update`, and `mautic:campaigns:trigger` / `mautic:campaign:trigger` console processes on managed instance roots.
+  - These external jobs now occupy the same segment / rebuild / trigger slots as native MCD launches, so MCD no longer over-dispatches when someone starts a real console job by hand.
+  - Externally started entity-specific jobs are also marked as executed in the current ring pass, so the same ID is not immediately relaunched by MCD in that cycle.
+  - Wrapper processes like `sudo`/`timeout` are ignored, so one real manual console launch consumes one slot instead of being double-counted.
+- Operator visibility:
+  - `mcd-cli scheduler status` now reports both tracked and external running tasks.
+  - maintenance status/kill logic now treats these observed external Mautic console jobs as managed work rather than orphan processes.
+
 ## 0.8.113 - 2026-04-23
 
 - Added install type to `mcd-cli instances list`.

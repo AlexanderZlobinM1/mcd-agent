@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -108,6 +109,15 @@ _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
     r"lock wait timeout|deadlock found|metadata lock|\(1040,|\(1205,|\(1213,|\(2006,|\(2013,)",
     re.IGNORECASE,
 )
+_EXTERNAL_TASK_TYPES = {
+    "mautic:segments:update": "segment",
+    "mautic:campaign:trigger": "campaign_trigger",
+    "mautic:campaigns:trigger": "campaign_trigger",
+    "mautic:campaign:rebuild": "campaign_rebuild",
+    "mautic:campaigns:rebuild": "campaign_rebuild",
+    "mautic:campaigns:update": "campaign_rebuild",
+}
+_EXTERNAL_PROCESS_WRAPPERS = {"sudo", "timeout", "bash", "sh", "setsid", "nohup"}
 
 
 @dataclass(frozen=True)
@@ -713,6 +723,7 @@ class RunningTask:
     started_at: float
     pid: int
     manual_request_id: int | None = None
+    external: bool = False
 
 
 def _load_id_file(path: str | None) -> set[int]:
@@ -2361,6 +2372,214 @@ def _pid_matches_task_command(pid: int, command_str: str) -> bool:
     return all(_cmdline_has_token(cmdline_args, tok) for tok in signature)
 
 
+def _normalize_root_path(path: str) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(Path(raw).resolve())
+    except Exception:
+        try:
+            return str(Path(raw).absolute())
+        except Exception:
+            return raw
+
+
+def _extract_mautic_task_entity_id(args: list[str], start_idx: int) -> int | None:
+    id_names = {"-i", "--id", "--list-id", "--campaign-id", "--segment-id"}
+    id_prefixes = ("--id=", "--list-id=", "--campaign-id=", "--segment-id=")
+    for idx in range(max(0, int(start_idx)), len(args)):
+        arg = str(args[idx] or "").strip()
+        if not arg:
+            continue
+        if arg in id_names and idx + 1 < len(args):
+            try:
+                return int(str(args[idx + 1]).strip())
+            except Exception:
+                continue
+        if arg.startswith("-i") and len(arg) > 2:
+            try:
+                return int(arg[2:])
+            except Exception:
+                continue
+        for prefix in id_prefixes:
+            if arg.startswith(prefix):
+                try:
+                    return int(arg[len(prefix) :].strip())
+                except Exception:
+                    break
+    return None
+
+
+def list_external_runtime_task_summaries(
+    known_roots: list[str] | set[str],
+    *,
+    tracked_pids: set[int] | None = None,
+    timeout_sec: int = 4,
+) -> list[dict[str, object]]:
+    roots_map: dict[str, str] = {}
+    for root in known_roots:
+        root_raw = str(root or "").strip()
+        if not root_raw:
+            continue
+        roots_map[_normalize_root_path(root_raw)] = root_raw
+    if not roots_map:
+        return []
+
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,etimes=,args="],
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_sec)),
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    tracked = {int(x) for x in (tracked_pids or set()) if int(x) > 0}
+    rows: list[dict[str, object]] = []
+    seen_pids: set[int] = set()
+    now_ts = time.time()
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            elapsed_sec = int(parts[1])
+        except Exception:
+            continue
+        if pid <= 0 or pid in seen_pids or pid in tracked:
+            continue
+        cmdline_args = _pid_cmdline_args(pid)
+        if not cmdline_args:
+            try:
+                cmdline_args = shlex.split(str(parts[2] or "").strip())
+            except Exception:
+                cmdline_args = []
+        if not cmdline_args:
+            continue
+        first_base = os.path.basename(str(cmdline_args[0] or "").strip())
+        if first_base in _EXTERNAL_PROCESS_WRAPPERS:
+            continue
+
+        console_idx = -1
+        console_path = ""
+        for idx, arg in enumerate(cmdline_args):
+            val = str(arg or "").strip()
+            if val.endswith("/bin/console") or val.endswith("/app/console"):
+                console_idx = idx
+                console_path = val
+                break
+        if console_idx < 0 or not console_path:
+            continue
+        command_idx = -1
+        command_name = ""
+        for idx in range(console_idx + 1, len(cmdline_args)):
+            val = str(cmdline_args[idx] or "").strip()
+            if val.startswith("mautic:"):
+                command_idx = idx
+                command_name = val
+                break
+        task_type = _EXTERNAL_TASK_TYPES.get(command_name)
+        if command_idx < 0 or not task_type:
+            continue
+
+        console_parent = Path(console_path).parent
+        if console_parent.name not in {"bin", "app"}:
+            continue
+        root_norm = _normalize_root_path(str(console_parent.parent))
+        root = roots_map.get(root_norm)
+        if not root:
+            continue
+
+        entity_id = _extract_mautic_task_entity_id(cmdline_args, command_idx + 1)
+        rows.append(
+            {
+                "root": root,
+                "task_type": task_type,
+                "entity_id": entity_id,
+                "pid": pid,
+                "elapsed_sec": elapsed_sec,
+                "started_at": float(now_ts - max(0, elapsed_sec)),
+                "command_str": _CMD_SEP.join(str(x) for x in cmdline_args if str(x or "").strip()),
+                "external": True,
+            }
+        )
+        seen_pids.add(pid)
+    rows.sort(key=lambda row: (str(row.get("root") or ""), str(row.get("task_type") or ""), int(row.get("pid") or 0)))
+    return rows
+
+
+def _external_task_key(root: str, task_type: str, entity_id: int | None, pid: int) -> str:
+    entity = "-" if entity_id is None else str(int(entity_id))
+    return f"external:{root}:{task_type}:{entity}:{int(pid)}"
+
+
+def _sync_external_running_tasks(
+    *,
+    installs: list[object],
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+) -> dict[str, int]:
+    stats = {"observed": 0, "adopted": 0, "updated": 0, "released": 0}
+    roots = [str(getattr(inst, "root", "") or "").strip() for inst in installs]
+    internal_pids = {int(t.pid) for t in running.values() if not bool(getattr(t, "external", False)) and int(t.pid or 0) > 0}
+    observed_rows = list_external_runtime_task_summaries(roots, tracked_pids=internal_pids)
+    stats["observed"] = len(observed_rows)
+    observed_by_key: dict[str, RunningTask] = {}
+    for row in observed_rows:
+        pid = int(row.get("pid") or 0)
+        root = str(row.get("root") or "").strip()
+        task_type = str(row.get("task_type") or "").strip()
+        entity_id = int(row["entity_id"]) if row.get("entity_id") is not None else None
+        key = _external_task_key(root, task_type, entity_id, pid)
+        observed_by_key[key] = RunningTask(
+            row_id=0,
+            root=root,
+            task_key=key,
+            task_type=task_type,
+            entity_id=entity_id,
+            command_str=str(row.get("command_str") or ""),
+            timeout_sec=0,
+            attempts=1,
+            started_at=float(row.get("started_at") or time.time()),
+            pid=pid,
+            manual_request_id=None,
+            external=True,
+        )
+
+    for key, task in list(running.items()):
+        if not bool(getattr(task, "external", False)):
+            continue
+        if key not in observed_by_key:
+            running.pop(key, None)
+            popens.pop(key, None)
+            stats["released"] += 1
+
+    for key, task in observed_by_key.items():
+        cur = running.get(key)
+        if cur is None:
+            running[key] = task
+            stats["adopted"] += 1
+            continue
+        if (
+            not bool(getattr(cur, "external", False))
+            or cur.pid != task.pid
+            or cur.entity_id != task.entity_id
+            or cur.task_type != task.task_type
+            or cur.command_str != task.command_str
+        ):
+            running[key] = task
+            stats["updated"] += 1
+    return stats
+
+
 def _kill_pid(pid: int, grace_sec: int) -> None:
     if not _is_pid_alive(pid):
         return
@@ -2604,6 +2823,21 @@ def _monitor_running(
 ) -> None:
     now = time.time()
     for key, task in list(running.items()):
+        if bool(getattr(task, "external", False)):
+            alive = _is_pid_alive(task.pid)
+            if alive and _pid_matches_task_command(task.pid, task.command_str):
+                continue
+            running.pop(key, None)
+            popens.pop(key, None)
+            logging.info(
+                "[%s] external %s entity=%s pid=%s released",
+                task.root,
+                task.task_type,
+                task.entity_id,
+                task.pid,
+            )
+            continue
+
         proc = popens.get(key)
         if proc is not None:
             rc = proc.poll()
@@ -2777,6 +3011,38 @@ def _reconcile_running_state(
         else:
             stats["kept"] += 1
     return stats
+
+
+def _mark_external_entities_executed(
+    *,
+    running: dict[str, RunningTask],
+    root: str,
+    seg_sql_done: set[int],
+    seg_sql_ring: deque[int],
+    seg_prio_ring: deque[int],
+    seg_reg_ring: deque[int],
+    trg_prio_ring: deque[int],
+    trg_reg_ring: deque[int],
+    reb_prio_ring: deque[int],
+    reb_reg_ring: deque[int],
+) -> None:
+    for task in running.values():
+        if not bool(getattr(task, "external", False)):
+            continue
+        if task.root != root or task.entity_id is None:
+            continue
+        entity_id = int(task.entity_id)
+        if task.task_type == "segment":
+            seg_sql_done.add(entity_id)
+            _mark_ring_entity_executed(seg_sql_ring, entity_id)
+            _mark_ring_entity_executed(seg_prio_ring, entity_id)
+            _mark_ring_entity_executed(seg_reg_ring, entity_id)
+        elif task.task_type == "campaign_trigger":
+            _mark_ring_entity_executed(trg_prio_ring, entity_id)
+            _mark_ring_entity_executed(trg_reg_ring, entity_id)
+        elif task.task_type == "campaign_rebuild":
+            _mark_ring_entity_executed(reb_prio_ring, entity_id)
+            _mark_ring_entity_executed(reb_reg_ring, entity_id)
 
 
 def _load_orphans_from_store(store: TaskStore) -> dict[str, RunningTask]:
@@ -2984,6 +3250,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     int(rec.get("shadow_replaced", 0) or 0),
                 )
             next_scheduler_reconcile_at = now + max(15, int(config.scheduler_reconcile_interval_sec or 60))
+        ext = _sync_external_running_tasks(installs=installs, running=running, popens=popens)
+        if any(int(ext.get(k, 0) or 0) > 0 for k in ("adopted", "updated", "released")):
+            logging.info(
+                "external task sync: observed=%s adopted=%s updated=%s released=%s",
+                int(ext.get("observed", 0) or 0),
+                int(ext.get("adopted", 0) or 0),
+                int(ext.get("updated", 0) or 0),
+                int(ext.get("released", 0) or 0),
+            )
         if now - last_launch_guard_prune_ts >= 300:
             _prune_entity_launch_guard(max_age_sec=3600, now_ts=now)
             last_launch_guard_prune_ts = now
@@ -4052,6 +4327,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set())
             reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set())
             reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set())
+            _mark_external_entities_executed(
+                running=running,
+                root=root,
+                seg_sql_done=seg_sql_done,
+                seg_sql_ring=seg_sql_ring,
+                seg_prio_ring=seg_prio_ring,
+                seg_reg_ring=seg_reg_ring,
+                trg_prio_ring=trg_prio_ring,
+                trg_reg_ring=trg_reg_ring,
+                reb_prio_ring=reb_prio_ring,
+                reb_reg_ring=reb_reg_ring,
+            )
 
             if dispatch_pause:
                 continue

@@ -34,7 +34,7 @@ from mcd_agent.admin_user import clear_hostnet_auth_mfa, hostnet_auth_mfa_status
 from mcd_agent.config import load_config
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
-from mcd_agent.daemon import TaskStore, run_loop
+from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.env import build_policy_plan, default_policy, ipv6_status, parse_policy_text, set_ipv6_disabled
 from mcd_agent.executor import (
@@ -645,6 +645,33 @@ def _tracked_running_tasks(cfg) -> list[dict[str, object]]:
     except Exception:
         return []
     return rows
+
+
+def _managed_instance_roots(cfg) -> list[str]:
+    try:
+        inventory = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inventory, cfg)
+        return [str(getattr(inst, "root", "") or "").strip() for inst in inventory.list_instances() if str(getattr(inst, "root", "") or "").strip()]
+    except Exception:
+        return []
+
+
+def _external_running_tasks(cfg, tracked: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
+    tracked_rows = tracked if tracked is not None else _tracked_running_tasks(cfg)
+    tracked_pids = {int(row.get("pid") or 0) for row in tracked_rows if int(row.get("pid") or 0) > 0}
+    roots = _managed_instance_roots(cfg)
+    if not roots:
+        return []
+    try:
+        return list_external_runtime_task_summaries(roots, tracked_pids=tracked_pids)
+    except Exception:
+        return []
+
+
+def _observed_running_tasks(cfg) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    tracked = _tracked_running_tasks(cfg)
+    external = _external_running_tasks(cfg, tracked)
+    return tracked, external
 
 
 def _list_mautic_console_processes() -> list[tuple[int, str]]:
@@ -2147,28 +2174,42 @@ def main() -> int:
             print(f"resumed: {flag}")
             return 0
         paused = flag.exists()
-        running = 0
-        try:
-            running = TaskStore(cfg.state_db_path, cfg).running_count()
-        except Exception:
-            running = -1
-        tracked: list[dict[str, object]] = []
-        if bool(getattr(args, "verbose", False)) or bool(getattr(args, "json", False)):
-            tracked = _tracked_running_tasks(cfg)
+        tracked, external = _observed_running_tasks(cfg)
+        running = len(tracked) + len(external)
         if bool(getattr(args, "json", False)):
             payload: dict[str, object] = {
                 "paused": bool(paused),
                 "running_tasks": int(running),
+                "tracked_running_tasks": int(len(tracked)),
+                "external_running_tasks": int(len(external)),
             }
             if bool(getattr(args, "verbose", False)):
                 payload["tracked_tasks"] = tracked
+                payload["external_tasks"] = external
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
-        print(f"paused={str(paused).lower()} running_tasks={running}")
+        print(
+            "paused={paused} running_tasks={running} tracked={tracked_count} external={external_count}".format(
+                paused=str(paused).lower(),
+                running=running,
+                tracked_count=len(tracked),
+                external_count=len(external),
+            )
+        )
         if bool(getattr(args, "verbose", False)):
             for task in tracked:
                 print(
                     "task type={task_type} entity={entity} pid={pid} root={root} cmd={cmd}".format(
+                        task_type=str(task.get("task_type") or "-"),
+                        entity=str(task.get("entity_id") if task.get("entity_id") is not None else "-"),
+                        pid=str(task.get("pid") or "-"),
+                        root=str(task.get("root") or "-"),
+                        cmd=str(task.get("command_str") or "-"),
+                    )
+                )
+            for task in external:
+                print(
+                    "external type={task_type} entity={entity} pid={pid} root={root} cmd={cmd}".format(
                         task_type=str(task.get("task_type") or "-"),
                         entity=str(task.get("entity_id") if task.get("entity_id") is not None else "-"),
                         pid=str(task.get("pid") or "-"),
@@ -2322,10 +2363,14 @@ def main() -> int:
             if flag.exists():
                 flag.unlink()
             cron_restore = restore_cron_service_if_needed(cfg)
-            tracked = _tracked_running_tasks(cfg)
-            tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
+            tracked, external = _observed_running_tasks(cfg)
+            managed_pids = {
+                int(x.get("pid") or 0)
+                for x in (tracked + external)
+                if int(x.get("pid") or 0) > 0
+            }
             consoles = _list_mautic_console_processes()
-            orphan_count = sum(1 for pid, _ in consoles if pid not in tracked_pids)
+            orphan_count = sum(1 for pid, _ in consoles if pid not in managed_pids)
             maintenance_state = collect_maintenance_state(cfg)
             payload = {
                 "status": "ok" if bool(cron_restore.get("ok", True)) else "error",
@@ -2336,6 +2381,8 @@ def main() -> int:
                 "cron_service_name": str(maintenance_state.get("cron_service_name", "") or ""),
                 "cron_service_active": maintenance_state.get("cron_service_active"),
                 "tracked_running": len(tracked),
+                "external_running": len(external),
+                "managed_running": len(tracked) + len(external),
                 "mautic_console_total": len(consoles),
                 "orphan_console": orphan_count,
                 "cron_restore": cron_restore,
@@ -2345,12 +2392,15 @@ def main() -> int:
             else:
                 print(
                     "maintenance=off paused={paused} cron_stopped={cron_stopped} cron_active={cron_active} "
-                    "cron_unit={cron_unit} tracked_running={tracked} mautic_console_total={total} orphan_console={orphans}".format(
+                    "cron_unit={cron_unit} managed_running={managed} tracked_running={tracked} external_running={external} "
+                    "mautic_console_total={total} orphan_console={orphans}".format(
                         paused=str(payload["paused"]).lower(),
                         cron_stopped=str(payload["cron_stopped"]).lower(),
                         cron_active=str(payload.get("cron_service_active")),
                         cron_unit=(payload.get("cron_service_name") or "-"),
+                        managed=payload["managed_running"],
                         tracked=payload["tracked_running"],
+                        external=payload["external_running"],
                         total=payload["mautic_console_total"],
                         orphans=payload["orphan_console"],
                     )
@@ -2361,10 +2411,14 @@ def main() -> int:
             return 0 if bool(cron_restore.get("ok", True)) else 1
 
         if args.op == "status":
-            tracked = _tracked_running_tasks(cfg)
-            tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
+            tracked, external = _observed_running_tasks(cfg)
+            managed_pids = {
+                int(x.get("pid") or 0)
+                for x in (tracked + external)
+                if int(x.get("pid") or 0) > 0
+            }
             consoles = _list_mautic_console_processes()
-            orphan_count = sum(1 for pid, _ in consoles if pid not in tracked_pids)
+            orphan_count = sum(1 for pid, _ in consoles if pid not in managed_pids)
             payload = {
                 "status": "ok",
                 "mode": str(maintenance_state.get("mode", "off")),
@@ -2374,6 +2428,8 @@ def main() -> int:
                 "cron_service_name": str(maintenance_state.get("cron_service_name", "") or ""),
                 "cron_service_active": maintenance_state.get("cron_service_active"),
                 "tracked_running": len(tracked),
+                "external_running": len(external),
+                "managed_running": len(tracked) + len(external),
                 "mautic_console_total": len(consoles),
                 "orphan_console": orphan_count,
             }
@@ -2382,13 +2438,16 @@ def main() -> int:
             else:
                 print(
                     "maintenance={mode} paused={paused} cron_stopped={cron_stopped} cron_active={cron_active} "
-                    "cron_unit={cron_unit} tracked_running={tracked} mautic_console_total={total} orphan_console={orphans}".format(
+                    "cron_unit={cron_unit} managed_running={managed} tracked_running={tracked} external_running={external} "
+                    "mautic_console_total={total} orphan_console={orphans}".format(
                         mode=payload["mode"],
                         paused=str(payload["paused"]).lower(),
                         cron_stopped=str(payload["cron_stopped"]).lower(),
                         cron_active=str(payload.get("cron_service_active")),
                         cron_unit=(payload.get("cron_service_name") or "-"),
+                        managed=payload["managed_running"],
                         tracked=payload["tracked_running"],
+                        external=payload["external_running"],
                         total=payload["mautic_console_total"],
                         orphans=payload["orphan_console"],
                     )
@@ -2402,11 +2461,14 @@ def main() -> int:
         cron_stop = {"ok": True, "requested": False, "unit": "", "cron_stopped": False, "message": ""}
 
         if not bool(args.no_kill_running):
-            tracked = _tracked_running_tasks(cfg)
-            for task in tracked:
+            tracked, external = _observed_running_tasks(cfg)
+            managed = tracked + external
+            seen_pids: set[int] = set()
+            for task in managed:
                 pid = int(task.get("pid") or 0)
-                if pid <= 0:
+                if pid <= 0 or pid in seen_pids:
                     continue
+                seen_pids.add(pid)
                 res = _kill_pid(pid, int(args.grace_sec))
                 if res in {"terminated", "killed", "already-exited"}:
                     stop_count += 1
@@ -2422,7 +2484,11 @@ def main() -> int:
                     )
 
             if bool(args.kill_orphans):
-                tracked_pids = {int(x.get("pid") or 0) for x in tracked if int(x.get("pid") or 0) > 0}
+                tracked_pids = {
+                    int(x.get("pid") or 0)
+                    for x in managed
+                    if int(x.get("pid") or 0) > 0
+                }
                 for pid, cmd in _list_mautic_console_processes():
                     if pid in tracked_pids:
                         continue
@@ -2438,7 +2504,7 @@ def main() -> int:
             if not bool(cron_stop.get("ok", False)):
                 print(f"WARN cron stop failed: {str(cron_stop.get('message', '') or '').strip()}")
 
-        tracked_after = _tracked_running_tasks(cfg)
+        tracked_after, external_after = _observed_running_tasks(cfg)
         consoles_after = _list_mautic_console_processes()
         maintenance_state = collect_maintenance_state(cfg)
         payload = {
@@ -2452,6 +2518,8 @@ def main() -> int:
             "stopped": stop_count,
             "stop_failed": failed_count,
             "tracked_running": len(tracked_after),
+            "external_running": len(external_after),
+            "managed_running": len(tracked_after) + len(external_after),
             "mautic_console_total": len(consoles_after),
             "cron_stop": cron_stop,
         }
@@ -2460,13 +2528,16 @@ def main() -> int:
         else:
             print(
                 "maintenance=on paused=true cron_stopped={cron_stopped} cron_active={cron_active} cron_unit={cron_unit} "
-                "stopped={stopped} stop_failed={failed} tracked_running={tracked} mautic_console_total={total}".format(
+                "stopped={stopped} stop_failed={failed} managed_running={managed} tracked_running={tracked} "
+                "external_running={external} mautic_console_total={total}".format(
                     cron_stopped=str(payload["cron_stopped"]).lower(),
                     cron_active=str(payload.get("cron_service_active")),
                     cron_unit=(payload.get("cron_service_name") or "-"),
                     stopped=payload["stopped"],
                     failed=payload["stop_failed"],
+                    managed=payload["managed_running"],
                     tracked=payload["tracked_running"],
+                    external=payload["external_running"],
                     total=payload["mautic_console_total"],
                 )
             )
