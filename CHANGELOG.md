@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.120 - 2026-04-25
+
+- Kept UI/CLI manual segment, campaign rebuild, and campaign trigger launches inside the MCD manual request queue for active profiles.
+  - If the daemon does not pick up the request immediately, `mcd-cli` now leaves the request queued instead of falling back to a direct console run.
+  - This preserves scheduler slot accounting: manual UI launches can temporarily overfill slots, and normal ring dispatch resumes only after running work drops back under configured limits.
+
 ## 0.8.119 - 2026-04-25
 
 - Moved stale Mautic lock cleanup to a lightweight all-day hourly schedule by default.

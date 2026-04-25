@@ -437,19 +437,6 @@ def _run_manual_command_with_scheduler(
             return 0, f"queued request_id={req_id} status={st_norm}"
         time.sleep(0.15)
 
-    # Daemon did not pick it quickly (service down/paused/etc) -> fallback to direct run.
-    if store.cancel_manual_request(req_id):
-        rc, output = execute_mautic_command(
-            php_bin=php_bin,
-            root=root,
-            command=command,
-            instance_id=instance_id,
-            timeout_sec=timeout_sec,
-            run_as_user=run_as_user,
-        )
-        prefix = f"manual request_id={req_id} fallback=direct\n"
-        return rc, prefix + (output or "")
-
     st = store.get_manual_request_status(req_id) or "unknown"
     return 0, f"queued request_id={req_id} status={st}"
 
