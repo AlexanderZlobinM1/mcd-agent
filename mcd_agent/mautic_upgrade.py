@@ -8,12 +8,14 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any
+from dataclasses import dataclass
 from urllib import error as urlerror
 import urllib.request
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.models import MauticInstall
 from mcd_agent.amazon_mailer_dep import (
     ensure_amazon_mailer_for_bundles,
     ensure_mailer_packages_for_sender_config,
@@ -47,7 +49,14 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
 }
 
 
-def _pick_install(config: AgentConfig, root: str | None) -> tuple[str, str]:
+@dataclass(slots=True)
+class UpgradeProbeResult:
+    ok: bool
+    summary: str
+    detail: str = ""
+
+
+def _pick_install_record(config: AgentConfig, root: str | None) -> MauticInstall:
     installs = discover_mautic(
         config.discovery_roots,
         config.exclude_path_contains,
@@ -57,13 +66,17 @@ def _pick_install(config: AgentConfig, root: str | None) -> tuple[str, str]:
     if root:
         for inst in installs:
             if inst.root == root:
-                return inst.root, inst.console_path
+                return inst
         raise RuntimeError(f"Mautic install not found: {root}")
     if not installs:
         raise RuntimeError("No Mautic install found")
     if len(installs) > 1:
         raise RuntimeError("Multiple installs found, pass --root")
-    inst = installs[0]
+    return installs[0]
+
+
+def _pick_install(config: AgentConfig, root: str | None) -> tuple[str, str]:
+    inst = _pick_install_record(config, root)
     return inst.root, inst.console_path
 
 
@@ -420,7 +433,7 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     _run([php_bin, console_path, "doctrine:migration:migrate", "--no-interaction"], cwd=project_root, as_www_data=True)
 
 
-def _pre_upgrade_permissions_check(config: AgentConfig, root: str) -> None:
+def _permissions_check(config: AgentConfig, root: str, *, stage_label: str) -> None:
     user = str(config.mautic_run_as_user or "www-data").strip() or "www-data"
     res = ensure_instance_permissions(
         root=root,
@@ -436,16 +449,129 @@ def _pre_upgrade_permissions_check(config: AgentConfig, root: str) -> None:
     repaired = len(res.repaired_paths)
     console_fixed = bool(res.console_exec_fixed)
     logging.info(
-        "[%s] pre-upgrade permissions check: repaired_paths=%s console_exec_fixed=%s missing_paths=%s",
+        "[%s] %s permissions check: repaired_paths=%s console_exec_fixed=%s missing_paths=%s",
         root,
+        stage_label,
         repaired,
         console_fixed,
         len(res.missing_paths),
     )
     print(
-        "Permissions pre-check: ok"
+        f"Permissions {stage_label}: ok"
         + (f" (repaired_paths={repaired}" + (", console_exec_fixed=1" if console_fixed else "") + ")" if (repaired or console_fixed) else "")
     )
+
+
+def _pre_upgrade_permissions_check(config: AgentConfig, root: str) -> None:
+    _permissions_check(config, root, stage_label="pre-upgrade")
+
+
+def _active_php_fpm_services() -> list[str]:
+    proc = subprocess.run(
+        [
+            "systemctl",
+            "list-units",
+            "--type",
+            "service",
+            "--state",
+            "active",
+            "--plain",
+            "--no-legend",
+            "php*-fpm.service",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in (proc.stdout or "").splitlines():
+        name = raw.strip().split(None, 1)[0].strip()
+        if name.endswith(".service"):
+            out.append(name)
+    return out
+
+
+def _curl_probe(url: str, *, resolve_local_host: str | None = None, follow_redirects: bool = True, timeout_sec: int = 20) -> UpgradeProbeResult:
+    cmd = ["curl", "-ksS", "--max-time", str(max(5, int(timeout_sec)))]
+    if follow_redirects:
+        cmd.append("-L")
+    if resolve_local_host:
+        cmd.extend(["--resolve", f"{resolve_local_host}:443:127.0.0.1"])
+    cmd.extend(["-o", "/dev/null", "-D", "-", url])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    body = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        detail = body or f"curl rc={proc.returncode}"
+        return UpgradeProbeResult(False, f"curl failed for {url}", detail)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    status_line = next((ln for ln in lines if ln.startswith("HTTP/")), "")
+    if not status_line:
+        return UpgradeProbeResult(False, f"probe returned no HTTP status for {url}", body[:600])
+    m = re.search(r"^HTTP/\S+\s+(\d{3})\b", status_line)
+    if not m:
+        return UpgradeProbeResult(False, f"probe returned malformed HTTP status for {url}", status_line)
+    code = int(m.group(1))
+    if 200 <= code < 400:
+        return UpgradeProbeResult(True, f"{url} -> HTTP {code}", status_line)
+    return UpgradeProbeResult(False, f"{url} -> HTTP {code}", body[:600])
+
+
+def _verify_nginx_and_php_services() -> None:
+    proc = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True)
+    nginx_state = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        print(f"Post-check: nginx inactive ({nginx_state or 'unknown'}), attempting start")
+        start = subprocess.run(["systemctl", "start", "nginx"], capture_output=True, text=True)
+        if start.returncode != 0:
+            raise RuntimeError(f"Post-check failed: cannot start nginx: {(start.stderr or start.stdout or '').strip()}")
+        proc = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True)
+        nginx_state = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Post-check failed: nginx still inactive after start: {nginx_state or 'unknown'}")
+        print("Post-check: nginx auto-start OK")
+    else:
+        print("Post-check: nginx service OK")
+
+    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    if test.returncode != 0:
+        raise RuntimeError(f"Post-check failed: nginx -t: {(test.stderr or test.stdout or '').strip()}")
+    print("Post-check: nginx -t OK")
+
+    php_services = _active_php_fpm_services()
+    if not php_services:
+        raise RuntimeError("Post-check failed: no active php-fpm service found")
+    print("Post-check: php-fpm active: " + ", ".join(php_services))
+
+
+def _best_probe_domain(inst: MauticInstall) -> str:
+    candidates: list[str] = []
+    if str(inst.primary_domain or "").strip():
+        candidates.append(str(inst.primary_domain or "").strip())
+    for value in list(inst.domains or []):
+        domain = str(value or "").strip()
+        if domain and domain not in candidates:
+            candidates.append(domain)
+    return candidates[0] if candidates else ""
+
+
+def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:
+    _permissions_check(config, inst.root, stage_label="post-upgrade")
+    _verify_nginx_and_php_services()
+    domain = _best_probe_domain(inst)
+    if not domain:
+        print("Post-check: no instance domain detected, skipping local/external HTTP probes")
+        return
+
+    local = _curl_probe(f"https://{domain}/", resolve_local_host=domain, follow_redirects=True, timeout_sec=20)
+    if not local.ok:
+        raise RuntimeError(f"Post-check failed: local origin probe: {local.summary}; {local.detail}".strip())
+    print("Post-check: local origin OK: " + local.summary)
+
+    external = _curl_probe(f"https://{domain}/", follow_redirects=True, timeout_sec=25)
+    if not external.ok:
+        raise RuntimeError(f"Post-check failed: external probe: {external.summary}; {external.detail}".strip())
+    print("Post-check: external HTTPS OK: " + external.summary)
 
 
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
@@ -474,7 +600,8 @@ def run_upgrade_apply(
     with_system_upgrade: bool,
     target_override: str | None = None,
 ) -> int:
-    install_root, console = _pick_install(config, root)
+    inst = _pick_install_record(config, root)
+    install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin)
     target = target_override or _latest_same_branch(config, current)
     if not target:
@@ -530,6 +657,8 @@ def run_upgrade_apply(
         bundles=installed_required_bundles(install_root),
         reason="mautic-upgrade",
     )
+
+    _post_upgrade_verify(config, inst)
 
     print(f"Upgrade completed: {current} -> {target}")
     return 0
