@@ -1,5 +1,127 @@
 # MCD Changelog
 
+## 0.8.137 - 2026-04-28
+
+- Added: Mautic upgrade post-check now runs after `mautic:update:apply` and validates runtime ownership/permissions again before declaring success.
+- Added: post-upgrade verification now checks `nginx` activity, auto-starts it if it stayed stopped after package or system changes, validates `nginx -t`, and confirms at least one `php-fpm` service is active.
+- Added: local origin HTTPS probe on the upgraded instance domain via `127.0.0.1` plus external HTTPS probe via the public domain, so MCC/MCD upgrade jobs fail fast if the web stack does not come back.
+
+## 0.8.138 - 2026-04-28
+
+- Added: `mcd-cli apt-upgrade` now runs a host service safety post-check after package upgrades.
+- Added: after `apt-get dist-upgrade -y`, the host-side APT flow ensures `nginx`, `mysql`/`mariadb`, `cron`, and detected `php-fpm` services are enabled for autostart and active again if package changes left them stopped.
+- Added: `nginx` receives extra validation via `nginx -t` after the service recovery step.
+- Added: MCC web APT jobs now expose these service post-check steps in the queue output because the web button executes `mcd-cli apt-upgrade --yes` through MCD.
+
+## 0.8.136 - 2026-04-27
+
+- Treat old `ondrej/nginx` `.mcd-disabled-*` files as unsatisfied nginx repo profile state, so the profile cleanup runs instead of being skipped by `apply_once`.
+
+## 0.8.135 - 2026-04-27
+
+- Removed dead `ppa:ondrej/nginx` source files instead of renaming them to `.mcd-disabled-*`.
+- Clean up old `ondrej/nginx` `.mcd-disabled-*` leftovers from `/etc/apt/sources.list.d` so `apt update` does not warn about invalid filename extensions.
+
+## 0.8.134 - 2026-04-27
+
+- Hardened APT repo profile convergence:
+  - active `.list`/`.sources` files are now checked separately from disabled backups;
+  - the official nginx profile no longer skips `apply_once` when an active Ondrej nginx source is still present;
+  - this prevents stale `ppa:ondrej/nginx` 404 sources from surviving after the profile was marked applied.
+- Old MCC runtime overrides with `service_profiles_components=["php_fpm","mysql"]` are migrated in-agent to include `apt`, so legacy host overrides do not block apt profile auto-apply.
+
+## 0.8.133 - 2026-04-27
+
+- Superseded by `0.8.134` before approval.
+
+## 0.8.132 - 2026-04-27
+
+- Enabled MCC-pulled service profiles by default:
+  - daemon auto-applies `php_fpm`, `mysql`, and `apt` profiles on the normal poll loop;
+  - hosts now pull dynamic stack parameters from MCC instead of requiring explicit MCC push/apply;
+  - apt repo profile markers now include a profile hash, so one-time repo setup re-runs when MCC changes the profile.
+
+## 0.8.131 - 2026-04-27
+
+- Added official stable `nginx.org` APT repo profile:
+  - disables the legacy Ondrej nginx PPA source when enabled;
+  - installs `/usr/share/keyrings/nginx-archive-keyring.gpg`;
+  - verifies fingerprint `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`;
+  - writes `/etc/apt/sources.list.d/nginx.list` for the host Ubuntu codename.
+- The legacy Ondrej PHP profile remains independent; only nginx is moved to official stable packages.
+
+## 0.8.130 - 2026-04-27
+
+- Added cluster asset guard for Mautic `plugins` and `app/bundles` only:
+  - `mcd-cli cluster-assets status|guard|fix-perms|reload` computes deterministic content digests, checks permissions, and reports Syncthing conflict files.
+  - Daemon guard can repair owner/mode drift and run cache clear/warmup plus PHP-FPM reload when plugin/bundle content changes.
+  - Agent state push reports asset digests to MCC so cluster nodes can be compared for plugin/bundle drift.
+
+## 0.8.129 - 2026-04-26
+
+- Fixed Mautic version cache source of truth:
+  - Cache refresh now uses the same MCD version detector as `mautic-upgrade check`, which is what MCC already uses for the displayed instance version.
+  - Zabbix still reads only `<instance-root>/.mcd/mautic.version`; `bin/console` is not run from the Zabbix UserParameter.
+  - This prevents stale package metadata such as `composer.lock` from downgrading the cached value when the running Mautic version is newer.
+
+## 0.8.128 - 2026-04-26
+
+- Added lightweight Mautic version cache for Zabbix:
+  - MCD state push now writes each instance version to `<instance-root>/.mcd/mautic.version`.
+  - Version discovery is performed by MCD and cached for monitoring.
+  - `mcd-cli zabbix install-mautic-version-cache` installs a `mautic.version[*]` UserParameter that reads the cache file without starting PHP/Mautic.
+  - `mcd-cli zabbix refresh-mautic-version-cache` refreshes all discovered instance caches on demand.
+
+## 0.8.127 - 2026-04-26
+
+- Added built-in Viber stats scheduling for instances with a Viber plugin installed.
+  - Active profiles run `viber:stats:update` every 10 minutes by default.
+  - MCC/runtime overrides can enable/disable it and change the interval per instance.
+  - Existing cron lines for `viber:stats:update` are commented while MCD manages tasks and restored when the host returns to `passive`.
+
+## 0.8.126 - 2026-04-26
+
+- Added unlimited campaign trigger mode:
+  - `runtime.campaign_limit = 0` / `off` / `unlimited` now omits `--campaign-limit`.
+  - Old persisted command templates containing `--campaign-limit={campaign_limit}` are also stripped when the limit is disabled.
+- Added self-update guard:
+  - automatic and manual MCD self-update is deferred while campaign trigger/rebuild/update console jobs are running.
+  - daemon auto-update also waits through a short post-campaign cooldown so updates do not slip between campaign batch passes.
+
+## 0.8.125 - 2026-04-26
+
+- Fixed legacy MCC-persisted `campaigns_due` migration for campaign trigger rings.
+  - Hosts that stored the generated trigger SQL without the old `date_triggered IS NULL` clause are now still recognized as legacy defaults.
+  - This lets package defaults replace stale local SQL and apply the UTC scheduled trigger fix without manual config surgery.
+
+## 0.8.124 - 2026-04-26
+
+- Fixed campaign trigger ring timing for scheduled/date-based Mautic campaigns.
+  - Mautic stores campaign event/log `trigger_date` in UTC, while publish windows remain local to the instance.
+  - MCD now compares scheduled campaign event `trigger_date` against `now_utc` so future campaigns such as ananasmk `621` enter the trigger ring at the intended local send time instead of up to the timezone offset early.
+
+## 0.8.123 - 2026-04-25
+
+- Made `mysql_hybrid` state backend safe for PXC/Galera cluster runtime.
+  - Normal daemon/status paths now only validate that the MySQL state database and schema already exist.
+  - Runtime paths no longer create databases, create tables, or run table migrations.
+  - Schema creation/migration is restricted to the explicit `mcd-cli state-db init` install/bootstrap command.
+  - The runtime MySQL user is granted DML-only permissions instead of DDL permissions.
+  - Bootstrap revokes existing runtime user grants before re-granting DML-only permissions, so old broad grants are not inherited.
+  - Added `mcd_schema_version` validation so old or partial schemas fall back to legacy SQLite mode instead of being modified by the daemon.
+
+## 0.8.122 - 2026-04-25
+
+- Migrated old MCC-generated `campaigns_due` SQL variants that still contained `campaign_lead_event_log.date_triggered IS NULL`.
+  - Hosts with an already-persisted legacy SQL now switch back to the current campaign trigger default during config load.
+  - This fixes scheduled Mautic 4 campaign triggers on hosts such as ananasmk where the stale SQL was stored in `/opt/mcd/etc/mcd.toml`.
+
+## 0.8.121 - 2026-04-25
+
+- Fixed campaign trigger due detection for scheduled/date-based Mautic 4 campaigns.
+  - MCD now treats `campaign_lead_event_log.is_scheduled = 1` plus `trigger_date <= now` as pending work.
+  - It no longer requires `date_triggered IS NULL`, because Mautic 4 fills `date_triggered` when the future event is scheduled, which made campaigns like ananasmk `622` invisible at the actual trigger time.
+
 ## 0.8.120 - 2026-04-25
 
 - Kept UI/CLI manual segment, campaign rebuild, and campaign trigger launches inside the MCD manual request queue for active profiles.

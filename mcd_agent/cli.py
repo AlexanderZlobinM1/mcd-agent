@@ -32,6 +32,13 @@ from mcd_agent.apt_profile import (
 )
 from mcd_agent.admin_user import clear_hostnet_auth_mfa, hostnet_auth_mfa_status, reset_admin_password
 from mcd_agent.config import load_config
+from mcd_agent.cluster_assets import (
+    collect_cluster_assets_status,
+    fix_cluster_asset_permissions,
+    format_cluster_assets_text,
+    guard_cluster_assets,
+    reload_cluster_asset_runtime,
+)
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
@@ -51,6 +58,10 @@ from mcd_agent.mautic6_core_patch import (
     ensure_m6_plugin_update_metadata_patch,
     patch_status as mautic6_patch_status,
     revert_m6_plugin_update_metadata_patch,
+)
+from mcd_agent.mautic_version_cache import (
+    discover_and_refresh_mautic_version_cache,
+    install_zabbix_mautic_version_userparameter,
 )
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
@@ -104,6 +115,105 @@ def _push_state_after_change(cfg, reason: str) -> None:
             logging.warning("MCC immediate push (%s) skipped/failed: %s", reason, msg)
     except Exception as e:
         logging.warning("MCC immediate push (%s) failed: %s", reason, e)
+
+
+def _unit_exists(service: str) -> bool:
+    proc = subprocess.run(["systemctl", "list-unit-files", f"{service}.service", "--no-legend"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return False
+    return f"{service}.service" in str(proc.stdout or "")
+
+
+def _php_fpm_services() -> list[str]:
+    proc = subprocess.run(
+        ["systemctl", "list-unit-files", "php*-fpm.service", "--type=service", "--no-legend"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in (proc.stdout or "").splitlines():
+        name = raw.strip().split(None, 1)[0].strip()
+        if name.endswith(".service"):
+            out.append(name.removesuffix(".service"))
+    return sorted(set(out))
+
+
+def _service_enable_and_start(service: str, lines: list[str]) -> bool:
+    enabled = subprocess.run(["systemctl", "is-enabled", service], capture_output=True, text=True)
+    enabled_state = (enabled.stdout or enabled.stderr or "").strip()
+    allowed_enabled_states = {"enabled", "enabled-runtime", "static", "alias", "indirect", "generated"}
+    if enabled.returncode != 0 or enabled_state not in allowed_enabled_states:
+        lines.append(f"postcheck: {service} enable required (state={enabled_state or 'disabled'})")
+        en = subprocess.run(["systemctl", "enable", service], capture_output=True, text=True)
+        if en.returncode != 0:
+            lines.append(f"postcheck: {service} enable failed: {(en.stderr or en.stdout or '').strip()}")
+            return False
+        lines.append(f"postcheck: {service} enable OK")
+    else:
+        lines.append(f"postcheck: {service} enabled ({enabled_state})")
+
+    active = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True)
+    active_state = (active.stdout or active.stderr or "").strip()
+    if active.returncode != 0 or active_state != "active":
+        lines.append(f"postcheck: {service} start required (state={active_state or 'inactive'})")
+        st = subprocess.run(["systemctl", "start", service], capture_output=True, text=True)
+        if st.returncode != 0:
+            lines.append(f"postcheck: {service} start failed: {(st.stderr or st.stdout or '').strip()}")
+            return False
+        active = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True)
+        active_state = (active.stdout or active.stderr or "").strip()
+        if active.returncode != 0 or active_state != "active":
+            lines.append(f"postcheck: {service} still not active after start (state={active_state or 'inactive'})")
+            return False
+        lines.append(f"postcheck: {service} start OK")
+    else:
+        lines.append(f"postcheck: {service} active")
+    return True
+
+
+def _apt_service_postcheck() -> tuple[bool, list[str]]:
+    lines: list[str] = []
+    ok = True
+
+    if _unit_exists("nginx"):
+        if not _service_enable_and_start("nginx", lines):
+            return False, lines
+        test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+        if test.returncode != 0:
+            lines.append(f"postcheck: nginx -t failed: {(test.stderr or test.stdout or '').strip()}")
+            return False, lines
+        lines.append("postcheck: nginx -t OK")
+    else:
+        lines.append("postcheck: nginx service not present, skip")
+
+    db_service = "mariadb" if _unit_exists("mariadb") else ("mysql" if _unit_exists("mysql") else "")
+    if db_service:
+        ok = _service_enable_and_start(db_service, lines) and ok
+    else:
+        lines.append("postcheck: mysql/mariadb service not present, skip")
+
+    if _unit_exists("cron"):
+        ok = _service_enable_and_start("cron", lines) and ok
+    else:
+        lines.append("postcheck: cron service not present, skip")
+
+    php_services = _php_fpm_services()
+    if php_services:
+        php_ok = False
+        for service in php_services:
+            if _service_enable_and_start(service, lines):
+                php_ok = True
+            else:
+                ok = False
+        if not php_ok:
+            lines.append("postcheck: no php-fpm service recovered")
+            ok = False
+    else:
+        lines.append("postcheck: php-fpm service not present, skip")
+
+    return ok, lines
 
 
 def _state_backend_status_payload(cfg) -> dict[str, object]:
@@ -1380,8 +1490,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     zbx = sub.add_parser("zabbix", help="Zabbix helper operations")
     zbx.add_argument("--config", default=default_cfg)
-    zbx.add_argument("op", choices=["status", "bootstrap-mysql-user"], nargs="?", default="status")
+    zbx.add_argument(
+        "op",
+        choices=[
+            "status",
+            "bootstrap-mysql-user",
+            "refresh-mautic-version-cache",
+            "install-mautic-version-cache",
+        ],
+        nargs="?",
+        default="status",
+    )
     zbx.add_argument("--force", action="store_true", help="Force rerun even if one-time marker exists")
+    zbx.add_argument("--no-restart", action="store_true", help="Do not restart zabbix-agent2 after config change")
     zbx.add_argument("--json", action="store_true")
 
     ro = sub.add_parser("runtime-overrides", help="Runtime overrides sync with MCC")
@@ -1468,6 +1589,17 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("op", choices=["status", "apply", "revert", "policy"], nargs="?", default="status")
     m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
     m6p.add_argument("--json", action="store_true")
+
+    assets = sub.add_parser("cluster-assets", help="Verify/sanitize cluster-shared Mautic plugins and app/bundles")
+    assets.add_argument("--config", default=default_cfg)
+    assets.add_argument("op", choices=["status", "guard", "fix-perms", "reload"], nargs="?", default="status")
+    assets.add_argument("--root", help="Instance root, uid, name, or primary domain (default: all local instances)")
+    assets.add_argument("--json", action="store_true")
+    assets.add_argument("--no-fix-perms", action="store_true", help="For guard: do not repair owner/mode drift")
+    assets.add_argument("--reload-on-change", action="store_true", help="For guard: force cache/opcache/FPM reload on content change")
+    assets.add_argument("--no-cache-clear", action="store_true", help="For reload: skip Mautic cache:clear")
+    assets.add_argument("--no-cache-warm", action="store_true", help="For reload: skip Mautic cache:warmup")
+    assets.add_argument("--no-fpm-reload", action="store_true", help="For reload: skip PHP-FPM reload/restart")
 
     uninst = sub.add_parser("uninstall", help="Remove MCD and restore pre-install crontab")
     uninst.add_argument("--service-name", default="mcd")
@@ -1897,6 +2029,70 @@ def main() -> int:
             _push_state_after_change(cfg, "plugins")
         return rc
 
+    if args.cmd == "cluster-assets":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        if args.op == "status":
+            payload = collect_cluster_assets_status(cfg, root=args.root)
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+            else:
+                print(format_cluster_assets_text(payload))
+            return 0 if str(payload.get("status")) in {"ok", "disabled"} else 1
+        if args.op == "guard":
+            payload = guard_cluster_assets(
+                cfg,
+                root=args.root,
+                fix_permissions=not bool(args.no_fix_perms),
+                reload_on_change=bool(args.reload_on_change) or bool(getattr(cfg, "cluster_assets_reload_on_change", False)),
+            )
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+            else:
+                assets_payload = payload.get("assets") if isinstance(payload.get("assets"), dict) else payload
+                print(format_cluster_assets_text(assets_payload))
+                if payload.get("changed"):
+                    print("changed roots: " + ", ".join(str(x) for x in payload.get("changed", [])))
+                if payload.get("reload"):
+                    print("reload status: " + str((payload.get("reload") or {}).get("status", "")))
+            _push_state_after_change(cfg, "cluster-assets-guard")
+            return 0 if str(payload.get("status")) in {"ok", "disabled"} else 1
+        if args.op == "fix-perms":
+            payload = fix_cluster_asset_permissions(cfg, root=args.root)
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+            else:
+                for row in payload.get("results", []) if isinstance(payload.get("results"), list) else []:
+                    print(
+                        "root={root} asset={asset} status={status} path={path}{reason}".format(
+                            root=str(row.get("root", "")),
+                            asset=str(row.get("asset", "")),
+                            status=str(row.get("status", "")),
+                            path=str(row.get("path", "")),
+                            reason=(" reason=" + str(row.get("reason", ""))) if row.get("reason") else "",
+                        )
+                    )
+            _push_state_after_change(cfg, "cluster-assets-fix-perms")
+            return 0 if str(payload.get("status")) == "ok" else 1
+        if args.op == "reload":
+            payload = reload_cluster_asset_runtime(
+                cfg,
+                root=args.root,
+                cache_clear=not bool(args.no_cache_clear),
+                cache_warm=not bool(args.no_cache_warm),
+                fpm_reload=not bool(args.no_fpm_reload),
+            )
+            if bool(args.json):
+                print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+            else:
+                print("cluster assets runtime reload: status=" + str(payload.get("status", "unknown")))
+                for row in payload.get("instances", []) if isinstance(payload.get("instances"), list) else []:
+                    print(f"root={row.get('root')} status={row.get('status')}")
+            _push_state_after_change(cfg, "cluster-assets-reload")
+            return 0 if str(payload.get("status")) == "ok" else 1
+
     if args.cmd == "mautic-upgrade":
         cfg = load_config(args.config)
         note = maybe_notify_update(cfg)
@@ -2093,6 +2289,28 @@ def main() -> int:
             print(json.dumps(out, ensure_ascii=True, indent=2))
             return 0
 
+        if op == "refresh-mautic-version-cache":
+            out = discover_and_refresh_mautic_version_cache(cfg)
+            print(json.dumps(out, ensure_ascii=True, indent=2))
+            return 0 if str(out.get("status", "")).lower() == "ok" else 1
+
+        if op == "install-mautic-version-cache":
+            install_res = install_zabbix_mautic_version_userparameter(restart_service=not bool(args.no_restart))
+            refresh_res = discover_and_refresh_mautic_version_cache(cfg)
+            out = {
+                "status": "ok"
+                if str(install_res.get("status", "")).lower() == "ok"
+                and str(refresh_res.get("status", "")).lower() == "ok"
+                else "error",
+                "install": install_res,
+                "refresh": refresh_res,
+            }
+            print(json.dumps(out, ensure_ascii=True, indent=2))
+            if out["status"] == "ok":
+                _push_state_after_change(cfg, "zabbix-mautic-version-cache")
+                return 0
+            return 1
+
         fetched = fetch_service_profile(cfg, "apt")
         profile = fetched.get("profile") if isinstance(fetched, dict) else None
         if not isinstance(profile, dict):
@@ -2254,12 +2472,19 @@ def main() -> int:
         update_rc = int(p_update.returncode)
         upgrade_rc = int(p_upgrade.returncode) if p_upgrade is not None else None
         ok = update_rc == 0 and (upgrade_rc in {0, None})
+        postcheck_lines: list[str] = []
+        if ok:
+            post_ok, postcheck_lines = _apt_service_postcheck()
+            for line in postcheck_lines:
+                print(line)
+            ok = ok and post_ok
         payload = {
             "status": ("ok" if ok else "error"),
             "update_rc": update_rc,
             "upgrade_rc": upgrade_rc,
             "duration_sec": duration,
             "dpkg_conf_policy": "force-confdef + force-confold",
+            "postcheck_lines": postcheck_lines,
         }
         if bool(args.json):
             print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -2622,6 +2847,8 @@ def main() -> int:
             return 1
         ok, msg = apply_update(cfg, decision)
         print(msg)
+        if (not ok) and "deferred" in str(msg).strip().lower():
+            return 2
         return 0 if ok else 1
 
     if args.cmd == "mautic6-patch":
