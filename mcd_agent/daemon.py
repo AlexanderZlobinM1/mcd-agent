@@ -32,6 +32,7 @@ from mcd_agent.backup import (
     backup_status,
     backup_storage_probe,
 )
+from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
@@ -40,6 +41,11 @@ from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.mautic_version_cache import (
+    install_zabbix_mautic_version_userparameter,
+    refresh_mautic_version_cache,
+)
+from mcd_agent.mode import reconcile_viber_stats_cron
 from mcd_agent.pagehit_cascade_patch import ensure_pagehit_cascade_patch
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
@@ -103,6 +109,12 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_mydumper_ionice_class",
     "backup_mydumper_ionice_level",
 }
+_VIBER_STATS_STABLE_RUNTIME_KEYS = {
+    "viber_stats_enabled",
+    "viber_stats_interval_sec",
+    "viber_stats_instance_settings",
+}
+_STABLE_RUNTIME_KEYS = _BACKUP_STABLE_RUNTIME_KEYS | _VIBER_STATS_STABLE_RUNTIME_KEYS
 
 _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
     r"(too many connections|lost connection to mysql|mysql server has gone away|"
@@ -118,6 +130,7 @@ _EXTERNAL_TASK_TYPES = {
     "mautic:campaigns:update": "campaign_rebuild",
 }
 _EXTERNAL_PROCESS_WRAPPERS = {"sudo", "timeout", "bash", "sh", "setsid", "nohup"}
+_ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC = 3600
 
 
 @dataclass(frozen=True)
@@ -134,8 +147,95 @@ def _to_int(value: object) -> int | None:
         return None
 
 
+def _to_boolish(value: object, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+    return bool(default)
+
+
+def _instance_has_viber_plugin(inst: object) -> bool:
+    root = str(getattr(inst, "root", "") or "").strip()
+    if not root:
+        return False
+    base = Path(root)
+    candidates = [
+        base / "plugins",
+        base / "docroot" / "plugins",
+        base / "public" / "plugins",
+    ]
+    for plugins_dir in candidates:
+        if not plugins_dir.exists() or not plugins_dir.is_dir():
+            continue
+        try:
+            for row in plugins_dir.iterdir():
+                if row.name.startswith(".") or not row.is_dir():
+                    continue
+                if "viber" in row.name.lower():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _viber_stats_setting_keys(inst: object) -> list[str]:
+    raw = [
+        getattr(inst, "instance_uid", None),
+        getattr(inst, "root", None),
+        getattr(inst, "name", None),
+        getattr(inst, "primary_domain", None),
+    ]
+    domains = getattr(inst, "domains", None)
+    if isinstance(domains, list):
+        raw.extend(domains)
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in raw:
+        key = str(value or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int]:
+    enabled = bool(getattr(config, "viber_stats_enabled", True))
+    interval = max(60, int(getattr(config, "viber_stats_interval_sec", 600) or 600))
+    settings = getattr(config, "viber_stats_instance_settings", {})
+    if not isinstance(settings, dict):
+        return enabled, interval
+    for key in _viber_stats_setting_keys(inst):
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw:
+                enabled = _to_boolish(raw.get("enabled"), enabled)
+            if "interval_sec" in raw:
+                try:
+                    interval = max(60, int(raw.get("interval_sec") or interval))
+                except Exception:
+                    pass
+            return enabled, interval
+        if isinstance(raw, bool):
+            return bool(raw), interval
+        try:
+            return enabled, max(60, int(raw or interval))
+        except Exception:
+            return enabled, interval
+    return enabled, interval
+
+
 def _persist_stable_backup_runtime_to_config(config: AgentConfig, applied_keys: list[str]) -> None:
-    stable_keys = sorted(set(applied_keys) & _BACKUP_STABLE_RUNTIME_KEYS)
+    stable_keys = sorted(set(applied_keys) & _STABLE_RUNTIME_KEYS)
     if not stable_keys:
         return
     eff_runtime = runtime_effective_map(config)
@@ -3151,6 +3251,47 @@ def _dispatch_manual_requests_for_root(
         )
 
 
+def _zabbix_agent2_present() -> bool:
+    return (
+        Path("/etc/zabbix/zabbix_agent2.conf").exists()
+        or Path("/etc/zabbix/zabbix_agent2.d").exists()
+        or Path("/usr/sbin/zabbix_agent2").exists()
+        or Path("/usr/bin/zabbix_agent2").exists()
+    )
+
+
+def _ensure_zabbix_mautic_version_cache_guard(config: AgentConfig, installs: list[object]) -> None:
+    if not _zabbix_agent2_present():
+        return
+    install_res = install_zabbix_mautic_version_userparameter(restart_service=False)
+    actions_raw = install_res.get("actions") if isinstance(install_res, dict) else []
+    actions = [str(x) for x in actions_raw] if isinstance(actions_raw, list) else []
+    changed = any(action.startswith("userparameter:") for action in actions)
+    refresh_res = refresh_mautic_version_cache(installs, config.php_bin, run_as_user=config.mautic_run_as_user)
+    if changed:
+        try:
+            proc = subprocess.run(
+                ["systemctl", "restart", "zabbix-agent2"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode == 0:
+                logging.info(
+                    "zabbix mautic.version cache guard repaired UserParameter; caches_updated=%s",
+                    int(refresh_res.get("updated", 0) or 0) if isinstance(refresh_res, dict) else 0,
+                )
+            else:
+                msg = (proc.stderr or proc.stdout or "restart failed").strip()
+                logging.warning("zabbix mautic.version cache guard restart failed: %s", msg[:500])
+        except Exception as e:
+            logging.warning("zabbix mautic.version cache guard restart failed: %s", e)
+    else:
+        updated = int(refresh_res.get("updated", 0) or 0) if isinstance(refresh_res, dict) else 0
+        if updated:
+            logging.debug("zabbix mautic.version cache guard refreshed caches=%s", updated)
+
+
 def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     logging.info("MCD loop started")
     base_config = config
@@ -3238,10 +3379,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_plan_refresh_at = 0.0
     next_update_check_at = 0.0
     update_deferred_by_backup = False
+    update_deferred_by_campaign = False
+    last_campaign_console_activity_ts = 0.0
     next_service_profile_apply_at = 0.0
     next_backup_profile_sync_at = 0.0
     next_backup_storage_probe_at = 0.0
+    next_zabbix_version_cache_guard_at = 0.0
     next_runtime_overrides_poll_at = 0.0
+    next_viber_cron_reconcile_at = 0.0
+    next_cluster_assets_guard_at = 0.0
     runtime_overrides_sync_requested = False
     # Always perform an initial runtime-overrides sync after daemon start/restart.
     # This is required even when periodic polling is disabled to avoid running
@@ -3279,6 +3425,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 int(ext.get("updated", 0) or 0),
                 int(ext.get("released", 0) or 0),
             )
+        if any(t.task_type in {"campaign_trigger", "campaign_rebuild", "campaign_update"} for t in running.values()):
+            last_campaign_console_activity_ts = now
         if now - last_launch_guard_prune_ts >= 300:
             _prune_entity_launch_guard(max_age_sec=3600, now_ts=now)
             last_launch_guard_prune_ts = now
@@ -3397,6 +3545,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("backup-profile sync from config failed: %s", e)
             next_backup_profile_sync_at = now + 60.0
 
+        if now >= next_zabbix_version_cache_guard_at:
+            try:
+                _ensure_zabbix_mautic_version_cache_guard(config, installs)
+            except Exception as e:
+                logging.warning("zabbix mautic.version cache guard failed: %s", e)
+            next_zabbix_version_cache_guard_at = now + _ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC
+
         if config.backup_enabled and now >= next_backup_storage_probe_at:
             try:
                 probe_res = backup_storage_probe(config)
@@ -3484,6 +3639,27 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.warning("custom cache cleanup failed: %s", e)
                 last_custom_cache_cleanup_ts = now
 
+        if bool(getattr(config, "cluster_assets_enabled", False)) and now >= next_cluster_assets_guard_at:
+            try:
+                guard_res = guard_cluster_assets(
+                    config,
+                    installs=installs,
+                    fix_permissions=bool(getattr(config, "cluster_assets_fix_permissions", True)),
+                    reload_on_change=bool(getattr(config, "cluster_assets_reload_on_change", True)),
+                )
+                pusher.latest_cluster_assets_state = guard_res.get("assets") if isinstance(guard_res.get("assets"), dict) else None
+                pusher.latest_cluster_assets_state_ts = now if pusher.latest_cluster_assets_state else 0.0
+                changed_roots = guard_res.get("changed") if isinstance(guard_res.get("changed"), list) else []
+                if changed_roots or str(guard_res.get("status", "")).lower() not in {"ok", "disabled"}:
+                    logging.warning(
+                        "cluster-assets guard: status=%s changed=%s",
+                        str(guard_res.get("status", "unknown")),
+                        ",".join(str(x) for x in changed_roots) if changed_roots else "-",
+                    )
+            except Exception as e:
+                logging.warning("cluster-assets guard failed: %s", e)
+            next_cluster_assets_guard_at = now + max(60, int(getattr(config, "cluster_assets_interval_sec", 600) or 600))
+
         if now >= next_update_check_at:
             update_backup_locked = False
             if config.backup_enabled:
@@ -3498,10 +3674,22 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.info("auto-update deferred: backup lock active; retry on next cycle")
                 update_deferred_by_backup = True
                 next_update_check_at = now + max(5, int(config.poll_interval_sec or 10))
+            elif (
+                bool(getattr(config, "mcd_update_defer_during_campaigns", True))
+                and last_campaign_console_activity_ts > 0.0
+                and now - last_campaign_console_activity_ts < max(60, int(config.mcd_update_wait_retry_sec or 60))
+            ):
+                if not update_deferred_by_campaign:
+                    logging.info("auto-update deferred: recent campaign console activity; retry after cooldown")
+                update_deferred_by_campaign = True
+                next_update_check_at = now + max(60, int(config.mcd_update_wait_retry_sec or 60))
             else:
                 if update_deferred_by_backup:
                     logging.info("auto-update defer cleared: backup lock released")
                 update_deferred_by_backup = False
+                if update_deferred_by_campaign:
+                    logging.info("auto-update campaign defer cleared: no recent campaign console activity")
+                update_deferred_by_campaign = False
                 try:
                     note, wait_sec = maybe_auto_update(config)
                     if note:
@@ -3519,7 +3707,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             try:
                 components = [c.strip().lower() for c in (config.service_profiles_components or []) if str(c).strip()]
                 if not components:
-                    components = ["php_fpm", "mysql"]
+                    components = ["php_fpm", "mysql", "apt"]
                 for comp in components:
                     if comp not in {"php_fpm", "php-fpm", "mysql", "apt"}:
                         continue
@@ -4265,6 +4453,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             except Exception as e:
                 logging.warning("profile guard check failed: %s", e)
             next_profile_guard_at = now + guard_interval
+
+        if now >= next_viber_cron_reconcile_at:
+            try:
+                vcron = reconcile_viber_stats_cron(
+                    profile_name=(config.profile_name or ""),
+                    install_dir="/opt/mcd",
+                )
+                changed = [
+                    line
+                    for line in vcron.lines
+                    if "commented viber stats" in line or "restored managed cron" in line
+                ]
+                if changed:
+                    logging.info("viber stats cron reconcile: %s", "; ".join(changed))
+                elif not vcron.ok:
+                    logging.warning("viber stats cron reconcile failed: %s", "; ".join(vcron.lines))
+            except Exception as e:
+                logging.warning("viber stats cron reconcile failed: %s", e)
+            next_viber_cron_reconcile_at = now + 60
 
         if (config.profile_name or "").strip().lower() == "passive":
             logging.info("Passive profile active: planning-only mode (no task dispatch)")
@@ -5204,6 +5411,31 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     popens=popens,
                 ):
                     last_cache_warm_ts[root] = now
+
+            if _instance_has_viber_plugin(inst):
+                viber_enabled, viber_interval = _viber_stats_effective_setting(config, inst)
+                viber_job_name = "viber:stats:update"
+                prev = jobs_last_run.get((root, viber_job_name), 0.0)
+                if viber_enabled and (prev <= 0 or now - prev >= max(60, viber_interval)):
+                    args = render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=viber_job_name,
+                    )
+                    if _submit_if_slot(
+                        config=config,
+                        store=store,
+                        running=running,
+                        root=root,
+                        task_type="job:viber_stats_update",
+                        entity_id=None,
+                        args=args,
+                        timeout_sec=config.command_timeout_sec,
+                        max_parallel_for_type=1,
+                        popens=popens,
+                    ):
+                        jobs_last_run[(root, viber_job_name)] = now
 
             for job in config.scheduled_jobs:
                 if not job.enabled:

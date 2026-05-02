@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import shutil
@@ -20,6 +21,8 @@ from mcd_agent.amazon_mailer_dep import (
     ensure_amazon_mailer_for_bundles,
     ensure_mailer_packages_for_sender_config,
     installed_required_bundles,
+    _ensure_node20,
+    _resolve_composer_bin,
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
@@ -164,14 +167,27 @@ def _parse_semver(raw: str) -> tuple[int, int, int]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def _read_current_version(root: str, console_path: str, php_bin: str) -> str:
+def _mautic_console_cmd(cmd: list[str], run_as_user: str | None = "www-data") -> list[str]:
+    user = str(run_as_user or "").strip()
+    if user and user != "root" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        return ["sudo", "-H", "-u", user] + cmd
+    return cmd
+
+
+def _read_current_version(root: str, console_path: str, php_bin: str, run_as_user: str | None = "www-data") -> str:
     cmds = [
         [php_bin, console_path, "--version"],
         [php_bin, console_path, "about", "--no-interaction"],
     ]
     for cmd in cmds:
         try:
-            proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=60)
+            proc = subprocess.run(
+                _mautic_console_cmd(cmd, run_as_user),
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
         except Exception:
             continue
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -418,19 +434,54 @@ def _resolve_composer_project_root(root: str) -> str:
     return root
 
 
+def _ensure_www_data_composer_cache() -> None:
+    cache_root = Path("/var/www/.cache/composer")
+    (cache_root / "vcs").mkdir(parents=True, exist_ok=True)
+    for path in (Path("/var/www/.cache"), cache_root, cache_root / "vcs"):
+        try:
+            os.chown(path, 33, 33)
+        except Exception:
+            subprocess.run(["chown", "www-data:www-data", str(path)], check=False)
+
+
+def _doctrine_migrate_command(project_root: str, console_path: str, php_bin: str) -> str:
+    proc = subprocess.run(
+        ["sudo", "-u", "www-data", php_bin, console_path, "list", "doctrine"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if "doctrine:migrations:migrate" in output:
+        return "doctrine:migrations:migrate"
+    if "doctrine:migration:migrate" in output:
+        return "doctrine:migration:migrate"
+    return "doctrine:migrations:migrate"
+
+
 def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str) -> None:
     project_root = _resolve_composer_project_root(root)
     cjson = Path(project_root) / "composer.json"
     if not cjson.exists():
         raise RuntimeError("composer.json not found")
+    composer_bin = _resolve_composer_bin()
+    _ensure_node20()
+    _ensure_www_data_composer_cache()
+    print(f"Composer preflight ok: {composer_bin}")
+    node_version = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=20, check=False)
+    if node_version.returncode == 0 and (node_version.stdout or "").strip():
+        print(f"Node.js preflight ok: {(node_version.stdout or '').strip()}")
     text = cjson.read_text(encoding="utf-8")
     updated, changes = _replace_version_tokens(text, current, target)
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
-    _run(["composer", "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
+    _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
     _run([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=project_root, as_www_data=True)
-    _run([php_bin, console_path, "doctrine:migration:migrate", "--no-interaction"], cwd=project_root, as_www_data=True)
+    migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
+    _run([php_bin, console_path, migration_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
 
 
 def _permissions_check(config: AgentConfig, root: str, *, stage_label: str) -> None:
@@ -576,7 +627,7 @@ def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:
 
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     install_root, console = _pick_install(config, root)
-    current = _read_current_version(install_root, console, config.php_bin)
+    current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _latest_same_branch(config, current)
     branch = _branch_key(current)
     print(f"root={install_root}")
@@ -602,7 +653,7 @@ def run_upgrade_apply(
 ) -> int:
     inst = _pick_install_record(config, root)
     install_root, console = inst.root, inst.console_path
-    current = _read_current_version(install_root, console, config.php_bin)
+    current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = target_override or _latest_same_branch(config, current)
     if not target:
         print(f"No upgrade target for current version {current}")
@@ -666,7 +717,7 @@ def run_upgrade_apply(
 
 def run_upgrade_interactive(config: AgentConfig, root: str | None) -> int:
     install_root, console = _pick_install(config, root)
-    current = _read_current_version(install_root, console, config.php_bin)
+    current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target_next = _latest_same_branch(config, current)
     branch = _branch_key(current)
     print(f"root={install_root}")

@@ -395,10 +395,10 @@ def _config_profile_payload(cfg: AgentConfig) -> dict[str, Any]:
         return {}
     out: dict[str, Any] = {}
     storage = _profile_storage_payload({"storage": backup.get("storage", {})})
-    if storage:
+    if storage and str(storage.get("host") or "").strip() and str(storage.get("user") or "").strip():
         out["storage"] = storage
     mysql = _profile_mysql_payload({"mysql": backup.get("mysql", {})})
-    if mysql:
+    if mysql and any(str(mysql.get(k) or "").strip() for k in ("host", "user", "password", "database")):
         out["mysql"] = mysql
     archive = _profile_archive_payload({"archive": backup.get("archive", {})})
     if archive:

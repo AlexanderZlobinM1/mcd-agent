@@ -47,6 +47,10 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 - Cron replacement workers:
   - use `[[jobs]]` in config for interval-based independent tasks
   - examples: `mautic:email:fetch` every 900 sec, `mautic:broadcasts:send` every 60 sec, `mautic:messages:send` every 60 sec
+- Viber stats worker:
+  - if an instance has a Viber plugin installed, active profiles run `viber:stats:update` through MCD every 600 sec by default
+  - MCC can override the interval per instance through `runtime.viber_stats_instance_settings`
+  - matching cron lines are commented while MCD manages tasks and restored when the host profile returns to `passive`
 - Scheduler model:
   - single daemon loop
   - DB/config refresh on `poll_interval_sec`
@@ -79,8 +83,8 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   - MCD keeps local config history (`10` snapshots by default).
 - MCC-driven dynamic service profiles:
   - service profile payload is stored on MCC and can be changed without MCD release rebuild.
-  - MCD fetches and applies host-specific profile by hardware plan (`php-fpm`, `mysql`, `apt` components).
-  - optional daemon auto-apply loop is controlled via runtime config.
+  - MCD pulls and auto-applies host-specific profile by hardware plan (`php-fpm`, `mysql`, `apt` components) on the normal daemon loop by default.
+  - manual fetch/apply remains available through `mcd-cli service-profile`.
 - Transitional shared agent-state backend for all installations:
   - optional `state.backend = "mysql_hybrid"` stores outbound events + latest state snapshot in MySQL/MariaDB,
   - agent uses dedicated state DB (`state.mysql_database`, default `mcd_state`) and auto-creates it if missing,
@@ -183,15 +187,19 @@ Manual command behavior:
 - `python -m mcd_agent service-profile --config ./etc/mcd-agent.example.toml rescan --component apt`
 - `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml status --json`
 - `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml bootstrap-mysql-user`
+- `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml refresh-mautic-version-cache`
+- `python -m mcd_agent zabbix --config ./etc/mcd-agent.example.toml install-mautic-version-cache`
 
 Notes:
 - `php_fpm` apply includes FPM pool/opcache/redis tuning. Global managed `98-mcd-php.ini` baseline is no longer used; legacy files are removed on apply if present.
 - APT profile includes one-time Zabbix DB monitor bootstrap (`zbx_monitor@127.0.0.1`) with marker tracking and manual override via `mcd-cli zabbix bootstrap-mysql-user --force`.
+- MCD writes each discovered Mautic version to `<instance-root>/.mcd/mautic.version`. The Zabbix `mautic.version[*]` helper installed by `install-mautic-version-cache` reads only that cache file and never runs `bin/console`.
 - APT profile includes modular one-time repo profiles with local markers (`/opt/mcd/var/apt-repo-profiles.json`):
   - `db_repo_profile` (auto-detect: MariaDB/Percona/MySQL families),
   - `ondrej_php_profile`,
-  - `ondrej_nginx_profile`.
-  Automatic checks stop after successful apply/verify; use `service-profile rescan --component apt` for manual recheck/fix.
+  - `nginx_official_stable_profile` (official stable `nginx.org` repo, disables Ondrej nginx source),
+  - `ondrej_nginx_profile` (legacy; disabled when official nginx profile is enabled).
+  Automatic checks stop after successful apply/verify for the same MCC profile hash and re-run when MCC changes the profile; use `service-profile rescan --component apt` for manual recheck/fix.
 - APT profile can also manage unattended-upgrades policy dynamically:
   - `unattended_upgrade_mode=off|security|all`,
   - `unattended_upgrade_schedule_cron` (host local cron),
@@ -325,7 +333,16 @@ Important:
   - guard runs in all profiles, including `passive` (planning-only mode still keeps filesystem ownership healthy).
 - Runtime tuning for large campaigns:
   - `runtime.campaign_limit` controls per-run trigger batch size.
+  - `runtime.campaign_limit = 0` (or `off` / `unlimited` via MCC runtime override) omits `--campaign-limit`, so one trigger run can process the whole campaign.
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.
+- Runtime tuning for Viber stats:
+  - `runtime.viber_stats_enabled = true` enables the built-in `viber:stats:update` scheduler for instances where a Viber plugin is installed.
+  - `runtime.viber_stats_interval_sec = 600` is the default interval.
+  - `runtime.viber_stats_instance_settings` can override specific instances by `instance_uid`, root, name, or domain.
+  - when the active profile is not `passive`, MCD comments matching `viber:stats:update` cron lines to avoid duplicate execution.
+- Self-update safety:
+  - `runtime.mcd_update_defer_during_campaigns = true` prevents MCD self-update while campaign trigger/rebuild/update console jobs are running.
+  - daemon auto-update keeps a short cooldown after campaign console activity to avoid restarting between batch passes.
 - Retry and watchdog:
   - `runtime.task_retry_max`, `runtime.task_retry_delay_sec` control retries for concrete command execution.
   - `runtime.task_retry_max` semantics:

@@ -1,10 +1,26 @@
 # MCD Changelog
 
-## 0.8.137 - 2026-04-28
+## 0.8.142 - 2026-05-01
 
-- Added: Mautic upgrade post-check now runs after `mautic:update:apply` and validates runtime ownership/permissions again before declaring success.
-- Added: post-upgrade verification now checks `nginx` activity, auto-starts it if it stayed stopped after package or system changes, validates `nginx -t`, and confirms at least one `php-fpm` service is active.
-- Added: local origin HTTPS probe on the upgraded instance domain via `127.0.0.1` plus external HTTPS probe via the public domain, so MCC/MCD upgrade jobs fail fast if the web stack does not come back.
+- Fixed: Mautic version probes no longer run `bin/console --version` as root; console probes run as the configured Mautic runtime user (`www-data` by default).
+- Changed: regular state pushes prefer the cached `.mcd/mautic.version` file and do not start Mautic console on every push.
+- Safety: forced version-cache refreshes still use Mautic's own detector, but execute under the runtime user to avoid root-owned Symfony/Mautic cache files.
+
+## 0.8.141 - 2026-05-01
+
+- Fixed: composer-based Mautic upgrades now run an idempotent preflight that installs Composer and Node.js 20 only when missing or too old.
+- Fixed: the www-data Composer cache directory is created before `composer update`, avoiding false upgrade failures on fresh migrated hosts.
+- Fixed: composer upgrade post-migration command now uses the available Doctrine migrations command, with fallback for older command names.
+
+## 0.8.140 - 2026-05-01
+
+- Added: nginx runtime baseline convergence for the official nginx profile and `apt-upgrade` post-check.
+- Added: MCD now enforces `user www-data;`, loads `/etc/nginx/sites-enabled/*.conf` when missing, and converts direct files in `sites-enabled` into symlinks backed by `sites-available`.
+- Safety: nginx baseline changes are validated with `nginx -t`; changed files are rolled back if validation fails.
+
+## 0.8.139 - 2026-04-30
+
+- Added: daemon-side Zabbix `mautic.version` cache guard. Hosts with Zabbix Agent2 now periodically enforce the cached UserParameter helper and refresh `.mcd/mautic.version` for discovered instances, preventing old `bin/console --version` checks from returning after config/profile reapplies.
 
 ## 0.8.138 - 2026-04-28
 
@@ -12,6 +28,12 @@
 - Added: after `apt-get dist-upgrade -y`, the host-side APT flow ensures `nginx`, `mysql`/`mariadb`, `cron`, and detected `php-fpm` services are enabled for autostart and active again if package changes left them stopped.
 - Added: `nginx` receives extra validation via `nginx -t` after the service recovery step.
 - Added: MCC web APT jobs now expose these service post-check steps in the queue output because the web button executes `mcd-cli apt-upgrade --yes` through MCD.
+
+## 0.8.137 - 2026-04-28
+
+- Added: Mautic upgrade post-check now runs after `mautic:update:apply` and validates runtime ownership/permissions again before declaring success.
+- Added: post-upgrade verification now checks `nginx` activity, auto-starts it if it stayed stopped after package or system changes, validates `nginx -t`, and confirms at least one `php-fpm` service is active.
+- Added: local origin HTTPS probe on the upgraded instance domain via `127.0.0.1` plus external HTTPS probe via the public domain, so MCC/MCD upgrade jobs fail fast if the web stack does not come back.
 
 ## 0.8.136 - 2026-04-27
 

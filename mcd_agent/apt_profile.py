@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import configparser
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from typing import Any
+from urllib import request as urlrequest
+
+from mcd_agent.nginx_baseline import ensure_nginx_baseline, nginx_baseline_satisfied
 
 
 def _run(cmd: list[str], *, timeout_sec: int = 120) -> subprocess.CompletedProcess[str]:
@@ -351,11 +356,7 @@ def _has_ppa_marker(marker: str) -> bool:
     marker_l = marker.strip().lower()
     if not marker_l:
         return False
-    files = [Path("/etc/apt/sources.list")]
-    files.extend(sorted(Path("/etc/apt/sources.list.d").glob("*")))
-    for p in files:
-        if not p.exists() or not p.is_file():
-            continue
+    for p in _active_source_files():
         try:
             txt = p.read_text(encoding="utf-8", errors="ignore").lower()
         except Exception:
@@ -375,6 +376,216 @@ def _ensure_ppa(ppa: str, *, timeout_sec: int) -> tuple[bool, str]:
         return True, f"added ppa:{ppa}"
     msg = (p.stderr or p.stdout or "").strip()
     return False, msg or f"add ppa:{ppa} failed"
+
+
+_NGINX_OFFICIAL_KEY_URL = "https://nginx.org/keys/nginx_signing.key"
+_NGINX_OFFICIAL_KEYRING = Path("/usr/share/keyrings/nginx-archive-keyring.gpg")
+_NGINX_OFFICIAL_SOURCE = Path("/etc/apt/sources.list.d/nginx.list")
+_NGINX_OFFICIAL_FINGERPRINT = "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+
+
+def _ubuntu_codename() -> str:
+    proc = _run(["lsb_release", "-cs"], timeout_sec=10) if shutil.which("lsb_release") else None
+    if proc is not None and proc.returncode == 0:
+        value = (proc.stdout or "").strip().splitlines()
+        if value and re.match(r"^[a-z][a-z0-9._-]+$", value[0]):
+            return value[0]
+    try:
+        for raw in Path("/etc/os-release").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if raw.startswith("VERSION_CODENAME="):
+                value = raw.split("=", 1)[1].strip().strip('"').strip("'")
+                if value and re.match(r"^[a-z][a-z0-9._-]+$", value):
+                    return value
+    except Exception:
+        pass
+    raise RuntimeError("ubuntu codename not detected")
+
+
+def _gpg_keyring_has_fingerprint(path: Path, fingerprint: str) -> bool:
+    if not path.exists() or not shutil.which("gpg"):
+        return False
+    proc = _run(["gpg", "--show-keys", "--with-colons", "--fingerprint", str(path)], timeout_sec=20)
+    if proc.returncode != 0:
+        return False
+    expected = re.sub(r"[^A-Fa-f0-9]", "", str(fingerprint or "")).upper()
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("fpr:"):
+            parts = line.split(":")
+            if len(parts) > 9 and parts[9].strip().upper() == expected:
+                return True
+    return False
+
+
+def _write_nginx_official_keyring(*, timeout_sec: int) -> tuple[bool, str]:
+    if not shutil.which("gpg"):
+        return False, "gpg not found; install gnupg2 before enabling nginx.org repository"
+    try:
+        with urlrequest.urlopen(_NGINX_OFFICIAL_KEY_URL, timeout=max(10, min(int(timeout_sec), 60))) as resp:
+            key_bytes = resp.read()
+    except Exception as e:
+        return False, f"nginx key download failed:{e}"
+    if not key_bytes:
+        return False, "nginx key download returned empty body"
+    _NGINX_OFFICIAL_KEYRING.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="nginx-signing-", suffix=".key", delete=False) as raw_tmp:
+        raw_tmp.write(key_bytes)
+        raw_tmp_path = Path(raw_tmp.name)
+    with tempfile.NamedTemporaryFile(prefix="nginx-keyring-", suffix=".gpg", delete=False) as gpg_tmp:
+        gpg_tmp_path = Path(gpg_tmp.name)
+    try:
+        proc = _run(["gpg", "--batch", "--yes", "--dearmor", "-o", str(gpg_tmp_path), str(raw_tmp_path)], timeout_sec=30)
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout or "").strip()
+            return False, msg or "nginx key dearmor failed"
+        if not _gpg_keyring_has_fingerprint(gpg_tmp_path, _NGINX_OFFICIAL_FINGERPRINT):
+            return False, "nginx key fingerprint mismatch"
+        gpg_tmp_path.chmod(0o644)
+        os.replace(str(gpg_tmp_path), str(_NGINX_OFFICIAL_KEYRING))
+        return True, f"installed:{_NGINX_OFFICIAL_KEYRING}"
+    finally:
+        try:
+            raw_tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            gpg_tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _nginx_official_repo_line(codename: str) -> str:
+    return (
+        "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] "
+        f"https://nginx.org/packages/ubuntu {codename} nginx"
+    )
+
+
+def _nginx_official_repo_present() -> bool:
+    txt = _all_sources_text_lower()
+    return "nginx.org/packages/ubuntu" in txt and " nginx" in txt
+
+
+def _source_has_ondrej_nginx_marker(text: str) -> bool:
+    low = text.lower()
+    return any(
+        marker in low
+        for marker in (
+            "ondrej/nginx",
+            "ppa.launchpadcontent.net/ondrej/nginx",
+            "ppa.launchpad.net/ondrej/nginx",
+        )
+    )
+
+
+def _disable_ondrej_nginx_sources() -> list[str]:
+    changed: list[str] = []
+    leftovers = sorted(Path("/etc/apt/sources.list.d").glob("*ondrej*nginx*.mcd-disabled-*"))
+    for p in leftovers:
+        try:
+            p.unlink()
+            changed.append(f"removed_leftover:{p}")
+        except Exception:
+            continue
+    for p in _active_source_files():
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _source_has_ondrej_nginx_marker(text):
+            continue
+        if p.suffix == ".sources":
+            try:
+                p.unlink()
+                changed.append(f"removed:{p}")
+            except Exception:
+                continue
+            continue
+        lines = text.splitlines()
+        new_lines: list[str] = []
+        touched = False
+        for line in lines:
+            if _source_has_ondrej_nginx_marker(line) and not line.lstrip().startswith("#"):
+                new_lines.append("# disabled by mcd nginx_official_stable profile: " + line)
+                touched = True
+            else:
+                new_lines.append(line)
+        if touched:
+            p.write_text("\n".join(new_lines).rstrip("\n") + "\n", encoding="utf-8")
+            changed.append(str(p))
+    return changed
+
+
+def _active_ondrej_nginx_source_present() -> bool:
+    for p in _active_source_files():
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if _source_has_ondrej_nginx_marker(line):
+                return True
+    return False
+
+
+def _ondrej_nginx_disabled_leftovers_present() -> bool:
+    try:
+        return any(Path("/etc/apt/sources.list.d").glob("*ondrej*nginx*.mcd-disabled-*"))
+    except Exception:
+        return False
+
+
+def _nginx_official_profile_satisfied(*, remove_ondrej: bool) -> bool:
+    if not _gpg_keyring_has_fingerprint(_NGINX_OFFICIAL_KEYRING, _NGINX_OFFICIAL_FINGERPRINT):
+        return False
+    if not _nginx_official_repo_present():
+        return False
+    if _ondrej_nginx_disabled_leftovers_present():
+        return False
+    if remove_ondrej and _active_ondrej_nginx_source_present():
+        return False
+    if not nginx_baseline_satisfied():
+        return False
+    return True
+
+
+def _ensure_nginx_official_stable_repo(
+    *,
+    remove_ondrej: bool,
+    timeout_sec: int,
+) -> tuple[bool, str, list[str]]:
+    actions: list[str] = []
+    if remove_ondrej:
+        disabled = _disable_ondrej_nginx_sources()
+        if disabled:
+            actions.append("disabled_ondrej_nginx_sources:" + ",".join(disabled))
+
+    key_ok = _gpg_keyring_has_fingerprint(_NGINX_OFFICIAL_KEYRING, _NGINX_OFFICIAL_FINGERPRINT)
+    if not key_ok:
+        ok, msg = _write_nginx_official_keyring(timeout_sec=timeout_sec)
+        if not ok:
+            return False, msg, actions
+        actions.append(msg)
+
+    codename = _ubuntu_codename()
+    desired = _nginx_official_repo_line(codename) + "\n"
+    existing = ""
+    try:
+        if _NGINX_OFFICIAL_SOURCE.exists():
+            existing = _NGINX_OFFICIAL_SOURCE.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        existing = ""
+    if existing != desired:
+        _NGINX_OFFICIAL_SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        _NGINX_OFFICIAL_SOURCE.write_text(desired, encoding="utf-8")
+        actions.append(f"wrote:{_NGINX_OFFICIAL_SOURCE}")
+
+    if not _nginx_official_repo_present():
+        return False, "nginx.org repository source not detected after write", actions
+    if not actions:
+        actions.append("nginx_official_stable_repo:already_present")
+    return True, "nginx_official_stable_repo:ok", actions
 
 
 def _run_mariadb_repo_setup(version: str, *, timeout_sec: int) -> tuple[bool, str]:
@@ -520,15 +731,16 @@ def clear_apt_repo_profile_markers(*, cfg: Any | None = None) -> dict[str, Any]:
     }
 
 
-def _all_source_files() -> list[Path]:
+def _active_source_files() -> list[Path]:
     files: list[Path] = [Path("/etc/apt/sources.list")]
-    files.extend(sorted(Path("/etc/apt/sources.list.d").glob("*")))
+    files.extend(sorted(Path("/etc/apt/sources.list.d").glob("*.list")))
+    files.extend(sorted(Path("/etc/apt/sources.list.d").glob("*.sources")))
     return [p for p in files if p.exists() and p.is_file()]
 
 
 def _all_sources_text_lower() -> str:
     chunks: list[str] = []
-    for p in _all_source_files():
+    for p in _active_source_files():
         try:
             chunks.append(p.read_text(encoding="utf-8", errors="ignore").lower())
         except Exception:
@@ -656,6 +868,7 @@ def _apply_repo_profiles(
         marker["profiles"] = profiles
 
     now = _now_utc_iso()
+    profile_hash = hashlib.sha256(json.dumps(profile or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     def _mark(
         key: str,
@@ -671,6 +884,7 @@ def _apply_repo_profiles(
             row = {}
         row["last_status"] = str(status or "")
         row["applied"] = bool(applied)
+        row["profile_hash"] = profile_hash
         row["checked_at_utc"] = now
         row["last_error"] = "" if applied else str(reason or "")
         if bool(applied):
@@ -687,9 +901,10 @@ def _apply_repo_profiles(
     db_enabled = _bool(profile.get("db_repo_profile_enabled", profile.get("mariadb_repo_setup_enabled")), True)
     db_once = _bool(profile.get("db_repo_profile_apply_once"), True)
     db_row = profiles.get("db_repo") if isinstance(profiles.get("db_repo"), dict) else {}
+    db_same_profile = str(db_row.get("profile_hash", "") or "") == profile_hash
     if not db_enabled:
         actions.append("db_repo_profile:disabled")
-    elif db_once and bool(db_row.get("applied", False)) and not force_rescan:
+    elif db_once and bool(db_row.get("applied", False)) and db_same_profile and not force_rescan:
         actions.append("db_repo_profile:skip_once")
     else:
         detected = _detect_db_repo_target(timeout_sec=max(10, int(timeout_sec)))
@@ -728,9 +943,10 @@ def _apply_repo_profiles(
     php_enabled = _bool(profile.get("ondrej_php_profile_enabled", profile.get("ensure_ondrej_php_ppa")), True)
     php_once = _bool(profile.get("ondrej_php_profile_apply_once"), True)
     php_row = profiles.get("ondrej_php") if isinstance(profiles.get("ondrej_php"), dict) else {}
+    php_same_profile = str(php_row.get("profile_hash", "") or "") == profile_hash
     if not php_enabled:
         actions.append("ondrej_php_profile:disabled")
-    elif php_once and bool(php_row.get("applied", False)) and not force_rescan:
+    elif php_once and bool(php_row.get("applied", False)) and php_same_profile and not force_rescan:
         actions.append("ondrej_php_profile:skip_once")
     else:
         if _has_ppa_marker("ondrej/php"):
@@ -746,13 +962,58 @@ def _apply_repo_profiles(
                 _mark("ondrej_php", status="error", applied=False, reason=msg, attempted_once=False)
                 errors.append(f"ondrej_php_profile:{msg}")
 
-    # Ondrej nginx repo profile (independent one-time profile).
+    # Official stable nginx.org repo profile. This replaces the historical Ondrej
+    # nginx PPA for nginx packages, while keeping Ondrej PHP independent.
+    nginx_official_enabled = _bool(
+        profile.get("nginx_official_stable_profile_enabled", profile.get("ensure_nginx_official_stable_repo")),
+        False,
+    )
+    nginx_official_once = _bool(profile.get("nginx_official_stable_profile_apply_once"), True)
+    nginx_official_remove_ondrej = _bool(profile.get("nginx_official_stable_remove_ondrej"), True)
+    nginx_official_row = profiles.get("nginx_official_stable") if isinstance(profiles.get("nginx_official_stable"), dict) else {}
+    nginx_official_same_profile = str(nginx_official_row.get("profile_hash", "") or "") == profile_hash
+    if not nginx_official_enabled:
+        actions.append("nginx_official_stable_profile:disabled")
+    elif (
+        nginx_official_once
+        and bool(nginx_official_row.get("applied", False))
+        and nginx_official_same_profile
+        and _nginx_official_profile_satisfied(remove_ondrej=bool(nginx_official_remove_ondrej))
+        and not force_rescan
+    ):
+        actions.append("nginx_official_stable_profile:skip_once")
+    else:
+        ok, msg, repo_actions = _ensure_nginx_official_stable_repo(
+            remove_ondrej=bool(nginx_official_remove_ondrej),
+            timeout_sec=max(30, int(timeout_sec)),
+        )
+        actions.extend(repo_actions)
+        if ok:
+            baseline = ensure_nginx_baseline(reload_service=True)
+            baseline_actions = baseline.get("actions") if isinstance(baseline, dict) else []
+            if isinstance(baseline_actions, list):
+                actions.extend(f"nginx_runtime_baseline:{x}" for x in baseline_actions)
+            if str(baseline.get("status", "") if isinstance(baseline, dict) else "").lower() == "error":
+                err = str(baseline.get("error", "nginx runtime baseline failed") if isinstance(baseline, dict) else "nginx runtime baseline failed")
+                _mark("nginx_official_stable", status="error", applied=False, reason=err, attempted_once=False)
+                errors.append(f"nginx_official_stable_profile:{err}")
+            else:
+                _mark("nginx_official_stable", status="applied", applied=True)
+                actions.append("nginx_official_stable_profile:applied")
+        else:
+            _mark("nginx_official_stable", status="error", applied=False, reason=msg, attempted_once=False)
+            errors.append(f"nginx_official_stable_profile:{msg}")
+
+    # Legacy Ondrej nginx repo profile (independent one-time profile).
     nginx_enabled = _bool(profile.get("ondrej_nginx_profile_enabled", profile.get("ensure_ondrej_nginx_ppa")), False)
     nginx_once = _bool(profile.get("ondrej_nginx_profile_apply_once"), True)
     nginx_row = profiles.get("ondrej_nginx") if isinstance(profiles.get("ondrej_nginx"), dict) else {}
-    if not nginx_enabled:
+    nginx_same_profile = str(nginx_row.get("profile_hash", "") or "") == profile_hash
+    if nginx_official_enabled:
+        actions.append("ondrej_nginx_profile:disabled_by_nginx_official_stable")
+    elif not nginx_enabled:
         actions.append("ondrej_nginx_profile:disabled")
-    elif nginx_once and bool(nginx_row.get("applied", False)) and not force_rescan:
+    elif nginx_once and bool(nginx_row.get("applied", False)) and nginx_same_profile and not force_rescan:
         actions.append("ondrej_nginx_profile:skip_once")
     else:
         if _has_ppa_marker("ondrej/nginx"):
@@ -1486,6 +1747,7 @@ def apply_apt_profile(
                 "remove_third_party_sources",
                 "dedupe_list_sources",
                 "repo_profiles",
+                "nginx_official_stable_repo",
                 "unattended_upgrades",
                 "repair_repos_on_error",
                 "apt_update",
@@ -1512,6 +1774,10 @@ def apply_apt_profile(
     db_repo_profile_enabled = _bool(profile.get("db_repo_profile_enabled", mariadb_repair), True)
     ondrej_php_profile_enabled = _bool(profile.get("ondrej_php_profile_enabled", ensure_php_ppa), True)
     ondrej_nginx_profile_enabled = _bool(profile.get("ondrej_nginx_profile_enabled", ensure_nginx_ppa), False)
+    nginx_official_stable_profile_enabled = _bool(
+        profile.get("nginx_official_stable_profile_enabled", profile.get("ensure_nginx_official_stable_repo")),
+        False,
+    )
     upgrade_mode = str(profile.get("upgrade_mode", "none")).strip().lower() or "none"
     packages_present = [str(x).strip() for x in list(profile.get("packages_present", []) or []) if str(x).strip()]
     packages_absent = [str(x).strip() for x in list(profile.get("packages_absent", []) or []) if str(x).strip()]
@@ -1578,7 +1844,13 @@ def apply_apt_profile(
                 fixed_any = True
             else:
                 errors.append(msg)
-        if (not ondrej_nginx_profile_enabled) and ensure_nginx_ppa and ("ondrej" in txt or "nginx" in txt) and not _has_ppa_marker("ondrej/nginx"):
+        if (
+            (not nginx_official_stable_profile_enabled)
+            and (not ondrej_nginx_profile_enabled)
+            and ensure_nginx_ppa
+            and ("ondrej" in txt or "nginx" in txt)
+            and not _has_ppa_marker("ondrej/nginx")
+        ):
             ok, msg = _ensure_ppa("ondrej/nginx", timeout_sec=refresh_timeout_sec)
             actions.append(msg)
             if ok:

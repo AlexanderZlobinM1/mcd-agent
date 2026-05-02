@@ -28,11 +28,13 @@ from pymysql.cursors import DictCursor
 from mcd_agent import __version__
 from mcd_agent.apt_profile import collect_apt_state
 from mcd_agent.backup import backup_profile_for_push, backup_state_for_push
+from mcd_agent.cluster_assets import collect_cluster_assets_status
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.maintenance_mode import collect_maintenance_state
+from mcd_agent.mautic_version_cache import collect_mautic_version
 from mcd_agent.runtime_overrides import local_runtime_overrides
 from mcd_agent.state_backend import (
     mark_outbound_event_mysql,
@@ -45,7 +47,6 @@ from mcd_agent.state_backend import (
 )
 
 _BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle$")
-_SEMVER_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/var/run/mysqld/mysqld.sock",
     "/run/mysqld/mysqld.sock",
@@ -954,60 +955,6 @@ def _candidate_roots(root: str) -> list[Path]:
     return out
 
 
-def _read_version_from_console(root: Path, php_bin: str) -> str | None:
-    console = root / "bin" / "console"
-    if not console.exists():
-        return None
-    cmds = [
-        [php_bin, str(console), "--version"],
-        [php_bin, str(console), "about", "--no-interaction"],
-    ]
-    for cmd in cmds:
-        try:
-            proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
-        except Exception:
-            continue
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        m = _SEMVER_RE.search(out)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _read_version_from_composer_lock(root: Path) -> str | None:
-    lock = root / "composer.lock"
-    if not lock.exists():
-        return None
-    try:
-        data = json.loads(lock.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    packages = data.get("packages", [])
-    if not isinstance(packages, list):
-        return None
-    for pkg in packages:
-        if not isinstance(pkg, dict):
-            continue
-        if str(pkg.get("name", "")) not in {"mautic/core-lib", "mautic/core-bundle", "mautic/core"}:
-            continue
-        v = str(pkg.get("version", ""))
-        m = _SEMVER_RE.search(v)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _collect_mautic_version(root: str, php_bin: str) -> str:
-    for candidate in _candidate_roots(root):
-        v = _read_version_from_console(candidate, php_bin)
-        if v:
-            return v
-        v = _read_version_from_composer_lock(candidate)
-        if v:
-            return v
-    return "-"
-
-
 def _collect_installed_plugins(root: str, limit: int = 200) -> list[dict[str, str]]:
     base = Path(root)
     candidates = [
@@ -1217,6 +1164,8 @@ class MCCStatePusher:
         self.latest_cluster_db_state_ts = 0.0
         self.latest_state_backend: dict[str, Any] | None = None
         self.latest_state_backend_ts = 0.0
+        self.latest_cluster_assets_state: dict[str, Any] | None = None
+        self.latest_cluster_assets_state_ts = 0.0
         self._last_snapshot_hash = ""
         self._last_snapshot_ts = 0.0
         # Filesystem-permissions repair deltas.
@@ -1435,6 +1384,15 @@ class MCCStatePusher:
         self.latest_state_backend_ts = now_ts
         return dict(payload)
 
+    def _cluster_assets_payload(self, now_ts: float, installs: list[MauticInstall]) -> dict[str, Any]:
+        interval = max(60, int(getattr(self.cfg, "cluster_assets_interval_sec", 600) or 600))
+        if self.latest_cluster_assets_state and (now_ts - self.latest_cluster_assets_state_ts) < interval:
+            return dict(self.latest_cluster_assets_state)
+        payload = collect_cluster_assets_status(self.cfg, installs=installs)
+        self.latest_cluster_assets_state = payload
+        self.latest_cluster_assets_state_ts = now_ts
+        return dict(payload)
+
     def should_push(self, now_ts: float, payload_no_ts: dict[str, Any]) -> tuple[bool, bool]:
         force_alert = False
         new_hash = _hash_payload(payload_no_ts)
@@ -1514,7 +1472,12 @@ class MCCStatePusher:
                     "source": i.source,
                     "domains": list(i.domains or ([] if not i.primary_domain else [i.primary_domain])),
                     "mautic_major": i.mautic_major,
-                    "mautic_version": _collect_mautic_version(i.root, self.cfg.php_bin),
+                    "mautic_version": collect_mautic_version(
+                        i.root,
+                        self.cfg.php_bin,
+                        console_path=i.console_path,
+                        run_as_user=self.cfg.mautic_run_as_user,
+                    ),
                     "install_type": detect_install_type(i.root),
                     "plugins": plugins,
                     "sender_type": str(sender.get("sender_type", "") or "").strip() or "unknown",
@@ -1557,6 +1520,7 @@ class MCCStatePusher:
             "apt_state": self._apt_state(now_ts),
             "cluster_db": self._cluster_db_state(now_ts),
             "state_backend": self._state_backend_payload(now_ts),
+            "cluster_assets": self._cluster_assets_payload(now_ts, installs),
             "instances": instances,
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }

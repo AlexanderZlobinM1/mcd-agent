@@ -65,6 +65,7 @@ from mcd_agent.mautic_version_cache import (
 )
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
+from mcd_agent.nginx_baseline import ensure_nginx_baseline
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
@@ -179,6 +180,14 @@ def _apt_service_postcheck() -> tuple[bool, list[str]]:
 
     if _unit_exists("nginx"):
         if not _service_enable_and_start("nginx", lines):
+            return False, lines
+        baseline = ensure_nginx_baseline(reload_service=True)
+        baseline_actions = baseline.get("actions") if isinstance(baseline, dict) else []
+        if isinstance(baseline_actions, list):
+            for action in baseline_actions:
+                lines.append(f"postcheck: nginx baseline {action}")
+        if str(baseline.get("status", "") if isinstance(baseline, dict) else "").lower() == "error":
+            lines.append(f"postcheck: nginx baseline failed: {baseline.get('error', 'unknown error')}")
             return False, lines
         test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
         if test.returncode != 0:

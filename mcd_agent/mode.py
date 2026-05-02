@@ -27,6 +27,7 @@ MANAGED_KEYWORDS = (
     "cache:warm",
     "cache:warmup",
     "mautic:emails:send",
+    "viber:stats:update",
 )
 
 
@@ -66,6 +67,13 @@ def _is_managed_job(line: str) -> bool:
     return any(k in s for k in MANAGED_KEYWORDS)
 
 
+def _is_viber_stats_job(line: str) -> bool:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return False
+    return "bin/console" in s and "viber:stats:update" in s
+
+
 def _comment_managed(content: str, stamp: str) -> tuple[str, int]:
     out: list[str] = []
     changed = 0
@@ -73,6 +81,20 @@ def _comment_managed(content: str, stamp: str) -> tuple[str, int]:
         line = raw.rstrip("\n")
         if _is_managed_job(line):
             out.append(f"# MCD_MANAGED {stamp}: disabled by mcd profile=active")
+            out.append("# " + line)
+            changed += 1
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _comment_viber_stats(content: str, stamp: str) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if _is_viber_stats_job(line):
+            out.append(f"# MCD_MANAGED {stamp}: disabled viber stats by mcd profile=active")
             out.append("# " + line)
             changed += 1
             continue
@@ -119,6 +141,42 @@ def _restore_from_backup(install_dir: str, user: str) -> tuple[bool, str]:
     if rc != 0:
         return False, f"restore {user} failed: {out}"
     return True, f"restored {user} crontab from backup"
+
+
+def reconcile_viber_stats_cron(*, profile_name: str, install_dir: str) -> ModeResult:
+    """
+    Keep legacy viber:stats:update cron from racing active MCD scheduling.
+
+    Profile commands already do this on explicit transitions. The daemon also
+    calls this idempotently so hosts that were already active before an update
+    are reconciled without requiring a manual profile toggle.
+    """
+    if os.geteuid() != 0:
+        return ModeResult(ok=False, lines=["viber cron reconcile requires root"])
+    profile = (profile_name or "").strip().lower()
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    for user in ("root", "www-data"):
+        rc, cur = _read_crontab(None if user == "root" else user)
+        if rc != 0:
+            lines.append(f"{user}: crontab not readable, skip")
+            continue
+        if profile == "passive":
+            updated, changed = _restore_managed_comments(cur)
+            action = "restored managed cron lines from markers"
+        else:
+            _ensure_backup(install_dir, user, cur)
+            updated, changed = _comment_viber_stats(cur, stamp)
+            action = "commented viber stats cron lines"
+        if changed <= 0:
+            lines.append(f"{user}: no viber cron change")
+            continue
+        rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+        if rc2 != 0:
+            lines.append(f"{user}: failed to write crontab: {out2}")
+            return ModeResult(ok=False, lines=lines)
+        lines.append(f"{user}: {action}={changed}")
+    return ModeResult(ok=True, lines=lines)
 
 
 def _profile_file(install_dir: str) -> Path:

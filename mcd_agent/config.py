@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -122,8 +123,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "    FROM {prefix}campaign_lead_event_log el "
     "    WHERE el.campaign_id = c.id "
     "      AND el.is_scheduled = 1 "
-    "      AND el.date_triggered IS NULL "
-    "      AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_local}') "
+    "      AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_utc}') "
     "    LIMIT 1"
     "  ) "
     "  UNION "
@@ -376,6 +376,18 @@ class AgentConfig:
     cache_warm_interval_sec: int
     cache_warm_quiet_hour: int
     cache_warm_quiet_window_min: int
+    viber_stats_enabled: bool
+    viber_stats_interval_sec: int
+    viber_stats_instance_settings: dict[str, Any]
+    cluster_assets_enabled: bool
+    cluster_assets_interval_sec: int
+    cluster_assets_state_file: str
+    cluster_assets_fix_permissions: bool
+    cluster_assets_reload_on_change: bool
+    cluster_assets_cache_clear_on_change: bool
+    cluster_assets_cache_warm_on_change: bool
+    cluster_assets_fpm_reload_on_change: bool
+    cluster_assets_reload_timeout_sec: int
     fs_permissions_guard_enabled: bool
     fs_permissions_guard_interval_sec: int
     fs_permissions_guard_paths: list[str]
@@ -503,6 +515,7 @@ class AgentConfig:
     mcd_update_policy: str
     mcd_update_allow_test_build: bool
     mcd_update_wait_retry_sec: int
+    mcd_update_defer_during_campaigns: bool
     mcd_update_cleanup_enabled: bool
     mcd_update_cleanup_interval_sec: int
     mcd_update_keep_archives: int
@@ -703,6 +716,19 @@ def _normalize_list(value: object) -> list[str]:
     return []
 
 
+def _normalize_service_profile_components(value: object) -> list[str]:
+    components = _normalize_list(value)
+    if not components:
+        components = ["php_fpm", "mysql", "apt"]
+    seen = {str(x).strip().lower().replace("-", "_") for x in components if str(x).strip()}
+    # MCC runtime overrides created before apt profiles existed often contain
+    # exactly ["php_fpm", "mysql"]. Treat that as the old default, not as an
+    # operator decision to disable apt profile convergence.
+    if seen == {"php_fpm", "mysql"}:
+        components.append("apt")
+    return components
+
+
 def _normalize_int_list(value: object) -> list[int]:
     items = _normalize_list(value)
     out: list[int] = []
@@ -712,6 +738,22 @@ def _normalize_int_list(value: object) -> list[int]:
         except ValueError:
             continue
     return out
+
+
+def _normalize_runtime_limit(value: object, *, default: int) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, bool):
+        return int(default) if value else 0
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return int(default)
+    if text in {"0", "false", "off", "disabled", "unlimited", "all"}:
+        return 0
+    try:
+        return max(0, int(text))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _normalize_json_dict(value: object) -> dict[str, Any]:
@@ -739,8 +781,30 @@ def _normalize_backup_dump_timeout(value: object) -> int:
     return raw if raw > 0 else 10_800
 
 
+def _normalize_sql_signature(value: object) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
 def _is_legacy_campaigns_due_sql(value: object) -> bool:
-    return str(value or "").strip() in _LEGACY_CAMPAIGNS_DUE_SQLS
+    raw = str(value or "").strip()
+    if raw in _LEGACY_CAMPAIGNS_DUE_SQLS:
+        return True
+    normalized = _normalize_sql_signature(raw)
+    if not normalized:
+        return False
+    # MCC used to persist the generated campaign trigger SQL under the legacy
+    # campaigns_due key. Match that shape structurally so hosts with old
+    # variants migrate instead of keeping stale trigger-date semantics forever.
+    signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_lead_event_log el",
+        "el.is_scheduled = 1",
+        "el.trigger_date",
+        "{prefix}campaign_leads cl",
+        "window_start_local_24h",
+        "el2.rotation <=> cl.rotation",
+    )
+    return all(sig in normalized for sig in signatures)
 
 
 def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
@@ -844,6 +908,12 @@ def _toml_literal(value: object) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
+    if isinstance(value, dict):
+        parts = []
+        for k, v in sorted(value.items(), key=lambda item: str(item[0])):
+            key = json.dumps(str(k), ensure_ascii=True)
+            parts.append(f"{key} = {_toml_literal(v)}")
+        return "{ " + ", ".join(parts) + " }"
     return json.dumps("" if value is None else str(value), ensure_ascii=True)
 
 
@@ -924,7 +994,7 @@ def _remove_section_keys_text(text: str, section: str, keys: set[str]) -> tuple[
 def _replace_section_string_defaults_text(
     text: str,
     section: str,
-    replacements: dict[str, tuple[set[str], str]],
+    replacements: dict[str, tuple[set[str] | Callable[[str], bool], str]],
 ) -> tuple[str, int]:
     if not replacements:
         return text, 0
@@ -952,7 +1022,12 @@ def _replace_section_string_defaults_text(
             continue
         expected_values, new_value = spec
         current_value = lm.group(3)
-        if current_value not in expected_values:
+        matches = (
+            expected_values(current_value)
+            if callable(expected_values)
+            else current_value in expected_values
+        )
+        if not matches:
             out_lines.append(line)
             continue
         escaped = new_value.replace("\\", "\\\\").replace('"', '\\"')
@@ -1003,7 +1078,7 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
                 _DEFAULT_SQL_SEGMENTS_DUE,
             ),
             "campaigns_due": (
-                _LEGACY_CAMPAIGNS_DUE_SQLS,
+                _is_legacy_campaigns_due_sql,
                 _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
             ),
         },
@@ -1331,6 +1406,18 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "cache_warm_interval_sec": "cache_warm_interval_sec",
     "cache_warm_quiet_hour": "cache_warm_quiet_hour",
     "cache_warm_quiet_window_min": "cache_warm_quiet_window_min",
+    "viber_stats_enabled": "viber_stats_enabled",
+    "viber_stats_interval_sec": "viber_stats_interval_sec",
+    "viber_stats_instance_settings": "viber_stats_instance_settings",
+    "cluster_assets_enabled": "cluster_assets_enabled",
+    "cluster_assets_interval_sec": "cluster_assets_interval_sec",
+    "cluster_assets_state_file": "cluster_assets_state_file",
+    "cluster_assets_fix_permissions": "cluster_assets_fix_permissions",
+    "cluster_assets_reload_on_change": "cluster_assets_reload_on_change",
+    "cluster_assets_cache_clear_on_change": "cluster_assets_cache_clear_on_change",
+    "cluster_assets_cache_warm_on_change": "cluster_assets_cache_warm_on_change",
+    "cluster_assets_fpm_reload_on_change": "cluster_assets_fpm_reload_on_change",
+    "cluster_assets_reload_timeout_sec": "cluster_assets_reload_timeout_sec",
     "fs_permissions_guard_enabled": "fs_permissions_guard_enabled",
     "fs_permissions_guard_interval_sec": "fs_permissions_guard_interval_sec",
     "fs_permissions_guard_paths": "fs_permissions_guard_paths",
@@ -1357,6 +1444,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_policy": "mcd_update_policy",
     "mcd_update_allow_test_build": "mcd_update_allow_test_build",
     "mcd_update_wait_retry_sec": "mcd_update_wait_retry_sec",
+    "mcd_update_defer_during_campaigns": "mcd_update_defer_during_campaigns",
     "mcd_update_cleanup_enabled": "mcd_update_cleanup_enabled",
     "mcd_update_cleanup_interval_sec": "mcd_update_cleanup_interval_sec",
     "mcd_update_keep_archives": "mcd_update_keep_archives",
@@ -1434,7 +1522,10 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
         if isinstance(current, bool):
             updates[attr] = bool(raw_value)
         elif isinstance(current, int):
-            updates[attr] = int(raw_value)
+            if attr == "campaign_limit":
+                updates[attr] = _normalize_runtime_limit(raw_value, default=current)
+            else:
+                updates[attr] = int(raw_value)
         elif isinstance(current, float):
             updates[attr] = float(raw_value)
         elif isinstance(current, list):
@@ -1903,6 +1994,24 @@ def _load_config_inner(path: str) -> AgentConfig:
         cache_warm_interval_sec=int(runtime.get("cache_warm_interval_sec", 86_400)),
         cache_warm_quiet_hour=int(runtime.get("cache_warm_quiet_hour", 8)),
         cache_warm_quiet_window_min=int(runtime.get("cache_warm_quiet_window_min", 60)),
+        viber_stats_enabled=bool(runtime.get("viber_stats_enabled", True)),
+        viber_stats_interval_sec=max(60, int(runtime.get("viber_stats_interval_sec", 600) or 600)),
+        viber_stats_instance_settings=(
+            dict(runtime.get("viber_stats_instance_settings", {}))
+            if isinstance(runtime.get("viber_stats_instance_settings", {}), dict)
+            else {}
+        ),
+        cluster_assets_enabled=bool(runtime.get("cluster_assets_enabled", False)),
+        cluster_assets_interval_sec=max(60, int(runtime.get("cluster_assets_interval_sec", 600) or 600)),
+        cluster_assets_state_file=str(
+            runtime.get("cluster_assets_state_file", "/opt/mcd/var/cluster-assets-state.json")
+        ),
+        cluster_assets_fix_permissions=bool(runtime.get("cluster_assets_fix_permissions", True)),
+        cluster_assets_reload_on_change=bool(runtime.get("cluster_assets_reload_on_change", True)),
+        cluster_assets_cache_clear_on_change=bool(runtime.get("cluster_assets_cache_clear_on_change", True)),
+        cluster_assets_cache_warm_on_change=bool(runtime.get("cluster_assets_cache_warm_on_change", True)),
+        cluster_assets_fpm_reload_on_change=bool(runtime.get("cluster_assets_fpm_reload_on_change", True)),
+        cluster_assets_reload_timeout_sec=max(60, int(runtime.get("cluster_assets_reload_timeout_sec", 300) or 300)),
         fs_permissions_guard_enabled=bool(runtime.get("fs_permissions_guard_enabled", True)),
         fs_permissions_guard_interval_sec=int(runtime.get("fs_permissions_guard_interval_sec", 300)),
         fs_permissions_guard_paths=fs_guard_paths,
@@ -1925,7 +2034,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         db_watchdog=dict(db_watchdog_cfg),
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),
         campaign_batch_limit=int(runtime.get("campaign_batch_limit", 1000)),
-        campaign_limit=int(runtime.get("campaign_limit", 60000)),
+        campaign_limit=_normalize_runtime_limit(runtime.get("campaign_limit", 60000), default=60000),
         import_limit=int(runtime.get("import_limit", 1000)),
         enable_import_polling=bool(runtime.get("enable_import_polling", True)),
         import_poll_interval_sec=int(runtime.get("import_poll_interval_sec", 15)),
@@ -2007,7 +2116,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         cmd_campaign_trigger_template=str(
             commands.get(
                 "campaign_trigger_template",
-                "mautic:campaigns:trigger -i {id} --campaign-limit={campaign_limit} --batch-limit={batch_limit}",
+                "mautic:campaigns:trigger -i {id}{campaign_limit_arg} --batch-limit={batch_limit}",
             )
         ),
         cmd_campaign_rebuild_template=str(
@@ -2144,6 +2253,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcd_update_policy=mcd_update_policy,
         mcd_update_allow_test_build=bool(runtime.get("mcd_update_allow_test_build", False)),
         mcd_update_wait_retry_sec=int(runtime.get("mcd_update_wait_retry_sec", 60)),
+        mcd_update_defer_during_campaigns=bool(runtime.get("mcd_update_defer_during_campaigns", True)),
         mcd_update_cleanup_enabled=bool(runtime.get("mcd_update_cleanup_enabled", True)),
         mcd_update_cleanup_interval_sec=int(runtime.get("mcd_update_cleanup_interval_sec", 86_400)),
         mcd_update_keep_archives=int(runtime.get("mcd_update_keep_archives", 3)),
@@ -2151,9 +2261,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcd_update_artifacts_max_age_days=int(runtime.get("mcd_update_artifacts_max_age_days", 30)),
         mcd_config_history_limit=int(runtime.get("mcd_config_history_limit", 10)),
         service_profiles_enabled=bool(runtime.get("service_profiles_enabled", True)),
-        service_profiles_auto_apply=bool(runtime.get("service_profiles_auto_apply", False)),
+        service_profiles_auto_apply=bool(runtime.get("service_profiles_auto_apply", True)),
         service_profiles_poll_interval_sec=int(runtime.get("service_profiles_poll_interval_sec", 3600)),
-        service_profiles_components=_normalize_list(runtime.get("service_profiles_components", ["php_fpm", "mysql"])),
+        service_profiles_components=_normalize_service_profile_components(
+            runtime.get("service_profiles_components", ["php_fpm", "mysql", "apt"])
+        ),
         mautic6_core_patch_policy=m6_patch_policy,
         mautic6_core_patch_version_min=m6_patch_min,
         mautic6_core_patch_version_max=m6_patch_max,

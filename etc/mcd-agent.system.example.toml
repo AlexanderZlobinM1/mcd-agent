@@ -116,7 +116,7 @@ campaign_whitelist_file = "/etc/mcd/campaign-whitelist.txt"
 segment_batch_limit = 1000
 # Batch for mautic:campaigns:trigger.
 campaign_batch_limit = 1000
-# Campaign limit for trigger command.
+# Campaign limit for trigger command. Set to 0/off/unlimited to omit --campaign-limit.
 campaign_limit = 60000
 # Limit for mautic:import.
 import_limit = 1000
@@ -145,6 +145,8 @@ mcd_update_policy = "approved"
 mcd_update_allow_test_build = false
 # Retry delay after MCC says "wait for free update slot".
 mcd_update_wait_retry_sec = 60
+# Do not self-update while campaign trigger/rebuild/update console jobs are running.
+mcd_update_defer_during_campaigns = true
 # Enable self-update artifacts cleanup (`/opt/mcd/var/updates`, preupdate tar backups).
 mcd_update_cleanup_enabled = true
 # How often to run cleanup policy, sec.
@@ -172,14 +174,14 @@ template_autopromote_on_clone = true
 # Service profiles (MCC-managed dynamic host tuning, independent from MCD build version).
 # Enable service-profile subsystem.
 service_profiles_enabled = true
-# Auto-apply profile from MCC on daemon loop.
-# Set true on test hosts first; for production rollout switch after validation.
-service_profiles_auto_apply = false
+# Auto-apply profile from MCC on daemon loop. Hosts pull dynamic stack
+# parameters from MCC and apply them idempotently without explicit push.
+service_profiles_auto_apply = true
 # Poll interval (sec) for auto-apply cycle.
 service_profiles_poll_interval_sec = 3600
 # Components controlled by service profiles.
-# Supported: php_fpm, mysql
-service_profiles_components = ["php_fpm", "mysql"]
+# Supported: php_fpm, mysql, apt
+service_profiles_components = ["php_fpm", "mysql", "apt"]
 
 # Global Mautic 6 core patch policy for PluginUpdateEvent metadata bug:
 # - required : daemon auto-checks and auto-applies hotfix every planning cycle
@@ -265,6 +267,15 @@ cache_warm_quiet_hour = 8
 # Quiet window length in minutes.
 cache_warm_quiet_window_min = 60
 
+# Viber plugin stats task (MCD-managed, runtime-dynamic).
+# If an instance has a Viber plugin directory, active profiles run:
+#   viber:stats:update
+# Default interval is 10 minutes. Per-instance overrides are keyed by
+# instance_uid/root/domain and are normally written by MCC Web.
+viber_stats_enabled = true
+viber_stats_interval_sec = 600
+viber_stats_instance_settings = {}
+
 # Filesystem permissions watchdog (MCD-managed, runtime-dynamic).
 # Keeps critical Mautic writable paths owned by `mautic_run_as_user`.
 fs_permissions_guard_enabled = true
@@ -304,7 +315,7 @@ segments_due = "SELECT ll.id FROM {prefix}lead_lists ll WHERE ll.is_published = 
 # Campaign source ids (published only; window checks are intentionally ignored).
 # Note: for Mautic 4 the agent auto-removes `c.deleted` predicate at runtime
 # because some M4 schemas do not have this column.
-campaigns_due = "SELECT c.id FROM {prefix}campaigns c WHERE c.is_published = 1 AND (c.deleted IS NULL) AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') ORDER BY c.id"
+campaigns_due = "SELECT DISTINCT q.id FROM (  SELECT c.id   FROM {prefix}campaigns c   WHERE c.is_published = 1   AND (c.deleted IS NULL)   AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}')   AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}')   AND EXISTS (    SELECT 1     FROM {prefix}campaign_lead_event_log el     WHERE el.campaign_id = c.id       AND el.is_scheduled = 1       AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_utc}')     LIMIT 1  )   UNION   SELECT c.id   FROM {prefix}campaigns c   INNER JOIN {prefix}campaign_leads cl     ON cl.campaign_id = c.id    AND cl.manually_removed = 0    AND cl.date_last_exited IS NULL    AND cl.date_added >= '{window_start_local_24h}' WHERE c.is_published = 1 AND (c.deleted IS NULL) AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') AND NOT EXISTS (  SELECT 1   FROM {prefix}campaign_lead_event_log el2   WHERE el2.campaign_id = cl.campaign_id     AND el2.lead_id = cl.lead_id     AND el2.rotation <=> cl.rotation     LIMIT 1  )) q ORDER BY q.id"
 
 # Segment weight source rows.
 segment_weights = "SELECT ll.id, UNIX_TIMESTAMP(ll.date_added) AS created_ts, UNIX_TIMESTAMP(ll.date_modified) AS modified_ts, UNIX_TIMESTAMP(ll.last_built_date) AS built_ts, COALESCE(a.recent_cnt, 0) AS recent_activity FROM {prefix}lead_lists ll LEFT JOIN (SELECT leadlist_id, COUNT(*) AS recent_cnt FROM {prefix}lead_lists_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY leadlist_id) a ON a.leadlist_id = ll.id WHERE ll.is_published = 1"
@@ -323,8 +334,8 @@ segment_update_template = "mautic:segments:update -i {id} --batch-limit={batch_l
 segment_full_update_template = "mautic:segments:update --batch-limit={batch_limit}"
 # Campaign update by id template (alias to rebuild in scheduler).
 campaign_update_template = "mautic:campaigns:update -i {id}"
-# Campaign trigger by id template.
-campaign_trigger_template = "mautic:campaigns:trigger -i {id} --campaign-limit={campaign_limit} --batch-limit={batch_limit}"
+# Campaign trigger by id template. {campaign_limit_arg} expands to " --campaign-limit=N" or empty.
+campaign_trigger_template = "mautic:campaigns:trigger -i {id}{campaign_limit_arg} --batch-limit={batch_limit}"
 # Campaign rebuild by id template.
 campaign_rebuild_template = "mautic:campaigns:rebuild -i {id}"
 # Import template.

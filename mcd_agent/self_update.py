@@ -24,6 +24,14 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
+_CAMPAIGN_CONSOLE_COMMANDS = (
+    "mautic:campaigns:trigger",
+    "mautic:campaign:trigger",
+    "mautic:campaigns:rebuild",
+    "mautic:campaign:rebuild",
+    "mautic:campaigns:update",
+)
+
 
 def _semver(v: str) -> tuple[int, int, int]:
     nums = [x for x in "".join(ch if ch.isdigit() else "." for ch in (v or "")).split(".") if x.isdigit()]
@@ -92,6 +100,63 @@ def _update_policy(cfg: AgentConfig) -> str:
     if ch == "off":
         return "off"
     return "approved"
+
+
+def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
+    stdout = ""
+    has_elapsed = True
+    for ps_args, elapsed_supported in (
+        (["ps", "-eo", "pid=,etimes=,args="], True),
+        (["ps", "-eo", "pid=,args="], False),
+    ):
+        try:
+            proc = subprocess.run(
+                ps_args,
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(timeout_sec)),
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            stdout = proc.stdout or ""
+            has_elapsed = elapsed_supported
+            break
+    if not stdout:
+        return []
+
+    current_pid = os.getpid()
+    rows: list[dict[str, Any]] = []
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line or "mautic:campaign" not in line:
+            continue
+        if "/bin/console" not in line and "/app/console" not in line:
+            continue
+        if not any(cmd in line for cmd in _CAMPAIGN_CONSOLE_COMMANDS):
+            continue
+        parts = line.split(None, 2 if has_elapsed else 1)
+        if len(parts) < (3 if has_elapsed else 2):
+            continue
+        try:
+            pid = int(parts[0])
+            elapsed_sec = int(parts[1]) if has_elapsed else 0
+        except Exception:
+            continue
+        if pid <= 0 or pid == current_pid:
+            continue
+        command = parts[2] if has_elapsed else parts[1]
+        rows.append({"pid": pid, "elapsed_sec": elapsed_sec, "cmd": command[:500]})
+    return rows
+
+
+def _active_campaign_update_defer_message(rows: list[dict[str, Any]]) -> str:
+    sample = ", ".join(
+        f"pid={int(row.get('pid') or 0)} age={int(row.get('elapsed_sec') or 0)}s"
+        for row in rows[:3]
+    )
+    suffix = f" ({sample})" if sample else ""
+    return f"MCD update deferred: active campaign console process is running{suffix}"
 
 
 def check_with_mcc(cfg: AgentConfig, *, auto_update_enabled: bool) -> dict[str, Any]:
@@ -445,6 +510,32 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
 
     state = _read_state(cfg)
     session_id = str(plan.get("session_id", "")).strip()
+    now_s = int(time.time())
+    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
+        active_campaigns = _active_campaign_processes()
+        if active_campaigns:
+            msg = _active_campaign_update_defer_message(active_campaigns)
+            state.update(
+                {
+                    "last_status": "deferred_active_campaign",
+                    "last_result": msg,
+                    "last_target": target,
+                    "last_attempt_ts": now_s,
+                    "last_session_id": session_id,
+                    "active_campaign_processes": active_campaigns[:10],
+                }
+            )
+            _write_state(cfg, state)
+            if session_id:
+                release_session(
+                    cfg,
+                    session_id,
+                    result_status="deferred",
+                    result_message=msg,
+                    new_version=__version__,
+                )
+            return False, msg
+
     install_dir = Path("/opt/mcd")
     src_dir = install_dir / "src"
     backup_dir = install_dir / "var" / "backup"
@@ -466,7 +557,6 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
             )
         return False, "another update is already running"
 
-    now_s = int(time.time())
     archive_name = f"mcd-agent-{target}.tar.gz"
     archive_path = updates_dir / archive_name
     backup_path = backup_dir / f"mcd-src-preupdate-{now_s}.tgz"
@@ -602,6 +692,18 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
                 return "MCD update deferred: backup lock is active", retry_sec
         except Exception as e:
             logging.warning("MCD update backup lock check failed: %s", e)
+
+    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
+        active_campaigns = _active_campaign_processes()
+        if active_campaigns:
+            retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
+            state["last_check_ts"] = now_s
+            state["last_check_status"] = "deferred_active_campaign"
+            state["last_result"] = _active_campaign_update_defer_message(active_campaigns)
+            state["active_campaign_processes"] = active_campaigns[:10]
+            state["next_check_ts"] = now_s + retry_sec
+            _write_state(cfg, state)
+            return str(state["last_result"]), retry_sec
 
     auto = bool(cfg.mcd_auto_update_enabled) and _update_policy(cfg) != "off"
     decision = check_with_mcc(cfg, auto_update_enabled=auto)

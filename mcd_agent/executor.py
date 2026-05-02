@@ -32,6 +32,7 @@ COMMAND_TASK_TYPES = {
 _CACHE_COMMANDS = {"cache:clear", "cache:warmup"}
 _PERMISSION_DENIED_RE = re.compile(r"permission denied", re.IGNORECASE)
 _CACHE_PERM_WARNING_MARKER = "MCD_WARNING_CACHE_PERMISSIONS_REPAIRED"
+_DISABLED_LIMIT_VALUES = {"", "0", "none", "null", "false", "off", "disabled", "unlimited", "all"}
 
 
 def _resolve_console_path(root: str) -> str | None:
@@ -46,6 +47,36 @@ def _resolve_console_path(root: str) -> str | None:
     return None
 
 
+def _is_disabled_limit(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return not value
+    text = str(value).strip().lower()
+    if text in _DISABLED_LIMIT_VALUES:
+        return True
+    try:
+        return int(text) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _strip_option(parts: list[str], option: str) -> list[str]:
+    stripped: list[str] = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == option:
+            skip_next = True
+            continue
+        if part.startswith(f"{option}="):
+            continue
+        stripped.append(part)
+    return stripped
+
+
 def render_mautic_command(
     *,
     php_bin: str,
@@ -58,8 +89,20 @@ def render_mautic_command(
     if not console:
         raise FileNotFoundError(f"Console not found in root: {root}")
 
-    rendered = template.format(**params)
+    render_params = dict(params)
+    has_campaign_limit_param = "campaign_limit" in render_params
+    campaign_limit = render_params.get("campaign_limit")
+    if has_campaign_limit_param and _is_disabled_limit(campaign_limit):
+        render_params.setdefault("campaign_limit_arg", "")
+    elif has_campaign_limit_param:
+        render_params.setdefault("campaign_limit_arg", f" --campaign-limit={campaign_limit}")
+    else:
+        render_params.setdefault("campaign_limit_arg", "")
+
+    rendered = template.format(**render_params)
     parts = shlex.split(rendered)
+    if has_campaign_limit_param and _is_disabled_limit(campaign_limit):
+        parts = _strip_option(parts, "--campaign-limit")
     cmd = [php_bin, console] + parts + ["--no-interaction"]
     if run_as_user:
         cmd = ["sudo", "-u", run_as_user] + cmd

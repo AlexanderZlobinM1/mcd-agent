@@ -28,6 +28,7 @@ _MYSQL_BACKOFF_MAX_SEC = 900
 _MYSQL_BACKOFF_READONLY_SEC = 600
 _MYSQL_BACKOFF_TOOMANY_SEC = 120
 _MYSQL_BACKOFF_AUTH_SEC = 300
+MYSQL_STATE_SCHEMA_VERSION = 2
 
 
 def _backoff_key(cfg: AgentConfig) -> str:
@@ -325,6 +326,7 @@ def _mysql_conn(cfg: AgentConfig, *, include_database: bool = True) -> pymysql.c
 def _table_name_map(cfg: AgentConfig) -> dict[str, str]:
     prefix = _safe_prefix(getattr(cfg, "state_mysql_table_prefix", "mcd_"))
     return {
+        "schema_version": f"{prefix}schema_version",
         "outbound_events": f"{prefix}outbound_events",
         "agent_state_snapshots": f"{prefix}agent_state_snapshots",
         "tasks": f"{prefix}tasks",
@@ -381,9 +383,7 @@ def _ensure_mysql_database(cfg: AgentConfig) -> None:
             )
             row = cur.fetchone()
             if row is None:
-                cur.execute(
-                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                )
+                raise RuntimeError(f"state database missing: {db_name}; run mcd-cli state-db init")
     _DB_READY.add(key)
 
 
@@ -439,11 +439,6 @@ def state_backend_status(cfg: AgentConfig, *, probe: bool = True) -> dict[str, A
         return status
     if not probe:
         return status
-    existed_before = False
-    try:
-        existed_before = _state_db_exists(cfg)
-    except Exception:
-        existed_before = False
     try:
         _ensure_mysql_database(cfg)
         with _mysql_conn(cfg) as conn:
@@ -452,12 +447,13 @@ def state_backend_status(cfg: AgentConfig, *, probe: bool = True) -> dict[str, A
         status["active_backend"] = "mysql"
         status["mode"] = "mysql"
         status["reason"] = "ok"
-        status["created_now"] = bool(not existed_before)
+        status["schema_version"] = MYSQL_STATE_SCHEMA_VERSION
+        status["created_now"] = False
         return status
     except Exception as e:
         _mysql_backoff_set(cfg, e)
         _active, _backoff = _mysql_backoff_status(cfg)
-        status["reason"] = "mysql_init_failed"
+        status["reason"] = "mysql_schema_unavailable"
         status["error"] = str(e)
         status["error_code"] = _mysql_error_code(e)
         if _active and isinstance(_backoff, dict):
@@ -525,7 +521,8 @@ def create_state_database_with_admin(
                 [
                     f"CREATE USER IF NOT EXISTS '{rt_user_lit}'@'{hp_lit}' IDENTIFIED BY '{rt_pwd_lit}'",
                     f"ALTER USER '{rt_user_lit}'@'{hp_lit}' IDENTIFIED BY '{rt_pwd_lit}'",
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX "
+                    f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM '{rt_user_lit}'@'{hp_lit}'",
+                    f"GRANT SELECT, INSERT, UPDATE, DELETE "
                     f"ON `{db_ident}`.* TO '{rt_user_lit}'@'{hp_lit}'",
                 ]
             )
@@ -571,7 +568,13 @@ def create_state_database_with_admin(
             else:
                 return False, str(admin_phase_err)
 
-        # Validate runtime account can use new DB and initialize schema.
+        schema_kwargs = dict(admin_kwargs)
+        schema_kwargs["database"] = db_name
+        with pymysql.connect(**schema_kwargs) as conn_schema:
+            _install_mysql_schema(cfg, conn_schema)
+
+        # Validate runtime account can use the prepared DB/schema. Runtime
+        # daemon must never perform DDL against Galera.
         runtime_kwargs: dict[str, Any] = {
             "user": rt_user,
             "password": rt_pwd,
@@ -590,17 +593,75 @@ def create_state_database_with_admin(
             runtime_kwargs["port"] = rt_port
         with pymysql.connect(**runtime_kwargs) as conn2:
             _ensure_mysql_schema(cfg, conn2)
+        _mysql_backoff_clear(cfg)
         return True, f"state database ready: {db_name} (runtime user: {rt_user})"
     except Exception as e:
         return False, str(e)
 
 
 def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection) -> None:
+    """
+    Validate that the state schema already exists.
+
+    This intentionally performs no DDL. In Galera/PXC cluster mode the daemon
+    must not create or migrate tables during normal runtime; schema creation is
+    restricted to explicit install/bootstrap commands.
+    """
     key = _schema_key(cfg)
     if key in _SCHEMA_READY:
         return
 
     names = _table_name_map(cfg)
+    required_columns: dict[str, set[str]] = {
+        names["schema_version"]: {"id", "schema_version", "updated_at"},
+        names["outbound_events"]: {"id", "host_name", "event_id", "event_type", "payload_json", "status"},
+        names["agent_state_snapshots"]: {"id", "host_name", "payload_hash", "payload_json"},
+        names["tasks"]: {"id", "host_name", "root", "task_key", "task_type", "pid", "state"},
+        names["weight_cache"]: {"host_name", "kind", "root", "entity_id", "weight", "computed_at"},
+        names["runtime_sync"]: {"host_name", "key", "payload_json", "updated_at"},
+        names["manual_requests"]: {"id", "host_name", "root", "task_type", "command_str", "status"},
+    }
+    with conn.cursor() as cur:
+        cur.execute("SELECT DATABASE() AS db")
+        db_row = cur.fetchone() or {}
+        db_name = str(db_row.get("db") or "")
+        if not db_name:
+            raise RuntimeError("state schema check failed: no selected database")
+        for table, columns in required_columns.items():
+            cur.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s
+                """,
+                (db_name, table),
+            )
+            present = {str(r.get("COLUMN_NAME") or "") for r in (cur.fetchall() or []) if isinstance(r, dict)}
+            missing = sorted(c for c in columns if c not in present)
+            if missing:
+                raise RuntimeError(f"state schema not initialized: table={table} missing={','.join(missing)}")
+        cur.execute(f"SELECT schema_version FROM `{names['schema_version']}` WHERE id=1 LIMIT 1")
+        row = cur.fetchone()
+        if not isinstance(row, dict) or row.get("schema_version") is None:
+            raise RuntimeError("state schema version missing; run mcd-cli state-db init")
+        try:
+            version = int(row.get("schema_version") or 0)
+        except Exception:
+            version = 0
+        if version != MYSQL_STATE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported state schema version: {version}; expected {MYSQL_STATE_SCHEMA_VERSION}"
+            )
+    _SCHEMA_READY.add(key)
+
+
+def _install_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection) -> None:
+    key = _schema_key(cfg)
+    # Explicit bootstrap/install path: do not trust the runtime validation cache.
+    _SCHEMA_READY.discard(key)
+
+    names = _table_name_map(cfg)
+    schema_version_table = names["schema_version"]
     events_table = names["outbound_events"]
     snapshots_table = names["agent_state_snapshots"]
     tasks_table = names["tasks"]
@@ -608,6 +669,15 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
     runtime_sync_table = names["runtime_sync"]
     manual_requests_table = names["manual_requests"]
     with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS `{schema_version_table}` (
+              id TINYINT PRIMARY KEY,
+              schema_version INT NOT NULL,
+              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS `{events_table}` (
@@ -824,11 +894,21 @@ def _ensure_mysql_schema(cfg: AgentConfig, conn: pymysql.connections.Connection)
             )
         if _index_columns(manual_requests_table, "idx_manual_requests_pending") != ["host_name", "status", "root", "requested_at"]:
             _rebuild_index(manual_requests_table, "idx_manual_requests_pending", "host_name, status, root(191), requested_at")
-    _SCHEMA_READY.add(key)
+        cur.execute(
+            f"""
+            INSERT INTO `{schema_version_table}`(id, schema_version)
+            VALUES(1, %s)
+            ON DUPLICATE KEY UPDATE schema_version=VALUES(schema_version)
+            """,
+            (MYSQL_STATE_SCHEMA_VERSION,),
+        )
+    # Do not mark runtime schema as validated here: install may run with admin
+    # credentials, but the daemon uses the restricted runtime account.
+    _SCHEMA_READY.discard(key)
 
 
 def ensure_mysql_state_schema(cfg: AgentConfig) -> None:
-    """Ensure state MySQL DB/tables are present and migrated to current layout."""
+    """Validate that state MySQL DB/tables are present and supported."""
     if not mysql_state_enabled(cfg):
         return
     _ensure_mysql_database(cfg)
