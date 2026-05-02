@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.8.143 - 2026-05-02
+
+- Added: backup method selection with `mydumper` logical dumps and `xtrabackup` physical backups.
+- Added: backup preflight/dry-run command validates tools, MySQL connectivity, xtrabackup version, and storage write access without creating a real backup.
+- Added: scheduled backups support exact `quiet_minute`, enabling starts such as `02:30` instead of hour-only starts.
+- Added: MCD can install missing backup packages (`sshfs`, `mydumper`, `percona-xtrabackup-80`) when backup auto-install is enabled.
+
 ## 0.8.142 - 2026-05-01
 
 - Fixed: Mautic version probes no longer run `bin/console --version` as root; console probes run as the configured Mautic runtime user (`www-data` by default).

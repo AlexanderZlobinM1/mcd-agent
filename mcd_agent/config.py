@@ -460,6 +460,8 @@ class AgentConfig:
     custom_downloads_keep_days: int
     custom_downloads_max_entries: int
     backup_enabled: bool
+    backup_method: str
+    backup_auto_install_packages: bool
     backup_state_dir: str
     backup_lock_dir: str
     backup_mount_base_dir: str
@@ -487,6 +489,8 @@ class AgentConfig:
     backup_mysql_password: str | None
     backup_mysql_password_ref: str | None
     backup_mysql_database: str | None
+    backup_sshfs_package: str
+    backup_mydumper_package: str
     backup_mydumper_bin: str
     backup_mydumper_threads: int
     backup_mydumper_verbose: int
@@ -501,11 +505,16 @@ class AgentConfig:
     backup_mydumper_ionice_level: int
     backup_myloader_bin: str
     backup_myloader_threads: int
+    backup_xtrabackup_package: str
+    backup_xtrabackup_bin: str
+    backup_xtrabackup_parallel: int
+    backup_xtrabackup_extra_args: list[str]
     backup_restore_apply_files: bool
     backup_restore_apply_databases: bool
     backup_schedule_enabled: bool
     backup_schedule_interval_sec: int
     backup_schedule_quiet_hour: int
+    backup_schedule_quiet_minute: int
     backup_schedule_quiet_window_min: int
     backup_schedule_pre_pause_sec: int
     mcd_update_notify: bool
@@ -1469,10 +1478,13 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "service_profiles_poll_interval_sec": "service_profiles_poll_interval_sec",
     "service_profiles_components": "service_profiles_components",
     "backup_enabled": "backup_enabled",
+    "backup_method": "backup_method",
+    "backup_auto_install_packages": "backup_auto_install_packages",
     "backup_dump_timeout_sec": "backup_dump_timeout_sec",
     "backup_schedule_enabled": "backup_schedule_enabled",
     "backup_schedule_interval_sec": "backup_schedule_interval_sec",
     "backup_schedule_quiet_hour": "backup_schedule_quiet_hour",
+    "backup_schedule_quiet_minute": "backup_schedule_quiet_minute",
     "backup_schedule_quiet_window_min": "backup_schedule_quiet_window_min",
     "backup_schedule_pre_pause_sec": "backup_schedule_pre_pause_sec",
     "backup_mydumper_threads": "backup_mydumper_threads",
@@ -1484,6 +1496,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_mydumper_use_ionice": "backup_mydumper_use_ionice",
     "backup_mydumper_ionice_class": "backup_mydumper_ionice_class",
     "backup_mydumper_ionice_level": "backup_mydumper_ionice_level",
+    "backup_xtrabackup_parallel": "backup_xtrabackup_parallel",
+    "backup_xtrabackup_extra_args": "backup_xtrabackup_extra_args",
     "mautic6_core_patch_policy": "mautic6_core_patch_policy",
     "mautic6_core_patch_version_min": "mautic6_core_patch_version_min",
     "mautic6_core_patch_version_max": "mautic6_core_patch_version_max",
@@ -1744,7 +1758,9 @@ def _load_config_inner(path: str) -> AgentConfig:
     state = data.get("state", {}) if isinstance(data.get("state", {}), dict) else {}
     backup = data.get("backup", {})
     backup_storage = backup.get("storage", {}) if isinstance(backup, dict) else {}
+    backup_packages = backup.get("packages", {}) if isinstance(backup, dict) else {}
     backup_mydumper = backup.get("mydumper", {}) if isinstance(backup, dict) else {}
+    backup_xtrabackup = backup.get("xtrabackup", {}) if isinstance(backup, dict) else {}
     backup_archive = backup.get("archive", {}) if isinstance(backup, dict) else {}
     backup_mysql = backup.get("mysql", {}) if isinstance(backup, dict) else {}
     backup_schedule = backup.get("schedule", {}) if isinstance(backup, dict) else {}
@@ -2184,6 +2200,8 @@ def _load_config_inner(path: str) -> AgentConfig:
             runtime.get("custom_downloads_max_entries", custom.get("downloads_max_entries", 200))
         ),
         backup_enabled=bool(backup.get("enabled", False)),
+        backup_method=str(backup.get("method", "mydumper")).strip().lower() or "mydumper",
+        backup_auto_install_packages=bool(backup_packages.get("auto_install", backup.get("auto_install_packages", True))),
         backup_state_dir=str(backup.get("state_dir", "/opt/mcd/var/state/backup")),
         backup_lock_dir=str(backup.get("lock_dir", "/opt/mcd/var/locks")),
         backup_mount_base_dir=str(backup.get("mount_base_dir", "/opt/mcd/var/backup/mounts")),
@@ -2225,6 +2243,8 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_mysql_password=str(backup_mysql.get("password")) if backup_mysql.get("password") else None,
         backup_mysql_password_ref=str(backup_mysql.get("password_ref")).strip() if backup_mysql.get("password_ref") else None,
         backup_mysql_database=str(backup_mysql.get("database")).strip() if backup_mysql.get("database") else None,
+        backup_sshfs_package=str(backup_packages.get("sshfs", "sshfs")).strip() or "sshfs",
+        backup_mydumper_package=str(backup_packages.get("mydumper", "mydumper")).strip() or "mydumper",
         backup_mydumper_bin=str(backup_mydumper.get("bin", "/usr/bin/mydumper")),
         backup_mydumper_threads=int(backup_mydumper.get("threads", 6)),
         backup_mydumper_verbose=int(backup_mydumper.get("verbose", 3)),
@@ -2239,11 +2259,17 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_mydumper_ionice_level=int(backup_mydumper.get("ionice_level", 7)),
         backup_myloader_bin=str(backup_mydumper.get("myloader_bin", "/usr/bin/myloader")),
         backup_myloader_threads=int(backup_mydumper.get("myloader_threads", 4)),
+        backup_xtrabackup_package=str(backup_packages.get("xtrabackup", backup_xtrabackup.get("package", "percona-xtrabackup-80"))).strip()
+        or "percona-xtrabackup-80",
+        backup_xtrabackup_bin=str(backup_xtrabackup.get("bin", "/usr/bin/xtrabackup")),
+        backup_xtrabackup_parallel=int(backup_xtrabackup.get("parallel", 4)),
+        backup_xtrabackup_extra_args=_normalize_list(backup_xtrabackup.get("extra_args", [])),
         backup_restore_apply_files=bool(backup.get("restore_apply_files", True)),
         backup_restore_apply_databases=bool(backup.get("restore_apply_databases", True)),
         backup_schedule_enabled=bool(backup_schedule.get("enabled", False)),
         backup_schedule_interval_sec=int(backup_schedule.get("interval_sec", 86_400)),
         backup_schedule_quiet_hour=int(backup_schedule.get("quiet_hour", 2)),
+        backup_schedule_quiet_minute=int(backup_schedule.get("quiet_minute", 0)),
         backup_schedule_quiet_window_min=int(backup_schedule.get("quiet_window_min", 60)),
         backup_schedule_pre_pause_sec=int(backup_schedule.get("pre_pause_sec", 3600)),
         mcd_update_notify=bool(runtime.get("mcd_update_notify", True)),

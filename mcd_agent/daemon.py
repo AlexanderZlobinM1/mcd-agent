@@ -93,10 +93,13 @@ _SQL_SEGMENTS_ALL_PUBLISHED = (
 
 _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_enabled",
+    "backup_method",
+    "backup_auto_install_packages",
     "backup_dump_timeout_sec",
     "backup_schedule_enabled",
     "backup_schedule_interval_sec",
     "backup_schedule_quiet_hour",
+    "backup_schedule_quiet_minute",
     "backup_schedule_quiet_window_min",
     "backup_schedule_pre_pause_sec",
     "backup_mydumper_threads",
@@ -108,6 +111,8 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_mydumper_use_ionice",
     "backup_mydumper_ionice_class",
     "backup_mydumper_ionice_level",
+    "backup_xtrabackup_parallel",
+    "backup_xtrabackup_extra_args",
 }
 _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_enabled",
@@ -788,9 +793,10 @@ def _backup_dispatch_pause_state(
         return False, ""
 
     quiet_hour = max(0, min(23, int(config.backup_schedule_quiet_hour)))
+    quiet_minute = max(0, min(59, int(getattr(config, "backup_schedule_quiet_minute", 0))))
     quiet_window_min = max(1, min(180, int(config.backup_schedule_quiet_window_min)))
     dt_local = now_local if now_local is not None else datetime.now()
-    start_today = dt_local.replace(hour=quiet_hour, minute=0, second=0, microsecond=0)
+    start_today = dt_local.replace(hour=quiet_hour, minute=quiet_minute, second=0, microsecond=0)
     done_today = _backup_attempted_for_local_date(config, dt_local)
     in_window = start_today <= dt_local < (start_today + timedelta(minutes=quiet_window_min))
 
@@ -3728,10 +3734,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
         if config.backup_enabled and config.backup_schedule_enabled:
             quiet_hour = max(0, min(23, int(config.backup_schedule_quiet_hour)))
+            quiet_minute = max(0, min(59, int(getattr(config, "backup_schedule_quiet_minute", 0))))
             quiet_window_min = max(1, min(180, int(config.backup_schedule_quiet_window_min)))
             interval_sec = max(300, int(config.backup_schedule_interval_sec))
             dt_local = datetime.now()
-            in_quiet = dt_local.hour == quiet_hour and dt_local.minute < quiet_window_min
+            start_today = dt_local.replace(hour=quiet_hour, minute=quiet_minute, second=0, microsecond=0)
+            in_quiet = start_today <= dt_local < (start_today + timedelta(minutes=quiet_window_min))
             if in_quiet and (last_backup_schedule_ts == 0.0 or now - last_backup_schedule_ts >= interval_sec):
                 run_day = dt_local.strftime("%Y-%m-%d")
                 if run_day == last_backup_schedule_day:

@@ -29,6 +29,7 @@ from mcd_agent.secret_store import SecretStore
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _PROFILE_ROW_ID = 1
 _MYDUMPER_FLAG_CACHE: dict[tuple[str, str], bool] = {}
+_XTRABACKUP_FLAG_CACHE: dict[tuple[str, str], bool] = {}
 
 
 @dataclass(frozen=True)
@@ -516,10 +517,62 @@ def _effective_cfg(cfg: AgentConfig) -> AgentConfig:
 def _validate_cfg(cfg: AgentConfig) -> None:
     if not cfg.backup_enabled:
         raise RuntimeError("backup is disabled in config ([backup].enabled=false)")
+    if _backup_method(cfg) not in {"mydumper", "xtrabackup"}:
+        raise RuntimeError("backup method must be 'mydumper' or 'xtrabackup'")
     if not cfg.backup_ssh_host or not cfg.backup_ssh_user:
         raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
     if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
         raise RuntimeError("backup storage auth is not configured (key_file or password required)")
+
+
+def _backup_method(cfg: AgentConfig) -> str:
+    method = str(getattr(cfg, "backup_method", "mydumper") or "mydumper").strip().lower()
+    if method in {"logical", "dump", "mydump"}:
+        return "mydumper"
+    if method in {"physical", "xtra", "xtrabackup"}:
+        return "xtrabackup"
+    return method
+
+
+def _apt_install_packages(packages: list[str]) -> None:
+    wanted = [p for p in [str(x or "").strip() for x in packages] if p]
+    if not wanted:
+        return
+    if not shutil.which("apt-get"):
+        raise RuntimeError(f"missing required backup packages and apt-get is unavailable: {', '.join(wanted)}")
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    _run(["apt-get", "update"], timeout_sec=900, env=env, check=True)
+    _run(["apt-get", "install", "-y", "--no-install-recommends"] + wanted, timeout_sec=1800, env=env, check=True)
+
+
+def _ensure_backup_tools(cfg: AgentConfig) -> dict[str, Any]:
+    method = _backup_method(cfg)
+    required: list[tuple[str, str]] = []
+    if cfg.backup_ssh_host and cfg.backup_ssh_user:
+        required.append(("sshfs", cfg.backup_sshfs_package))
+    if method == "mydumper":
+        required.append((cfg.backup_mydumper_bin, cfg.backup_mydumper_package))
+    elif method == "xtrabackup":
+        required.append((cfg.backup_xtrabackup_bin, cfg.backup_xtrabackup_package))
+    missing = [(bin_path, pkg) for bin_path, pkg in required if not shutil.which(bin_path) and not Path(bin_path).exists()]
+    installed: list[str] = []
+    if missing:
+        packages = []
+        seen: set[str] = set()
+        for _bin, pkg in missing:
+            pkg = str(pkg or "").strip()
+            if pkg and pkg not in seen:
+                seen.add(pkg)
+                packages.append(pkg)
+        if not cfg.backup_auto_install_packages:
+            raise RuntimeError("missing required backup tools: " + ", ".join(bin_path for bin_path, _ in missing))
+        _apt_install_packages(packages)
+        installed = packages
+    still_missing = [bin_path for bin_path, _ in required if not shutil.which(bin_path) and not Path(bin_path).exists()]
+    if still_missing:
+        raise RuntimeError("required backup tools are still missing after package preflight: " + ", ".join(still_missing))
+    return {"method": method, "installed_packages": installed}
 
 
 def _mount(cfg: AgentConfig, mount_path: Path) -> None:
@@ -561,12 +614,18 @@ def _mysql_defaults_file(
     user: str,
     password: str,
 ) -> tempfile.NamedTemporaryFile:
+    def opt_value(value: str) -> str:
+        # MySQL option files treat leading "#" as comments unless the value is quoted.
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     tf = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
-    tf.write("[client]\n")
-    tf.write(f"host={host}\n")
-    tf.write(f"port={port}\n")
-    tf.write(f"user={user}\n")
-    tf.write(f"password={password}\n")
+    for group in ("client", "xtrabackup"):
+        tf.write(f"[{group}]\n")
+        tf.write(f"host={opt_value(host)}\n")
+        tf.write(f"port={port}\n")
+        tf.write(f"user={opt_value(user)}\n")
+        tf.write(f"password={opt_value(password)}\n")
     tf.flush()
     tf.close()
     try:
@@ -611,6 +670,26 @@ def _mydumper_supports_flag(bin_path: str, flag: str) -> bool:
     return supported
 
 
+def _xtrabackup_supports_flag(bin_path: str, flag: str) -> bool:
+    key = (bin_path, flag)
+    if key in _XTRABACKUP_FLAG_CACHE:
+        return _XTRABACKUP_FLAG_CACHE[key]
+    try:
+        proc = subprocess.run(
+            [bin_path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        supported = flag in text
+    except Exception:
+        supported = False
+    _XTRABACKUP_FLAG_CACHE[key] = supported
+    return supported
+
+
 def _priority_prefix(cfg: AgentConfig) -> list[str]:
     prefix: list[str] = []
     if cfg.backup_mydumper_use_ionice and shutil.which("ionice"):
@@ -623,6 +702,90 @@ def _priority_prefix(cfg: AgentConfig) -> list[str]:
         nice_level = max(-20, min(19, int(cfg.backup_mydumper_nice_level)))
         prefix += ["nice", "-n", str(nice_level)]
     return prefix
+
+
+def _backup_db_from_config_or_instances(cfg: AgentConfig, db_instances: list[MauticInstall]) -> DBConfig:
+    if cfg.backup_mysql_user and cfg.backup_mysql_password:
+        first_db = db_instances[0].db if db_instances and db_instances[0].db else None
+        return DBConfig(
+            host=cfg.backup_mysql_host or (first_db.host if first_db else "localhost"),
+            port=int(cfg.backup_mysql_port or (first_db.port if first_db else 3306)),
+            name=cfg.backup_mysql_database or (first_db.name if first_db else ""),
+            user=cfg.backup_mysql_user,
+            password=cfg.backup_mysql_password,
+            table_prefix=first_db.table_prefix if first_db else "",
+        )
+    if db_instances and db_instances[0].db:
+        return _effective_db_for_instance(cfg, db_instances[0])
+    raise RuntimeError("No DB credentials found for backup")
+
+
+def _mysql_capture(cfg: AgentConfig, db: DBConfig, sql: str) -> str:
+    defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
+    try:
+        proc = _run(
+            ["mysql", f"--defaults-extra-file={defaults.name}", "-N", "-s", "-e", sql],
+            timeout_sec=min(max(cfg.backup_mount_timeout_sec, 15), 120),
+            check=True,
+        )
+        return str(proc.stdout or "").strip()
+    except Exception:
+        env = dict(os.environ)
+        env["MYSQL_PWD"] = db.password
+        proc = _run(
+            ["mysql", "-h", db.host, "-P", str(db.port), "-u", db.user, "-N", "-s", "-e", sql],
+            timeout_sec=min(max(cfg.backup_mount_timeout_sec, 15), 120),
+            env=env,
+            check=True,
+        )
+        return str(proc.stdout or "").strip()
+    finally:
+        try:
+            os.remove(defaults.name)
+        except Exception:
+            pass
+
+
+def _mysql_server_snapshot(cfg: AgentConfig, db: DBConfig) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    try:
+        raw = _mysql_capture(
+            cfg,
+            db,
+            "SELECT @@hostname, @@server_id, @@global.read_only, @@global.super_read_only, "
+            "@@global.gtid_mode, @@global.log_bin, @@version",
+        )
+        parts = raw.split("\t")
+        if len(parts) >= 7:
+            out.update(
+                {
+                    "hostname": parts[0],
+                    "server_id": parts[1],
+                    "read_only": parts[2],
+                    "super_read_only": parts[3],
+                    "gtid_mode": parts[4],
+                    "log_bin": parts[5],
+                    "version": parts[6],
+                }
+            )
+    except Exception as e:
+        out["server_snapshot_error"] = str(e)
+    try:
+        raw = _mysql_capture(
+            cfg,
+            db,
+            "SHOW REPLICA STATUS",
+        )
+        if raw:
+            out["replica_status_available"] = True
+    except Exception:
+        try:
+            raw = _mysql_capture(cfg, db, "SHOW SLAVE STATUS")
+            if raw:
+                out["replica_status_available"] = True
+        except Exception:
+            pass
+    return out
 
 
 def _effective_long_query_guard(value: int) -> int:
@@ -759,6 +922,60 @@ def _run_mydumper(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
             pass
 
 
+def _effective_xtrabackup_extra_args(cfg: AgentConfig) -> list[str]:
+    out = [str(x).strip() for x in cfg.backup_xtrabackup_extra_args if str(x).strip()]
+    if not any(a == "--slave-info" or a.startswith("--slave-info=") for a in out):
+        if _xtrabackup_supports_flag(cfg.backup_xtrabackup_bin, "--slave-info"):
+            out.append("--slave-info")
+    return out
+
+
+def _run_xtrabackup(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
+    defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        parallel = max(1, int(cfg.backup_xtrabackup_parallel or 1))
+        cmd = _priority_prefix(cfg) + [
+            cfg.backup_xtrabackup_bin,
+            f"--defaults-file={defaults.name}",
+            "--backup",
+            f"--target-dir={output_dir}",
+            "--parallel",
+            str(parallel),
+        ]
+        cmd += _effective_xtrabackup_extra_args(cfg)
+        _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    finally:
+        try:
+            os.remove(defaults.name)
+        except Exception:
+            pass
+
+
+def _verify_xtrabackup_dir(path: Path) -> tuple[bool, str, int]:
+    if not path.exists() or not path.is_dir():
+        return False, "xtrabackup directory missing", 0
+    checkpoints = path / "xtrabackup_checkpoints"
+    if not checkpoints.exists():
+        return False, "xtrabackup_checkpoints missing", 0
+    try:
+        text = checkpoints.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    if "backup_type" not in text:
+        return False, "xtrabackup_checkpoints is invalid", 0
+    total = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_file():
+                total += int(f.stat().st_size)
+        except Exception:
+            pass
+    if total <= 0:
+        return False, "xtrabackup output is empty", 0
+    return True, "ok", total
+
+
 def _run_mysql_sql(cfg: AgentConfig, db: DBConfig, sql: str) -> None:
     defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
     try:
@@ -893,16 +1110,26 @@ def _read_backup_marker(backup_dir: Path) -> dict[str, Any]:
 
 def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
     cfg = _effective_cfg(config)
+    method = _backup_method(cfg)
     state_path = _state_path(cfg)
     state = _json_read(state_path)
     start_monotonic = time.monotonic()
     started_ts = _utc_now_iso()
     try:
         _validate_cfg(cfg)
-        instances = _list_instances(cfg)
+        tool_state = _ensure_backup_tools(cfg)
+        try:
+            instances = _list_instances(cfg)
+        except Exception:
+            if method == "xtrabackup" and cfg.backup_mysql_user and cfg.backup_mysql_password:
+                instances = []
+            else:
+                raise
         db_instances = [x for x in instances if x.db]
-        if not db_instances:
+        if method == "mydumper" and not db_instances:
             raise RuntimeError("No instances with DB credentials found in inventory")
+        if method == "xtrabackup" and not db_instances and not (cfg.backup_mysql_user and cfg.backup_mysql_password):
+            raise RuntimeError("No DB credentials found for xtrabackup ([backup.mysql] required when inventory has no DB)")
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
         fail_state = dict(state)
@@ -926,6 +1153,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 "last_error": str(e),
                 "last_duration_sec": duration,
                 "job": "backup.run",
+                "method": method,
                 "history": history,
             }
         )
@@ -967,6 +1195,8 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "last_success_at": state.get("last_success_at", ""),
             "last_backup_path": state.get("last_backup_path", ""),
             "job": "backup.run",
+            "method": method,
+            "tool_state": tool_state,
         }
     )
     _json_write(state_path, run_state)
@@ -1038,30 +1268,52 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
         db_root.mkdir(parents=True, exist_ok=True)
         total_bytes = 0
         dumped: list[dict[str, Any]] = []
-        seen_db_keys: set[tuple[str, int, str, str]] = set()
-        for inst in db_instances:
-            assert inst.db is not None
-            effective_db = _effective_db_for_instance(cfg, inst)
-            key = (effective_db.host, effective_db.port, effective_db.user, effective_db.name)
-            if key in seen_db_keys:
-                continue
-            seen_db_keys.add(key)
-            db_dir = db_root / f"{inst.instance_uid}__{effective_db.name}"
-            db_dir.mkdir(parents=True, exist_ok=False)
-            _run_mydumper(cfg, effective_db, db_dir)
-            ok, verify_msg, one_bytes = _verify_dump_dir(db_dir)
+        server_snapshot: dict[str, Any] = {}
+        if method == "xtrabackup":
+            effective_db = _backup_db_from_config_or_instances(cfg, db_instances)
+            server_snapshot = _mysql_server_snapshot(cfg, effective_db)
+            db_dir = db_root / "physical-xtrabackup"
+            _run_xtrabackup(cfg, effective_db, db_dir)
+            ok, verify_msg, one_bytes = _verify_xtrabackup_dir(db_dir)
             if not ok:
-                raise RuntimeError(f"backup verification failed for {inst.instance_uid}: {verify_msg}")
+                raise RuntimeError(f"xtrabackup verification failed: {verify_msg}")
             total_bytes += one_bytes
             dumped.append(
                 {
-                    "instance_uid": inst.instance_uid,
-                    "instance_name": inst.name,
-                    "root": inst.root,
-                    "database": effective_db.name,
+                    "instance_uid": "physical-xtrabackup",
+                    "instance_name": cfg.backup_instance_name or cfg.backup_host_name or host_name,
+                    "root": "",
+                    "database": effective_db.name or "*",
+                    "method": "xtrabackup",
                     "bytes": one_bytes,
                 }
             )
+        else:
+            seen_db_keys: set[tuple[str, int, str, str]] = set()
+            for inst in db_instances:
+                assert inst.db is not None
+                effective_db = _effective_db_for_instance(cfg, inst)
+                key = (effective_db.host, effective_db.port, effective_db.user, effective_db.name)
+                if key in seen_db_keys:
+                    continue
+                seen_db_keys.add(key)
+                db_dir = db_root / f"{inst.instance_uid}__{effective_db.name}"
+                db_dir.mkdir(parents=True, exist_ok=False)
+                _run_mydumper(cfg, effective_db, db_dir)
+                ok, verify_msg, one_bytes = _verify_dump_dir(db_dir)
+                if not ok:
+                    raise RuntimeError(f"backup verification failed for {inst.instance_uid}: {verify_msg}")
+                total_bytes += one_bytes
+                dumped.append(
+                    {
+                        "instance_uid": inst.instance_uid,
+                        "instance_name": inst.name,
+                        "root": inst.root,
+                        "database": effective_db.name,
+                        "method": "mydumper",
+                        "bytes": one_bytes,
+                    }
+                )
         bytes_written = total_bytes
 
         os.replace(tmp_dir, final_dir)
@@ -1075,7 +1327,11 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "instances_total": len(instances),
             "instances_with_db": len(db_instances),
             "dumped_instances": dumped,
-            "mydumper_threads": cfg.backup_mydumper_threads,
+            "method": method,
+            "mydumper_threads": cfg.backup_mydumper_threads if method == "mydumper" else None,
+            "xtrabackup_parallel": cfg.backup_xtrabackup_parallel if method == "xtrabackup" else None,
+            "server_snapshot": server_snapshot,
+            "tool_state": tool_state,
         }
         if isinstance(storage_usage, dict):
             marker["storage"] = {
@@ -1156,6 +1412,89 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             lock_fh.close()
         except Exception:
             pass
+
+
+def backup_preflight(config: AgentConfig, root: str | None = None) -> BackupResult:
+    cfg = _effective_cfg(config)
+    method = _backup_method(cfg)
+    state_path = _state_path(cfg)
+    start_monotonic = time.monotonic()
+    started_ts = _utc_now_iso()
+    details: dict[str, Any] = {"method": method, "job": "backup.preflight", "ts": started_ts}
+    try:
+        _validate_cfg(cfg)
+        details["tools"] = _ensure_backup_tools(cfg)
+        try:
+            instances = _list_instances(cfg)
+        except Exception:
+            if method == "xtrabackup" and cfg.backup_mysql_user and cfg.backup_mysql_password:
+                instances = []
+            else:
+                raise
+        db_instances = [x for x in instances if x.db]
+        details["instances_total"] = len(instances)
+        details["instances_with_db"] = len(db_instances)
+        if method == "mydumper" and not db_instances:
+            raise RuntimeError("No instances with DB credentials found in inventory")
+        db = _backup_db_from_config_or_instances(cfg, db_instances)
+        details["mysql"] = _mysql_server_snapshot(cfg, db)
+        if method == "mydumper":
+            proc = _run([cfg.backup_mydumper_bin, "--version"], timeout_sec=15, check=False)
+            details["mydumper_version"] = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[:3]
+        else:
+            proc = _run([cfg.backup_xtrabackup_bin, "--version"], timeout_sec=15, check=False)
+            details["xtrabackup_version"] = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[:3]
+
+        host_name = _host_name(cfg)
+        mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+        remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, host_name)
+        probe_dir = remote_parent / f".preflight-{_fmt_local_ts()}"
+        _mount(cfg, mount_path)
+        try:
+            remote_parent.mkdir(parents=True, exist_ok=True)
+            probe_dir.mkdir(parents=False, exist_ok=False)
+            marker = probe_dir / "probe.json"
+            marker.write_text(json.dumps({"status": "ok", "ts_utc": _utc_now_iso()}, ensure_ascii=True) + "\n", encoding="utf-8")
+            marker.unlink(missing_ok=True)
+            probe_dir.rmdir()
+            usage = _storage_usage(mount_path)
+            if isinstance(usage, dict):
+                details["storage"] = usage
+        finally:
+            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+
+        duration = int(time.monotonic() - start_monotonic)
+        details["duration_sec"] = duration
+        state = _json_read(state_path)
+        state.update(
+            {
+                "host_name": host_name,
+                "selected_root": root or "",
+                "last_preflight_at": started_ts,
+                "last_preflight_status": "ok",
+                "last_preflight_error": "",
+                "last_preflight": details,
+            }
+        )
+        _json_write(state_path, state)
+        return BackupResult(ok=True, message="backup preflight ok", state_path=str(state_path), duration_sec=duration)
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        details["duration_sec"] = duration
+        details["error"] = str(e)
+        state = _json_read(state_path)
+        state.update(
+            {
+                "host_name": _host_name(cfg),
+                "selected_root": root or "",
+                "last_preflight_at": started_ts,
+                "last_preflight_status": "failed",
+                "last_preflight_error": str(e),
+                "last_preflight": details,
+            }
+        )
+        _json_write(state_path, state)
+        return BackupResult(ok=False, message=f"backup preflight failed: {e}", state_path=str(state_path), duration_sec=duration)
 
 
 def backup_restore(

@@ -18,6 +18,7 @@ import time
 
 from mcd_agent import __version__
 from mcd_agent.backup import (
+    backup_preflight,
     backup_profile_masked,
     backup_profile_set,
     backup_prune,
@@ -1617,12 +1618,12 @@ def _build_parser() -> argparse.ArgumentParser:
     uninst.add_argument("--no-purge", action="store_true", help="Keep /opt/mcd and /etc/mcd")
     uninst.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
 
-    bkp = sub.add_parser("backup", help="Remote mydumper backup via sshfs")
+    bkp = sub.add_parser("backup", help="Remote backup via sshfs")
     bkp.add_argument("--config", default=default_cfg)
     bkp.add_argument("--root", help="Optional instance root selector (accepted for MCC compatibility; backup scope is host-level)")
     bkp.add_argument(
         "op",
-        choices=["run", "status", "history", "prune", "restore", "profile-show", "profile-set"],
+        choices=["run", "preflight", "dry-run", "status", "history", "prune", "restore", "profile-show", "profile-set"],
         nargs="?",
         default="status",
     )
@@ -2981,6 +2982,26 @@ def main() -> int:
         note = maybe_notify_update(cfg)
         if note:
             print(f"NOTICE: {note}")
+        if args.op in {"preflight", "dry-run"}:
+            res = backup_preflight(cfg, args.root)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                            "duration_sec": res.duration_sec,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+            _push_state_after_change(cfg, "backup-preflight")
+            return 0 if res.ok else 1
         if args.op == "run":
             res = backup_run(cfg, args.root)
             if args.json:
