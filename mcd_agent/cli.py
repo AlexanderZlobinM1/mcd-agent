@@ -25,6 +25,12 @@ from mcd_agent.backup import (
     backup_restore,
     backup_run,
     backup_status,
+    cluster_backup_files_snapshot,
+    cluster_backup_local_full,
+    cluster_backup_local_incremental,
+    cluster_backup_offsite,
+    cluster_backup_retention_plan,
+    cluster_backup_status,
 )
 from mcd_agent.apt_profile import (
     clear_apt_repo_profile_markers,
@@ -1623,7 +1629,23 @@ def _build_parser() -> argparse.ArgumentParser:
     bkp.add_argument("--root", help="Optional instance root selector (accepted for MCC compatibility; backup scope is host-level)")
     bkp.add_argument(
         "op",
-        choices=["run", "preflight", "dry-run", "status", "history", "prune", "restore", "profile-show", "profile-set"],
+        choices=[
+            "run",
+            "preflight",
+            "dry-run",
+            "status",
+            "history",
+            "prune",
+            "restore",
+            "profile-show",
+            "profile-set",
+            "cluster-status",
+            "cluster-local-full",
+            "cluster-incremental",
+            "cluster-files",
+            "cluster-offsite",
+            "cluster-retention-plan",
+        ],
         nargs="?",
         default="status",
     )
@@ -2982,6 +3004,52 @@ def main() -> int:
         note = maybe_notify_update(cfg)
         if note:
             print(f"NOTICE: {note}")
+        if args.op == "cluster-status":
+            st = cluster_backup_status(cfg)
+            if args.json:
+                print(json.dumps(st, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(st, ensure_ascii=True, indent=2))
+            return 0
+        if args.op == "cluster-retention-plan":
+            plan = cluster_backup_retention_plan(cfg, apply=False)
+            print(json.dumps(plan, ensure_ascii=True, indent=2))
+            return 1 if plan.get("problems") else 0
+        if args.op in {"cluster-local-full", "cluster-incremental", "cluster-files", "cluster-offsite"}:
+            if args.op == "cluster-local-full":
+                res = cluster_backup_local_full(cfg)
+                event = "backup-cluster-local-full"
+            elif args.op == "cluster-incremental":
+                res = cluster_backup_local_incremental(cfg)
+                event = "backup-cluster-incremental"
+            elif args.op == "cluster-files":
+                res = cluster_backup_files_snapshot(cfg)
+                event = "backup-cluster-files"
+            else:
+                res = cluster_backup_offsite(cfg)
+                event = "backup-cluster-offsite"
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                            "backup_path": res.backup_path,
+                            "duration_sec": res.duration_sec,
+                            "bytes_written": res.bytes_written,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+                if res.backup_path:
+                    print(f"path={res.backup_path}")
+            _push_state_after_change(cfg, event)
+            return 0 if res.ok else 1
         if args.op in {"preflight", "dry-run"}:
             res = backup_preflight(cfg, args.root)
             if args.json:

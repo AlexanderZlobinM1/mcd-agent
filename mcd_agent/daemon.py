@@ -31,6 +31,11 @@ from mcd_agent.backup import (
     backup_run,
     backup_status,
     backup_storage_probe,
+    cluster_backup_files_snapshot,
+    cluster_backup_local_full,
+    cluster_backup_local_incremental,
+    cluster_backup_offsite,
+    cluster_backup_status,
 )
 from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
@@ -117,6 +122,21 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_xtrabackup_full_interval_days",
     "backup_xtrabackup_retention_full_copies",
     "backup_xtrabackup_retention_incremental_days",
+    "backup_cluster_enabled",
+    "backup_cluster_local_root_dir",
+    "backup_cluster_full_hour",
+    "backup_cluster_full_minute",
+    "backup_cluster_offsite_not_before_hour",
+    "backup_cluster_offsite_not_before_minute",
+    "backup_cluster_incremental_start_hour",
+    "backup_cluster_incremental_end_hour",
+    "backup_cluster_incremental_interval_sec",
+    "backup_cluster_files_snapshot_enabled",
+    "backup_cluster_files_snapshot_paths",
+    "backup_cluster_files_snapshot_exclude",
+    "backup_cluster_remote_enabled",
+    "backup_cluster_remote_retention_daily",
+    "backup_cluster_remote_retention_weekly",
 }
 _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_enabled",
@@ -777,6 +797,69 @@ def _backup_attempted_for_local_date(config: AgentConfig, local_dt: datetime) ->
         return ts.astimezone().date() == local_dt.date()
     except Exception:
         return False
+
+
+def _cluster_state_ts_local_date(value: str, local_dt: datetime) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone().date() == local_dt.date()
+    except Exception:
+        return False
+
+
+def _cluster_local_full_done_for_date(config: AgentConfig, local_dt: datetime) -> bool:
+    try:
+        st = cluster_backup_status(config)
+    except Exception:
+        return False
+    return _cluster_state_ts_local_date(str(st.get("last_local_full_at") or ""), local_dt)
+
+
+def _cluster_offsite_done_for_date(config: AgentConfig, local_dt: datetime) -> bool:
+    try:
+        st = cluster_backup_status(config)
+    except Exception:
+        return False
+    if str(st.get("last_backup_kind") or "") != "cluster_offsite":
+        return False
+    return _cluster_state_ts_local_date(str(st.get("last_success_at") or ""), local_dt)
+
+
+def _cluster_incremental_recent(config: AgentConfig, now_ts: float) -> bool:
+    try:
+        st = cluster_backup_status(config)
+    except Exception:
+        return False
+    raw = str(st.get("last_local_incremental_at") or "").strip()
+    if not raw:
+        return False
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        interval = max(300, int(config.backup_cluster_incremental_interval_sec or 7200))
+        return now_ts - ts.timestamp() < interval
+    except Exception:
+        return False
+
+
+def _local_time_reached(dt_local: datetime, hour: int, minute: int) -> bool:
+    target = dt_local.replace(hour=max(0, min(23, int(hour))), minute=max(0, min(59, int(minute))), second=0, microsecond=0)
+    return dt_local >= target
+
+
+def _local_hour_in_closed_window(dt_local: datetime, start_hour: int, end_hour: int) -> bool:
+    start = max(0, min(23, int(start_hour)))
+    end = max(0, min(23, int(end_hour)))
+    hour = dt_local.hour
+    if start <= end:
+        return start <= hour <= end
+    return hour >= start or hour <= end
 
 
 def _backup_dispatch_pause_state(
@@ -3384,6 +3467,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_backup_schedule_ts = 0.0
     last_backup_schedule_day = ""
     backup_thread: threading.Thread | None = None
+    cluster_backup_thread: threading.Thread | None = None
+    last_cluster_full_day = ""
+    last_cluster_offsite_day = ""
     backup_dispatch_pause_active = False
     scheduler_dispatch_pause_active = False
     next_plan_refresh_at = 0.0
@@ -3736,7 +3822,84 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("service-profile auto-apply failed: %s", e)
                 next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
 
-        if config.backup_enabled and config.backup_schedule_enabled:
+        if bool(getattr(config, "backup_cluster_enabled", False)):
+            dt_local = datetime.now()
+            run_day = dt_local.strftime("%Y-%m-%d")
+            cluster_busy = cluster_backup_thread is not None and cluster_backup_thread.is_alive()
+            if not cluster_busy:
+                cluster_job = ""
+                if (
+                    run_day != last_cluster_full_day
+                    and _local_time_reached(
+                        dt_local,
+                        int(getattr(config, "backup_cluster_full_hour", 1) or 1),
+                        int(getattr(config, "backup_cluster_full_minute", 0) or 0),
+                    )
+                    and not _cluster_local_full_done_for_date(config, dt_local)
+                ):
+                    cluster_job = "local-full"
+                elif (
+                    run_day != last_cluster_offsite_day
+                    and bool(getattr(config, "backup_cluster_remote_enabled", True))
+                    and _cluster_local_full_done_for_date(config, dt_local)
+                    and _local_time_reached(
+                        dt_local,
+                        int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 2),
+                        int(getattr(config, "backup_cluster_offsite_not_before_minute", 0) or 0),
+                    )
+                    and not _cluster_offsite_done_for_date(config, dt_local)
+                ):
+                    cluster_job = "offsite"
+                elif (
+                    _cluster_local_full_done_for_date(config, dt_local)
+                    and _local_hour_in_closed_window(
+                        dt_local,
+                        int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8),
+                        int(getattr(config, "backup_cluster_incremental_end_hour", 20) or 20),
+                    )
+                    and not _cluster_incremental_recent(config, now)
+                ):
+                    cluster_job = "incremental"
+
+                if cluster_job:
+                    def _cluster_backup_worker(job: str = cluster_job) -> None:
+                        try:
+                            if job == "local-full":
+                                res = cluster_backup_local_full(config)
+                                if res.ok and bool(getattr(config, "backup_cluster_files_snapshot_enabled", True)):
+                                    files_res = cluster_backup_files_snapshot(config)
+                                    if not files_res.ok:
+                                        logging.warning("cluster files snapshot failed after local full: %s", files_res.message)
+                                logging.info("cluster local full: %s", res.message)
+                            elif job == "offsite":
+                                res = cluster_backup_offsite(config)
+                                if res.ok:
+                                    logging.info("cluster offsite: %s", res.message)
+                                else:
+                                    logging.warning("cluster offsite failed: %s", res.message)
+                            else:
+                                res = cluster_backup_local_incremental(config)
+                                if res.ok:
+                                    logging.info("cluster incremental: %s", res.message)
+                                else:
+                                    logging.warning("cluster incremental failed: %s", res.message)
+                        except Exception as e:
+                            logging.warning("cluster backup %s failed: %s", job, e)
+
+                    cluster_backup_thread = threading.Thread(
+                        target=_cluster_backup_worker,
+                        name=f"mcd-cluster-backup-{cluster_job}",
+                        daemon=True,
+                    )
+                    cluster_backup_thread.start()
+                    if cluster_job == "local-full":
+                        last_cluster_full_day = run_day
+                    elif cluster_job == "offsite":
+                        last_cluster_offsite_day = run_day
+
+        if config.backup_enabled and config.backup_schedule_enabled and not bool(
+            getattr(config, "backup_cluster_enabled", False)
+        ):
             quiet_hour = max(0, min(23, int(config.backup_schedule_quiet_hour)))
             quiet_minute = max(0, min(59, int(getattr(config, "backup_schedule_quiet_minute", 0))))
             quiet_window_min = max(1, min(180, int(config.backup_schedule_quiet_window_min)))

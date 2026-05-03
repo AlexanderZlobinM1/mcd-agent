@@ -571,6 +571,38 @@ retention_incremental_days = 7
 # Additional raw args passed to xtrabackup. MCD adds --slave-info when supported.
 extra_args = []
 
+[backup.cluster]
+# Cluster backup mode is intended for replica/backup nodes.
+# Local operational layer uses xtrabackup on a local data disk.
+enabled = false
+local_root_dir = "/mnt/data/backup/local/ananasrs"
+# Daily local full xtrabackup start time (host local time).
+full_hour = 1
+full_minute = 0
+# Remote offsite starts only after a successful local full and not before this time.
+offsite_not_before_hour = 2
+offsite_not_before_minute = 0
+# Local incrementals from current daily full.
+incremental_start_hour = 8
+incremental_end_hour = 20
+incremental_interval_sec = 7200
+# Local files snapshot uses hardlinks and `latest`; offsite copies from latest snapshot.
+files_snapshot_enabled = true
+files_snapshot_paths = []
+files_snapshot_exclude = [
+  "*/var/cache/*",
+  "*/var/logs/*",
+  "*/var/tmp/*",
+  "*/cache/*",
+  "*/logs/*",
+  "*/tmp/*",
+  "*/sessions/*",
+]
+# Remote offsite layer uses mydumper directly to Storage Box.
+remote_enabled = true
+remote_retention_daily = 7
+remote_retention_weekly = 4
+
 [[jobs]]
 # Job name (for logs/state).
 name = "email-fetch"

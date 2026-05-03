@@ -530,6 +530,10 @@ def _lock_path(cfg: AgentConfig) -> Path:
 def backup_lock_active(config: AgentConfig) -> bool:
     """Return True when host backup/restore lock is currently held."""
     cfg = _effective_cfg(config)
+    if bool(getattr(cfg, "backup_cluster_enabled", False)):
+        for name in ("local-full", "local-incremental", "files", "offsite"):
+            if _lock_active(_cluster_lock_path(cfg, name)):
+                return True
     lock_path = _lock_path(cfg)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -1407,6 +1411,1058 @@ def _read_backup_marker(backup_dir: Path) -> dict[str, Any]:
         return {}
 
 
+def _safe_slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-") or "cluster"
+
+
+def _cluster_name(cfg: AgentConfig) -> str:
+    raw = (
+        str(getattr(cfg, "backup_instance_name", "") or "").strip()
+        or str(getattr(cfg, "backup_host_name", "") or "").strip()
+        or _host_name(cfg)
+    )
+    return raw.strip("/") or "cluster"
+
+
+def _cluster_state_path(cfg: AgentConfig) -> Path:
+    # Keep host-level backup state as the push source for MCC; cluster mode is
+    # represented by the selected backup/replica node.
+    return _state_path(cfg)
+
+
+def _cluster_local_root(cfg: AgentConfig) -> Path:
+    root = Path(str(getattr(cfg, "backup_cluster_local_root_dir", "") or "").strip())
+    if not root.is_absolute() or str(root) in {"", "/"}:
+        raise RuntimeError("backup.cluster.local_root_dir must be an absolute non-root path")
+    return root
+
+
+def _cluster_lock_path(cfg: AgentConfig, name: str) -> Path:
+    return Path(cfg.backup_lock_dir) / f"backup-cluster-{_safe_slug(_cluster_name(cfg))}-{name}.lock"
+
+
+def _lock_active(path: Path) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = path.open("w", encoding="utf-8")
+    locked = False
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = True
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        if locked:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _replace_symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    tmp = link.with_name(f".{link.name}.tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    os.symlink(target.name, tmp)
+    os.replace(tmp, link)
+
+
+def _cluster_db_instances(cfg: AgentConfig) -> list[MauticInstall]:
+    try:
+        return [x for x in _list_instances(cfg) if x.db]
+    except Exception:
+        if cfg.backup_mysql_user and cfg.backup_mysql_password:
+            return []
+        raise
+
+
+def _validate_cluster_cfg(cfg: AgentConfig, *, remote: bool = False) -> None:
+    if not bool(getattr(cfg, "backup_cluster_enabled", False)):
+        raise RuntimeError("cluster backup is disabled in config ([backup.cluster].enabled=false)")
+    _cluster_local_root(cfg)
+    if remote:
+        if not bool(getattr(cfg, "backup_cluster_remote_enabled", True)):
+            raise RuntimeError("cluster remote backup is disabled ([backup.cluster].remote_enabled=false)")
+        if not cfg.backup_ssh_host or not cfg.backup_ssh_user:
+            raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
+        if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
+            raise RuntimeError("backup storage auth is not configured (key_file or password required)")
+
+
+def _ensure_cluster_tools(cfg: AgentConfig, methods: set[str]) -> dict[str, Any]:
+    required: list[tuple[str, str]] = []
+    if "sshfs" in methods and cfg.backup_ssh_host and cfg.backup_ssh_user:
+        required.append(("sshfs", cfg.backup_sshfs_package))
+    if "mydumper" in methods:
+        required.append((cfg.backup_mydumper_bin, cfg.backup_mydumper_package))
+    if "xtrabackup" in methods:
+        required.append((cfg.backup_xtrabackup_bin, cfg.backup_xtrabackup_package))
+    missing = [(bin_path, pkg) for bin_path, pkg in required if not shutil.which(bin_path) and not Path(bin_path).exists()]
+    installed: list[str] = []
+    if missing:
+        packages: list[str] = []
+        seen: set[str] = set()
+        for _bin, pkg in missing:
+            pkg = str(pkg or "").strip()
+            if pkg and pkg not in seen:
+                seen.add(pkg)
+                packages.append(pkg)
+        if not cfg.backup_auto_install_packages:
+            raise RuntimeError("missing required backup tools: " + ", ".join(bin_path for bin_path, _ in missing))
+        _apt_install_packages(packages)
+        installed = packages
+    still_missing = [bin_path for bin_path, _ in required if not shutil.which(bin_path) and not Path(bin_path).exists()]
+    if still_missing:
+        raise RuntimeError("required backup tools are still missing after package preflight: " + ", ".join(still_missing))
+    return {"methods": sorted(methods), "installed_packages": installed}
+
+
+def _cluster_db_root(cfg: AgentConfig) -> Path:
+    return _cluster_local_root(cfg) / "db"
+
+
+def _cluster_files_root(cfg: AgentConfig) -> Path:
+    return _cluster_local_root(cfg) / "files" / "snapshots"
+
+
+def _cluster_current_full_dir(cfg: AgentConfig) -> Path | None:
+    link = _cluster_db_root(cfg) / "current-full"
+    candidates: list[Path] = []
+    try:
+        if link.exists():
+            resolved = link.resolve()
+            if resolved.exists() and resolved.is_dir():
+                candidates.append(resolved)
+    except Exception:
+        pass
+    root = _cluster_db_root(cfg)
+    if root.exists():
+        candidates += [x for x in root.iterdir() if x.is_dir() and x.name.startswith("full-")]
+    good: list[Path] = []
+    for path in candidates:
+        marker = _read_backup_marker(path)
+        if str(marker.get("status") or "").lower() == "ok" and (path / "physical-xtrabackup").exists():
+            good.append(path)
+    good.sort(key=lambda p: p.name)
+    return good[-1] if good else None
+
+
+def _cluster_latest_incremental_dir(cfg: AgentConfig, chain_id: str) -> Path | None:
+    root = _cluster_db_root(cfg) / "incrementals"
+    if not root.exists():
+        return None
+    candidates: list[Path] = []
+    for path in root.iterdir():
+        if not path.is_dir() or not path.name.startswith("incr-"):
+            continue
+        marker = _read_backup_marker(path)
+        if str(marker.get("status") or "").lower() != "ok":
+            continue
+        if str(marker.get("chain_id") or "") != chain_id:
+            continue
+        if (path / "physical-xtrabackup").exists():
+            candidates.append(path)
+    candidates.sort(key=lambda p: p.name)
+    return candidates[-1] if candidates else None
+
+
+def _cluster_update_state(cfg: AgentConfig, updates: dict[str, Any], *, history_item: dict[str, Any] | None = None) -> Path:
+    state_path = _cluster_state_path(cfg)
+    state = _json_read(state_path)
+    history = state.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    if history_item is not None:
+        history = [history_item] + history[:19]
+        updates = dict(updates)
+        updates["history"] = history
+    state.update(updates)
+    _json_write(state_path, state)
+    return state_path
+
+
+def _cluster_prune_local_after_full(cfg: AgentConfig, keep_full: Path) -> list[str]:
+    removed: list[str] = []
+    db_root = _cluster_db_root(cfg)
+    incr_root = db_root / "incrementals"
+    keep_marker = _read_backup_marker(keep_full)
+    keep_chain = str(keep_marker.get("chain_id") or keep_full.name)
+    for path in db_root.iterdir() if db_root.exists() else []:
+        if path == keep_full or not path.is_dir() or not path.name.startswith("full-"):
+            continue
+        try:
+            shutil.rmtree(path)
+            removed.append(str(path))
+        except Exception:
+            pass
+    if incr_root.exists():
+        for path in incr_root.iterdir():
+            if not path.is_dir() or not path.name.startswith("incr-"):
+                continue
+            marker = _read_backup_marker(path)
+            if str(marker.get("chain_id") or "") == keep_chain:
+                continue
+            try:
+                shutil.rmtree(path)
+                removed.append(str(path))
+            except Exception:
+                pass
+    return removed
+
+
+def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        tool_state = _ensure_cluster_tools(cfg, {"xtrabackup"})
+        db_instances = _cluster_db_instances(cfg)
+        db = _backup_db_from_config_or_instances(cfg, db_instances)
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "job": "backup.cluster.local_full",
+                "method": "xtrabackup",
+            },
+            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.local_full", "error": str(e)},
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+
+    lock_path = _cluster_lock_path(cfg, "local-full")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="cluster local full backup is already running", state_path=str(state_path))
+
+    ts = _fmt_local_ts()
+    db_root = _cluster_db_root(cfg)
+    tmp_dir = db_root / f".incomplete-full-{ts}"
+    final_dir = db_root / f"full-{ts}"
+    db_dir = tmp_dir / "physical-xtrabackup"
+    try:
+        db_root.mkdir(parents=True, exist_ok=True)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "last_backup_path": str(final_dir),
+                "job": "backup.cluster.local_full",
+                "method": "xtrabackup",
+                "tool_state": tool_state,
+            },
+        )
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        _run_xtrabackup(replace(cfg, backup_method="xtrabackup"), db, db_dir)
+        ok, msg, bytes_written = _verify_xtrabackup_dir(db_dir)
+        if not ok:
+            raise RuntimeError(f"xtrabackup verification failed: {msg}")
+        chain_id = final_dir.name
+        marker = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "host_name": _host_name(cfg),
+            "method": "xtrabackup",
+            "backup_kind": "full",
+            "chain_id": chain_id,
+            "path": str(final_dir),
+            "db_dir": str(final_dir / "physical-xtrabackup"),
+            "bytes_written": bytes_written,
+            "server_snapshot": _mysql_server_snapshot(cfg, db),
+        }
+        _write_marker(tmp_dir, marker)
+        os.replace(tmp_dir, final_dir)
+        _replace_symlink(db_root / "current-full", final_dir)
+        removed = _cluster_prune_local_after_full(cfg, final_dir)
+        if removed:
+            marker["local_pruned"] = removed
+            _write_marker(final_dir, marker)
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(final_dir),
+                "last_bytes_written": bytes_written,
+                "last_backup_kind": "cluster_local_full",
+                "last_chain_id": chain_id,
+                "last_local_full_path": str(final_dir),
+                "last_local_full_at": marker["ts_utc"],
+                "last_local_pruned": removed,
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.local_full",
+                "duration_sec": duration,
+                "backup_path": str(final_dir),
+                "bytes_written": bytes_written,
+                "chain_id": chain_id,
+                "local_pruned": removed,
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster local full completed: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=bytes_written,
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.local_full",
+                "duration_sec": duration,
+                "error": str(e),
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def cluster_backup_local_incremental(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        _ensure_cluster_tools(cfg, {"xtrabackup"})
+        db_instances = _cluster_db_instances(cfg)
+        db = _backup_db_from_config_or_instances(cfg, db_instances)
+        full_dir = _cluster_current_full_dir(cfg)
+        if full_dir is None:
+            raise RuntimeError("no completed local full backup found for incremental base")
+        full_marker = _read_backup_marker(full_dir)
+        chain_id = str(full_marker.get("chain_id") or full_dir.name)
+        latest_incr = _cluster_latest_incremental_dir(cfg, chain_id)
+        base_dir = (latest_incr or full_dir) / "physical-xtrabackup"
+        if not base_dir.exists():
+            raise RuntimeError(f"incremental base xtrabackup dir missing: {base_dir}")
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "job": "backup.cluster.incremental",
+                "method": "xtrabackup",
+            },
+            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.incremental", "error": str(e)},
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+
+    lock_path = _cluster_lock_path(cfg, "local-incremental")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="cluster local incremental backup is already running", state_path=str(state_path))
+
+    ts = _fmt_local_ts()
+    incr_root = _cluster_db_root(cfg) / "incrementals"
+    tmp_dir = incr_root / f".incomplete-incr-{ts}"
+    final_dir = incr_root / f"incr-{ts}"
+    db_dir = tmp_dir / "physical-xtrabackup"
+    try:
+        incr_root.mkdir(parents=True, exist_ok=True)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "last_backup_path": str(final_dir),
+                "job": "backup.cluster.incremental",
+                "method": "xtrabackup",
+                "last_chain_id": chain_id,
+            },
+        )
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        _run_xtrabackup(replace(cfg, backup_method="xtrabackup"), db, db_dir, incremental_base_dir=base_dir)
+        ok, msg, bytes_written = _verify_xtrabackup_dir(db_dir)
+        if not ok:
+            raise RuntimeError(f"xtrabackup incremental verification failed: {msg}")
+        marker = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "host_name": _host_name(cfg),
+            "method": "xtrabackup",
+            "backup_kind": "incremental",
+            "chain_id": chain_id,
+            "full_backup_path": str(full_dir),
+            "base_backup_path": str(latest_incr or full_dir),
+            "path": str(final_dir),
+            "db_dir": str(final_dir / "physical-xtrabackup"),
+            "bytes_written": bytes_written,
+        }
+        _write_marker(tmp_dir, marker)
+        os.replace(tmp_dir, final_dir)
+        _replace_symlink(incr_root / "current-incremental", final_dir)
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(final_dir),
+                "last_bytes_written": bytes_written,
+                "last_backup_kind": "cluster_local_incremental",
+                "last_chain_id": chain_id,
+                "last_local_incremental_path": str(final_dir),
+                "last_local_incremental_at": marker["ts_utc"],
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.incremental",
+                "duration_sec": duration,
+                "backup_path": str(final_dir),
+                "bytes_written": bytes_written,
+                "chain_id": chain_id,
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster local incremental completed: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=bytes_written,
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.incremental",
+                "duration_sec": duration,
+                "error": str(e),
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _cluster_snapshot_paths(cfg: AgentConfig) -> list[str]:
+    raw = list(getattr(cfg, "backup_cluster_files_snapshot_paths", []) or [])
+    if not raw:
+        raw = list(getattr(cfg, "backup_archive_paths", []) or [])
+    out: list[str] = []
+    for item in raw:
+        p = str(item or "").strip()
+        if p and Path(p).exists():
+            out.append(p)
+    return out
+
+
+def cluster_backup_files_snapshot(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    lock_path = _cluster_lock_path(cfg, "files")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="cluster files snapshot is already running", state_path=str(state_path))
+    ts = _fmt_local_ts()
+    snap_root = _cluster_files_root(cfg)
+    tmp_dir = snap_root / f".incomplete-{ts}"
+    final_dir = snap_root / ts
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        if not bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)):
+            raise RuntimeError("cluster files snapshot is disabled")
+        paths = _cluster_snapshot_paths(cfg)
+        if not paths:
+            raise RuntimeError("no existing paths configured for cluster files snapshot")
+        snap_root.mkdir(parents=True, exist_ok=True)
+        latest = snap_root / "latest"
+        link_dest = ""
+        try:
+            if latest.exists():
+                resolved = latest.resolve()
+                if resolved.exists() and resolved.is_dir():
+                    link_dest = str(resolved)
+        except Exception:
+            link_dest = ""
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        cmd = ["rsync", "-a", "--delete", "--numeric-ids", "--relative"]
+        if link_dest:
+            cmd.append(f"--link-dest={link_dest}")
+        for pattern in list(getattr(cfg, "backup_cluster_files_snapshot_exclude", []) or []):
+            pattern = str(pattern or "").strip()
+            if pattern:
+                cmd.append(f"--exclude={pattern}")
+        cmd += paths + [str(tmp_dir)]
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "last_backup_path": str(final_dir),
+                "job": "backup.cluster.files_snapshot",
+                "method": "rsync-hardlink",
+            },
+        )
+        _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+        bytes_written = _path_total_bytes(tmp_dir)
+        manifest = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "host_name": _host_name(cfg),
+            "method": "rsync-hardlink",
+            "paths": paths,
+            "excludes": list(getattr(cfg, "backup_cluster_files_snapshot_exclude", []) or []),
+            "link_dest": link_dest,
+            "bytes_written": bytes_written,
+        }
+        _write_marker(tmp_dir, manifest)
+        os.replace(tmp_dir, final_dir)
+        _replace_symlink(snap_root / "latest", final_dir)
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(final_dir),
+                "last_bytes_written": bytes_written,
+                "last_backup_kind": "cluster_files_snapshot",
+                "last_files_snapshot_path": str(final_dir),
+                "last_files_snapshot_at": manifest["ts_utc"],
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.files_snapshot",
+                "duration_sec": duration,
+                "backup_path": str(final_dir),
+                "bytes_written": bytes_written,
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster files snapshot completed: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=bytes_written,
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.files_snapshot",
+                "duration_sec": duration,
+                "error": str(e),
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _cluster_latest_files_snapshot(cfg: AgentConfig) -> Path | None:
+    latest = _cluster_files_root(cfg) / "latest"
+    try:
+        if latest.exists():
+            resolved = latest.resolve()
+            if resolved.exists() and resolved.is_dir():
+                return resolved
+    except Exception:
+        pass
+    root = _cluster_files_root(cfg)
+    if not root.exists():
+        return None
+    candidates = [x for x in root.iterdir() if x.is_dir() and not x.name.startswith(".")]
+    candidates.sort(key=lambda p: p.name)
+    return candidates[-1] if candidates else None
+
+
+def _cluster_remote_parent(cfg: AgentConfig, mount_path: Path) -> Path:
+    return mount_path / _format_remote_dir(cfg.backup_remote_root_dir, _cluster_name(cfg))
+
+
+def _cluster_is_protected_archive(path: Path) -> tuple[bool, str]:
+    lname = path.name.lower()
+    manual_tokens = ("manual", "dont-touch", "do-not-touch", "do_not_touch", "do-not-prune", "do_not_prune")
+    if any(tok in lname for tok in manual_tokens):
+        return True, "protected_by_name"
+    marker = _read_backup_marker(path)
+    for key in ("manual", "manual_archive", "do_not_prune", "dont_touch", "protected"):
+        if bool(marker.get(key)):
+            return True, f"protected_by_marker:{key}"
+    kind = str(marker.get("kind") or marker.get("backup_kind") or marker.get("type") or "").strip().lower()
+    if kind in {"manual", "manual_archive"}:
+        return True, "protected_by_marker_kind"
+    return False, ""
+
+
+def _cluster_remote_retention_plan_for_parent(
+    parent: Path,
+    *,
+    keep_daily: int,
+    keep_weekly: int,
+    apply: bool = False,
+) -> dict[str, Any]:
+    plan: dict[str, Any] = {
+        "root": str(parent),
+        "apply": bool(apply),
+        "keep_daily": int(keep_daily),
+        "keep_weekly": int(keep_weekly),
+        "kept": [],
+        "delete_candidates": [],
+        "protected": [],
+        "problems": [],
+        "removed": [],
+    }
+    if not parent.exists():
+        return plan
+
+    candidates: list[dict[str, Any]] = []
+
+    def rel(p: Path) -> str:
+        try:
+            return str(p.relative_to(parent))
+        except Exception:
+            return str(p)
+
+    def scan(container: Path, scope: str) -> None:
+        if not container.exists():
+            return
+        for child in sorted(container.iterdir(), key=lambda p: p.name):
+            if child.is_symlink() or child.is_file():
+                continue
+            if not child.is_dir():
+                continue
+            if child.name.startswith(".incomplete-"):
+                continue
+            protected, reason = _cluster_is_protected_archive(child)
+            if protected:
+                plan["protected"].append({"path": rel(child), "reason": reason})
+                continue
+            dt = _dir_date(child)
+            if dt is None:
+                plan["problems"].append(
+                    {
+                        "path": rel(child),
+                        "reason": "directory is not date-named and is not marked protected/manual",
+                    }
+                )
+                continue
+            candidates.append({"path": child, "rel": rel(child), "date": dt, "scope": scope})
+
+    known = {"daily", "weekly"}
+    for child in sorted(parent.iterdir(), key=lambda p: p.name):
+        if child.is_dir() and child.name in known:
+            scan(child, child.name)
+        elif child.is_dir() and child.name.startswith(".incomplete-"):
+            continue
+        elif child.is_dir():
+            protected, reason = _cluster_is_protected_archive(child)
+            if protected:
+                plan["protected"].append({"path": rel(child), "reason": reason})
+                continue
+            dt = _dir_date(child)
+            if dt is not None:
+                candidates.append({"path": child, "rel": rel(child), "date": dt, "scope": "legacy"})
+            else:
+                plan["problems"].append(
+                    {
+                        "path": rel(child),
+                        "reason": "top-level directory is not daily/weekly/date and is not marked protected/manual",
+                    }
+                )
+
+    candidates.sort(key=lambda x: x["date"], reverse=True)
+    keep_paths: set[str] = set()
+    for item in [x for x in candidates if x["scope"] in {"daily", "legacy"}][: max(0, int(keep_daily))]:
+        keep_paths.add(str(item["path"]))
+    weekly_candidates = [x for x in candidates if x["scope"] == "weekly" or x["date"].weekday() == 6]
+    for item in weekly_candidates[: max(0, int(keep_weekly))]:
+        keep_paths.add(str(item["path"]))
+
+    for item in candidates:
+        row = {"path": item["rel"], "date": item["date"].strftime("%Y-%m-%d"), "scope": item["scope"]}
+        if str(item["path"]) in keep_paths:
+            plan["kept"].append(row)
+        else:
+            plan["delete_candidates"].append(row)
+
+    if apply and not plan["problems"]:
+        for item in plan["delete_candidates"]:
+            path = parent / str(item["path"])
+            try:
+                shutil.rmtree(path)
+                plan["removed"].append(dict(item))
+            except Exception as e:
+                plan["problems"].append({"path": str(item["path"]), "reason": f"delete failed: {e}"})
+        if plan["removed"]:
+            plan["delete_candidates"] = [
+                x
+                for x in plan["delete_candidates"]
+                if str(x.get("path") or "") not in {str(y.get("path") or "") for y in plan["removed"]}
+            ]
+    return plan
+
+
+def cluster_backup_retention_plan(config: AgentConfig, *, apply: bool = False) -> dict[str, Any]:
+    cfg = _effective_cfg(config)
+    _validate_cluster_cfg(cfg, remote=True)
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    _mount(cfg, mount_path)
+    try:
+        parent = _cluster_remote_parent(cfg, mount_path)
+        parent.mkdir(parents=True, exist_ok=True)
+        return _cluster_remote_retention_plan_for_parent(
+            parent,
+            keep_daily=max(1, int(getattr(cfg, "backup_cluster_remote_retention_daily", 7) or 7)),
+            keep_weekly=max(0, int(getattr(cfg, "backup_cluster_remote_retention_weekly", 4) or 4)),
+            apply=apply,
+        )
+    finally:
+        _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+
+
+def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=True)
+        tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
+        db_instances = _cluster_db_instances(cfg)
+        db = _backup_db_from_config_or_instances(cfg, db_instances)
+        full_dir = _cluster_current_full_dir(cfg)
+        if full_dir is None:
+            raise RuntimeError("offsite backup requires a completed local full backup")
+        full_marker = _read_backup_marker(full_dir)
+        files_snapshot = _cluster_latest_files_snapshot(cfg) if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)) else None
+        if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)) and files_snapshot is None:
+            raise RuntimeError("offsite backup requires a completed local files snapshot")
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "job": "backup.cluster.offsite",
+                "method": "mydumper",
+            },
+            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.offsite", "error": str(e)},
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+
+    lock_path = _cluster_lock_path(cfg, "offsite")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="cluster offsite backup is already running", state_path=str(state_path))
+
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    date_dir = _fmt_local_date()
+    tmp_dir: Path | None = None
+    final_dir: Path | None = None
+    try:
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "job": "backup.cluster.offsite",
+                "method": "mydumper",
+                "tool_state": tool_state,
+            },
+        )
+        _mount(cfg, mount_path)
+        remote_parent = _cluster_remote_parent(cfg, mount_path)
+        daily_parent = remote_parent / "daily"
+        daily_parent.mkdir(parents=True, exist_ok=True)
+        removed_incomplete, failed_incomplete = _cleanup_incomplete_dirs(daily_parent)
+        if failed_incomplete:
+            raise RuntimeError("failed to cleanup stale incomplete offsite dirs: " + ", ".join(sorted(failed_incomplete)))
+        final_dir = daily_parent / date_dir
+        if final_dir.exists():
+            marker = _read_backup_marker(final_dir)
+            if str(marker.get("status") or "").lower() == "ok":
+                duration = int(time.monotonic() - start_monotonic)
+                _cluster_update_state(
+                    cfg,
+                    {
+                        "last_status": "ok",
+                        "last_error": "",
+                        "last_success_at": _utc_now_iso(),
+                        "last_duration_sec": duration,
+                        "last_backup_path": str(final_dir),
+                        "last_backup_kind": "cluster_offsite",
+                    },
+                    history_item={
+                        "ts": _utc_now_iso(),
+                        "status": "ok_skip_existing",
+                        "job": "backup.cluster.offsite",
+                        "duration_sec": duration,
+                        "backup_path": str(final_dir),
+                    },
+                )
+                return BackupResult(
+                    ok=True,
+                    message=f"cluster offsite backup already exists: {final_dir}",
+                    state_path=str(state_path),
+                    backup_path=str(final_dir),
+                    duration_sec=duration,
+                )
+            raise RuntimeError(f"offsite backup target already exists: {final_dir}")
+        tmp_dir = daily_parent / f".incomplete-{date_dir}-{_fmt_local_ts()}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        db_dir = tmp_dir / "databases" / f"cluster__{db.name or 'all'}"
+        db_dir.mkdir(parents=True, exist_ok=False)
+        _run_mydumper(replace(cfg, backup_method="mydumper"), db, db_dir)
+        ok, verify_msg, db_bytes = _verify_dump_dir(db_dir)
+        if not ok:
+            raise RuntimeError(f"cluster offsite mydumper verification failed: {verify_msg}")
+        files_bytes = 0
+        if files_snapshot is not None:
+            files_dst = tmp_dir / "files"
+            files_dst.mkdir(parents=True, exist_ok=True)
+            _run(
+                ["rsync", "-a", "--delete", "--numeric-ids", f"{files_snapshot}/", f"{files_dst}/"],
+                timeout_sec=cfg.backup_dump_timeout_sec,
+                check=True,
+            )
+            files_bytes = _path_total_bytes(files_dst)
+        bytes_written = db_bytes + files_bytes
+        marker = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "host_name": _host_name(cfg),
+            "method": "mydumper",
+            "path": str(final_dir),
+            "database": db.name or "*",
+            "bytes_written": bytes_written,
+            "db_bytes": db_bytes,
+            "files_bytes": files_bytes,
+            "local_full_path": str(full_dir),
+            "local_full_chain_id": str(full_marker.get("chain_id") or full_dir.name),
+            "files_snapshot_path": str(files_snapshot) if files_snapshot is not None else "",
+            "server_snapshot": _mysql_server_snapshot(cfg, db),
+            "cleanup_incomplete_removed": removed_incomplete,
+        }
+        _write_marker(tmp_dir, marker)
+        os.replace(tmp_dir, final_dir)
+        retention_plan = _cluster_remote_retention_plan_for_parent(
+            remote_parent,
+            keep_daily=max(1, int(getattr(cfg, "backup_cluster_remote_retention_daily", 7) or 7)),
+            keep_weekly=max(0, int(getattr(cfg, "backup_cluster_remote_retention_weekly", 4) or 4)),
+            apply=True,
+        )
+        marker["retention_plan"] = retention_plan
+        if retention_plan.get("problems"):
+            marker["retention_skipped_reason"] = "problems_detected_no_delete"
+        _write_marker(final_dir, marker)
+        usage = _storage_usage(mount_path)
+        duration = int(time.monotonic() - start_monotonic)
+        state_updates = {
+            "last_status": "ok",
+            "last_error": "",
+            "last_success_at": _utc_now_iso(),
+            "last_duration_sec": duration,
+            "last_backup_path": str(final_dir),
+            "last_bytes_written": bytes_written,
+            "last_backup_kind": "cluster_offsite",
+            "last_remote_retention_plan": retention_plan,
+        }
+        if isinstance(usage, dict):
+            state_updates.update(
+                {
+                    "last_storage_total_bytes": int(usage.get("total_bytes") or 0),
+                    "last_storage_used_bytes": int(usage.get("used_bytes") or 0),
+                    "last_storage_free_bytes": int(usage.get("free_bytes") or 0),
+                    "last_storage_used_pct": float(usage.get("used_pct") or 0.0),
+                    "last_storage_checked_at": str(usage.get("checked_at") or ""),
+                }
+            )
+        _cluster_update_state(
+            cfg,
+            state_updates,
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.offsite",
+                "duration_sec": duration,
+                "backup_path": str(final_dir),
+                "bytes_written": bytes_written,
+                "retention_removed": retention_plan.get("removed", []),
+                "retention_problems": retention_plan.get("problems", []),
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster offsite backup completed: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=bytes_written,
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir is not None and tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.offsite",
+                "duration_sec": duration,
+                "error": str(e),
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+        except Exception:
+            pass
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    state = _json_read(state_path)
+    root = _cluster_local_root(cfg)
+    current_full = _cluster_current_full_dir(cfg)
+    latest_incr = None
+    chain_id = ""
+    if current_full is not None:
+        marker = _read_backup_marker(current_full)
+        chain_id = str(marker.get("chain_id") or current_full.name)
+        latest_incr = _cluster_latest_incremental_dir(cfg, chain_id)
+    latest_files = _cluster_latest_files_snapshot(cfg)
+    state.update(
+        {
+            "cluster_enabled": bool(getattr(cfg, "backup_cluster_enabled", False)),
+            "cluster_name": _cluster_name(cfg),
+            "state_path": str(state_path),
+            "local_root_dir": str(root),
+            "current_full": str(current_full) if current_full is not None else "",
+            "current_chain_id": chain_id,
+            "latest_incremental": str(latest_incr) if latest_incr is not None else "",
+            "latest_files_snapshot": str(latest_files) if latest_files is not None else "",
+            "local_full_running": _lock_active(_cluster_lock_path(cfg, "local-full")),
+            "local_incremental_running": _lock_active(_cluster_lock_path(cfg, "local-incremental")),
+            "files_snapshot_running": _lock_active(_cluster_lock_path(cfg, "files")),
+            "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")),
+        }
+    )
+    return state
+
+
 def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
     cfg = _effective_cfg(config)
     method = _backup_method(cfg)
@@ -2097,7 +3153,7 @@ def backup_status(config: AgentConfig, root: str | None = None) -> dict[str, Any
 
 def backup_state_for_push(config: AgentConfig) -> dict[str, Any]:
     st = backup_status(config)
-    return {
+    out = {
         "last_run_at": st.get("last_run_at"),
         "last_success_at": st.get("last_success_at"),
         "last_status": st.get("last_status"),
@@ -2118,6 +3174,27 @@ def backup_state_for_push(config: AgentConfig) -> dict[str, Any]:
         "last_storage_probe_status": st.get("last_storage_probe_status"),
         "last_storage_probe_error": st.get("last_storage_probe_error"),
     }
+    if bool(getattr(config, "backup_cluster_enabled", False)):
+        try:
+            cst = cluster_backup_status(config)
+            out.update(
+                {
+                    "cluster_enabled": cst.get("cluster_enabled"),
+                    "cluster_name": cst.get("cluster_name"),
+                    "last_backup_kind": cst.get("last_backup_kind"),
+                    "last_chain_id": cst.get("last_chain_id"),
+                    "last_local_full_path": cst.get("last_local_full_path") or cst.get("current_full"),
+                    "last_local_full_at": cst.get("last_local_full_at"),
+                    "last_local_incremental_path": cst.get("last_local_incremental_path") or cst.get("latest_incremental"),
+                    "last_local_incremental_at": cst.get("last_local_incremental_at"),
+                    "last_files_snapshot_path": cst.get("last_files_snapshot_path") or cst.get("latest_files_snapshot"),
+                    "last_files_snapshot_at": cst.get("last_files_snapshot_at"),
+                    "last_remote_retention_plan": cst.get("last_remote_retention_plan"),
+                }
+            )
+        except Exception:
+            pass
+    return out
 
 
 def backup_profile_for_push(config: AgentConfig) -> dict[str, Any]:

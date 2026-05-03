@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.145 - 2026-05-03
+
+- Added: cluster backup commands for replica-based two-layer backups: local xtrabackup full, local xtrabackup incremental, local hardlink file snapshot, and remote offsite mydumper.
+- Added: daemon scheduling for cluster backups: daily local full, offsite after successful full and not before configured time, and daytime local incrementals.
+- Safety: cluster remote retention now produces an explicit plan and refuses deletion when unknown or unmarked directories are found; manual/protected archives are never deleted.
+
 ## 0.8.144 - 2026-05-03
 
 - Added: xtrabackup physical backups now support incremental chains.

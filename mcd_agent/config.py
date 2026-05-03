@@ -513,6 +513,21 @@ class AgentConfig:
     backup_xtrabackup_full_interval_days: int
     backup_xtrabackup_retention_full_copies: int
     backup_xtrabackup_retention_incremental_days: int
+    backup_cluster_enabled: bool
+    backup_cluster_local_root_dir: str
+    backup_cluster_full_hour: int
+    backup_cluster_full_minute: int
+    backup_cluster_offsite_not_before_hour: int
+    backup_cluster_offsite_not_before_minute: int
+    backup_cluster_incremental_start_hour: int
+    backup_cluster_incremental_end_hour: int
+    backup_cluster_incremental_interval_sec: int
+    backup_cluster_files_snapshot_enabled: bool
+    backup_cluster_files_snapshot_paths: list[str]
+    backup_cluster_files_snapshot_exclude: list[str]
+    backup_cluster_remote_enabled: bool
+    backup_cluster_remote_retention_daily: int
+    backup_cluster_remote_retention_weekly: int
     backup_restore_apply_files: bool
     backup_restore_apply_databases: bool
     backup_schedule_enabled: bool
@@ -1506,6 +1521,21 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_xtrabackup_full_interval_days": "backup_xtrabackup_full_interval_days",
     "backup_xtrabackup_retention_full_copies": "backup_xtrabackup_retention_full_copies",
     "backup_xtrabackup_retention_incremental_days": "backup_xtrabackup_retention_incremental_days",
+    "backup_cluster_enabled": "backup_cluster_enabled",
+    "backup_cluster_local_root_dir": "backup_cluster_local_root_dir",
+    "backup_cluster_full_hour": "backup_cluster_full_hour",
+    "backup_cluster_full_minute": "backup_cluster_full_minute",
+    "backup_cluster_offsite_not_before_hour": "backup_cluster_offsite_not_before_hour",
+    "backup_cluster_offsite_not_before_minute": "backup_cluster_offsite_not_before_minute",
+    "backup_cluster_incremental_start_hour": "backup_cluster_incremental_start_hour",
+    "backup_cluster_incremental_end_hour": "backup_cluster_incremental_end_hour",
+    "backup_cluster_incremental_interval_sec": "backup_cluster_incremental_interval_sec",
+    "backup_cluster_files_snapshot_enabled": "backup_cluster_files_snapshot_enabled",
+    "backup_cluster_files_snapshot_paths": "backup_cluster_files_snapshot_paths",
+    "backup_cluster_files_snapshot_exclude": "backup_cluster_files_snapshot_exclude",
+    "backup_cluster_remote_enabled": "backup_cluster_remote_enabled",
+    "backup_cluster_remote_retention_daily": "backup_cluster_remote_retention_daily",
+    "backup_cluster_remote_retention_weekly": "backup_cluster_remote_retention_weekly",
     "mautic6_core_patch_policy": "mautic6_core_patch_policy",
     "mautic6_core_patch_version_min": "mautic6_core_patch_version_min",
     "mautic6_core_patch_version_max": "mautic6_core_patch_version_max",
@@ -1769,6 +1799,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     backup_packages = backup.get("packages", {}) if isinstance(backup, dict) else {}
     backup_mydumper = backup.get("mydumper", {}) if isinstance(backup, dict) else {}
     backup_xtrabackup = backup.get("xtrabackup", {}) if isinstance(backup, dict) else {}
+    backup_cluster = backup.get("cluster", {}) if isinstance(backup, dict) else {}
     backup_archive = backup.get("archive", {}) if isinstance(backup, dict) else {}
     backup_mysql = backup.get("mysql", {}) if isinstance(backup, dict) else {}
     backup_schedule = backup.get("schedule", {}) if isinstance(backup, dict) else {}
@@ -2279,6 +2310,57 @@ def _load_config_inner(path: str) -> AgentConfig:
             1,
             int(backup_xtrabackup.get("retention_incremental_days", 7)),
         ),
+        backup_cluster_enabled=bool(backup_cluster.get("enabled", False)),
+        backup_cluster_local_root_dir=str(
+            backup_cluster.get("local_root_dir", "/mnt/data/backup/local/ananasrs")
+        ).strip()
+        or "/mnt/data/backup/local/ananasrs",
+        backup_cluster_full_hour=max(0, min(23, int(backup_cluster.get("full_hour", 1)))),
+        backup_cluster_full_minute=max(0, min(59, int(backup_cluster.get("full_minute", 0)))),
+        backup_cluster_offsite_not_before_hour=max(
+            0,
+            min(23, int(backup_cluster.get("offsite_not_before_hour", 2))),
+        ),
+        backup_cluster_offsite_not_before_minute=max(
+            0,
+            min(59, int(backup_cluster.get("offsite_not_before_minute", 0))),
+        ),
+        backup_cluster_incremental_start_hour=max(
+            0,
+            min(23, int(backup_cluster.get("incremental_start_hour", 8))),
+        ),
+        backup_cluster_incremental_end_hour=max(
+            0,
+            min(23, int(backup_cluster.get("incremental_end_hour", 20))),
+        ),
+        backup_cluster_incremental_interval_sec=max(
+            300,
+            int(backup_cluster.get("incremental_interval_sec", 7200)),
+        ),
+        backup_cluster_files_snapshot_enabled=bool(backup_cluster.get("files_snapshot_enabled", True)),
+        backup_cluster_files_snapshot_paths=_normalize_list(
+            backup_cluster.get(
+                "files_snapshot_paths",
+                backup_archive.get("paths", []),
+            )
+        ),
+        backup_cluster_files_snapshot_exclude=_normalize_list(
+            backup_cluster.get(
+                "files_snapshot_exclude",
+                [
+                    "*/var/cache/*",
+                    "*/var/logs/*",
+                    "*/var/tmp/*",
+                    "*/cache/*",
+                    "*/logs/*",
+                    "*/tmp/*",
+                    "*/sessions/*",
+                ],
+            )
+        ),
+        backup_cluster_remote_enabled=bool(backup_cluster.get("remote_enabled", True)),
+        backup_cluster_remote_retention_daily=max(1, int(backup_cluster.get("remote_retention_daily", 7))),
+        backup_cluster_remote_retention_weekly=max(0, int(backup_cluster.get("remote_retention_weekly", 4))),
         backup_restore_apply_files=bool(backup.get("restore_apply_files", True)),
         backup_restore_apply_databases=bool(backup.get("restore_apply_databases", True)),
         backup_schedule_enabled=bool(backup_schedule.get("enabled", False)),
