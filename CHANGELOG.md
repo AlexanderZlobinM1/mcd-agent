@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.8.147 - 2026-05-03
+
+- Fixed: cluster-routed manual requests now match all local node aliases (`mcc_host_name`, local hostname, observed/effective hostnames) instead of only the internal state node id, so commands queued to MCC host names are consumed by the correct daemon.
+
 ## 0.8.146 - 2026-05-03
 
 - Fixed: cluster backup is now guarded by cluster authority and can run only on the configured authority node, defaulting to the replica role.

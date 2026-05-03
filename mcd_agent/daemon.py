@@ -38,7 +38,11 @@ from mcd_agent.backup import (
     cluster_backup_offsite,
     cluster_backup_status,
 )
-from mcd_agent.cluster_routing import cluster_route_allows, cluster_route_authority_status
+from mcd_agent.cluster_routing import (
+    cluster_local_identity_values,
+    cluster_route_allows,
+    cluster_route_authority_status,
+)
 from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
@@ -1331,6 +1335,14 @@ class TaskStore:
             pass
         self._init_sqlite_schema()
         self._node_id = _state_node_id(cfg)
+        aliases = {str(self._node_id or "").strip()}
+        if cfg is not None:
+            try:
+                aliases.update(cluster_local_identity_values(cfg))
+            except Exception:
+                pass
+        self._node_aliases = {x.strip() for x in aliases if str(x or "").strip()}
+        self._node_aliases_lc = {x.lower() for x in self._node_aliases}
 
         self._mysql_mode = bool(
             cfg is not None
@@ -1348,6 +1360,15 @@ class TaskStore:
                     self._mysql_mark_error()
             if self._mysql_available(force_probe=True) and self._migrate_sqlite_to_mysql_once():
                 self._sqlite_prune_for_failover()
+
+    def _is_local_host_alias(self, host_name: str | None) -> bool:
+        host_lc = str(host_name or "").strip().lower()
+        return bool(host_lc and host_lc in self._node_aliases_lc)
+
+    def _mysql_alias_where(self) -> tuple[str, tuple[str, ...]]:
+        aliases = tuple(sorted(self._node_aliases or {self._node_id}))
+        placeholders = ",".join(["%s"] * len(aliases))
+        return placeholders, aliases
 
     def _init_sqlite_schema(self) -> None:
         self.conn.execute(
@@ -2317,7 +2338,7 @@ class TaskStore:
                         """,
                         (target_host, str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
                     )
-                    if target_host == self._node_id:
+                    if self._is_local_host_alias(target_host):
                         self.conn.execute(
                             """
                             INSERT OR REPLACE INTO manual_requests(
@@ -2364,15 +2385,16 @@ class TaskStore:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
+                    placeholders, aliases = self._mysql_alias_where()
                     return self._mysql_query(
                         f"""
                         SELECT *
                         FROM `{table}`
-                        WHERE host_name=%s AND status='pending' AND root=%s
+                        WHERE host_name IN ({placeholders}) AND status='pending' AND root=%s
                         ORDER BY requested_at ASC, id ASC
                         LIMIT {lim}
                         """,
-                        (self._node_id, str(root)),
+                        (*aliases, str(root)),
                     )
                 except Exception:
                     pass
@@ -2389,7 +2411,7 @@ class TaskStore:
         )
 
     def get_manual_request_status(self, req_id: int) -> str | None:
-        return self.get_manual_request_status_for_host(req_id, self._node_id)
+        return self.get_manual_request_status_for_host(req_id, None)
 
     def get_manual_request_status_for_host(self, req_id: int, host_name: str | None = None) -> str | None:
         target_host = str(host_name or self._node_id).strip() or self._node_id
@@ -2397,10 +2419,17 @@ class TaskStore:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
-                    rows = self._mysql_query(
-                        f"SELECT status FROM `{table}` WHERE id=%s AND host_name=%s LIMIT 1",
-                        (int(req_id), target_host),
-                    )
+                    if host_name is None:
+                        placeholders, aliases = self._mysql_alias_where()
+                        rows = self._mysql_query(
+                            f"SELECT status FROM `{table}` WHERE id=%s AND host_name IN ({placeholders}) LIMIT 1",
+                            (int(req_id), *aliases),
+                        )
+                    else:
+                        rows = self._mysql_query(
+                            f"SELECT status FROM `{table}` WHERE id=%s AND host_name=%s LIMIT 1",
+                            (int(req_id), target_host),
+                        )
                     if rows:
                         return str(rows[0].get("status") or "")
                 except Exception:
@@ -2416,13 +2445,14 @@ class TaskStore:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
+                    placeholders, aliases = self._mysql_alias_where()
                     _, cnt = self._mysql_exec(
                         f"""
                         UPDATE `{table}`
                         SET status='cancelled', note=%s, finished_at=%s
-                        WHERE id=%s AND host_name=%s AND status='pending'
+                        WHERE id=%s AND host_name IN ({placeholders}) AND status='pending'
                         """,
-                        (str(note), now, int(req_id), self._node_id),
+                        (str(note), now, int(req_id), *aliases),
                     )
                     self.conn.execute(
                         """
@@ -2454,13 +2484,14 @@ class TaskStore:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
+                    placeholders, aliases = self._mysql_alias_where()
                     self._mysql_exec(
                         f"""
                         UPDATE `{table}`
                         SET status='launched', task_key=%s, launched_at=%s, note=NULL
-                        WHERE id=%s AND host_name=%s AND status='pending'
+                        WHERE id=%s AND host_name IN ({placeholders}) AND status='pending'
                         """,
-                        (str(task_key), now, int(req_id), self._node_id),
+                        (str(task_key), now, int(req_id), *aliases),
                     )
                     self.conn.execute(
                         """
@@ -2491,13 +2522,14 @@ class TaskStore:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
+                    placeholders, aliases = self._mysql_alias_where()
                     self._mysql_exec(
                         f"""
                         UPDATE `{table}`
                         SET status=%s, note=%s, finished_at=%s
-                        WHERE id=%s AND host_name=%s AND status IN ('pending','launched')
+                        WHERE id=%s AND host_name IN ({placeholders}) AND status IN ('pending','launched')
                         """,
-                        (str(status), note, now, int(req_id), self._node_id),
+                        (str(status), note, now, int(req_id), *aliases),
                     )
                     self.conn.execute(
                         """
