@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.8.154 - 2026-05-03
+
+- Fixed: cluster offsite backup now treats a live matching `mydumper` process as an active backup even if MCD was restarted and the original flock was released, preventing duplicate offsite dumps during agent upgrades/restarts.
+
 ## 0.8.153 - 2026-05-03
 
 - Fixed: cluster auto-update no longer blocks the download phase on recent campaign activity; active campaign trigger/rebuild work remains an install/apply blocker.

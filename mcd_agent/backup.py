@@ -535,6 +535,8 @@ def backup_lock_active(config: AgentConfig) -> bool:
         for name in ("local-full", "local-incremental", "files", "offsite"):
             if _lock_active(_cluster_lock_path(cfg, name)):
                 return True
+        if _cluster_offsite_processes(cfg):
+            return True
     lock_path = _lock_path(cfg)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -1531,6 +1533,44 @@ def _lock_active(path: Path) -> bool:
             lock_fh.close()
         except Exception:
             pass
+
+
+def _proc_cmdline(pid_dir: Path) -> str:
+    try:
+        raw = (pid_dir / "cmdline").read_bytes()
+    except Exception:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+
+
+def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
+    """Detect offsite mydumper jobs that survived an MCD restart.
+
+    The daemon uses flock while it is alive, but mydumper intentionally keeps
+    running across MCD restarts. A fresh daemon must therefore treat a matching
+    child process as an active cluster backup even when the old lock FD is gone.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    mount_path = str(Path(cfg.backup_mount_base_dir) / _host_slug(cfg)).rstrip("/")
+    cluster_name = _cluster_name(cfg)
+    if not mount_path or not cluster_name:
+        return []
+    mydumper_name = Path(str(getattr(cfg, "backup_mydumper_bin", "mydumper") or "mydumper")).name
+    daily_marker = f"{mount_path}/backup/{cluster_name}/daily/.incomplete-"
+    matches: list[int] = []
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        cmdline = _proc_cmdline(pid_dir)
+        if not cmdline:
+            continue
+        if mydumper_name not in cmdline:
+            continue
+        if daily_marker in cmdline and "/databases/cluster__" in cmdline:
+            matches.append(int(pid_dir.name))
+    return sorted(matches)
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
@@ -2832,6 +2872,27 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
     try:
         _validate_cluster_cfg(cfg, remote=True)
         _ensure_cluster_backup_authority(cfg)
+        active_pids = _cluster_offsite_processes(cfg)
+        if active_pids:
+            _cluster_update_state(
+                cfg,
+                {
+                    "host_name": _host_name(cfg),
+                    "cluster_name": _cluster_name(cfg),
+                    "last_run_at": started_ts,
+                    "last_status": "running",
+                    "last_error": "",
+                    "job": "backup.cluster.offsite",
+                    "method": "mydumper",
+                    "active_offsite_pids": active_pids,
+                },
+            )
+            return BackupResult(
+                ok=False,
+                message=f"cluster offsite backup is already running (pids: {', '.join(map(str, active_pids))})",
+                state_path=str(state_path),
+                duration_sec=0,
+            )
         tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
@@ -3086,7 +3147,7 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             "local_full_running": _lock_active(_cluster_lock_path(cfg, "local-full")),
             "local_incremental_running": _lock_active(_cluster_lock_path(cfg, "local-incremental")),
             "files_snapshot_running": _lock_active(_cluster_lock_path(cfg, "files")),
-            "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")),
+            "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")) or bool(_cluster_offsite_processes(cfg)),
         }
     )
     return state
