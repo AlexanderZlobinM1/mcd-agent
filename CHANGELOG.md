@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.149 - 2026-05-03
+
+- Added: cluster-channel self-update coordination through the shared Galera state. Cluster nodes download the new package one by one, wait until every expected node has the package locally, then install one by one only after cluster update health is clear.
+- Safety: clustered self-updates no longer defer the download phase because of local campaign/backup activity; those blockers apply to the install phase so all nodes can stage the package without touching the running agent.
+- Changed: cluster-channel agents query MCC as a release catalog only and do not acquire MCC per-host update sessions; the shared cluster coordinator owns sequencing.
+- Safety: if the shared cluster coordinator is unavailable, cluster-channel agents defer updates instead of falling back to uncoordinated local installs.
+- Safety: cluster update state uses the existing `runtime_sync` table, avoiding any daemon-side DDL or schema bump on Galera.
+
 ## 0.8.148 - 2026-05-03
 
 - Fixed: passive-profile daemon loop now dispatches manual cluster-routed requests before any automatic planning, preventing route variables from being referenced before initialization and keeping passive mode non-planning.

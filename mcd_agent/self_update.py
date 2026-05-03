@@ -16,8 +16,10 @@ from urllib.error import HTTPError, URLError
 
 from mcd_agent import __version__
 from mcd_agent.backup import backup_lock_active
+from mcd_agent.cluster_routing import cluster_route_targets
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
+from mcd_agent.state_backend import mysql_state_connection, mysql_state_enabled, mysql_state_table_names
 
 try:
     import fcntl
@@ -31,6 +33,10 @@ _CAMPAIGN_CONSOLE_COMMANDS = (
     "mautic:campaign:rebuild",
     "mautic:campaigns:update",
 )
+_CLUSTER_UPDATE_SYNC_KEY = "mcd_update_cluster"
+_CLUSTER_UPDATE_DOWNLOAD_LOCK_TTL_SEC = 900
+_CLUSTER_UPDATE_INSTALL_LOCK_TTL_SEC = 900
+_CLUSTER_UPDATE_HEALTH_STALE_SEC = 300
 
 
 def _semver(v: str) -> tuple[int, int, int]:
@@ -227,6 +233,35 @@ def _sha256_file(path: Path) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _update_archive_path(target: str) -> Path:
+    return Path("/opt/mcd") / "var" / "updates" / f"mcd-agent-{target}.tar.gz"
+
+
+def _ensure_update_archive(cfg: AgentConfig, plan: dict[str, Any]) -> Path:
+    target = str(plan.get("target", "")).strip()
+    package_url = str(plan.get("package_url", "")).strip()
+    if not target or not package_url:
+        raise RuntimeError("invalid plan: target/package_url is required")
+    archive_path = _update_archive_path(target)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_sha = str(plan.get("sha256", "")).strip().lower()
+    if archive_path.exists() and expected_sha:
+        actual = _sha256_file(archive_path).lower()
+        if actual == expected_sha:
+            return archive_path
+        archive_path.unlink(missing_ok=True)
+    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+    _download_package(package_url, tmp_path, cfg.mcc_token)
+    if expected_sha:
+        actual = _sha256_file(tmp_path).lower()
+        if actual != expected_sha:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"sha256 mismatch expected={expected_sha} actual={actual}")
+    os.replace(tmp_path, archive_path)
+    return archive_path
 
 
 def _copytree_ignore_artifacts(_src_dir: str, names: list[str]) -> set[str]:
@@ -497,6 +532,514 @@ def _maybe_run_update_cleanup(cfg: AgentConfig, state: dict[str, Any], *, now_s:
         _release_update_lock(lock_f)
 
 
+def _cluster_update_enabled(cfg: AgentConfig) -> bool:
+    return bool(getattr(cfg, "cluster_id", None)) and _update_policy(cfg) == "cluster" and mysql_state_enabled(cfg)
+
+
+def _dedupe_hosts(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _cluster_local_host_name(cfg: AgentConfig) -> str:
+    ident = resolve_agent_identity(cfg)
+    for key in (
+        "effective_mcc_host_name",
+        "configured_host_name",
+        "local_hostname",
+        "effective_hostname",
+    ):
+        text = str(ident.get(key) or "").strip()
+        if text:
+            return text
+    return "unknown-host"
+
+
+def _cluster_expected_update_hosts(cfg: AgentConfig) -> list[str]:
+    hosts: list[str] = []
+    # Cache route normally lists all writable web nodes and preserves the operator-defined node order.
+    hosts.extend(cluster_route_targets(cfg, "cache"))
+    hosts.extend(cluster_route_targets(cfg, "cron"))
+    hosts.extend(cluster_route_targets(cfg, "import"))
+    hosts.extend(cluster_route_targets(cfg, "backup"))
+    hosts.append(_cluster_local_host_name(cfg))
+    return _dedupe_hosts(hosts)
+
+
+def _cluster_sync_host_name(cfg: AgentConfig) -> str:
+    cluster_id = str(getattr(cfg, "cluster_id", "") or "").strip() or "default"
+    return f"__cluster__:{cluster_id}"
+
+
+def _cluster_plan_from_decision(cfg: AgentConfig, decision: dict[str, Any], *, now_s: int) -> dict[str, Any] | None:
+    status = str(decision.get("status", "")).strip().lower()
+    if status not in {"update", "update_available"}:
+        return None
+    target = str(decision.get("target", "")).strip()
+    package_url = str(decision.get("package_url", "")).strip()
+    if not target or not package_url:
+        return None
+    if _semver(target) <= _semver(__version__):
+        return None
+    return {
+        "status": "update",
+        "target": target,
+        "package_url": package_url,
+        "sha256": str(decision.get("sha256", "") or "").strip(),
+        "session_id": str(decision.get("session_id", "") or "").strip(),
+        "session_owner": _cluster_local_host_name(cfg),
+        "created_at": now_s,
+    }
+
+
+def _cluster_local_update_blockers(cfg: AgentConfig) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if cfg.backup_enabled:
+        try:
+            if backup_lock_active(cfg):
+                blockers.append({"kind": "backup_lock", "message": "backup lock is active"})
+        except Exception as e:
+            blockers.append({"kind": "backup_lock_probe_failed", "message": str(e)[:300]})
+    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
+        campaigns = _active_campaign_processes()
+        if campaigns:
+            blockers.append(
+                {
+                    "kind": "active_campaigns",
+                    "message": _active_campaign_update_defer_message(campaigns),
+                    "processes": campaigns[:10],
+                }
+            )
+    return blockers
+
+
+def _cluster_payload_plan(payload: dict[str, Any]) -> dict[str, Any] | None:
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return None
+    target = str(plan.get("target", "") or "").strip()
+    package_url = str(plan.get("package_url", "") or "").strip()
+    if not target or not package_url:
+        return None
+    out = dict(plan)
+    out["status"] = "update"
+    return out
+
+
+def _cluster_update_lock_expired(lock: Any, *, now_s: int, ttl_sec: int) -> bool:
+    if not isinstance(lock, dict):
+        return True
+    ts = float(lock.get("ts") or 0.0)
+    if ts <= 0:
+        return True
+    return (now_s - ts) > max(60, int(ttl_sec))
+
+
+def _cluster_update_mutate(cfg: AgentConfig, mutator: Any) -> Any:
+    names = mysql_state_table_names(cfg)
+    table = names["runtime_sync"]
+    host_name = _cluster_sync_host_name(cfg)
+    key = _CLUSTER_UPDATE_SYNC_KEY
+    now_s = int(time.time())
+    conn = mysql_state_connection(cfg)
+    try:
+        conn.begin()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO `{table}`(host_name, `key`, payload_json, updated_at)
+                VALUES(%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE updated_at=updated_at
+                """,
+                (host_name, key, "{}", now_s),
+            )
+            cur.execute(
+                f"""
+                SELECT payload_json
+                FROM `{table}`
+                WHERE host_name=%s AND `key`=%s
+                FOR UPDATE
+                """,
+                (host_name, key),
+            )
+            row = cur.fetchone() or {}
+            raw_payload = row.get("payload_json") if isinstance(row, dict) else None
+            try:
+                payload = json.loads(str(raw_payload or "{}"))
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            result = mutator(payload)
+            payload["updated_at"] = now_s
+            cur.execute(
+                f"""
+                UPDATE `{table}`
+                SET payload_json=%s, updated_at=%s
+                WHERE host_name=%s AND `key`=%s
+                """,
+                (json.dumps(payload, ensure_ascii=True, separators=(",", ":")), now_s, host_name, key),
+            )
+        conn.commit()
+        return result
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _cluster_update_seed_or_refresh(
+    cfg: AgentConfig,
+    payload: dict[str, Any],
+    *,
+    candidate_plan: dict[str, Any] | None,
+    expected_hosts: list[str],
+    local_host: str,
+    blockers: list[dict[str, Any]],
+    now_s: int,
+) -> dict[str, Any] | None:
+    current_plan = _cluster_payload_plan(payload)
+    if candidate_plan is not None:
+        current_target = str((current_plan or {}).get("target", "") or "").strip()
+        candidate_target = str(candidate_plan.get("target", "") or "").strip()
+        phase = str(payload.get("phase", "") or "").strip().lower()
+        if not current_plan or phase in {"", "done", "failed"} or _semver(candidate_target) > _semver(current_target):
+            payload.clear()
+            payload.update(
+                {
+                    "cluster_id": str(getattr(cfg, "cluster_id", "") or ""),
+                    "phase": "download",
+                    "plan": dict(candidate_plan),
+                    "expected_hosts": expected_hosts,
+                    "nodes": {},
+                    "created_at": now_s,
+                }
+            )
+            current_plan = dict(candidate_plan)
+        elif candidate_target == current_target:
+            # Preserve the first session owner, but refresh immutable package metadata if MCC changed it.
+            plan = dict(current_plan)
+            for field in ("package_url", "sha256"):
+                if str(candidate_plan.get(field, "") or "").strip():
+                    plan[field] = str(candidate_plan.get(field) or "").strip()
+            payload["plan"] = plan
+            current_plan = plan
+    elif not current_plan:
+        return None
+
+    payload["expected_hosts"] = _dedupe_hosts(list(payload.get("expected_hosts") or []) + expected_hosts)
+    nodes = payload.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+        payload["nodes"] = nodes
+    for host in payload["expected_hosts"]:
+        node = nodes.setdefault(host, {})
+        if not isinstance(node, dict):
+            node = {}
+            nodes[host] = node
+        node.setdefault("download_status", "pending")
+        node.setdefault("install_status", "pending")
+    local_node = nodes.setdefault(local_host, {})
+    local_node.update(
+        {
+            "last_seen": now_s,
+            "running_version": __version__,
+            "node_index": int(getattr(cfg, "cluster_node_index", 0) or 0),
+            "node_role": str(getattr(cfg, "cluster_node_role", "") or ""),
+            "blockers": blockers,
+            "blockers_at": now_s,
+        }
+    )
+    target = str((current_plan or {}).get("target", "") or "").strip()
+    if target and _semver(__version__) >= _semver(target):
+        local_node["download_status"] = "downloaded"
+        local_node["install_status"] = "success"
+        local_node.setdefault("downloaded_at", now_s)
+        local_node.setdefault("installed_at", now_s)
+    return current_plan
+
+
+def _cluster_recent_blockers(payload: dict[str, Any], *, now_s: int) -> list[str]:
+    blockers: list[str] = []
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return ["cluster update state has no node health"]
+    for host in payload.get("expected_hosts") or []:
+        node = nodes.get(host)
+        if not isinstance(node, dict):
+            blockers.append(f"{host}: no update health")
+            continue
+        seen = int(node.get("last_seen") or 0)
+        if seen <= 0 or now_s - seen > _CLUSTER_UPDATE_HEALTH_STALE_SEC:
+            blockers.append(f"{host}: update health stale")
+            continue
+        raw_blockers = node.get("blockers")
+        if isinstance(raw_blockers, list) and raw_blockers:
+            label = str(raw_blockers[0].get("kind") if isinstance(raw_blockers[0], dict) else raw_blockers[0])
+            blockers.append(f"{host}: {label}")
+    return blockers
+
+
+def _all_cluster_hosts_have_status(payload: dict[str, Any], field: str, value: str) -> bool:
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return False
+    for host in payload.get("expected_hosts") or []:
+        node = nodes.get(host)
+        if not isinstance(node, dict) or str(node.get(field) or "") != value:
+            return False
+    return True
+
+
+def _next_cluster_host_for_status(payload: dict[str, Any], field: str, value: str) -> str | None:
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return None
+    for host in payload.get("expected_hosts") or []:
+        node = nodes.get(host)
+        if not isinstance(node, dict) or str(node.get(field) or "") != value:
+            return str(host)
+    return None
+
+
+def _cluster_update_decide_locked(
+    cfg: AgentConfig,
+    payload: dict[str, Any],
+    *,
+    candidate_plan: dict[str, Any] | None,
+    now_s: int,
+) -> dict[str, Any]:
+    local_host = _cluster_local_host_name(cfg)
+    expected_hosts = _cluster_expected_update_hosts(cfg)
+    blockers = _cluster_local_update_blockers(cfg)
+    plan = _cluster_update_seed_or_refresh(
+        cfg,
+        payload,
+        candidate_plan=candidate_plan,
+        expected_hosts=expected_hosts,
+        local_host=local_host,
+        blockers=blockers,
+        now_s=now_s,
+    )
+    if plan is None:
+        return {"action": "idle", "handled": False}
+
+    phase = str(payload.get("phase", "download") or "download").strip().lower()
+    nodes = payload.get("nodes") if isinstance(payload.get("nodes"), dict) else {}
+    local_node = nodes.get(local_host) if isinstance(nodes, dict) else {}
+    if not isinstance(local_node, dict):
+        local_node = {}
+        nodes[local_host] = local_node
+
+    if phase == "download":
+        if _all_cluster_hosts_have_status(payload, "download_status", "downloaded"):
+            payload["phase"] = "install"
+            phase = "install"
+        else:
+            next_host = _next_cluster_host_for_status(payload, "download_status", "downloaded")
+            lock = payload.get("download_lock")
+            if _cluster_update_lock_expired(lock, now_s=now_s, ttl_sec=_CLUSTER_UPDATE_DOWNLOAD_LOCK_TTL_SEC):
+                payload.pop("download_lock", None)
+                lock = None
+            if str(local_node.get("download_status") or "") == "downloaded":
+                return {"action": "wait", "handled": True, "message": "cluster update: package downloaded locally; waiting for peers"}
+            if next_host != local_host:
+                return {
+                    "action": "wait",
+                    "handled": True,
+                    "message": f"cluster update: waiting for {next_host or 'peer'} package download",
+                }
+            if isinstance(lock, dict) and str(lock.get("host") or "") != local_host:
+                return {
+                    "action": "wait",
+                    "handled": True,
+                    "message": f"cluster update: package download held by {lock.get('host')}",
+                }
+            payload["download_lock"] = {
+                "host": local_host,
+                "node_index": int(getattr(cfg, "cluster_node_index", 0) or 0),
+                "ts": now_s,
+            }
+            local_node["download_status"] = "running"
+            local_node["download_started_at"] = now_s
+            return {"action": "download", "handled": True, "plan": dict(plan), "local_host": local_host}
+
+    if phase == "install":
+        if not _all_cluster_hosts_have_status(payload, "download_status", "downloaded"):
+            payload["phase"] = "download"
+            return {"action": "wait", "handled": True, "message": "cluster update: waiting for all packages to be downloaded"}
+        if _all_cluster_hosts_have_status(payload, "install_status", "success"):
+            payload["phase"] = "done"
+            payload["completed_at"] = now_s
+            return {"action": "done", "handled": True, "message": "cluster update: completed"}
+        recent_blockers = _cluster_recent_blockers(payload, now_s=now_s)
+        if recent_blockers:
+            return {
+                "action": "wait",
+                "handled": True,
+                "message": "cluster update deferred: " + "; ".join(recent_blockers[:5]),
+            }
+        next_host = _next_cluster_host_for_status(payload, "install_status", "success")
+        if next_host != local_host:
+            return {
+                "action": "wait",
+                "handled": True,
+                "message": f"cluster update: waiting for {next_host or 'peer'} install",
+            }
+        lock = payload.get("install_lock")
+        if _cluster_update_lock_expired(lock, now_s=now_s, ttl_sec=_CLUSTER_UPDATE_INSTALL_LOCK_TTL_SEC):
+            payload.pop("install_lock", None)
+            lock = None
+        if isinstance(lock, dict) and str(lock.get("host") or "") != local_host:
+            return {
+                "action": "wait",
+                "handled": True,
+                "message": f"cluster update: install held by {lock.get('host')}",
+            }
+        payload["install_lock"] = {
+            "host": local_host,
+            "node_index": int(getattr(cfg, "cluster_node_index", 0) or 0),
+            "ts": now_s,
+        }
+        local_node["install_status"] = "running"
+        local_node["install_started_at"] = now_s
+        return {"action": "install", "handled": True, "plan": dict(plan), "local_host": local_host}
+
+    if phase == "failed":
+        return {
+            "action": "failed",
+            "handled": True,
+            "message": f"cluster update failed on {payload.get('failed_host') or 'unknown node'}: {payload.get('failed_reason') or '-'}",
+        }
+    return {"action": "done", "handled": True, "message": "cluster update: no active action"}
+
+
+def _cluster_update_finalize_download(
+    cfg: AgentConfig,
+    *,
+    local_host: str,
+    ok: bool,
+    message: str,
+    now_s: int,
+) -> None:
+    def mutator(payload: dict[str, Any]) -> None:
+        nodes = payload.setdefault("nodes", {})
+        node = nodes.setdefault(local_host, {}) if isinstance(nodes, dict) else {}
+        if isinstance(node, dict):
+            node["download_status"] = "downloaded" if ok else "failed"
+            node["download_result"] = message[:500]
+            node["download_finished_at"] = now_s
+        lock = payload.get("download_lock")
+        if isinstance(lock, dict) and str(lock.get("host") or "") == local_host:
+            payload.pop("download_lock", None)
+        if ok and _all_cluster_hosts_have_status(payload, "download_status", "downloaded"):
+            payload["phase"] = "install"
+
+    _cluster_update_mutate(cfg, mutator)
+
+
+def _cluster_update_finalize_install(
+    cfg: AgentConfig,
+    *,
+    local_host: str,
+    ok: bool,
+    message: str,
+    now_s: int,
+) -> None:
+    def mutator(payload: dict[str, Any]) -> None:
+        nodes = payload.setdefault("nodes", {})
+        node = nodes.setdefault(local_host, {}) if isinstance(nodes, dict) else {}
+        if isinstance(node, dict):
+            node["install_status"] = "success" if ok else "failed"
+            node["install_result"] = message[:500]
+            node["install_finished_at"] = now_s
+            node["running_version"] = str(payload.get("plan", {}).get("target") or __version__) if ok else __version__
+        lock = payload.get("install_lock")
+        if isinstance(lock, dict) and str(lock.get("host") or "") == local_host:
+            payload.pop("install_lock", None)
+        if ok and _all_cluster_hosts_have_status(payload, "install_status", "success"):
+            payload["phase"] = "done"
+            payload["completed_at"] = now_s
+        if not ok:
+            payload["phase"] = "failed"
+            payload["failed_host"] = local_host
+            payload["failed_reason"] = message[:500]
+
+    _cluster_update_mutate(cfg, mutator)
+
+
+def maybe_cluster_auto_update(
+    cfg: AgentConfig,
+    decision: dict[str, Any],
+    *,
+    now_s: int,
+) -> tuple[bool, str | None, int]:
+    if not _cluster_update_enabled(cfg):
+        return False, None, 0
+    candidate_plan = _cluster_plan_from_decision(cfg, decision, now_s=now_s)
+    retry_sec = max(60, int(getattr(cfg, "mcd_update_wait_retry_sec", 60) or 60))
+
+    try:
+        action = _cluster_update_mutate(
+            cfg,
+            lambda payload: _cluster_update_decide_locked(
+                cfg,
+                payload,
+                candidate_plan=candidate_plan,
+                now_s=now_s,
+            ),
+        )
+    except Exception as e:
+        logging.warning("MCD cluster update coordinator unavailable: %s", e)
+        return False, None, 0
+
+    if not isinstance(action, dict) or not bool(action.get("handled")):
+        return False, None, 0
+
+    action_name = str(action.get("action") or "wait")
+    if action_name == "download":
+        plan = action.get("plan") if isinstance(action.get("plan"), dict) else {}
+        local_host = str(action.get("local_host") or _cluster_local_host_name(cfg))
+        try:
+            archive_path = _ensure_update_archive(cfg, plan)
+            msg = f"cluster update: package downloaded on {local_host}: {archive_path}"
+            _cluster_update_finalize_download(cfg, local_host=local_host, ok=True, message=msg, now_s=int(time.time()))
+            return True, msg, retry_sec
+        except Exception as e:
+            msg = f"cluster update download failed on {local_host}: {e}"
+            _cluster_update_finalize_download(cfg, local_host=local_host, ok=False, message=msg, now_s=int(time.time()))
+            return True, msg, retry_sec
+
+    if action_name == "install":
+        plan = dict(action.get("plan") if isinstance(action.get("plan"), dict) else {})
+        local_host = str(action.get("local_host") or _cluster_local_host_name(cfg))
+        if str(plan.get("session_owner") or "") != local_host:
+            plan["session_id"] = ""
+        ok, msg = apply_update(cfg, plan)
+        _cluster_update_finalize_install(cfg, local_host=local_host, ok=ok, message=msg, now_s=int(time.time()))
+        return True, msg, retry_sec
+
+    msg = str(action.get("message") or "cluster update: waiting")
+    return True, msg, retry_sec
+
+
 def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     status = str(plan.get("status", "")).strip().lower()
     if status != "update":
@@ -557,19 +1100,13 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
             )
         return False, "another update is already running"
 
-    archive_name = f"mcd-agent-{target}.tar.gz"
-    archive_path = updates_dir / archive_name
+    archive_path = _update_archive_path(target)
     backup_path = backup_dir / f"mcd-src-preupdate-{now_s}.tgz"
-    expected_sha = str(plan.get("sha256", "")).strip().lower()
 
     old_src_dir: Path | None = None
     swapped = False
     try:
-        _download_package(package_url, archive_path, cfg.mcc_token)
-        if expected_sha:
-            actual = _sha256_file(archive_path).lower()
-            if actual != expected_sha:
-                raise RuntimeError(f"sha256 mismatch expected={expected_sha} actual={actual}")
+        archive_path = _ensure_update_archive(cfg, plan)
 
         if src_dir.exists():
             with tarfile.open(backup_path, "w:gz") as tf:
@@ -681,7 +1218,10 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
             _write_state(cfg, state)
         return None, max(1, next_allowed - now_s)
 
-    if cfg.backup_enabled:
+    auto = bool(cfg.mcd_auto_update_enabled) and _update_policy(cfg) != "off"
+    cluster_update_mode = auto and _cluster_update_enabled(cfg)
+
+    if cfg.backup_enabled and not cluster_update_mode:
         try:
             if backup_lock_active(cfg):
                 retry_sec = max(5, int(cfg.poll_interval_sec or 10))
@@ -693,7 +1233,7 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
         except Exception as e:
             logging.warning("MCD update backup lock check failed: %s", e)
 
-    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
+    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)) and not cluster_update_mode:
         active_campaigns = _active_campaign_processes()
         if active_campaigns:
             retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
@@ -705,8 +1245,9 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
             _write_state(cfg, state)
             return str(state["last_result"]), retry_sec
 
-    auto = bool(cfg.mcd_auto_update_enabled) and _update_policy(cfg) != "off"
-    decision = check_with_mcc(cfg, auto_update_enabled=auto)
+    # Cluster mode has its own Galera-backed rollout coordinator, so MCC is
+    # queried as a release catalog and must not reserve a per-host update slot.
+    decision = check_with_mcc(cfg, auto_update_enabled=(auto and not cluster_update_mode))
     status = str(decision.get("status", "")).strip().lower()
     retry_after = int(decision.get("retry_after_sec", 0) or 0)
     if retry_after <= 0:
@@ -715,6 +1256,25 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
     state["last_check_ts"] = now_s
     state["last_check_status"] = status or "unknown"
     state["last_decision"] = decision
+
+    if cluster_update_mode:
+        handled, cluster_msg, cluster_retry = maybe_cluster_auto_update(cfg, decision, now_s=now_s)
+        if handled:
+            state2 = _read_state(cfg)
+            state2["last_check_ts"] = now_s
+            state2["last_check_status"] = status or "unknown"
+            state2["last_decision"] = decision
+            state2["last_cluster_update_result"] = cluster_msg or ""
+            state2["next_check_ts"] = now_s + max(60, int(cluster_retry or cfg.mcd_update_wait_retry_sec or 60))
+            _write_state(cfg, state2)
+            return cluster_msg, int(state2["next_check_ts"]) - now_s
+        if status in {"update", "update_available"}:
+            retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or retry_after or 60))
+            msg = "MCD cluster update deferred: shared cluster coordinator is unavailable"
+            state["last_cluster_update_result"] = msg
+            state["next_check_ts"] = now_s + retry_sec
+            _write_state(cfg, state)
+            return msg, retry_sec
 
     if status in {"up_to_date", "disabled"}:
         state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
