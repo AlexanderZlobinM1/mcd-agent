@@ -345,6 +345,29 @@ cache_clear_template = "cache:clear"
 # Cache warm template.
 cache_warm_template = "cache:warmup"
 
+[cluster]
+# Optional local cluster identity. MCC normally injects these dynamically.
+# Without MCC, use these keys in the shared/Galera config plus
+# [backup.cluster].authority_host or per-node node_role when needed.
+id = ""
+name = ""
+node_role = "" # node|replica|arbiter|other
+# node_index = 1
+
+[cluster.routing]
+# Cluster MCD nodes are command entrypoints. With mysql_hybrid state enabled,
+# commands submitted on any node are routed through the shared Galera-backed
+# queue to the configured execution node(s).
+enabled = true
+# Segments and campaigns run only on this node.
+cron_host = ""
+# Imports run only on this node.
+import_host = ""
+# Cluster backup runs only on this node.
+backup_host = ""
+# Cache operations fan out to these nodes. Empty means local compatibility mode.
+cache_hosts = []
+
 [state]
 # Agent state backend:
 # - "sqlite"       : legacy local-only state
@@ -572,10 +595,15 @@ retention_incremental_days = 7
 extra_args = []
 
 [backup.cluster]
-# Cluster backup mode is intended for replica/backup nodes.
+# Cluster backup mode is configured as one logical cluster feature.
+# All nodes may receive the same config, but only the authority node can run it.
 # Local operational layer uses xtrabackup on a local data disk.
 enabled = false
 local_root_dir = "/mnt/data/backup/local/ananasrs"
+# Autonomous authority guard. Prefer authority_host when all nodes share the
+# same Galera-backed config; otherwise authority_role=replica uses cluster.node_role.
+authority_role = "replica"
+authority_host = ""
 # Daily local full xtrabackup start time (host local time).
 full_hour = 1
 full_minute = 0

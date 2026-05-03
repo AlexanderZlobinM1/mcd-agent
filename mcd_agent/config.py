@@ -435,6 +435,15 @@ class AgentConfig:
     mcc_profile_guard_enabled: bool
     outbound_events_sent_keep_days: int
     mcc_host_name: str | None
+    cluster_id: str | None
+    cluster_name: str | None
+    cluster_node_role: str
+    cluster_node_index: int | None
+    cluster_routing_enabled: bool
+    cluster_route_cron_host: str | None
+    cluster_route_import_host: str | None
+    cluster_route_backup_host: str | None
+    cluster_route_cache_hosts: list[str]
     host_template: bool
     template_autopromote_on_clone: bool
     mcc_mcd_manifest_url: str | None
@@ -528,6 +537,8 @@ class AgentConfig:
     backup_cluster_remote_enabled: bool
     backup_cluster_remote_retention_daily: int
     backup_cluster_remote_retention_weekly: int
+    backup_cluster_authority_role: str
+    backup_cluster_authority_host: str | None
     backup_restore_apply_files: bool
     backup_restore_apply_databases: bool
     backup_schedule_enabled: bool
@@ -1479,6 +1490,15 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_keep_preupdate_backups": "mcd_update_keep_preupdate_backups",
     "mcd_update_artifacts_max_age_days": "mcd_update_artifacts_max_age_days",
     "mcd_config_history_limit": "mcd_config_history_limit",
+    "cluster_id": "cluster_id",
+    "cluster_name": "cluster_name",
+    "cluster_node_role": "cluster_node_role",
+    "cluster_node_index": "cluster_node_index",
+    "cluster_routing_enabled": "cluster_routing_enabled",
+    "cluster_route_cron_host": "cluster_route_cron_host",
+    "cluster_route_import_host": "cluster_route_import_host",
+    "cluster_route_backup_host": "cluster_route_backup_host",
+    "cluster_route_cache_hosts": "cluster_route_cache_hosts",
     "plugins_repo_base_url": "plugins_repo_base_url",
     "plugins_repo_fallback_ip": "plugins_repo_fallback_ip",
     "outbound_events_sent_keep_days": "outbound_events_sent_keep_days",
@@ -1536,6 +1556,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_cluster_remote_enabled": "backup_cluster_remote_enabled",
     "backup_cluster_remote_retention_daily": "backup_cluster_remote_retention_daily",
     "backup_cluster_remote_retention_weekly": "backup_cluster_remote_retention_weekly",
+    "backup_cluster_authority_role": "backup_cluster_authority_role",
+    "backup_cluster_authority_host": "backup_cluster_authority_host",
     "mautic6_core_patch_policy": "mautic6_core_patch_policy",
     "mautic6_core_patch_version_min": "mautic6_core_patch_version_min",
     "mautic6_core_patch_version_max": "mautic6_core_patch_version_max",
@@ -1588,7 +1610,13 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
         elif isinstance(current, dict):
             updates[attr] = dict(raw_value) if isinstance(raw_value, dict) else dict(current)
         elif current is None:
-            updates[attr] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
+            if attr == "cluster_node_index":
+                try:
+                    updates[attr] = int(raw_value) if raw_value is not None and str(raw_value).strip() else None
+                except Exception:
+                    updates[attr] = None
+            else:
+                updates[attr] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
         else:
             updates[attr] = str(raw_value)
     if not updates:
@@ -1804,6 +1832,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     backup_mysql = backup.get("mysql", {}) if isinstance(backup, dict) else {}
     backup_schedule = backup.get("schedule", {}) if isinstance(backup, dict) else {}
     backup_secrets = backup.get("secrets", {}) if isinstance(backup, dict) else {}
+    cluster_cfg = data.get("cluster", {}) if isinstance(data.get("cluster", {}), dict) else {}
     profile = data.get("profile", {})
 
     profile_name = str(profile.get("name", runtime.get("profile", "custom"))).strip().lower() or "custom"
@@ -1848,6 +1877,73 @@ def _load_config_inner(path: str) -> AgentConfig:
             mcd_update_policy = "approved"
     if mcd_update_policy not in {"off", "lts", "approved", "test", "cluster"}:
         mcd_update_policy = "approved"
+    cluster_id = str(runtime.get("cluster_id", cluster_cfg.get("id", "")) or "").strip() or None
+    cluster_name = str(runtime.get("cluster_name", cluster_cfg.get("name", "")) or "").strip() or None
+    cluster_node_role = str(runtime.get("cluster_node_role", cluster_cfg.get("node_role", "")) or "").strip().lower()
+    if cluster_node_role not in {"node", "replica", "arbiter", "other"}:
+        cluster_node_role = ""
+    cluster_node_index: int | None = None
+    raw_cluster_node_index = runtime.get("cluster_node_index", cluster_cfg.get("node_index"))
+    if raw_cluster_node_index is not None and str(raw_cluster_node_index).strip():
+        try:
+            cluster_node_index = int(raw_cluster_node_index)
+        except Exception:
+            cluster_node_index = None
+    cluster_routing = cluster_cfg.get("routing", {}) if isinstance(cluster_cfg.get("routing", {}), dict) else {}
+    cluster_routing_enabled = bool(runtime.get("cluster_routing_enabled", cluster_routing.get("enabled", True)))
+    cluster_route_cron_host = (
+        str(
+            runtime.get(
+                "cluster_route_cron_host",
+                cluster_routing.get("cron_host", cluster_routing.get("cron_node", "")),
+            )
+            or ""
+        ).strip()
+        or None
+    )
+    cluster_route_import_host = (
+        str(
+            runtime.get(
+                "cluster_route_import_host",
+                cluster_routing.get("import_host", cluster_routing.get("import_node", "")),
+            )
+            or ""
+        ).strip()
+        or None
+    )
+    cluster_route_backup_host = (
+        str(
+            runtime.get(
+                "cluster_route_backup_host",
+                cluster_routing.get("backup_host", cluster_routing.get("backup_node", "")),
+            )
+            or ""
+        ).strip()
+        or None
+    )
+    cluster_route_cache_hosts = _normalize_list(
+        runtime.get(
+            "cluster_route_cache_hosts",
+            cluster_routing.get("cache_hosts", []),
+        )
+    )
+    backup_cluster_authority_role = str(
+        runtime.get("backup_cluster_authority_role", backup_cluster.get("authority_role", "replica")) or "replica"
+    ).strip().lower()
+    if backup_cluster_authority_role in {"*", "all"}:
+        backup_cluster_authority_role = "any"
+    if backup_cluster_authority_role not in {"replica", "node", "arbiter", "other", "any"}:
+        backup_cluster_authority_role = "replica"
+    backup_cluster_authority_host = (
+        str(
+            runtime.get(
+                "backup_cluster_authority_host",
+                backup_cluster.get("authority_host", cluster_route_backup_host or ""),
+            )
+            or ""
+        ).strip()
+        or None
+    )
     m6_patch_policy = str(runtime.get("mautic6_core_patch_policy", "required")).strip().lower() or "required"
     if m6_patch_policy not in {"required", "off"}:
         m6_patch_policy = "required"
@@ -2200,6 +2296,15 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcc_profile_guard_enabled=bool(mcc.get("profile_guard_enabled", False)),
         outbound_events_sent_keep_days=int(runtime.get("outbound_events_sent_keep_days", 14)),
         mcc_host_name=str(mcc.get("host_name")).strip() if mcc.get("host_name") else None,
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        cluster_node_role=cluster_node_role,
+        cluster_node_index=cluster_node_index,
+        cluster_routing_enabled=cluster_routing_enabled,
+        cluster_route_cron_host=cluster_route_cron_host,
+        cluster_route_import_host=cluster_route_import_host,
+        cluster_route_backup_host=cluster_route_backup_host,
+        cluster_route_cache_hosts=cluster_route_cache_hosts,
         host_template=bool(runtime.get("host_template", False)),
         template_autopromote_on_clone=bool(runtime.get("template_autopromote_on_clone", True)),
         mcc_mcd_manifest_url=str(mcc.get("mcd_manifest_url")) if mcc.get("mcd_manifest_url") else None,
@@ -2361,6 +2466,8 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_cluster_remote_enabled=bool(backup_cluster.get("remote_enabled", True)),
         backup_cluster_remote_retention_daily=max(1, int(backup_cluster.get("remote_retention_daily", 7))),
         backup_cluster_remote_retention_weekly=max(0, int(backup_cluster.get("remote_retention_weekly", 4))),
+        backup_cluster_authority_role=backup_cluster_authority_role,
+        backup_cluster_authority_host=backup_cluster_authority_host,
         backup_restore_apply_files=bool(backup.get("restore_apply_files", True)),
         backup_restore_apply_databases=bool(backup.get("restore_apply_databases", True)),
         backup_schedule_enabled=bool(backup_schedule.get("enabled", False)),

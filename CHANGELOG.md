@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.146 - 2026-05-03
+
+- Fixed: cluster backup is now guarded by cluster authority and can run only on the configured authority node, defaulting to the replica role.
+- Added: autonomous cluster identity/authority config support through `[cluster]` and `[backup.cluster]`, so shared Galera-backed MCD config works without MCC.
+- Added: autonomous cluster command routing through shared state: segments/campaigns route to the configured cron node, imports to the import node, backups to the backup node, and cache operations fan out to configured cache nodes even when invoked from any cluster node CLI.
+- Changed: passive profile still accepts explicit manual/cluster-routed requests, while automatic ring planning stays disabled.
+- Changed: `cluster-status` reports authority status and suppression reasons.
+
 ## 0.8.145 - 2026-05-03
 
 - Added: cluster backup commands for replica-based two-layer backups: local xtrabackup full, local xtrabackup incremental, local hardlink file snapshot, and remote offsite mydumper.

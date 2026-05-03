@@ -1417,11 +1417,80 @@ def _safe_slug(value: str) -> str:
 
 def _cluster_name(cfg: AgentConfig) -> str:
     raw = (
-        str(getattr(cfg, "backup_instance_name", "") or "").strip()
+        str(getattr(cfg, "cluster_name", "") or "").strip()
+        or str(getattr(cfg, "cluster_id", "") or "").strip()
+        or str(getattr(cfg, "backup_instance_name", "") or "").strip()
         or str(getattr(cfg, "backup_host_name", "") or "").strip()
         or _host_name(cfg)
     )
     return raw.strip("/") or "cluster"
+
+
+def _cluster_local_identity_values(cfg: AgentConfig) -> set[str]:
+    values = {
+        str(getattr(cfg, "mcc_host_name", "") or "").strip(),
+        str(getattr(cfg, "backup_instance_name", "") or "").strip(),
+        str(getattr(cfg, "backup_host_name", "") or "").strip(),
+        _host_name(cfg),
+    }
+    try:
+        values.add(socket.gethostname().strip())
+        values.add(socket.getfqdn().strip())
+    except Exception:
+        pass
+    return {v.lower() for v in values if v}
+
+
+def cluster_backup_authority_status(config: AgentConfig) -> dict[str, Any]:
+    # Do not call _effective_cfg() here: authority must be cheap and safe even
+    # before backup profile storage exists, and it is used by daemon scheduler
+    # on non-authority nodes.
+    cfg = config
+    cluster_id = str(getattr(cfg, "cluster_id", "") or "").strip()
+    role = str(getattr(cfg, "cluster_node_role", "") or "").strip().lower()
+    required_role = str(getattr(cfg, "backup_cluster_authority_role", "replica") or "replica").strip().lower()
+    if required_role in {"*", "all"}:
+        required_role = "any"
+    authority_host = (
+        str(getattr(cfg, "backup_cluster_authority_host", "") or "").strip()
+        or str(getattr(cfg, "cluster_route_backup_host", "") or "").strip()
+    )
+    identities = _cluster_local_identity_values(cfg)
+    allowed = False
+    reason = ""
+    if not bool(getattr(cfg, "backup_cluster_enabled", False)):
+        reason = "cluster backup disabled"
+    elif authority_host:
+        allowed = authority_host.lower() in identities
+        reason = "authority host match" if allowed else f"authority host mismatch: required {authority_host}"
+    elif not cluster_id:
+        reason = "missing cluster_id"
+    elif required_role == "any":
+        allowed = True
+        reason = "authority role any"
+    elif role == required_role:
+        allowed = True
+        reason = f"authority role match: {role}"
+    else:
+        reason = f"authority role mismatch: node role {role or '-'}, required {required_role}"
+    return {
+        "allowed": allowed,
+        "reason": reason,
+        "cluster_id": cluster_id,
+        "cluster_name": str(getattr(cfg, "cluster_name", "") or "").strip(),
+        "node_role": role,
+        "node_index": getattr(cfg, "cluster_node_index", None),
+        "authority_role": required_role,
+        "authority_host": authority_host,
+        "local_identities": sorted(identities),
+    }
+
+
+def _ensure_cluster_backup_authority(cfg: AgentConfig) -> None:
+    status = cluster_backup_authority_status(cfg)
+    if bool(status.get("allowed")):
+        return
+    raise RuntimeError(f"cluster backup is not allowed on this node: {status.get('reason')}")
 
 
 def _cluster_state_path(cfg: AgentConfig) -> Path:
@@ -1624,6 +1693,7 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
     start_monotonic = time.monotonic()
     try:
         _validate_cluster_cfg(cfg, remote=False)
+        _ensure_cluster_backup_authority(cfg)
         tool_state = _ensure_cluster_tools(cfg, {"xtrabackup"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
@@ -1771,6 +1841,7 @@ def cluster_backup_local_incremental(config: AgentConfig) -> BackupResult:
     start_monotonic = time.monotonic()
     try:
         _validate_cluster_cfg(cfg, remote=False)
+        _ensure_cluster_backup_authority(cfg)
         _ensure_cluster_tools(cfg, {"xtrabackup"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
@@ -1927,6 +1998,29 @@ def cluster_backup_files_snapshot(config: AgentConfig) -> BackupResult:
     state_path = _cluster_state_path(cfg)
     started_ts = _utc_now_iso()
     start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        _ensure_cluster_backup_authority(cfg)
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "error",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "last_backup_kind": "cluster_files_snapshot",
+                "last_started_at": started_ts,
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "error",
+                "job": "backup.cluster.files",
+                "error": str(e),
+                "duration_sec": duration,
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
     lock_path = _cluster_lock_path(cfg, "files")
     lock_fh = lock_path.open("w", encoding="utf-8")
     try:
@@ -2197,6 +2291,7 @@ def _cluster_remote_retention_plan_for_parent(
 def cluster_backup_retention_plan(config: AgentConfig, *, apply: bool = False) -> dict[str, Any]:
     cfg = _effective_cfg(config)
     _validate_cluster_cfg(cfg, remote=True)
+    _ensure_cluster_backup_authority(cfg)
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
     _mount(cfg, mount_path)
     try:
@@ -2219,6 +2314,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
     start_monotonic = time.monotonic()
     try:
         _validate_cluster_cfg(cfg, remote=True)
+        _ensure_cluster_backup_authority(cfg)
         tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
@@ -2448,6 +2544,10 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
         {
             "cluster_enabled": bool(getattr(cfg, "backup_cluster_enabled", False)),
             "cluster_name": _cluster_name(cfg),
+            "cluster_id": str(getattr(cfg, "cluster_id", "") or "").strip(),
+            "cluster_node_role": str(getattr(cfg, "cluster_node_role", "") or "").strip(),
+            "cluster_node_index": getattr(cfg, "cluster_node_index", None),
+            "cluster_backup_authority": cluster_backup_authority_status(cfg),
             "state_path": str(state_path),
             "local_root_dir": str(root),
             "current_full": str(current_full) if current_full is not None else "",

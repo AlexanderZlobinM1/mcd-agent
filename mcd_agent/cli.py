@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,6 +47,11 @@ from mcd_agent.cluster_assets import (
     guard_cluster_assets,
     reload_cluster_asset_runtime,
 )
+from mcd_agent.cluster_routing import (
+    cluster_local_identity_values,
+    cluster_route_for_command,
+    cluster_route_targets,
+)
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
@@ -55,7 +61,6 @@ from mcd_agent.executor import (
     build_mautic_exec_args,
     command_task_type,
     execute_mautic_command,
-    execute_mautic_command_template,
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
@@ -504,6 +509,95 @@ def _run_manual_command_with_scheduler(
     run_as_user: str | None,
 ) -> tuple[int, str]:
     task_type = command_task_type(command)
+    route = cluster_route_for_command(command)
+    route_targets = cluster_route_targets(cfg, route)
+    if route_targets:
+        try:
+            cmd_args = build_mautic_exec_args(
+                php_bin=php_bin,
+                root=root,
+                command=command,
+                instance_id=instance_id,
+                run_as_user=run_as_user,
+            )
+        except ValueError as e:
+            return 2, str(e)
+        except FileNotFoundError as e:
+            return 3, str(e)
+
+        route_task_type = task_type
+        if route_task_type is None and command == "cache:clear":
+            route_task_type = "cache_clear"
+        elif route_task_type is None and command == "cache:warmup":
+            route_task_type = "cache_warm"
+        if route_task_type is None:
+            # Route is configured but this command has no scheduler task
+            # representation. Fall back to local execution for compatibility.
+            return execute_mautic_command(
+                php_bin=php_bin,
+                root=root,
+                command=command,
+                instance_id=instance_id,
+                timeout_sec=timeout_sec,
+                run_as_user=run_as_user,
+            )
+
+        store = TaskStore(cfg.state_db_path, cfg)
+        local_ids = cluster_local_identity_values(cfg)
+        local_ids.add(str(getattr(store, "_node_id", "") or "").strip().lower())
+        remote_targets = [t for t in route_targets if str(t or "").strip().lower() not in local_ids]
+        if remote_targets and not bool(getattr(store, "_mysql_mode", False)):
+            return 2, (
+                "cluster route requires mysql_hybrid state backend; "
+                f"route={route} targets={','.join(route_targets)}"
+            )
+
+        reqs: list[tuple[str, int]] = []
+        command_payload = _MANUAL_CMD_SEP.join(cmd_args)
+        for target in route_targets:
+            target_clean = str(target or "").strip()
+            if not target_clean:
+                continue
+            req_id = store.enqueue_manual_request(
+                root=root,
+                task_type=route_task_type,
+                entity_id=instance_id,
+                command_str=command_payload,
+                timeout_sec=timeout_sec,
+                target_host_name=target_clean,
+            )
+            reqs.append((target_clean, req_id))
+        if not reqs:
+            return 2, f"cluster route has no valid targets for route={route}"
+
+        wait_sec = max(1.0, min(8.0, float(cfg.dispatch_interval_sec) * 3.0))
+        deadline = time.time() + wait_sec
+        terminal = {"launched", "done", "failed", "timeout", "lost", "skipped", "cancelled"}
+        statuses: dict[tuple[str, int], str] = {}
+        while time.time() < deadline:
+            all_terminal = True
+            for target, req_id in reqs:
+                key = (target, req_id)
+                st = store.get_manual_request_status_for_host(req_id, target) or "unknown"
+                statuses[key] = st
+                if st.strip().lower() not in terminal:
+                    all_terminal = False
+            if all_terminal:
+                break
+            time.sleep(0.15)
+
+        parts = [
+            f"{target}:request_id={req_id}:status={statuses.get((target, req_id), 'unknown')}"
+            for target, req_id in reqs
+        ]
+        bad = [
+            st
+            for st in statuses.values()
+            if str(st).strip().lower() in {"failed", "timeout", "lost", "cancelled"}
+        ]
+        rc = 1 if bad else 0
+        return rc, f"cluster routed route={route} " + " ".join(parts)
+
     if not task_type:
         return execute_mautic_command(
             php_bin=php_bin,
@@ -565,6 +659,83 @@ def _run_manual_command_with_scheduler(
 
     st = store.get_manual_request_status(req_id) or "unknown"
     return 0, f"queued request_id={req_id} status={st}"
+
+
+def _build_cache_hard_local_cli_args(cfg, root: str) -> list[str]:
+    exe = shutil.which("mcd-cli")
+    if not exe:
+        current = str(sys.argv[0] or "").strip()
+        exe = current if current and current != "-m" else "mcd-cli"
+    return [
+        exe,
+        "cache:hard",
+        "--config",
+        str(getattr(cfg, "config_file_path", "") or _default_config_path()),
+        "--root",
+        str(root),
+        "--local",
+    ]
+
+
+def _run_cache_hard_clear_cluster_aware(cfg, root: str) -> tuple[int, str]:
+    route_targets = cluster_route_targets(cfg, "cache")
+    if not route_targets:
+        return _run_cache_hard_clear(cfg, root)
+
+    store = TaskStore(cfg.state_db_path, cfg)
+    local_ids = cluster_local_identity_values(cfg)
+    local_ids.add(str(getattr(store, "_node_id", "") or "").strip().lower())
+    remote_targets = [t for t in route_targets if str(t or "").strip().lower() not in local_ids]
+    if remote_targets and not bool(getattr(store, "_mysql_mode", False)):
+        return 2, (
+            "cluster route requires mysql_hybrid state backend; "
+            f"route=cache targets={','.join(route_targets)}"
+        )
+
+    reqs: list[tuple[str, int]] = []
+    command_payload = _MANUAL_CMD_SEP.join(_build_cache_hard_local_cli_args(cfg, root))
+    for target in route_targets:
+        target_clean = str(target or "").strip()
+        if not target_clean:
+            continue
+        req_id = store.enqueue_manual_request(
+            root=root,
+            task_type="cache_hard",
+            entity_id=None,
+            command_str=command_payload,
+            timeout_sec=int(getattr(cfg, "command_timeout_sec", 1800) or 1800),
+            target_host_name=target_clean,
+        )
+        reqs.append((target_clean, req_id))
+    if not reqs:
+        return 2, "cluster route has no valid targets for route=cache"
+
+    wait_sec = max(1.0, min(8.0, float(getattr(cfg, "dispatch_interval_sec", 2) or 2) * 3.0))
+    deadline = time.time() + wait_sec
+    terminal = {"launched", "done", "failed", "timeout", "lost", "skipped", "cancelled"}
+    statuses: dict[tuple[str, int], str] = {}
+    while time.time() < deadline:
+        all_terminal = True
+        for target, req_id in reqs:
+            key = (target, req_id)
+            st = store.get_manual_request_status_for_host(req_id, target) or "unknown"
+            statuses[key] = st
+            if st.strip().lower() not in terminal:
+                all_terminal = False
+        if all_terminal:
+            break
+        time.sleep(0.15)
+
+    parts = [
+        f"{target}:request_id={req_id}:status={statuses.get((target, req_id), 'unknown')}"
+        for target, req_id in reqs
+    ]
+    bad = [
+        st
+        for st in statuses.values()
+        if str(st).strip().lower() in {"failed", "timeout", "lost", "cancelled"}
+    ]
+    return (1 if bad else 0), "cluster routed route=cache " + " ".join(parts)
 
 
 def _select_installs_for_patch(cfg, root: str | None):
@@ -834,27 +1005,31 @@ def _run_cache_menu(cfg, root: str | None) -> int:
             continue
 
         if choice == "1":
-            rc, out = execute_mautic_command_template(
+            rc, out = _run_manual_command_with_scheduler(
+                cfg=cfg,
                 php_bin=cfg.php_bin,
                 root=target_root,
-                template="cache:clear",
+                command="cache:clear",
+                instance_id=None,
                 timeout_sec=cfg.command_timeout_sec,
                 run_as_user=cfg.mautic_run_as_user,
             )
             print(out or f"cache:clear rc={rc}")
             continue
         if choice == "2":
-            rc, out = execute_mautic_command_template(
+            rc, out = _run_manual_command_with_scheduler(
+                cfg=cfg,
                 php_bin=cfg.php_bin,
                 root=target_root,
-                template="cache:warmup",
+                command="cache:warmup",
+                instance_id=None,
                 timeout_sec=cfg.command_timeout_sec,
                 run_as_user=cfg.mautic_run_as_user,
             )
             print(out or f"cache:warmup rc={rc}")
             continue
         if choice == "3":
-            rc, out = _run_cache_hard_clear(cfg, target_root)
+            rc, out = _run_cache_hard_clear_cluster_aware(cfg, target_root)
             print(out or f"cache:hard rc={rc}")
             continue
         print("Unknown option")
@@ -1390,6 +1565,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sh_ch = sub.add_parser("cache:hard", help="Hard clear cache directory (delete/recreate var/cache/prod)")
     _add_shorthand_exec_args(sh_ch, with_instance_id=False)
+    sh_ch.add_argument("--local", action="store_true", help=argparse.SUPPRESS)
 
     pfix = sub.add_parser("permissions:fix", help="Repair instance filesystem permissions for Mautic runtime")
     pfix.add_argument("--config", default=default_cfg)
@@ -1809,7 +1985,10 @@ def main() -> int:
         except Exception as e:
             print(str(e))
             return 2
-        rc, output = _run_cache_hard_clear(cfg, root)
+        if bool(getattr(args, "local", False)):
+            rc, output = _run_cache_hard_clear(cfg, root)
+        else:
+            rc, output = _run_cache_hard_clear_cluster_aware(cfg, root)
         if output:
             print(output)
         return rc

@@ -31,12 +31,14 @@ from mcd_agent.backup import (
     backup_run,
     backup_status,
     backup_storage_probe,
+    cluster_backup_authority_status,
     cluster_backup_files_snapshot,
     cluster_backup_local_full,
     cluster_backup_local_incremental,
     cluster_backup_offsite,
     cluster_backup_status,
 )
+from mcd_agent.cluster_routing import cluster_route_allows, cluster_route_authority_status
 from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
@@ -137,13 +139,26 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_cluster_remote_enabled",
     "backup_cluster_remote_retention_daily",
     "backup_cluster_remote_retention_weekly",
+    "backup_cluster_authority_role",
+    "backup_cluster_authority_host",
 }
 _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_enabled",
     "viber_stats_interval_sec",
     "viber_stats_instance_settings",
 }
-_STABLE_RUNTIME_KEYS = _BACKUP_STABLE_RUNTIME_KEYS | _VIBER_STATS_STABLE_RUNTIME_KEYS
+_CLUSTER_STABLE_RUNTIME_KEYS = {
+    "cluster_id",
+    "cluster_name",
+    "cluster_node_role",
+    "cluster_node_index",
+    "cluster_routing_enabled",
+    "cluster_route_cron_host",
+    "cluster_route_import_host",
+    "cluster_route_backup_host",
+    "cluster_route_cache_hosts",
+}
+_STABLE_RUNTIME_KEYS = _BACKUP_STABLE_RUNTIME_KEYS | _VIBER_STATS_STABLE_RUNTIME_KEYS | _CLUSTER_STABLE_RUNTIME_KEYS
 
 _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
     r"(too many connections|lost connection to mysql|mysql server has gone away|"
@@ -2286,8 +2301,10 @@ class TaskStore:
         entity_id: int | None,
         command_str: str,
         timeout_sec: int,
+        target_host_name: str | None = None,
     ) -> int:
         now = time.time()
+        target_host = str(target_host_name or self._node_id).strip() or self._node_id
         if self._mysql_mode:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
@@ -2298,17 +2315,27 @@ class TaskStore:
                           host_name, root, task_type, entity_id, command_str, timeout_sec, status, requested_at
                         ) VALUES(%s,%s,%s,%s,%s,%s,'pending',%s)
                         """,
-                        (self._node_id, str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
+                        (target_host, str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), now),
                     )
-                    self.conn.execute(
-                        """
-                        INSERT OR REPLACE INTO manual_requests(
-                          id, root, task_type, entity_id, command_str, timeout_sec, status, requested_at
-                        ) VALUES(?,?,?,?,?,?,?,?)
-                        """,
-                        (int(req_id), str(root), str(task_type), entity_id, str(command_str), int(timeout_sec), "pending", now),
-                    )
-                    self.conn.commit()
+                    if target_host == self._node_id:
+                        self.conn.execute(
+                            """
+                            INSERT OR REPLACE INTO manual_requests(
+                              id, root, task_type, entity_id, command_str, timeout_sec, status, requested_at
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                int(req_id),
+                                str(root),
+                                str(task_type),
+                                entity_id,
+                                str(command_str),
+                                int(timeout_sec),
+                                "pending",
+                                now,
+                            ),
+                        )
+                        self.conn.commit()
                     return int(req_id)
                 except Exception:
                     pass
@@ -2362,13 +2389,17 @@ class TaskStore:
         )
 
     def get_manual_request_status(self, req_id: int) -> str | None:
+        return self.get_manual_request_status_for_host(req_id, self._node_id)
+
+    def get_manual_request_status_for_host(self, req_id: int, host_name: str | None = None) -> str | None:
+        target_host = str(host_name or self._node_id).strip() or self._node_id
         if self._mysql_mode:
             table = self._mysql_tables.get("manual_requests", "")
             if table and self._mysql_available():
                 try:
                     rows = self._mysql_query(
                         f"SELECT status FROM `{table}` WHERE id=%s AND host_name=%s LIMIT 1",
-                        (int(req_id), self._node_id),
+                        (int(req_id), target_host),
                     )
                     if rows:
                         return str(rows[0].get("status") or "")
@@ -3470,6 +3501,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     cluster_backup_thread: threading.Thread | None = None
     last_cluster_full_day = ""
     last_cluster_offsite_day = ""
+    last_cluster_backup_suppressed_reason = ""
     backup_dispatch_pause_active = False
     scheduler_dispatch_pause_active = False
     next_plan_refresh_at = 0.0
@@ -3823,79 +3855,94 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
 
         if bool(getattr(config, "backup_cluster_enabled", False)):
-            dt_local = datetime.now()
-            run_day = dt_local.strftime("%Y-%m-%d")
-            cluster_busy = cluster_backup_thread is not None and cluster_backup_thread.is_alive()
-            if not cluster_busy:
-                cluster_job = ""
-                if (
-                    run_day != last_cluster_full_day
-                    and _local_time_reached(
-                        dt_local,
-                        int(getattr(config, "backup_cluster_full_hour", 1) or 1),
-                        int(getattr(config, "backup_cluster_full_minute", 0) or 0),
+            authority = cluster_backup_authority_status(config)
+            if not bool(authority.get("allowed")):
+                reason = str(authority.get("reason") or "not authority").strip()
+                if reason != last_cluster_backup_suppressed_reason:
+                    logging.info(
+                        "cluster backup suppressed on this node: %s (cluster=%s role=%s authority_role=%s authority_host=%s)",
+                        reason,
+                        authority.get("cluster_id") or authority.get("cluster_name") or "-",
+                        authority.get("node_role") or "-",
+                        authority.get("authority_role") or "-",
+                        authority.get("authority_host") or "-",
                     )
-                    and not _cluster_local_full_done_for_date(config, dt_local)
-                ):
-                    cluster_job = "local-full"
-                elif (
-                    run_day != last_cluster_offsite_day
-                    and bool(getattr(config, "backup_cluster_remote_enabled", True))
-                    and _cluster_local_full_done_for_date(config, dt_local)
-                    and _local_time_reached(
-                        dt_local,
-                        int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 2),
-                        int(getattr(config, "backup_cluster_offsite_not_before_minute", 0) or 0),
-                    )
-                    and not _cluster_offsite_done_for_date(config, dt_local)
-                ):
-                    cluster_job = "offsite"
-                elif (
-                    _cluster_local_full_done_for_date(config, dt_local)
-                    and _local_hour_in_closed_window(
-                        dt_local,
-                        int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8),
-                        int(getattr(config, "backup_cluster_incremental_end_hour", 20) or 20),
-                    )
-                    and not _cluster_incremental_recent(config, now)
-                ):
-                    cluster_job = "incremental"
+                    last_cluster_backup_suppressed_reason = reason
+            else:
+                last_cluster_backup_suppressed_reason = ""
+                dt_local = datetime.now()
+                run_day = dt_local.strftime("%Y-%m-%d")
+                cluster_busy = cluster_backup_thread is not None and cluster_backup_thread.is_alive()
+                if not cluster_busy:
+                    cluster_job = ""
+                    if (
+                        run_day != last_cluster_full_day
+                        and _local_time_reached(
+                            dt_local,
+                            int(getattr(config, "backup_cluster_full_hour", 1) or 1),
+                            int(getattr(config, "backup_cluster_full_minute", 0) or 0),
+                        )
+                        and not _cluster_local_full_done_for_date(config, dt_local)
+                    ):
+                        cluster_job = "local-full"
+                    elif (
+                        run_day != last_cluster_offsite_day
+                        and bool(getattr(config, "backup_cluster_remote_enabled", True))
+                        and _cluster_local_full_done_for_date(config, dt_local)
+                        and _local_time_reached(
+                            dt_local,
+                            int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 2),
+                            int(getattr(config, "backup_cluster_offsite_not_before_minute", 0) or 0),
+                        )
+                        and not _cluster_offsite_done_for_date(config, dt_local)
+                    ):
+                        cluster_job = "offsite"
+                    elif (
+                        _cluster_local_full_done_for_date(config, dt_local)
+                        and _local_hour_in_closed_window(
+                            dt_local,
+                            int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8),
+                            int(getattr(config, "backup_cluster_incremental_end_hour", 20) or 20),
+                        )
+                        and not _cluster_incremental_recent(config, now)
+                    ):
+                        cluster_job = "incremental"
 
-                if cluster_job:
-                    def _cluster_backup_worker(job: str = cluster_job) -> None:
-                        try:
-                            if job == "local-full":
-                                res = cluster_backup_local_full(config)
-                                if res.ok and bool(getattr(config, "backup_cluster_files_snapshot_enabled", True)):
-                                    files_res = cluster_backup_files_snapshot(config)
-                                    if not files_res.ok:
-                                        logging.warning("cluster files snapshot failed after local full: %s", files_res.message)
-                                logging.info("cluster local full: %s", res.message)
-                            elif job == "offsite":
-                                res = cluster_backup_offsite(config)
-                                if res.ok:
-                                    logging.info("cluster offsite: %s", res.message)
+                    if cluster_job:
+                        def _cluster_backup_worker(job: str = cluster_job) -> None:
+                            try:
+                                if job == "local-full":
+                                    res = cluster_backup_local_full(config)
+                                    if res.ok and bool(getattr(config, "backup_cluster_files_snapshot_enabled", True)):
+                                        files_res = cluster_backup_files_snapshot(config)
+                                        if not files_res.ok:
+                                            logging.warning("cluster files snapshot failed after local full: %s", files_res.message)
+                                    logging.info("cluster local full: %s", res.message)
+                                elif job == "offsite":
+                                    res = cluster_backup_offsite(config)
+                                    if res.ok:
+                                        logging.info("cluster offsite: %s", res.message)
+                                    else:
+                                        logging.warning("cluster offsite failed: %s", res.message)
                                 else:
-                                    logging.warning("cluster offsite failed: %s", res.message)
-                            else:
-                                res = cluster_backup_local_incremental(config)
-                                if res.ok:
-                                    logging.info("cluster incremental: %s", res.message)
-                                else:
-                                    logging.warning("cluster incremental failed: %s", res.message)
-                        except Exception as e:
-                            logging.warning("cluster backup %s failed: %s", job, e)
+                                    res = cluster_backup_local_incremental(config)
+                                    if res.ok:
+                                        logging.info("cluster incremental: %s", res.message)
+                                    else:
+                                        logging.warning("cluster incremental failed: %s", res.message)
+                            except Exception as e:
+                                logging.warning("cluster backup %s failed: %s", job, e)
 
-                    cluster_backup_thread = threading.Thread(
-                        target=_cluster_backup_worker,
-                        name=f"mcd-cluster-backup-{cluster_job}",
-                        daemon=True,
-                    )
-                    cluster_backup_thread.start()
-                    if cluster_job == "local-full":
-                        last_cluster_full_day = run_day
-                    elif cluster_job == "offsite":
-                        last_cluster_offsite_day = run_day
+                        cluster_backup_thread = threading.Thread(
+                            target=_cluster_backup_worker,
+                            name=f"mcd-cluster-backup-{cluster_job}",
+                            daemon=True,
+                        )
+                        cluster_backup_thread.start()
+                        if cluster_job == "local-full":
+                            last_cluster_full_day = run_day
+                        elif cluster_job == "offsite":
+                            last_cluster_offsite_day = run_day
 
         if config.backup_enabled and config.backup_schedule_enabled and not bool(
             getattr(config, "backup_cluster_enabled", False)
@@ -4057,7 +4104,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_ids: list[int] | None = None
                 campaign_trigger_ids: list[int] | None = None
                 campaign_rebuild_ids: list[int] | None = None
-                if now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
+                if cluster_import_allowed and now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
                     try:
                         import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
                     except Exception as e:
@@ -4086,51 +4133,58 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     and now - float(segment_last_full_scan_ts.get(root, 0.0)) >= float(full_scan_interval_sec)
                 ):
                     force_segment_full_scan = True
-                try:
-                    if force_segment_full_scan:
-                        segment_ids = db.fetch_ids(_SQL_SEGMENTS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
-                        segment_last_full_scan_ts[root] = now
-                        logging.info(
-                            "[%s] segment full-scan planned (reason=%s pending_imports=%s interval=%ss)",
-                            root,
-                            "import_activity" if now < import_force_until else "periodic_full_scan",
-                            import_pending_now,
-                            full_scan_interval_sec,
-                        )
-                    else:
-                        segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
-                except Exception as e:
-                    logging.warning("[%s] segment query failed: %s", root, e)
-                    if _is_db_dispatch_pause_error(e):
-                        _mark_db_dispatch_pause(
-                            root=root,
-                            reason=f"segment planning db error: {e}",
-                            now_ts=now,
-                            pause_until=db_dispatch_pause_until,
-                            pause_reasons=db_dispatch_pause_reasons,
-                        )
+                if cluster_cron_allowed:
+                    try:
+                        if force_segment_full_scan:
+                            segment_ids = db.fetch_ids(_SQL_SEGMENTS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
+                            segment_last_full_scan_ts[root] = now
+                            logging.info(
+                                "[%s] segment full-scan planned (reason=%s pending_imports=%s interval=%ss)",
+                                root,
+                                "import_activity" if now < import_force_until else "periodic_full_scan",
+                                import_pending_now,
+                                full_scan_interval_sec,
+                            )
+                        else:
+                            segment_ids = db.fetch_ids(config.sql_segments_due, limit=5000, context=sql_ctx)
+                    except Exception as e:
+                        logging.warning("[%s] segment query failed: %s", root, e)
+                        if _is_db_dispatch_pause_error(e):
+                            _mark_db_dispatch_pause(
+                                root=root,
+                                reason=f"segment planning db error: {e}",
+                                now_ts=now,
+                                pause_until=db_dispatch_pause_until,
+                                pause_reasons=db_dispatch_pause_reasons,
+                            )
+                else:
+                    segment_ids = []
 
                 campaign_query_error: Exception | None = None
-                try:
-                    campaign_triggers_due_sql = _campaign_sql_for_major(
-                        config.sql_campaign_triggers_due,
-                        inst.mautic_major,
-                    )
-                    campaign_trigger_ids = db.fetch_ids(campaign_triggers_due_sql, limit=5000, context=sql_ctx)
-                except Exception as e:
-                    campaign_query_error = e
-                    logging.warning("[%s] campaign trigger query failed: %s", root, e)
-                if config.enable_campaign_rebuild:
+                if cluster_cron_allowed:
                     try:
-                        campaign_rebuilds_due_sql = _campaign_sql_for_major(
-                            config.sql_campaign_rebuilds_due,
+                        campaign_triggers_due_sql = _campaign_sql_for_major(
+                            config.sql_campaign_triggers_due,
                             inst.mautic_major,
                         )
-                        campaign_rebuild_ids = db.fetch_ids(campaign_rebuilds_due_sql, limit=5000, context=sql_ctx)
+                        campaign_trigger_ids = db.fetch_ids(campaign_triggers_due_sql, limit=5000, context=sql_ctx)
                     except Exception as e:
                         campaign_query_error = e
-                        logging.warning("[%s] campaign rebuild query failed: %s", root, e)
+                        logging.warning("[%s] campaign trigger query failed: %s", root, e)
+                    if config.enable_campaign_rebuild:
+                        try:
+                            campaign_rebuilds_due_sql = _campaign_sql_for_major(
+                                config.sql_campaign_rebuilds_due,
+                                inst.mautic_major,
+                            )
+                            campaign_rebuild_ids = db.fetch_ids(campaign_rebuilds_due_sql, limit=5000, context=sql_ctx)
+                        except Exception as e:
+                            campaign_query_error = e
+                            logging.warning("[%s] campaign rebuild query failed: %s", root, e)
+                    else:
+                        campaign_rebuild_ids = []
                 else:
+                    campaign_trigger_ids = []
                     campaign_rebuild_ids = []
 
                 if campaign_query_error is not None and _is_db_dispatch_pause_error(campaign_query_error):
@@ -4352,7 +4406,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set(reb_reg_ring))
 
                 q_samples = queue_samples.setdefault(root, deque())
-                if config.disable_throttle:
+                if not cluster_cron_allowed:
+                    throttled[root] = False
+                elif config.disable_throttle:
                     throttled[root] = False
                 else:
                     try:
@@ -4649,7 +4705,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             next_viber_cron_reconcile_at = now + 60
 
         if (config.profile_name or "").strip().lower() == "passive":
-            logging.info("Passive profile active: planning-only mode (no task dispatch)")
+            for inst in installs:
+                root = str(getattr(inst, "root", "") or "").strip()
+                if not root:
+                    continue
+                _dispatch_manual_requests_for_root(
+                    config=config,
+                    store=store,
+                    running=running,
+                    popens=popens,
+                    root=root,
+                    seg_sql_ring=segment_sql_rings.setdefault(root, deque()),
+                    seg_prio_ring=segment_prio_rings.setdefault(root, deque()),
+                    seg_reg_ring=segment_reg_rings.setdefault(root, deque()),
+                    trg_prio_ring=campaign_trigger_prio_rings.setdefault(root, deque()),
+                    trg_reg_ring=campaign_trigger_reg_rings.setdefault(root, deque()),
+                    reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
+                    reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
+                )
+            logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
             if single_cycle:
                 return
             time.sleep(max(0.1, float(config.dispatch_interval_sec)))
@@ -4692,6 +4766,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.info("backup guard released: task dispatch resumed")
             backup_dispatch_pause_active = backup_dispatch_pause
         dispatch_pause = bool(scheduler_dispatch_pause or backup_dispatch_pause)
+        cluster_cron_allowed = cluster_route_allows(config, "cron")
+        cluster_import_allowed = cluster_route_allows(config, "import")
+        cluster_cache_allowed = cluster_route_allows(config, "cache")
 
         for inst in installs:
             if not inst.db:
@@ -4771,7 +4848,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 reb_reg_ring=reb_reg_ring,
             )
 
-            if config.segment_mode != "classic_loop":
+            if not (cluster_cron_allowed or cluster_import_allowed or cluster_cache_allowed):
+                continue
+
+            if cluster_cron_allowed and config.segment_mode != "classic_loop":
                 _run_sql_segment_ring(
                     config=config,
                     store=store,
@@ -4787,7 +4867,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     now_local=inst_now,
                 )
 
-            if config.segment_mode == "classic_loop":
+            if cluster_cron_allowed and config.segment_mode == "classic_loop":
                 args = render_mautic_command(
                     php_bin=config.php_bin,
                     run_as_user=config.mautic_run_as_user,
@@ -4807,7 +4887,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     max_parallel_for_type=1,
                     popens=popens,
                 )
-            else:
+            elif cluster_cron_allowed:
                 if throttled.get(root, False):
                     if config.segment_throttle_whitelist_only:
                         seg_prio_limit = max(0, config.segment_throttle_whitelist_parallel)
@@ -5037,7 +5117,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             # `mautic:campaigns:update` is treated as synonym of
             # `mautic:campaigns:rebuild` and is not scheduled separately.
             # This avoids duplicate campaign pre-processing passes.
-            if (config.profile_name or "").strip().lower() == "tiny":
+            if cluster_cron_allowed and (config.profile_name or "").strip().lower() == "tiny":
                 if _running_campaign_total(running, root) == 0:
                     next_trigger_id = None
                     if trg_prio_ring:
@@ -5100,7 +5180,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             # - then rebuild-due campaigns
             # Import polling must stay independent from campaign slot occupancy.
             if (config.profile_name or "").strip().lower() == "tiny":
-                if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+                if cluster_import_allowed and config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
                     args = render_mautic_command(
                         php_bin=config.php_bin,
                         run_as_user=config.mautic_run_as_user,
@@ -5123,7 +5203,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 # Skip generic multi-ring campaign scheduler.
                 continue
 
-            shared_campaign_cap = max(0, config.campaign_total_parallel)
+            shared_campaign_cap = max(0, config.campaign_total_parallel) if cluster_cron_allowed else 0
             rr = campaign_round_robin.get(root, 0)
             trigger_lane_configured = (
                 max(0, int(config.campaign_trigger_priority_parallel))
@@ -5134,8 +5214,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 and config.enable_campaign_rebuild
                 and (rr % 2 == 1)
             )
-            trg_prio_limit = max(0, config.campaign_trigger_priority_parallel)
-            trg_reg_limit = max(0, config.campaign_trigger_regular_parallel)
+            trg_prio_limit = max(0, config.campaign_trigger_priority_parallel) if cluster_cron_allowed else 0
+            trg_reg_limit = max(0, config.campaign_trigger_regular_parallel) if cluster_cron_allowed else 0
             trg_total_limit = trg_prio_limit + trg_reg_limit
             if shared_campaign_cap > 0:
                 rem = max(0, shared_campaign_cap - _running_campaign_total(running, root))
@@ -5233,7 +5313,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             batch_limit=config.campaign_batch_limit,
                         ),
                     )
-            if config.enable_campaign_rebuild:
+            if cluster_cron_allowed and config.enable_campaign_rebuild:
                 rebuild_prio_limit = max(0, config.campaign_rebuild_priority_parallel)
                 rebuild_reg_limit = max(0, config.campaign_rebuild_regular_parallel)
                 rebuild_total_limit = rebuild_prio_limit + rebuild_reg_limit
@@ -5330,7 +5410,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
 
-            if config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+            if cluster_import_allowed and config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
                 args = render_mautic_command(
                     php_bin=config.php_bin,
                     run_as_user=config.mautic_run_as_user,
@@ -5364,7 +5444,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             in_quiet = dt.hour == max(0, min(23, config.contacts_cleanup_quiet_hour)) and dt.minute < max(
                 1, min(180, config.contacts_cleanup_quiet_window_min)
             )
-            if config.enable_contacts_cleanup and in_quiet and (last_cleanup == 0.0 or now - last_cleanup >= interval):
+            if cluster_cron_allowed and config.enable_contacts_cleanup and in_quiet and (last_cleanup == 0.0 or now - last_cleanup >= interval):
                 try:
                     before = db.count_contacts_without_comm(
                         email_field=config.contacts_cleanup_email_field,
@@ -5399,6 +5479,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             )
             if (
                 config.enable_mautic_lock_cleanup
+                and cluster_cron_allowed
                 and mautic_lock_cleanup_in_quiet
                 and not mautic_lock_cleanup_backup_pause
                 and (last_mautic_lock_cleanup == 0.0 or now - last_mautic_lock_cleanup >= mautic_lock_cleanup_interval)
@@ -5448,6 +5529,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 last_mautic_lock_cleanup_ts[root] = now
             elif (
                 config.enable_mautic_lock_cleanup
+                and cluster_cron_allowed
                 and mautic_lock_cleanup_in_quiet
                 and mautic_lock_cleanup_backup_pause
                 and (last_mautic_lock_cleanup == 0.0 or now - last_mautic_lock_cleanup >= mautic_lock_cleanup_interval)
@@ -5475,6 +5557,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             )
             if (
                 config.enable_page_hits_orphan_cleanup
+                and cluster_cron_allowed
                 and page_hits_cleanup_in_quiet
                 and not page_hits_cleanup_backup_pause
                 and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
@@ -5523,6 +5606,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 last_page_hits_orphan_cleanup_ts[root] = now
             elif (
                 config.enable_page_hits_orphan_cleanup
+                and cluster_cron_allowed
                 and page_hits_cleanup_in_quiet
                 and page_hits_cleanup_backup_pause
                 and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
@@ -5536,6 +5620,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
                 config.enable_cache_clear
+                and cluster_cache_allowed
                 and dt.hour == max(0, min(23, config.cache_clear_quiet_hour))
                 and dt.minute < max(1, min(180, config.cache_clear_quiet_window_min))
                 and (last_cache_clear == 0.0 or now - last_cache_clear >= max(1, config.cache_clear_interval_sec))
@@ -5563,6 +5648,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             last_cache_warm = last_cache_warm_ts.get(root, 0.0)
             if (
                 config.enable_cache_warm
+                and cluster_cache_allowed
                 and dt.hour == max(0, min(23, config.cache_warm_quiet_hour))
                 and dt.minute < max(1, min(180, config.cache_warm_quiet_window_min))
                 and (last_cache_warm == 0.0 or now - last_cache_warm >= max(1, config.cache_warm_interval_sec))
@@ -5587,7 +5673,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 ):
                     last_cache_warm_ts[root] = now
 
-            if _instance_has_viber_plugin(inst):
+            if cluster_cron_allowed and _instance_has_viber_plugin(inst):
                 viber_enabled, viber_interval = _viber_stats_effective_setting(config, inst)
                 viber_job_name = "viber:stats:update"
                 prev = jobs_last_run.get((root, viber_job_name), 0.0)
@@ -5613,6 +5699,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         jobs_last_run[(root, viber_job_name)] = now
 
             for job in config.scheduled_jobs:
+                if not cluster_cron_allowed:
+                    break
                 if not job.enabled:
                     continue
                 prev = jobs_last_run.get((root, job.name), 0.0)
