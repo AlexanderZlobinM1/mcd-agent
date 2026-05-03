@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +209,297 @@ def _cleanup_incomplete_dirs(parent: Path) -> tuple[list[str], list[str]]:
         except Exception:
             failed.append(child.name)
     return removed, failed
+
+
+def _dir_date(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.name, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _xtrabackup_db_dir(backup_dir: Path) -> Path:
+    return backup_dir / "databases" / "physical-xtrabackup"
+
+
+def _xtrabackup_checkpoint_text(db_dir: Path) -> str:
+    checkpoints = db_dir / "xtrabackup_checkpoints"
+    if not checkpoints.exists():
+        return ""
+    try:
+        return checkpoints.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _xtrabackup_kind_from_checkpoints(db_dir: Path) -> str:
+    text = _xtrabackup_checkpoint_text(db_dir).lower()
+    if "backup_type" not in text:
+        return ""
+    if "full-backuped" in text or "full-prepared" in text:
+        return "full"
+    if "incremental" in text:
+        return "incremental"
+    return ""
+
+
+def _xtrabackup_chain_id_for_full(path: Path) -> str:
+    return f"full:{path.name}"
+
+
+def _xtrabackup_marker_kind(marker: dict[str, Any]) -> str:
+    for key in ("backup_kind", "xtrabackup_kind"):
+        value = str(marker.get(key) or "").strip().lower()
+        if value in {"full", "incremental"}:
+            return value
+    return ""
+
+
+def _xtrabackup_marker_chain_id(marker: dict[str, Any]) -> str:
+    for key in ("chain_id", "xtrabackup_chain_id"):
+        value = str(marker.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _xtrabackup_marker_full_path(marker: dict[str, Any]) -> str:
+    for key in ("full_backup_path", "xtrabackup_full_backup_path", "xtrabackup_chain_full_path"):
+        value = str(marker.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _xtrabackup_backup_entries(parent: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if not parent.exists():
+        return entries
+    for child in parent.iterdir():
+        if not child.is_dir() or not _DATE_RE.match(child.name):
+            continue
+        db_dir = _xtrabackup_db_dir(child)
+        marker = _read_backup_marker(child)
+        status = str(marker.get("status") or "").strip().lower()
+        if status and status != "ok":
+            continue
+        method = str(marker.get("method") or "").strip().lower()
+        if method and method != "xtrabackup":
+            continue
+        if not db_dir.exists():
+            continue
+        kind = _xtrabackup_marker_kind(marker)
+        if kind not in {"full", "incremental"}:
+            kind = _xtrabackup_kind_from_checkpoints(db_dir)
+        if kind not in {"full", "incremental"}:
+            continue
+        chain_id = _xtrabackup_marker_chain_id(marker)
+        if not chain_id:
+            if kind == "full":
+                chain_id = _xtrabackup_chain_id_for_full(child)
+            else:
+                full_path_raw = _xtrabackup_marker_full_path(marker)
+                chain_id = f"full:{Path(full_path_raw).name}" if full_path_raw else ""
+        if not chain_id:
+            continue
+        dt = _dir_date(child)
+        entries.append(
+            {
+                "path": child,
+                "db_dir": db_dir,
+                "date": dt,
+                "kind": kind,
+                "chain_id": chain_id,
+                "marker": marker,
+            }
+        )
+    entries.sort(key=lambda x: (x.get("date") or datetime.min, str(x.get("path") or "")))
+    return entries
+
+
+def _select_xtrabackup_plan(cfg: AgentConfig, parent: Path) -> dict[str, Any]:
+    entries = _xtrabackup_backup_entries(parent)
+    fulls = [x for x in entries if x.get("kind") == "full"]
+    full_defaults = {
+        "kind": "full",
+        "base_dir": None,
+        "base_path": "",
+        "chain_id": "",
+        "full_path": "",
+        "chain_index": 0,
+    }
+    if not bool(getattr(cfg, "backup_xtrabackup_incremental_enabled", True)):
+        return dict(full_defaults)
+    if not fulls:
+        return dict(full_defaults)
+    latest_full = fulls[-1]
+    latest_full_dt = latest_full.get("date")
+    full_interval_days = max(1, int(getattr(cfg, "backup_xtrabackup_full_interval_days", 7) or 7))
+    if isinstance(latest_full_dt, datetime):
+        if datetime.now() - latest_full_dt >= timedelta(days=full_interval_days):
+            return dict(full_defaults)
+    chain_id = str(latest_full.get("chain_id") or "")
+    chain_entries = [x for x in entries if str(x.get("chain_id") or "") == chain_id]
+    latest = chain_entries[-1] if chain_entries else latest_full
+    base_dir = latest.get("db_dir")
+    if not isinstance(base_dir, Path) or not base_dir.exists():
+        return dict(full_defaults)
+    return {
+        "kind": "incremental",
+        "base_dir": base_dir,
+        "base_path": str(latest.get("path") or ""),
+        "chain_id": chain_id,
+        "full_path": str(latest_full.get("path") or ""),
+        "chain_index": len(chain_entries),
+    }
+
+
+def _prune_xtrabackup_retention(parent: Path, cfg: AgentConfig) -> list[str]:
+    removed: list[str] = []
+    entries = _xtrabackup_backup_entries(parent)
+    if not entries:
+        return removed
+    full_keep = max(1, int(getattr(cfg, "backup_xtrabackup_retention_full_copies", 3) or 3))
+    incr_keep_days = max(1, int(getattr(cfg, "backup_xtrabackup_retention_incremental_days", 7) or 7))
+    fulls = [x for x in entries if x.get("kind") == "full"]
+    keep_chains = {str(x.get("chain_id") or "") for x in fulls[-full_keep:]}
+    cutoff = datetime.now() - timedelta(days=incr_keep_days)
+    remove_paths: list[Path] = []
+    for entry in entries:
+        path = entry.get("path")
+        if not isinstance(path, Path):
+            continue
+        chain_id = str(entry.get("chain_id") or "")
+        kind = str(entry.get("kind") or "")
+        dt = entry.get("date")
+        if chain_id and chain_id not in keep_chains:
+            remove_paths.append(path)
+            continue
+        if kind == "incremental" and isinstance(dt, datetime) and dt < cutoff:
+            remove_paths.append(path)
+    seen: set[str] = set()
+    for path in sorted(remove_paths, key=lambda p: str(p)):
+        key = str(path)
+        if key in seen or not path.exists():
+            continue
+        seen.add(key)
+        subprocess.run(["rm", "-rf", str(path)], check=False)
+        removed.append(path.name)
+    return removed
+
+
+def _path_total_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += int(item.stat().st_size)
+        except Exception:
+            pass
+    return total
+
+
+def _backup_entry_bytes(entry: dict[str, Any]) -> int:
+    marker = entry.get("marker")
+    if isinstance(marker, dict):
+        try:
+            value = int(marker.get("bytes_written") or 0)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    path = entry.get("path")
+    return _path_total_bytes(path) if isinstance(path, Path) else 0
+
+
+def _estimate_xtrabackup_required_bytes(parent: Path, plan: dict[str, Any]) -> int:
+    entries = _xtrabackup_backup_entries(parent)
+    kind = str(plan.get("kind") or "full").strip().lower()
+    full_entries = [x for x in entries if x.get("kind") == "full"]
+    full_sizes = [_backup_entry_bytes(x) for x in full_entries]
+    latest_full_size = next((x for x in reversed(full_sizes) if x > 0), 0)
+    if kind == "incremental":
+        chain_id = str(plan.get("chain_id") or "").strip()
+        chain_entries = [x for x in entries if str(x.get("chain_id") or "") == chain_id]
+        incremental_sizes = [_backup_entry_bytes(x) for x in chain_entries if x.get("kind") == "incremental"]
+        previous_incremental = max(incremental_sizes) if incremental_sizes else 0
+        baseline = max(previous_incremental, min(latest_full_size // 5, 100 * 1024 * 1024 * 1024))
+        return max(5 * 1024 * 1024 * 1024, int(float(baseline) * 1.25)) if latest_full_size > 0 else 0
+    return int(float(latest_full_size) * 1.10) if latest_full_size > 0 else 0
+
+
+def _delete_xtrabackup_chain(parent: Path, chain_id: str) -> list[str]:
+    removed: list[str] = []
+    if not chain_id:
+        return removed
+    entries = _xtrabackup_backup_entries(parent)
+    paths = [
+        x.get("path")
+        for x in entries
+        if str(x.get("chain_id") or "") == chain_id and isinstance(x.get("path"), Path)
+    ]
+    for path in sorted(paths, key=lambda p: str(p)):
+        if not isinstance(path, Path) or not path.exists():
+            continue
+        subprocess.run(["rm", "-rf", str(path)], check=False)
+        removed.append(path.name)
+    return removed
+
+
+def _oldest_xtrabackup_chain_ids(parent: Path, *, exclude_chain_id: str = "") -> list[str]:
+    entries = _xtrabackup_backup_entries(parent)
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in [x for x in entries if x.get("kind") == "full"]:
+        chain_id = str(entry.get("chain_id") or "").strip()
+        if not chain_id or chain_id == exclude_chain_id or chain_id in seen:
+            continue
+        seen.add(chain_id)
+        out.append(chain_id)
+    return out
+
+
+def _ensure_xtrabackup_space(parent: Path, mount_path: Path, plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    required = _estimate_xtrabackup_required_bytes(parent, plan)
+    if required <= 0:
+        return plan, []
+    usage = _storage_usage(mount_path)
+    free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+    if free >= required:
+        return plan, []
+    removed: list[str] = []
+    protected_chain = str(plan.get("chain_id") or "").strip() if str(plan.get("kind") or "") == "incremental" else ""
+    for chain_id in _oldest_xtrabackup_chain_ids(parent, exclude_chain_id=protected_chain):
+        removed += _delete_xtrabackup_chain(parent, chain_id)
+        usage = _storage_usage(mount_path)
+        free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+        if free >= required:
+            return plan, removed
+    if str(plan.get("kind") or "") == "incremental":
+        # If only the active chain is left and storage is still insufficient,
+        # fall back to a new full backup and allow removing the oldest full chain.
+        full_plan = {
+            "kind": "full",
+            "base_dir": None,
+            "base_path": "",
+            "chain_id": "",
+            "full_path": "",
+            "chain_index": 0,
+        }
+        required = _estimate_xtrabackup_required_bytes(parent, full_plan)
+        usage = _storage_usage(mount_path)
+        free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+        if required > 0 and free < required:
+            for chain_id in _oldest_xtrabackup_chain_ids(parent):
+                removed += _delete_xtrabackup_chain(parent, chain_id)
+                usage = _storage_usage(mount_path)
+                free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+                if free >= required:
+                    return full_plan, removed
+        return full_plan, removed
+    return plan, removed
 
 
 def _list_instances(cfg: AgentConfig, *, force_rescan: bool = False) -> list[MauticInstall]:
@@ -930,7 +1221,13 @@ def _effective_xtrabackup_extra_args(cfg: AgentConfig) -> list[str]:
     return out
 
 
-def _run_xtrabackup(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
+def _run_xtrabackup(
+    cfg: AgentConfig,
+    db: DBConfig,
+    output_dir: Path,
+    *,
+    incremental_base_dir: Path | None = None,
+) -> None:
     defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -943,6 +1240,8 @@ def _run_xtrabackup(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
             "--parallel",
             str(parallel),
         ]
+        if incremental_base_dir is not None:
+            cmd.append(f"--incremental-basedir={incremental_base_dir}")
         cmd += _effective_xtrabackup_extra_args(cfg)
         _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
     finally:
@@ -1211,7 +1510,8 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 "failed to cleanup stale incomplete backup dirs: "
                 + ", ".join(sorted(failed_incomplete))
             )
-        _prune_by_copies(remote_parent, cfg.backup_retention_copies)
+        if method != "xtrabackup":
+            _prune_by_copies(remote_parent, cfg.backup_retention_copies)
         if final_dir.exists():
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").strip().lower() == "ok":
@@ -1269,14 +1569,45 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
         total_bytes = 0
         dumped: list[dict[str, Any]] = []
         server_snapshot: dict[str, Any] = {}
+        xtrabackup_plan: dict[str, Any] = {}
+        xtrabackup_space_removed: list[str] = []
         if method == "xtrabackup":
             effective_db = _backup_db_from_config_or_instances(cfg, db_instances)
             server_snapshot = _mysql_server_snapshot(cfg, effective_db)
             db_dir = db_root / "physical-xtrabackup"
-            _run_xtrabackup(cfg, effective_db, db_dir)
+            xtrabackup_plan = _select_xtrabackup_plan(cfg, remote_parent)
+            xtrabackup_plan, xtrabackup_space_removed = _ensure_xtrabackup_space(
+                remote_parent,
+                mount_path,
+                xtrabackup_plan,
+            )
+            backup_kind = str(xtrabackup_plan.get("kind") or "full").strip().lower()
+            incremental_base_dir = xtrabackup_plan.get("base_dir") if backup_kind == "incremental" else None
+            if incremental_base_dir is not None and not isinstance(incremental_base_dir, Path):
+                incremental_base_dir = None
+            _run_xtrabackup(
+                cfg,
+                effective_db,
+                db_dir,
+                incremental_base_dir=incremental_base_dir,
+            )
             ok, verify_msg, one_bytes = _verify_xtrabackup_dir(db_dir)
             if not ok:
                 raise RuntimeError(f"xtrabackup verification failed: {verify_msg}")
+            verified_kind = _xtrabackup_kind_from_checkpoints(db_dir) or backup_kind
+            if verified_kind not in {"full", "incremental"}:
+                verified_kind = backup_kind if backup_kind in {"full", "incremental"} else "full"
+            if verified_kind == "full":
+                xtrabackup_plan = {
+                    "kind": "full",
+                    "base_dir": None,
+                    "base_path": "",
+                    "chain_id": _xtrabackup_chain_id_for_full(final_dir),
+                    "full_path": str(final_dir),
+                    "chain_index": 0,
+                }
+            elif not str(xtrabackup_plan.get("chain_id") or "").strip():
+                raise RuntimeError("xtrabackup incremental completed without chain metadata")
             total_bytes += one_bytes
             dumped.append(
                 {
@@ -1285,6 +1616,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                     "root": "",
                     "database": effective_db.name or "*",
                     "method": "xtrabackup",
+                    "backup_kind": verified_kind,
                     "bytes": one_bytes,
                 }
             )
@@ -1318,6 +1650,14 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
 
         os.replace(tmp_dir, final_dir)
         storage_usage = _storage_usage(mount_path)
+        xtrabackup_kind = str(xtrabackup_plan.get("kind") or "").strip().lower() if method == "xtrabackup" else ""
+        xtrabackup_base_path = str(xtrabackup_plan.get("base_path") or "").strip() if method == "xtrabackup" else ""
+        xtrabackup_chain_id = str(xtrabackup_plan.get("chain_id") or "").strip() if method == "xtrabackup" else ""
+        xtrabackup_full_path = str(xtrabackup_plan.get("full_path") or "").strip() if method == "xtrabackup" else ""
+        if method == "xtrabackup" and xtrabackup_kind == "full":
+            xtrabackup_chain_id = xtrabackup_chain_id or _xtrabackup_chain_id_for_full(final_dir)
+            xtrabackup_full_path = xtrabackup_full_path or str(final_dir)
+        retention_removed: list[str] = []
         marker = {
             "status": "ok",
             "ts_utc": _utc_now_iso(),
@@ -1333,6 +1673,29 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "server_snapshot": server_snapshot,
             "tool_state": tool_state,
         }
+        if method == "xtrabackup":
+            marker.update(
+                {
+                    "backup_kind": xtrabackup_kind or "full",
+                    "chain_id": xtrabackup_chain_id,
+                    "full_backup_path": xtrabackup_full_path,
+                    "base_backup_path": xtrabackup_base_path,
+                    "chain_index": int(xtrabackup_plan.get("chain_index") or 0),
+                    "xtrabackup_incremental_enabled": bool(
+                        getattr(cfg, "backup_xtrabackup_incremental_enabled", True)
+                    ),
+                    "xtrabackup_full_interval_days": int(
+                        getattr(cfg, "backup_xtrabackup_full_interval_days", 7) or 7
+                    ),
+                    "xtrabackup_retention_full_copies": int(
+                        getattr(cfg, "backup_xtrabackup_retention_full_copies", 3) or 3
+                    ),
+                    "xtrabackup_retention_incremental_days": int(
+                        getattr(cfg, "backup_xtrabackup_retention_incremental_days", 7) or 7
+                    ),
+                    "xtrabackup_space_pruned": xtrabackup_space_removed,
+                }
+            )
         if isinstance(storage_usage, dict):
             marker["storage"] = {
                 "total_bytes": int(storage_usage.get("total_bytes") or 0),
@@ -1342,6 +1705,11 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 "checked_at": str(storage_usage.get("checked_at") or ""),
             }
         _write_marker(final_dir, marker)
+        if method == "xtrabackup":
+            retention_removed = _prune_xtrabackup_retention(remote_parent, cfg)
+            if retention_removed:
+                marker["retention_removed"] = retention_removed
+                _write_marker(final_dir, marker)
 
         duration = int(time.monotonic() - start_monotonic)
         success_state = dict(run_state)
@@ -1353,6 +1721,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "bytes_written": bytes_written,
             "instances_with_db": len(db_instances),
         }
+        if method == "xtrabackup":
+            hist_item["backup_kind"] = xtrabackup_kind or "full"
+            hist_item["chain_id"] = xtrabackup_chain_id
+            hist_item["base_backup_path"] = xtrabackup_base_path
+            hist_item["space_pruned"] = xtrabackup_space_removed
+            hist_item["retention_removed"] = retention_removed
         history = [hist_item] + history[:19]
         success_state.update(
             {
@@ -1365,6 +1739,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 "history": history,
             }
         )
+        if method == "xtrabackup":
+            success_state["last_backup_kind"] = xtrabackup_kind or "full"
+            success_state["last_chain_id"] = xtrabackup_chain_id
+            success_state["last_base_backup_path"] = xtrabackup_base_path
+            success_state["last_space_pruned"] = xtrabackup_space_removed
+            success_state["last_retention_removed"] = retention_removed
         if isinstance(storage_usage, dict):
             success_state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
             success_state["last_storage_used_bytes"] = int(storage_usage.get("used_bytes") or 0)
@@ -1789,7 +2169,10 @@ def backup_prune(config: AgentConfig, root: str | None = None) -> BackupResult:
     try:
         _mount(cfg, mount_path)
         remote_parent.mkdir(parents=True, exist_ok=True)
-        removed = _prune_by_copies(remote_parent, cfg.backup_retention_copies)
+        if _backup_method(cfg) == "xtrabackup":
+            removed = _prune_xtrabackup_retention(remote_parent, cfg)
+        else:
+            removed = _prune_by_copies(remote_parent, cfg.backup_retention_copies)
         return BackupResult(
             ok=True,
             message=f"prune done, removed={len(removed)}",

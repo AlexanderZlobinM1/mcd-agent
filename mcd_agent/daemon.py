@@ -113,6 +113,10 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_mydumper_ionice_level",
     "backup_xtrabackup_parallel",
     "backup_xtrabackup_extra_args",
+    "backup_xtrabackup_incremental_enabled",
+    "backup_xtrabackup_full_interval_days",
+    "backup_xtrabackup_retention_full_copies",
+    "backup_xtrabackup_retention_incremental_days",
 }
 _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_enabled",

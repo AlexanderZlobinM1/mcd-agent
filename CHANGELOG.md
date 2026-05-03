@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.144 - 2026-05-03
+
+- Added: xtrabackup physical backups now support incremental chains.
+- Changed: xtrabackup defaults are weekly full backups plus daily incrementals.
+- Added: xtrabackup retention keeps 3 full backup chains and prunes incrementals older than 7 days.
+- Added: when estimated storage space is insufficient, xtrabackup can free space by deleting the oldest full backup chain before starting the next run.
+- Compatibility: legacy full xtrabackup directories are recognized from `xtrabackup_checkpoints` even when old markers do not contain chain metadata.
+
 ## 0.8.143 - 2026-05-02
 
 - Added: backup method selection with `mydumper` logical dumps and `xtrabackup` physical backups.

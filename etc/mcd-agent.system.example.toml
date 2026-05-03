@@ -558,6 +558,19 @@ myloader_bin = "/usr/bin/myloader"
 # myloader parallel threads for restore.
 myloader_threads = 4
 
+[backup.xtrabackup]
+package = "percona-xtrabackup-80"
+bin = "/usr/bin/xtrabackup"
+parallel = 4
+# Default physical backup policy: weekly full + daily incrementals.
+incremental_enabled = true
+full_interval_days = 7
+# Retention policy for physical chains: keep 3 full backups and incrementals for 7 days.
+retention_full_copies = 3
+retention_incremental_days = 7
+# Additional raw args passed to xtrabackup. MCD adds --slave-info when supported.
+extra_args = []
+
 [[jobs]]
 # Job name (for logs/state).
 name = "email-fetch"

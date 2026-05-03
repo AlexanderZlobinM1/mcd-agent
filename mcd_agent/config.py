@@ -509,6 +509,10 @@ class AgentConfig:
     backup_xtrabackup_bin: str
     backup_xtrabackup_parallel: int
     backup_xtrabackup_extra_args: list[str]
+    backup_xtrabackup_incremental_enabled: bool
+    backup_xtrabackup_full_interval_days: int
+    backup_xtrabackup_retention_full_copies: int
+    backup_xtrabackup_retention_incremental_days: int
     backup_restore_apply_files: bool
     backup_restore_apply_databases: bool
     backup_schedule_enabled: bool
@@ -1498,6 +1502,10 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_mydumper_ionice_level": "backup_mydumper_ionice_level",
     "backup_xtrabackup_parallel": "backup_xtrabackup_parallel",
     "backup_xtrabackup_extra_args": "backup_xtrabackup_extra_args",
+    "backup_xtrabackup_incremental_enabled": "backup_xtrabackup_incremental_enabled",
+    "backup_xtrabackup_full_interval_days": "backup_xtrabackup_full_interval_days",
+    "backup_xtrabackup_retention_full_copies": "backup_xtrabackup_retention_full_copies",
+    "backup_xtrabackup_retention_incremental_days": "backup_xtrabackup_retention_incremental_days",
     "mautic6_core_patch_policy": "mautic6_core_patch_policy",
     "mautic6_core_patch_version_min": "mautic6_core_patch_version_min",
     "mautic6_core_patch_version_max": "mautic6_core_patch_version_max",
@@ -2264,6 +2272,13 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_xtrabackup_bin=str(backup_xtrabackup.get("bin", "/usr/bin/xtrabackup")),
         backup_xtrabackup_parallel=int(backup_xtrabackup.get("parallel", 4)),
         backup_xtrabackup_extra_args=_normalize_list(backup_xtrabackup.get("extra_args", [])),
+        backup_xtrabackup_incremental_enabled=bool(backup_xtrabackup.get("incremental_enabled", True)),
+        backup_xtrabackup_full_interval_days=max(1, int(backup_xtrabackup.get("full_interval_days", 7))),
+        backup_xtrabackup_retention_full_copies=max(1, int(backup_xtrabackup.get("retention_full_copies", 3))),
+        backup_xtrabackup_retention_incremental_days=max(
+            1,
+            int(backup_xtrabackup.get("retention_incremental_days", 7)),
+        ),
         backup_restore_apply_files=bool(backup.get("restore_apply_files", True)),
         backup_restore_apply_databases=bool(backup.get("restore_apply_databases", True)),
         backup_schedule_enabled=bool(backup_schedule.get("enabled", False)),
