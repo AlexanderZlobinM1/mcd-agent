@@ -32,6 +32,7 @@ from mcd_agent.backup import (
     cluster_backup_local_full,
     cluster_backup_local_incremental,
     cluster_backup_offsite,
+    cluster_backup_offsite_dry_run,
     cluster_backup_retention_plan,
     cluster_backup_status,
 )
@@ -1824,6 +1825,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "cluster-files-produce",
             "cluster-files-assemble",
             "cluster-offsite",
+            "cluster-offsite-dry-run",
             "cluster-retention-plan",
         ],
         nargs="?",
@@ -3205,6 +3207,7 @@ def main() -> int:
             "cluster-files-produce",
             "cluster-files-assemble",
             "cluster-offsite",
+            "cluster-offsite-dry-run",
         }:
             if args.op == "cluster-local-full":
                 res = cluster_backup_local_full(cfg)
@@ -3221,6 +3224,10 @@ def main() -> int:
             elif args.op == "cluster-files":
                 res = cluster_backup_files_snapshot(cfg)
                 event = "backup-cluster-files"
+            elif args.op == "cluster-offsite-dry-run":
+                dry = cluster_backup_offsite_dry_run(cfg)
+                print(json.dumps(dry, ensure_ascii=True, indent=2))
+                return 0 if dry.get("ok") else 1
             else:
                 res = cluster_backup_offsite(cfg)
                 event = "backup-cluster-offsite"

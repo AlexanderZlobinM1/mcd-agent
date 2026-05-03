@@ -624,10 +624,30 @@ files_transport = "syncthing"
 # Syncthing-shared folder root. On backup replica this should point to the
 # receiving folder on the data disk; on web nodes it can stay under /opt/mcd.
 files_sync_dir = "/opt/mcd/var/cluster-backup-files"
-# Node-local paths prepared by each expected node.
-files_node_paths = []
+# Node-local paths prepared by each expected node. Keep this host-specific:
+# service configs, cron/systemd/firewall/network/MCD config and small helper
+# scripts. Do not put Mautic code here; the application tree is a shared
+# cluster artifact.
+files_node_paths = [
+  "/etc",
+  "/var/spool/cron/crontabs",
+  "/opt/mcd/etc",
+  "/opt/mcd/var/state",
+  "/etc/mcd",
+  "/usr/local/bin",
+  "/usr/local/sbin",
+  "/var/lib/glusterd",
+  "/var/lib/syncthing-mcd/config.xml",
+  "/var/lib/syncthing-mcd/cert.pem",
+  "/var/lib/syncthing-mcd/key.pem",
+  "/root/.ssh",
+  "/root/*.sh",
+  "/root/*.py",
+  "/root/*.toml",
+  "/root/*.cnf",
+]
 # Shared paths are produced by one node only (files_shared_producer_host, or node #1 by default).
-files_shared_paths = []
+files_shared_paths = ["/var/www/mautic"]
 files_shared_producer_host = ""
 # Expected producer node host ids/names. When set, replica refuses to assemble
 # a snapshot until every expected layer has a fresh manifest.
@@ -639,13 +659,18 @@ files_produce_interval_sec = 3600
 # Legacy local-mode source paths. Kept for compatibility with files_transport="local".
 files_snapshot_paths = []
 files_snapshot_exclude = [
-  "*/var/cache/*",
-  "*/var/logs/*",
-  "*/var/tmp/*",
-  "*/cache/*",
-  "*/logs/*",
-  "*/tmp/*",
-  "*/sessions/*",
+  "var/www/mautic/var/cache/***",
+  "var/www/mautic/var/logs/***",
+  "var/www/mautic/var/spool/***",
+  "var/www/mautic/var/sessions/***",
+  "var/www/mautic/app/cache/***",
+  "var/www/mautic/app/logs/***",
+  "*/var/www/mautic/var/cache/***",
+  "*/var/www/mautic/var/logs/***",
+  "*/var/www/mautic/var/spool/***",
+  "*/var/www/mautic/var/sessions/***",
+  "*/var/www/mautic/app/cache/***",
+  "*/var/www/mautic/app/logs/***",
 ]
 # Remote offsite layer uses mydumper directly to Storage Box.
 remote_enabled = true

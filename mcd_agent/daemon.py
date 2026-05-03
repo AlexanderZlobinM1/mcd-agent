@@ -871,6 +871,29 @@ def _cluster_local_full_done_for_date(config: AgentConfig, local_dt: datetime) -
     return _cluster_state_ts_local_date(str(st.get("last_local_full_at") or ""), local_dt)
 
 
+def _cluster_local_full_ready_for_offsite(config: AgentConfig, local_dt: datetime) -> bool:
+    try:
+        st = cluster_backup_status(config)
+    except Exception:
+        return False
+    raw = str(st.get("last_local_full_at") or "").strip()
+    if not raw:
+        return False
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        full_local = ts.astimezone()
+    except Exception:
+        return False
+    if full_local.date() != local_dt.date():
+        return False
+    daytime_start = max(0, min(23, int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8)))
+    # Offsite belongs to the nightly chain. A full completed after the daytime
+    # window starts is treated as manual/test and must not trigger offsite.
+    return full_local.hour < daytime_start
+
+
 def _cluster_offsite_done_for_date(config: AgentConfig, local_dt: datetime) -> bool:
     try:
         st = cluster_backup_status(config)
@@ -3968,7 +3991,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         run_day != last_cluster_offsite_day
                         and now >= next_cluster_offsite_retry_at
                         and bool(getattr(config, "backup_cluster_remote_enabled", True))
-                        and _cluster_local_full_done_for_date(config, dt_local)
+                        and _cluster_local_full_ready_for_offsite(config, dt_local)
                         and _local_time_reached(
                             dt_local,
                             int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 2),

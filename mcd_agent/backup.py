@@ -1681,14 +1681,24 @@ def _cluster_file_source_paths(cfg: AgentConfig, attr_name: str, fallback: list[
         p = str(item or "").strip()
         if not p:
             continue
-        path = Path(p)
-        if not path.exists():
-            continue
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(key)
+        paths: list[Path]
+        if any(ch in p for ch in "*?["):
+            base = Path(p)
+            parent = base.parent if str(base.parent) else Path(".")
+            try:
+                paths = sorted(parent.glob(base.name))
+            except Exception:
+                paths = []
+        else:
+            paths = [Path(p)]
+        for path in paths:
+            if not path.exists():
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
     return out
 
 
@@ -3115,6 +3125,72 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             lock_fh.close()
         except Exception:
             pass
+
+
+def cluster_backup_offsite_dry_run(config: AgentConfig) -> dict[str, Any]:
+    cfg = _effective_cfg(config)
+    started_ts = _utc_now_iso()
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    result: dict[str, Any] = {
+        "ok": False,
+        "job": "backup.cluster.offsite.dry_run",
+        "ts": started_ts,
+        "cluster_name": _cluster_name(cfg),
+        "host_name": _host_name(cfg),
+        "method": "mydumper",
+        "would_run_mydumper": False,
+        "would_include_files": False,
+        "would_write_remote": False,
+    }
+    try:
+        _validate_cluster_cfg(cfg, remote=True)
+        _ensure_cluster_backup_authority(cfg)
+        active_pids = _cluster_offsite_processes(cfg)
+        result["active_offsite_pids"] = active_pids
+        if active_pids:
+            raise RuntimeError(f"cluster offsite backup is already running (pids: {', '.join(map(str, active_pids))})")
+        result["tools"] = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
+        db_instances = _cluster_db_instances(cfg)
+        db = _backup_db_from_config_or_instances(cfg, db_instances)
+        result["database"] = db.name or "*"
+        full_dir = _cluster_current_full_dir(cfg)
+        if full_dir is None:
+            raise RuntimeError("offsite dry-run requires a completed local full backup")
+        result["local_full_path"] = str(full_dir)
+        files_snapshot = None
+        if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)):
+            files_snapshot = _cluster_latest_files_snapshot(cfg)
+            if files_snapshot is None:
+                raise RuntimeError("offsite dry-run requires a completed local files snapshot")
+            result["files_snapshot_path"] = str(files_snapshot)
+            result["files_snapshot_bytes"] = _path_total_bytes(files_snapshot)
+            result["would_include_files"] = True
+        _mount(cfg, mount_path)
+        try:
+            remote_parent = _cluster_remote_parent(cfg, mount_path)
+            daily_parent = remote_parent / "daily"
+            daily_parent.mkdir(parents=True, exist_ok=True)
+            probe = daily_parent / f".mcd-offsite-dry-run-{_fmt_local_ts()}.json"
+            probe.write_text(json.dumps({"ts": started_ts, "cluster": _cluster_name(cfg)}) + "\n", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            result["remote_parent"] = str(remote_parent)
+            result["remote_daily_parent"] = str(daily_parent)
+            result["would_write_remote"] = True
+            result["would_run_mydumper"] = True
+            result["retention_plan"] = _cluster_remote_retention_plan_for_parent(
+                remote_parent,
+                keep_daily=max(1, int(getattr(cfg, "backup_cluster_remote_retention_daily", 7) or 7)),
+                keep_weekly=max(0, int(getattr(cfg, "backup_cluster_remote_retention_weekly", 4) or 4)),
+                apply=False,
+            )
+        finally:
+            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+        result["ok"] = True
+        result["message"] = "cluster offsite dry-run ok"
+    except Exception as e:
+        result["error"] = str(e)
+        result["message"] = str(e)
+    return result
 
 
 def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:

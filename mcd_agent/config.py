@@ -28,6 +28,44 @@ LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
     "segment_non_whitelist_policy",
 )
 
+_DEFAULT_CLUSTER_FILE_NODE_PATHS = [
+    "/etc",
+    "/var/spool/cron/crontabs",
+    "/opt/mcd/etc",
+    "/opt/mcd/var/state",
+    "/etc/mcd",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/var/lib/glusterd",
+    "/var/lib/syncthing-mcd/config.xml",
+    "/var/lib/syncthing-mcd/cert.pem",
+    "/var/lib/syncthing-mcd/key.pem",
+    "/root/.ssh",
+    "/root/*.sh",
+    "/root/*.py",
+    "/root/*.toml",
+    "/root/*.cnf",
+]
+
+_DEFAULT_CLUSTER_FILE_SHARED_PATHS = [
+    "/var/www/mautic",
+]
+
+_DEFAULT_CLUSTER_FILE_EXCLUDES = [
+    "var/www/mautic/var/cache/***",
+    "var/www/mautic/var/logs/***",
+    "var/www/mautic/var/spool/***",
+    "var/www/mautic/var/sessions/***",
+    "var/www/mautic/app/cache/***",
+    "var/www/mautic/app/logs/***",
+    "*/var/www/mautic/var/cache/***",
+    "*/var/www/mautic/var/logs/***",
+    "*/var/www/mautic/var/spool/***",
+    "*/var/www/mautic/var/sessions/***",
+    "*/var/www/mautic/app/cache/***",
+    "*/var/www/mautic/app/logs/***",
+]
+
 _LEGACY_SQL_SEGMENTS_DUE_DEFAULT = (
     "SELECT id FROM {prefix}lead_lists WHERE is_published = 1 ORDER BY id"
 )
@@ -2468,15 +2506,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_cluster_files_snapshot_exclude=_normalize_list(
             backup_cluster.get(
                 "files_snapshot_exclude",
-                [
-                    "*/var/cache/*",
-                    "*/var/logs/*",
-                    "*/var/tmp/*",
-                    "*/cache/*",
-                    "*/logs/*",
-                    "*/tmp/*",
-                    "*/sessions/*",
-                ],
+                _DEFAULT_CLUSTER_FILE_EXCLUDES,
             )
         ),
         backup_cluster_files_transport=str(backup_cluster.get("files_transport", "syncthing")).strip().lower()
@@ -2488,10 +2518,12 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_cluster_files_node_paths=_normalize_list(
             backup_cluster.get(
                 "files_node_paths",
-                backup_cluster.get("files_snapshot_paths", backup_archive.get("paths", [])),
+                _DEFAULT_CLUSTER_FILE_NODE_PATHS,
             )
         ),
-        backup_cluster_files_shared_paths=_normalize_list(backup_cluster.get("files_shared_paths", [])),
+        backup_cluster_files_shared_paths=_normalize_list(
+            backup_cluster.get("files_shared_paths", _DEFAULT_CLUSTER_FILE_SHARED_PATHS)
+        ),
         backup_cluster_files_shared_producer_host=(
             str(backup_cluster.get("files_shared_producer_host")).strip()
             if backup_cluster.get("files_shared_producer_host")

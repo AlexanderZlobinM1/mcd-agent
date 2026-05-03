@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.8.155 - 2026-05-03
+
+- Fixed: cluster file backup defaults now keep per-node layers host-specific (`/etc`, cron spool, MCD config/state, helper scripts, Syncthing identity/config and Gluster state) and store the Mautic application tree once as the shared layer.
+- Added: cluster file layer source paths now support simple glob patterns such as `/root/*.sh`, allowing small root helper scripts to be captured without backing up large root dumps.
+- Fixed: cluster offsite scheduler now treats daytime local full runs as manual/test runs and does not immediately trigger offsite after them; offsite waits for the nightly full chain.
+- Added: `mcd-cli backup cluster-offsite-dry-run` checks authority, tools, local full, latest file snapshot and Storage Box write access without starting `mydumper`.
+
 ## 0.8.154 - 2026-05-03
 
 - Fixed: cluster offsite backup now treats a live matching `mydumper` process as an active backup even if MCD was restarted and the original flock was released, preventing duplicate offsite dumps during agent upgrades/restarts.
