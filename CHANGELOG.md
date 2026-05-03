@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.8.148 - 2026-05-03
+
+- Fixed: passive-profile daemon loop now dispatches manual cluster-routed requests before any automatic planning, preventing route variables from being referenced before initialization and keeping passive mode non-planning.
+
 ## 0.8.147 - 2026-05-03
 
 - Fixed: cluster-routed manual requests now match all local node aliases (`mcc_host_name`, local hostname, observed/effective hostnames) instead of only the internal state node id, so commands queued to MCC host names are consumed by the correct daemon.

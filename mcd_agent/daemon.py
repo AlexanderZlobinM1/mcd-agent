@@ -4058,11 +4058,38 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         if now >= next_plan_refresh_at:
             installs = inventory.list_instances()
             logging.info("Instance inventory count: %d", len(installs))
+            if (config.profile_name or "").strip().lower() == "passive":
+                for inst in installs:
+                    root = str(getattr(inst, "root", "") or "").strip()
+                    if not root:
+                        continue
+                    _dispatch_manual_requests_for_root(
+                        config=config,
+                        store=store,
+                        running=running,
+                        popens=popens,
+                        root=root,
+                        seg_sql_ring=segment_sql_rings.setdefault(root, deque()),
+                        seg_prio_ring=segment_prio_rings.setdefault(root, deque()),
+                        seg_reg_ring=segment_reg_rings.setdefault(root, deque()),
+                        trg_prio_ring=campaign_trigger_prio_rings.setdefault(root, deque()),
+                        trg_reg_ring=campaign_trigger_reg_rings.setdefault(root, deque()),
+                        reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
+                        reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
+                    )
+                logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                if single_cycle:
+                    return
+                time.sleep(max(0.1, float(config.dispatch_interval_sec)))
+                continue
             now_utc = datetime.now(timezone.utc)
             now_ts = int(now_utc.timestamp())
             sql_segment_rules_cfg = _parse_sql_segment_rules(getattr(config, "segment_sql_ring_rules", {}))
             if config.segment_sql_ring_enabled and config.segment_mode == "classic_loop" and sql_segment_rules_cfg:
                 logging.warning("segment_sql_ring ignored because segment_mode=classic_loop")
+            cluster_cron_allowed = cluster_route_allows(config, "cron")
+            cluster_import_allowed = cluster_route_allows(config, "import")
+            cluster_cache_allowed = cluster_route_allows(config, "cache")
             for inst in installs:
                 # Mautic 6 core hotfix: ReloadHelper may pass null metadata to
                 # PluginUpdateEvent (strict array in M6), which breaks
