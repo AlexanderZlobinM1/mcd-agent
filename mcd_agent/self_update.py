@@ -152,6 +152,13 @@ def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
         if pid <= 0 or pid == current_pid:
             continue
         command = parts[2] if has_elapsed else parts[1]
+        argv0 = command.split(None, 1)[0] if command else ""
+        exe = Path(argv0).name.lower()
+        # Only a running PHP console process blocks self-update. Wrappers
+        # waiting on flock/timeout/sudo do not execute Mautic work and must not
+        # prevent agent replacement.
+        if not (exe == "php" or exe.startswith("php")):
+            continue
         rows.append({"pid": pid, "elapsed_sec": elapsed_sec, "cmd": command[:500]})
     return rows
 
@@ -162,7 +169,7 @@ def _active_campaign_update_defer_message(rows: list[dict[str, Any]]) -> str:
         for row in rows[:3]
     )
     suffix = f" ({sample})" if sample else ""
-    return f"MCD update deferred: active campaign console process is running{suffix}"
+    return f"MCD update deferred: active campaign trigger/rebuild process is running{suffix}"
 
 
 def check_with_mcc(cfg: AgentConfig, *, auto_update_enabled: bool) -> dict[str, Any]:

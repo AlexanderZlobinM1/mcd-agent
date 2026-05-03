@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.8.150 - 2026-05-03
+
+- Changed: self-update blockers now include only active PHP campaign trigger/rebuild work, including `mautic:campaigns:update` because MCD treats it as rebuild. Segment updates and wrapper processes (`flock`, `timeout`, `sudo`) waiting on locks do not block agent replacement.
+
 ## 0.8.149 - 2026-05-03
 
 - Added: cluster-channel self-update coordination through the shared Galera state. Cluster nodes download the new package one by one, wait until every expected node has the package locally, then install one by one only after cluster update health is clear.
