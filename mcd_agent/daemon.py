@@ -32,6 +32,7 @@ from mcd_agent.backup import (
     backup_status,
     backup_storage_probe,
     cluster_backup_authority_status,
+    cluster_backup_files_produce,
     cluster_backup_files_snapshot,
     cluster_backup_local_full,
     cluster_backup_local_incremental,
@@ -140,6 +141,14 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_cluster_files_snapshot_enabled",
     "backup_cluster_files_snapshot_paths",
     "backup_cluster_files_snapshot_exclude",
+    "backup_cluster_files_transport",
+    "backup_cluster_files_sync_dir",
+    "backup_cluster_files_node_paths",
+    "backup_cluster_files_shared_paths",
+    "backup_cluster_files_shared_producer_host",
+    "backup_cluster_files_expected_nodes",
+    "backup_cluster_files_layer_max_age_sec",
+    "backup_cluster_files_produce_interval_sec",
     "backup_cluster_remote_enabled",
     "backup_cluster_remote_retention_daily",
     "backup_cluster_remote_retention_weekly",
@@ -207,6 +216,29 @@ def _to_boolish(value: object, default: bool = True) -> bool:
         if raw in {"0", "false", "no", "n", "off", "disabled"}:
             return False
     return bool(default)
+
+
+def _runtime_slug(value: object) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-").lower()
+
+
+def _cluster_files_producer_allowed(config: AgentConfig) -> bool:
+    if not bool(getattr(config, "backup_cluster_enabled", False)):
+        return False
+    if not bool(getattr(config, "backup_cluster_files_snapshot_enabled", True)):
+        return False
+    transport = str(getattr(config, "backup_cluster_files_transport", "syncthing") or "syncthing").strip().lower()
+    if transport != "syncthing":
+        return False
+    expected = {
+        _runtime_slug(item)
+        for item in list(getattr(config, "backup_cluster_files_expected_nodes", []) or [])
+        if _runtime_slug(item)
+    }
+    if not expected:
+        return True
+    local = {_runtime_slug(item) for item in cluster_local_identity_values(config) if _runtime_slug(item)}
+    return bool(local & expected)
 
 
 def _instance_has_viber_plugin(inst: object) -> bool:
@@ -3531,15 +3563,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_backup_schedule_day = ""
     backup_thread: threading.Thread | None = None
     cluster_backup_thread: threading.Thread | None = None
+    cluster_files_thread: threading.Thread | None = None
+    next_cluster_files_produce_at = 0.0
     last_cluster_full_day = ""
     last_cluster_offsite_day = ""
+    next_cluster_full_retry_at = 0.0
+    next_cluster_offsite_retry_at = 0.0
     last_cluster_backup_suppressed_reason = ""
     backup_dispatch_pause_active = False
     scheduler_dispatch_pause_active = False
     next_plan_refresh_at = 0.0
     next_update_check_at = 0.0
     update_deferred_by_backup = False
-    update_deferred_by_campaign = False
     last_campaign_console_activity_ts = 0.0
     next_service_profile_apply_at = 0.0
     next_backup_profile_sync_at = 0.0
@@ -3834,22 +3869,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.info("auto-update deferred: backup lock active; retry on next cycle")
                 update_deferred_by_backup = True
                 next_update_check_at = now + max(5, int(config.poll_interval_sec or 10))
-            elif (
-                bool(getattr(config, "mcd_update_defer_during_campaigns", True))
-                and last_campaign_console_activity_ts > 0.0
-                and now - last_campaign_console_activity_ts < max(60, int(config.mcd_update_wait_retry_sec or 60))
-            ):
-                if not update_deferred_by_campaign:
-                    logging.info("auto-update deferred: recent campaign console activity; retry after cooldown")
-                update_deferred_by_campaign = True
-                next_update_check_at = now + max(60, int(config.mcd_update_wait_retry_sec or 60))
             else:
                 if update_deferred_by_backup:
                     logging.info("auto-update defer cleared: backup lock released")
                 update_deferred_by_backup = False
-                if update_deferred_by_campaign:
-                    logging.info("auto-update campaign defer cleared: no recent campaign console activity")
-                update_deferred_by_campaign = False
                 try:
                     note, wait_sec = maybe_auto_update(config)
                     if note:
@@ -3886,6 +3909,29 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("service-profile auto-apply failed: %s", e)
                 next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
 
+        if _cluster_files_producer_allowed(config) and now >= next_cluster_files_produce_at:
+            interval = max(300, int(getattr(config, "backup_cluster_files_produce_interval_sec", 3600) or 3600))
+            if cluster_files_thread is not None and cluster_files_thread.is_alive():
+                logging.info("cluster files producer: previous layer build still active, skip this tick")
+            else:
+                def _cluster_files_producer_worker() -> None:
+                    try:
+                        res = cluster_backup_files_produce(config)
+                        if res.ok:
+                            logging.info("cluster files producer: %s", res.message)
+                        else:
+                            logging.warning("cluster files producer failed: %s", res.message)
+                    except Exception as e:
+                        logging.warning("cluster files producer failed: %s", e)
+
+                cluster_files_thread = threading.Thread(
+                    target=_cluster_files_producer_worker,
+                    name="mcd-cluster-files-producer",
+                    daemon=True,
+                )
+                cluster_files_thread.start()
+            next_cluster_files_produce_at = now + interval
+
         if bool(getattr(config, "backup_cluster_enabled", False)):
             authority = cluster_backup_authority_status(config)
             if not bool(authority.get("allowed")):
@@ -3909,6 +3955,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     cluster_job = ""
                     if (
                         run_day != last_cluster_full_day
+                        and now >= next_cluster_full_retry_at
                         and _local_time_reached(
                             dt_local,
                             int(getattr(config, "backup_cluster_full_hour", 1) or 1),
@@ -3919,6 +3966,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         cluster_job = "local-full"
                     elif (
                         run_day != last_cluster_offsite_day
+                        and now >= next_cluster_offsite_retry_at
                         and bool(getattr(config, "backup_cluster_remote_enabled", True))
                         and _cluster_local_full_done_for_date(config, dt_local)
                         and _local_time_reached(
@@ -3941,7 +3989,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         cluster_job = "incremental"
 
                     if cluster_job:
-                        def _cluster_backup_worker(job: str = cluster_job) -> None:
+                        def _cluster_backup_worker(job: str = cluster_job, job_day: str = run_day) -> None:
+                            nonlocal last_cluster_full_day
+                            nonlocal last_cluster_offsite_day
+                            nonlocal next_cluster_full_retry_at
+                            nonlocal next_cluster_offsite_retry_at
                             try:
                                 if job == "local-full":
                                     res = cluster_backup_local_full(config)
@@ -3949,12 +4001,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                         files_res = cluster_backup_files_snapshot(config)
                                         if not files_res.ok:
                                             logging.warning("cluster files snapshot failed after local full: %s", files_res.message)
+                                    if res.ok:
+                                        last_cluster_full_day = job_day
+                                        next_cluster_full_retry_at = 0.0
+                                    else:
+                                        next_cluster_full_retry_at = time.monotonic() + 900
                                     logging.info("cluster local full: %s", res.message)
                                 elif job == "offsite":
                                     res = cluster_backup_offsite(config)
                                     if res.ok:
+                                        last_cluster_offsite_day = job_day
+                                        next_cluster_offsite_retry_at = 0.0
                                         logging.info("cluster offsite: %s", res.message)
                                     else:
+                                        next_cluster_offsite_retry_at = time.monotonic() + 600
                                         logging.warning("cluster offsite failed: %s", res.message)
                                 else:
                                     res = cluster_backup_local_incremental(config)
@@ -3971,10 +4031,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             daemon=True,
                         )
                         cluster_backup_thread.start()
-                        if cluster_job == "local-full":
-                            last_cluster_full_day = run_day
-                        elif cluster_job == "offsite":
-                            last_cluster_offsite_day = run_day
 
         if config.backup_enabled and config.backup_schedule_enabled and not bool(
             getattr(config, "backup_cluster_enabled", False)

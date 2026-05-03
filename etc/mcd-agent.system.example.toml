@@ -614,8 +614,29 @@ offsite_not_before_minute = 0
 incremental_start_hour = 8
 incremental_end_hour = 20
 incremental_interval_sec = 7200
-# Local files snapshot uses hardlinks and `latest`; offsite copies from latest snapshot.
+# Local files snapshot is assembled on the backup authority from node layers.
+# Default transport is Syncthing: every expected web node prepares its own
+# file layer under files_sync_dir; the replica receives those layers and
+# assembles files/snapshots/latest without pulling files over SSH.
 files_snapshot_enabled = true
+# syncthing|local. `local` is legacy single-node hardlink snapshot mode.
+files_transport = "syncthing"
+# Syncthing-shared folder root. On backup replica this should point to the
+# receiving folder on the data disk; on web nodes it can stay under /opt/mcd.
+files_sync_dir = "/opt/mcd/var/cluster-backup-files"
+# Node-local paths prepared by each expected node.
+files_node_paths = []
+# Shared paths are produced by one node only (files_shared_producer_host, or node #1 by default).
+files_shared_paths = []
+files_shared_producer_host = ""
+# Expected producer node host ids/names. When set, replica refuses to assemble
+# a snapshot until every expected layer has a fresh manifest.
+files_expected_nodes = []
+# Reject layers older than this many seconds.
+files_layer_max_age_sec = 86400
+# Daemon producer interval on expected nodes.
+files_produce_interval_sec = 3600
+# Legacy local-mode source paths. Kept for compatibility with files_transport="local".
 files_snapshot_paths = []
 files_snapshot_exclude = [
   "*/var/cache/*",

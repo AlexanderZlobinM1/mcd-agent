@@ -26,6 +26,8 @@ from mcd_agent.backup import (
     backup_restore,
     backup_run,
     backup_status,
+    cluster_backup_files_assemble,
+    cluster_backup_files_produce,
     cluster_backup_files_snapshot,
     cluster_backup_local_full,
     cluster_backup_local_incremental,
@@ -1819,6 +1821,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "cluster-local-full",
             "cluster-incremental",
             "cluster-files",
+            "cluster-files-produce",
+            "cluster-files-assemble",
             "cluster-offsite",
             "cluster-retention-plan",
         ],
@@ -3194,13 +3198,26 @@ def main() -> int:
             plan = cluster_backup_retention_plan(cfg, apply=False)
             print(json.dumps(plan, ensure_ascii=True, indent=2))
             return 1 if plan.get("problems") else 0
-        if args.op in {"cluster-local-full", "cluster-incremental", "cluster-files", "cluster-offsite"}:
+        if args.op in {
+            "cluster-local-full",
+            "cluster-incremental",
+            "cluster-files",
+            "cluster-files-produce",
+            "cluster-files-assemble",
+            "cluster-offsite",
+        }:
             if args.op == "cluster-local-full":
                 res = cluster_backup_local_full(cfg)
                 event = "backup-cluster-local-full"
             elif args.op == "cluster-incremental":
                 res = cluster_backup_local_incremental(cfg)
                 event = "backup-cluster-incremental"
+            elif args.op == "cluster-files-produce":
+                res = cluster_backup_files_produce(cfg)
+                event = "backup-cluster-files-produce"
+            elif args.op == "cluster-files-assemble":
+                res = cluster_backup_files_assemble(cfg)
+                event = "backup-cluster-files-assemble"
             elif args.op == "cluster-files":
                 res = cluster_backup_files_snapshot(cfg)
                 event = "backup-cluster-files"

@@ -21,6 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover - py3.10 compatibility
     import tomli as tomllib  # type: ignore[no-redef]
 
 from mcd_agent.config import AgentConfig, resolve_mutable_config_path, upsert_section_values
+from mcd_agent.cluster_routing import cluster_local_identity_values
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.models import DBConfig, MauticInstall
 from mcd_agent.secret_store import SecretStore
@@ -1601,6 +1602,119 @@ def _cluster_files_root(cfg: AgentConfig) -> Path:
     return _cluster_local_root(cfg) / "files" / "snapshots"
 
 
+def _cluster_files_sync_root(cfg: AgentConfig) -> Path:
+    root = Path(str(getattr(cfg, "backup_cluster_files_sync_dir", "") or "").strip())
+    if not root.is_absolute() or str(root) in {"", "/"}:
+        raise RuntimeError("backup.cluster.files_sync_dir must be an absolute non-root path")
+    return root
+
+
+def _cluster_file_layers_root(cfg: AgentConfig) -> Path:
+    return _cluster_files_sync_root(cfg) / "layers" / _safe_slug(_cluster_name(cfg))
+
+
+def _cluster_node_slug(cfg: AgentConfig) -> str:
+    node_id = str(getattr(cfg, "mcc_host_name", "") or getattr(cfg, "backup_host_name", "") or "").strip()
+    if not node_id:
+        node_id = _host_name(cfg)
+    return _safe_slug(node_id)
+
+
+def _cluster_expected_file_nodes(cfg: AgentConfig) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in list(getattr(cfg, "backup_cluster_files_expected_nodes", []) or []):
+        slug = _safe_slug(str(item or "").strip())
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out
+
+
+def _cluster_file_source_paths(cfg: AgentConfig, attr_name: str, fallback: list[str] | None = None) -> list[str]:
+    raw = list(getattr(cfg, attr_name, []) or [])
+    if not raw and fallback:
+        raw = list(fallback)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        p = str(item or "").strip()
+        if not p:
+            continue
+        path = Path(p)
+        if not path.exists():
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _cluster_should_produce_shared(cfg: AgentConfig) -> bool:
+    shared_paths = list(getattr(cfg, "backup_cluster_files_shared_paths", []) or [])
+    if not shared_paths:
+        return False
+    wanted = str(getattr(cfg, "backup_cluster_files_shared_producer_host", "") or "").strip()
+    if wanted:
+        wanted_slug = _safe_slug(wanted)
+        return wanted_slug in {_safe_slug(x) for x in cluster_local_identity_values(cfg) if x}
+    idx = getattr(cfg, "cluster_node_index", None)
+    try:
+        return int(idx or 0) == 1
+    except Exception:
+        return False
+
+
+def _replace_dir_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    old = dst.with_name(f".{dst.name}.old-{_fmt_local_ts()}")
+    if dst.exists() or dst.is_symlink():
+        os.replace(dst, old)
+    try:
+        os.replace(src, dst)
+    except Exception:
+        if old.exists() and not dst.exists():
+            os.replace(old, dst)
+        raise
+    if old.exists():
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _rsync_tree(
+    src_paths: list[str],
+    dst: Path,
+    cfg: AgentConfig,
+    *,
+    link_dest: Path | None = None,
+    relative: bool = True,
+) -> int:
+    if not src_paths:
+        return 0
+    dst.mkdir(parents=True, exist_ok=True)
+    cmd = ["rsync", "-a", "--delete", "--numeric-ids"]
+    if relative:
+        cmd.append("--relative")
+    if link_dest is not None and link_dest.exists():
+        cmd.append(f"--link-dest={link_dest}")
+    for pattern in list(getattr(cfg, "backup_cluster_files_snapshot_exclude", []) or []):
+        pattern = str(pattern or "").strip()
+        if pattern:
+            cmd.append(f"--exclude={pattern}")
+    cmd += src_paths + [str(dst)]
+    _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    return _path_total_bytes(dst)
+
+
+def _layer_manifest_path(layer_dir: Path) -> Path:
+    return layer_dir / ".mcd-cluster-file-layer.json"
+
+
+def _snapshot_manifest_path(snapshot_dir: Path) -> Path:
+    return snapshot_dir / ".mcd-backup.json"
+
+
 def _cluster_current_full_dir(cfg: AgentConfig) -> Path | None:
     link = _cluster_db_root(cfg) / "current-full"
     candidates: list[Path] = []
@@ -1993,7 +2107,410 @@ def _cluster_snapshot_paths(cfg: AgentConfig) -> list[str]:
     return out
 
 
+def cluster_backup_files_produce(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        transport = str(getattr(cfg, "backup_cluster_files_transport", "syncthing") or "syncthing").strip().lower()
+        if transport != "syncthing":
+            raise RuntimeError(f"unsupported cluster files transport: {transport}")
+        node_slug = _cluster_node_slug(cfg)
+        node_paths = _cluster_file_source_paths(
+            cfg,
+            "backup_cluster_files_node_paths",
+            fallback=_cluster_snapshot_paths(cfg),
+        )
+        shared_paths = (
+            _cluster_file_source_paths(cfg, "backup_cluster_files_shared_paths")
+            if _cluster_should_produce_shared(cfg)
+            else []
+        )
+        if not node_paths and not shared_paths:
+            raise RuntimeError("no existing node/shared paths configured for cluster file layer producer")
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "job": "backup.cluster.files_produce",
+                "method": "syncthing-layer",
+            },
+            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.files_produce", "error": str(e)},
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+
+    lock_path = _cluster_lock_path(cfg, f"files-produce-{node_slug}")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message=f"cluster file layer producer already running for {node_slug}", state_path=str(state_path))
+
+    layer_root = _cluster_file_layers_root(cfg) / node_slug
+    tmp_dir = layer_root / f".incomplete-{_fmt_local_ts()}"
+    current_dir = layer_root / "current"
+    try:
+        layer_root.mkdir(parents=True, exist_ok=True)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "last_backup_path": str(current_dir),
+                "last_backup_kind": "cluster_files_layer",
+                "job": "backup.cluster.files_produce",
+                "method": "syncthing-layer",
+            },
+        )
+        node_bytes = (
+            _rsync_tree(
+                node_paths,
+                tmp_dir / "node",
+                cfg,
+                link_dest=(current_dir / "node") if (current_dir / "node").exists() else None,
+            )
+            if node_paths
+            else 0
+        )
+        shared_bytes = (
+            _rsync_tree(
+                shared_paths,
+                tmp_dir / "shared",
+                cfg,
+                link_dest=(current_dir / "shared") if (current_dir / "shared").exists() else None,
+            )
+            if shared_paths
+            else 0
+        )
+        manifest = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "cluster_id": str(getattr(cfg, "cluster_id", "") or ""),
+            "node_slug": node_slug,
+            "node_role": str(getattr(cfg, "cluster_node_role", "") or ""),
+            "node_index": getattr(cfg, "cluster_node_index", None),
+            "host_name": _host_name(cfg),
+            "transport": "syncthing",
+            "node_paths": node_paths,
+            "shared_paths": shared_paths,
+            "bytes_written": int(node_bytes + shared_bytes),
+            "node_bytes": int(node_bytes),
+            "shared_bytes": int(shared_bytes),
+        }
+        _json_write(_layer_manifest_path(tmp_dir), manifest)
+        _replace_dir_atomic(tmp_dir, current_dir)
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(current_dir),
+                "last_backup_kind": "cluster_files_layer",
+                "last_files_layer_path": str(current_dir),
+                "last_files_layer_at": manifest["ts_utc"],
+                "last_bytes_written": int(node_bytes + shared_bytes),
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.files_produce",
+                "duration_sec": duration,
+                "backup_path": str(current_dir),
+                "bytes_written": int(node_bytes + shared_bytes),
+                "node_slug": node_slug,
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster file layer produced: {current_dir}",
+            state_path=str(state_path),
+            backup_path=str(current_dir),
+            duration_sec=duration,
+            bytes_written=int(node_bytes + shared_bytes),
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.files_produce",
+                "duration_sec": duration,
+                "error": str(e),
+                "node_slug": node_slug,
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def _read_cluster_file_layers(cfg: AgentConfig) -> tuple[list[dict[str, Any]], list[str]]:
+    layers_root = _cluster_file_layers_root(cfg)
+    expected = _cluster_expected_file_nodes(cfg)
+    problems: list[str] = []
+    layers: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    if not layers_root.exists():
+        return [], [f"layers root missing: {layers_root}"]
+    candidates = []
+    if expected:
+        candidates = [layers_root / node / "current" for node in expected]
+    else:
+        candidates = [p / "current" for p in layers_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    seen: set[str] = set()
+    for layer_dir in candidates:
+        manifest_path = _layer_manifest_path(layer_dir)
+        if not manifest_path.exists():
+            problems.append(f"missing layer manifest: {manifest_path}")
+            continue
+        manifest = _json_read(manifest_path)
+        node_slug = _safe_slug(str(manifest.get("node_slug") or layer_dir.parent.name))
+        if expected and node_slug not in expected:
+            problems.append(f"unexpected node layer {node_slug}: {manifest_path}")
+            continue
+        if node_slug in seen:
+            problems.append(f"duplicate node layer: {node_slug}")
+            continue
+        if str(manifest.get("status") or "").lower() != "ok":
+            problems.append(f"node layer not ok: {node_slug}")
+            continue
+        ts_raw = str(manifest.get("ts_utc") or "").strip()
+        try:
+            layer_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            age_sec = int((now - layer_dt).total_seconds())
+        except Exception:
+            age_sec = 10**9
+        if age_sec > int(getattr(cfg, "backup_cluster_files_layer_max_age_sec", 86400) or 86400):
+            problems.append(f"node layer stale: {node_slug} age_sec={age_sec}")
+            continue
+        node_dir = layer_dir / "node"
+        shared_dir = layer_dir / "shared"
+        if not node_dir.exists() and not shared_dir.exists():
+            problems.append(f"node layer has no node/shared directories: {node_slug}")
+            continue
+        seen.add(node_slug)
+        layers.append({"node_slug": node_slug, "path": layer_dir, "manifest": manifest})
+    if expected:
+        missing = [node for node in expected if node not in seen]
+        for node in missing:
+            problems.append(f"missing expected node layer: {node}")
+    return layers, problems
+
+
+def cluster_backup_files_assemble(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    state_path = _cluster_state_path(cfg)
+    started_ts = _utc_now_iso()
+    start_monotonic = time.monotonic()
+    try:
+        _validate_cluster_cfg(cfg, remote=False)
+        _ensure_cluster_backup_authority(cfg)
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "error",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "last_backup_kind": "cluster_files_snapshot",
+                "last_started_at": started_ts,
+            },
+            history_item={"ts": _utc_now_iso(), "status": "error", "job": "backup.cluster.files_assemble", "error": str(e)},
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+
+    lock_path = _cluster_lock_path(cfg, "files")
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="cluster files snapshot is already running", state_path=str(state_path))
+
+    ts = _fmt_local_ts()
+    snap_root = _cluster_files_root(cfg)
+    tmp_dir = snap_root / f".incomplete-{ts}"
+    final_dir = snap_root / ts
+    try:
+        if not bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)):
+            raise RuntimeError("cluster files snapshot is disabled")
+        layers, problems = _read_cluster_file_layers(cfg)
+        if problems:
+            raise RuntimeError("cluster file layers are not ready: " + "; ".join(problems[:10]))
+        if not layers:
+            raise RuntimeError("no cluster file layers found")
+        snap_root.mkdir(parents=True, exist_ok=True)
+        latest = snap_root / "latest"
+        latest_resolved: Path | None = None
+        try:
+            if latest.exists():
+                resolved = latest.resolve()
+                if resolved.exists() and resolved.is_dir():
+                    latest_resolved = resolved
+        except Exception:
+            latest_resolved = None
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        _cluster_update_state(
+            cfg,
+            {
+                "host_name": _host_name(cfg),
+                "cluster_name": _cluster_name(cfg),
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "last_backup_path": str(final_dir),
+                "job": "backup.cluster.files_assemble",
+                "method": "syncthing-layer-assemble",
+            },
+        )
+        total_bytes = 0
+        layer_rows: list[dict[str, Any]] = []
+        shared_done = False
+        for layer in sorted(layers, key=lambda x: str(x.get("node_slug") or "")):
+            node_slug = str(layer["node_slug"])
+            layer_path = Path(layer["path"])
+            node_src = layer_path / "node"
+            shared_src = layer_path / "shared"
+            node_dst = tmp_dir / "nodes" / node_slug
+            shared_dst = tmp_dir / "shared"
+            node_bytes = 0
+            shared_bytes = 0
+            if node_src.exists():
+                node_bytes = _rsync_tree(
+                    [str(node_src) + "/"],
+                    node_dst,
+                    cfg,
+                    link_dest=(latest_resolved / "nodes" / node_slug) if latest_resolved is not None else None,
+                    relative=False,
+                )
+            if shared_src.exists() and not shared_done:
+                shared_bytes = _rsync_tree(
+                    [str(shared_src) + "/"],
+                    shared_dst,
+                    cfg,
+                    link_dest=(latest_resolved / "shared") if latest_resolved is not None else None,
+                    relative=False,
+                )
+                shared_done = True
+            total_bytes += int(node_bytes + shared_bytes)
+            layer_rows.append(
+                {
+                    "node_slug": node_slug,
+                    "layer_path": str(layer_path),
+                    "layer_ts_utc": str((layer.get("manifest") or {}).get("ts_utc") or ""),
+                    "node_bytes": int(node_bytes),
+                    "shared_bytes": int(shared_bytes),
+                }
+            )
+        marker = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "cluster_backup": True,
+            "cluster_name": _cluster_name(cfg),
+            "cluster_id": str(getattr(cfg, "cluster_id", "") or ""),
+            "host_name": _host_name(cfg),
+            "method": "syncthing-layer-assemble",
+            "path": str(final_dir),
+            "bytes_written": int(total_bytes),
+            "layers": layer_rows,
+            "expected_nodes": _cluster_expected_file_nodes(cfg),
+        }
+        _json_write(_snapshot_manifest_path(tmp_dir), marker)
+        os.replace(tmp_dir, final_dir)
+        _replace_symlink(snap_root / "latest", final_dir)
+        duration = int(time.monotonic() - start_monotonic)
+        _cluster_update_state(
+            cfg,
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(final_dir),
+                "last_bytes_written": int(total_bytes),
+                "last_backup_kind": "cluster_files_snapshot",
+                "last_files_snapshot_path": str(final_dir),
+                "last_files_snapshot_at": marker["ts_utc"],
+                "last_files_snapshot_layers": layer_rows,
+            },
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok",
+                "job": "backup.cluster.files_assemble",
+                "duration_sec": duration,
+                "backup_path": str(final_dir),
+                "bytes_written": int(total_bytes),
+                "layers": layer_rows,
+            },
+        )
+        return BackupResult(
+            ok=True,
+            message=f"cluster files snapshot assembled: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=int(total_bytes),
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cluster_update_state(
+            cfg,
+            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "failed",
+                "job": "backup.cluster.files_assemble",
+                "duration_sec": duration,
+                "error": str(e),
+            },
+        )
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
 def cluster_backup_files_snapshot(config: AgentConfig) -> BackupResult:
+    cfg = _effective_cfg(config)
+    transport = str(getattr(cfg, "backup_cluster_files_transport", "syncthing") or "syncthing").strip().lower()
+    if transport == "syncthing":
+        return cluster_backup_files_assemble(cfg)
     cfg = _effective_cfg(config)
     state_path = _cluster_state_path(cfg)
     started_ts = _utc_now_iso()
@@ -2322,9 +2839,21 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         if full_dir is None:
             raise RuntimeError("offsite backup requires a completed local full backup")
         full_marker = _read_backup_marker(full_dir)
-        files_snapshot = _cluster_latest_files_snapshot(cfg) if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)) else None
+        files_snapshot = (
+            _cluster_latest_files_snapshot(cfg)
+            if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True))
+            else None
+        )
         if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)) and files_snapshot is None:
-            raise RuntimeError("offsite backup requires a completed local files snapshot")
+            snapshot_res = cluster_backup_files_snapshot(cfg)
+            if not snapshot_res.ok:
+                raise RuntimeError(
+                    "offsite backup requires a completed local files snapshot; "
+                    f"snapshot attempt failed: {snapshot_res.message}"
+                )
+            files_snapshot = _cluster_latest_files_snapshot(cfg)
+            if files_snapshot is None:
+                raise RuntimeError("offsite backup requires a completed local files snapshot")
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
         _cluster_update_state(

@@ -534,6 +534,14 @@ class AgentConfig:
     backup_cluster_files_snapshot_enabled: bool
     backup_cluster_files_snapshot_paths: list[str]
     backup_cluster_files_snapshot_exclude: list[str]
+    backup_cluster_files_transport: str
+    backup_cluster_files_sync_dir: str
+    backup_cluster_files_node_paths: list[str]
+    backup_cluster_files_shared_paths: list[str]
+    backup_cluster_files_shared_producer_host: str | None
+    backup_cluster_files_expected_nodes: list[str]
+    backup_cluster_files_layer_max_age_sec: int
+    backup_cluster_files_produce_interval_sec: int
     backup_cluster_remote_enabled: bool
     backup_cluster_remote_retention_daily: int
     backup_cluster_remote_retention_weekly: int
@@ -1553,6 +1561,14 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_cluster_files_snapshot_enabled": "backup_cluster_files_snapshot_enabled",
     "backup_cluster_files_snapshot_paths": "backup_cluster_files_snapshot_paths",
     "backup_cluster_files_snapshot_exclude": "backup_cluster_files_snapshot_exclude",
+    "backup_cluster_files_transport": "backup_cluster_files_transport",
+    "backup_cluster_files_sync_dir": "backup_cluster_files_sync_dir",
+    "backup_cluster_files_node_paths": "backup_cluster_files_node_paths",
+    "backup_cluster_files_shared_paths": "backup_cluster_files_shared_paths",
+    "backup_cluster_files_shared_producer_host": "backup_cluster_files_shared_producer_host",
+    "backup_cluster_files_expected_nodes": "backup_cluster_files_expected_nodes",
+    "backup_cluster_files_layer_max_age_sec": "backup_cluster_files_layer_max_age_sec",
+    "backup_cluster_files_produce_interval_sec": "backup_cluster_files_produce_interval_sec",
     "backup_cluster_remote_enabled": "backup_cluster_remote_enabled",
     "backup_cluster_remote_retention_daily": "backup_cluster_remote_retention_daily",
     "backup_cluster_remote_retention_weekly": "backup_cluster_remote_retention_weekly",
@@ -2462,6 +2478,33 @@ def _load_config_inner(path: str) -> AgentConfig:
                     "*/sessions/*",
                 ],
             )
+        ),
+        backup_cluster_files_transport=str(backup_cluster.get("files_transport", "syncthing")).strip().lower()
+        or "syncthing",
+        backup_cluster_files_sync_dir=str(
+            backup_cluster.get("files_sync_dir", "/opt/mcd/var/cluster-backup-files")
+        ).strip()
+        or "/opt/mcd/var/cluster-backup-files",
+        backup_cluster_files_node_paths=_normalize_list(
+            backup_cluster.get(
+                "files_node_paths",
+                backup_cluster.get("files_snapshot_paths", backup_archive.get("paths", [])),
+            )
+        ),
+        backup_cluster_files_shared_paths=_normalize_list(backup_cluster.get("files_shared_paths", [])),
+        backup_cluster_files_shared_producer_host=(
+            str(backup_cluster.get("files_shared_producer_host")).strip()
+            if backup_cluster.get("files_shared_producer_host")
+            else None
+        ),
+        backup_cluster_files_expected_nodes=_normalize_list(backup_cluster.get("files_expected_nodes", [])),
+        backup_cluster_files_layer_max_age_sec=max(
+            300,
+            int(backup_cluster.get("files_layer_max_age_sec", 86400) or 86400),
+        ),
+        backup_cluster_files_produce_interval_sec=max(
+            300,
+            int(backup_cluster.get("files_produce_interval_sec", 3600) or 3600),
         ),
         backup_cluster_remote_enabled=bool(backup_cluster.get("remote_enabled", True)),
         backup_cluster_remote_retention_daily=max(1, int(backup_cluster.get("remote_retention_daily", 7))),

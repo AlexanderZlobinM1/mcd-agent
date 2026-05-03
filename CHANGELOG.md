@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.8.153 - 2026-05-03
+
+- Fixed: cluster auto-update no longer blocks the download phase on recent campaign activity; active campaign trigger/rebuild work remains an install/apply blocker.
+
+## 0.8.152 - 2026-05-03
+
+- Fixed: cluster offsite backup now attempts to assemble the latest local files snapshot when the snapshot is missing, instead of failing immediately.
+- Fixed: cluster backup scheduler now marks local full/offsite days only after successful completion; failed attempts use short cooldowns and can retry in the same window.
+
+## 0.8.151 - 2026-05-03
+
+- Added: cluster file backup now uses a Syncthing data plane. Every expected cluster node prepares its own local file layer, the replica assembles received layers into `files/snapshots/latest`, and offsite backup uses that prepared snapshot.
+- Added: `mcd-cli backup cluster-files-produce` and `cluster-files-assemble` for explicit producer/replica checks.
+- Added: daemon-side cluster file layer producer loop; passive mode still does not run rings, but can keep cluster backup file layers fresh when cluster backup is enabled.
+- Added: runtime-config keys for Syncthing file transport, expected producer nodes, shared-file producer, layer freshness and producer interval.
+
 ## 0.8.150 - 2026-05-03
 
 - Changed: self-update blockers now include only active PHP campaign trigger/rebuild work, including `mautic:campaigns:update` because MCD treats it as rebuild. Segment updates and wrapper processes (`flock`, `timeout`, `sudo`) waiting on locks do not block agent replacement.
