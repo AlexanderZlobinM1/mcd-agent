@@ -1544,11 +1544,12 @@ def _proc_cmdline(pid_dir: Path) -> str:
 
 
 def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
-    """Detect offsite mydumper jobs that survived an MCD restart.
+    """Detect offsite jobs that survived an MCD restart.
 
-    The daemon uses flock while it is alive, but mydumper intentionally keeps
-    running across MCD restarts. A fresh daemon must therefore treat a matching
-    child process as an active cluster backup even when the old lock FD is gone.
+    The daemon uses flock while it is alive, but long-running offsite child
+    processes intentionally keep running across MCD restarts. A fresh daemon
+    must therefore treat matching children as active cluster backups even when
+    the old lock FD is gone.
     """
     proc_root = Path("/proc")
     if not proc_root.exists():
@@ -1557,7 +1558,6 @@ def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
     cluster_name = _cluster_name(cfg)
     if not mount_path or not cluster_name:
         return []
-    mydumper_name = Path(str(getattr(cfg, "backup_mydumper_bin", "mydumper") or "mydumper")).name
     daily_marker = f"{mount_path}/backup/{cluster_name}/daily/.incomplete-"
     matches: list[int] = []
     for pid_dir in proc_root.iterdir():
@@ -1566,11 +1566,37 @@ def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
         cmdline = _proc_cmdline(pid_dir)
         if not cmdline:
             continue
-        if mydumper_name not in cmdline:
+        if daily_marker not in cmdline:
             continue
-        if daily_marker in cmdline and "/databases/cluster__" in cmdline:
+        if "/databases/cluster__" in cmdline or "/files-snapshot-" in cmdline:
             matches.append(int(pid_dir.name))
     return sorted(matches)
+
+
+def _cluster_archive_files_snapshot_to_remote(
+    cfg: AgentConfig,
+    files_snapshot: Path,
+    dst_dir: Path,
+) -> tuple[Path, int]:
+    if not files_snapshot.exists() or not files_snapshot.is_dir():
+        raise RuntimeError(f"files snapshot missing: {files_snapshot}")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    archive_name = f"files-snapshot-{files_snapshot.name}.tar.gz"
+    archive_path = dst_dir / archive_name
+    if archive_path.exists():
+        archive_path.unlink()
+    _run(
+        ["tar", "-C", str(files_snapshot), "-czf", str(archive_path), "."],
+        timeout_sec=cfg.backup_dump_timeout_sec,
+        check=True,
+    )
+    try:
+        size = int(archive_path.stat().st_size)
+    except Exception:
+        size = 0
+    if size <= 0:
+        raise RuntimeError(f"files snapshot archive is empty: {archive_path}")
+    return archive_path, size
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
@@ -1636,6 +1662,45 @@ def _ensure_cluster_tools(cfg: AgentConfig, methods: set[str]) -> dict[str, Any]
 
 def _cluster_db_root(cfg: AgentConfig) -> Path:
     return _cluster_local_root(cfg) / "db"
+
+
+def _same_directory(a: Path, b: Path) -> bool:
+    try:
+        ast = a.stat()
+        bst = b.stat()
+    except OSError:
+        return False
+    return ast.st_dev == bst.st_dev and ast.st_ino == bst.st_ino
+
+
+def _path_is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure_cluster_local_root_outside_mysql_datadir(cfg: AgentConfig, db: DBConfig) -> None:
+    raw = _mysql_capture(cfg, db, "SELECT @@datadir")
+    datadir = Path(str(raw).strip().splitlines()[0].strip())
+    local_root = _cluster_local_root(cfg)
+    if not datadir.is_absolute():
+        return
+    if _path_is_under(local_root, datadir):
+        raise RuntimeError(
+            f"backup.cluster.local_root_dir must not be inside MySQL datadir: {local_root} under {datadir}"
+        )
+    # Bind mounts can make two different path prefixes point to the same
+    # directory. Walk local_root parents and reject aliases of datadir too.
+    for parent in [local_root, *local_root.parents]:
+        if str(parent) == "/":
+            break
+        if _same_directory(parent, datadir):
+            raise RuntimeError(
+                "backup.cluster.local_root_dir is under a mount/bind alias of MySQL datadir: "
+                f"{local_root} via {parent} == {datadir}"
+            )
 
 
 def _cluster_files_root(cfg: AgentConfig) -> Path:
@@ -1850,6 +1915,38 @@ def _cluster_prune_local_after_full(cfg: AgentConfig, keep_full: Path) -> list[s
     return removed
 
 
+def _cluster_prune_local_before_full(cfg: AgentConfig) -> list[str]:
+    """Free operational backup space before writing the next cluster full.
+
+    Cluster local backups are a fast operational layer on the replica. The
+    authoritative source still exists in the replica plus production nodes and
+    the offsite tier, so this intentionally trades old-local-full retention for
+    enough free space to create the next local full.
+    """
+    removed: list[str] = []
+    db_root = _cluster_db_root(cfg)
+    if not db_root.exists():
+        return removed
+    allowed_prefixes = (".incomplete-", "full-", "incremental-")
+    allowed_names = {"current-full", "current-incremental", "incrementals"}
+    for path in list(db_root.iterdir()):
+        if path.name not in allowed_names and not path.name.startswith(allowed_prefixes):
+            continue
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                continue
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+        except Exception:
+            pass
+    return removed
+
+
 def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
     cfg = _effective_cfg(config)
     state_path = _cluster_state_path(cfg)
@@ -1861,6 +1958,7 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
         tool_state = _ensure_cluster_tools(cfg, {"xtrabackup"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
+        _ensure_cluster_local_root_outside_mysql_datadir(cfg, db)
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
         _cluster_update_state(
@@ -1907,6 +2005,9 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
                 "tool_state": tool_state,
             },
         )
+        prepruned = _cluster_prune_local_before_full(cfg)
+        if prepruned:
+            _cluster_update_state(cfg, {"last_local_prepruned": prepruned})
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         _run_xtrabackup(replace(cfg, backup_method="xtrabackup"), db, db_dir)
@@ -1934,6 +2035,9 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
         removed = _cluster_prune_local_after_full(cfg, final_dir)
         if removed:
             marker["local_pruned"] = removed
+        if prepruned:
+            marker["local_prepruned"] = prepruned
+        if removed or prepruned:
             _write_marker(final_dir, marker)
         duration = int(time.monotonic() - start_monotonic)
         _cluster_update_state(
@@ -1950,6 +2054,7 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
                 "last_local_full_path": str(final_dir),
                 "last_local_full_at": marker["ts_utc"],
                 "last_local_pruned": removed,
+                "last_local_prepruned": prepruned,
             },
             history_item={
                 "ts": _utc_now_iso(),
@@ -1960,6 +2065,7 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
                 "bytes_written": bytes_written,
                 "chain_id": chain_id,
                 "local_pruned": removed,
+                "local_prepruned": prepruned,
             },
         )
         return BackupResult(
@@ -3008,22 +3114,17 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             raise RuntimeError(f"offsite backup target already exists: {final_dir}")
         tmp_dir = daily_parent / f".incomplete-{date_dir}-{_fmt_local_ts()}"
         tmp_dir.mkdir(parents=True, exist_ok=False)
+        files_bytes = 0
+        files_archive_path = ""
+        if files_snapshot is not None:
+            archive_path, files_bytes = _cluster_archive_files_snapshot_to_remote(cfg, files_snapshot, tmp_dir)
+            files_archive_path = str(archive_path)
         db_dir = tmp_dir / "databases" / f"cluster__{db.name or 'all'}"
         db_dir.mkdir(parents=True, exist_ok=False)
         _run_mydumper(replace(cfg, backup_method="mydumper"), db, db_dir)
         ok, verify_msg, db_bytes = _verify_dump_dir(db_dir)
         if not ok:
             raise RuntimeError(f"cluster offsite mydumper verification failed: {verify_msg}")
-        files_bytes = 0
-        if files_snapshot is not None:
-            files_dst = tmp_dir / "files"
-            files_dst.mkdir(parents=True, exist_ok=True)
-            _run(
-                ["rsync", "-a", "--delete", "--numeric-ids", f"{files_snapshot}/", f"{files_dst}/"],
-                timeout_sec=cfg.backup_dump_timeout_sec,
-                check=True,
-            )
-            files_bytes = _path_total_bytes(files_dst)
         bytes_written = db_bytes + files_bytes
         marker = {
             "status": "ok",
@@ -3040,6 +3141,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             "local_full_path": str(full_dir),
             "local_full_chain_id": str(full_marker.get("chain_id") or full_dir.name),
             "files_snapshot_path": str(files_snapshot) if files_snapshot is not None else "",
+            "files_archive_path": files_archive_path,
             "server_snapshot": _mysql_server_snapshot(cfg, db),
             "cleanup_incomplete_removed": removed_incomplete,
         }

@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.156 - 2026-05-04
+
+- Fixed: cluster offsite backup now archives the prepared file snapshot as a single `files-snapshot-<ts>.tar.gz` directly into the remote incomplete backup before `mydumper`, avoiding the previous slow `rsync` file stage after the database dump.
+- Fixed: cluster offsite process detection now treats both database dump and file archive child processes as active backups across MCD restarts.
+- Safety: cluster local xtrabackup now rejects local backup roots inside the MySQL datadir, including bind-mount aliases, and can pre-prune the operational local backup chain before a new full when disk space is intentionally tight.
+
 ## 0.8.155 - 2026-05-03
 
 - Fixed: cluster file backup defaults now keep per-node layers host-specific (`/etc`, cron spool, MCD config/state, helper scripts, Syncthing identity/config and Gluster state) and store the Mautic application tree once as the shared layer.
