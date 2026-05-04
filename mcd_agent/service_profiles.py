@@ -302,6 +302,39 @@ def _detect_mysql_dropin(profile: dict[str, Any]) -> Path:
     return Path("/etc/mysql/conf.d") / raw
 
 
+def _mysql_include_root_content() -> str:
+    return (
+        "# Managed by MCD service profile (mysql include root)\n"
+        "# Keep server tuning in drop-in files so profile precedence is deterministic.\n\n"
+        "!includedir /etc/mysql/conf.d/\n"
+        "!includedir /etc/mysql/mysql.conf.d/\n"
+    )
+
+
+def _cleanup_legacy_mysql_top_level_configs() -> dict[Path, str | None]:
+    """
+    Older MCD ops tuning wrote a full [mysqld] section directly into top-level
+    files after includedir statements. That makes profile drop-ins ineffective
+    because later top-level values override them. Only rewrite files that are
+    explicitly marked as old MCD-managed tuning.
+    """
+    before: dict[Path, str | None] = {}
+    replacement = _mysql_include_root_content()
+    for path in (Path("/etc/mysql/my.cnf"), Path("/etc/mysql/mysql.cnf")):
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        first_line = text.splitlines()[0].strip() if text.splitlines() else ""
+        if not first_line.startswith("# Managed by MCD ops tuning"):
+            continue
+        before[path] = text
+        _write_file(path, replacement)
+    return before
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -361,6 +394,90 @@ def _build_mysql_override(profile: dict[str, Any], *, engine: str) -> str:
         f"log_queries_not_using_indexes = {'ON' if _as_bool(profile.get('log_queries_not_using_indexes'), False) else 'OFF'}"
     )
     return "\n".join(lines) + "\n"
+
+
+def _mysql_client_cmd() -> list[str] | None:
+    client = shutil.which("mysql") or shutil.which("mariadb")
+    if not client:
+        return None
+    debian_cnf = Path("/etc/mysql/debian.cnf")
+    if debian_cnf.exists():
+        return [client, "--defaults-extra-file=/etc/mysql/debian.cnf"]
+    return [client]
+
+
+def _mysql_mb_bytes(profile: dict[str, Any], key: str, default_mb: int) -> int | None:
+    raw = profile.get(key)
+    if raw is None:
+        raw = default_mb
+    try:
+        mb = int(raw)
+    except Exception:
+        return None
+    if mb <= 0:
+        return None
+    return mb * 1024 * 1024
+
+
+def _apply_mysql_dynamic_profile(profile: dict[str, Any], *, engine: str, timeout_sec: int = 20) -> dict[str, Any]:
+    """
+    Apply dynamic variables immediately. Static settings remain in the drop-in
+    and take effect on the next controlled MySQL restart.
+    """
+    cmd = _mysql_client_cmd()
+    if not cmd:
+        return {"status": "skipped", "reason": "mysql_client_not_found"}
+
+    statements: list[str] = []
+    bp = _mysql_mb_bytes(profile, "innodb_buffer_pool_size_mb", 2048)
+    if bp:
+        statements.append(f"SET GLOBAL innodb_buffer_pool_size={bp}")
+    redo = _mysql_mb_bytes(profile, "innodb_redo_log_capacity_mb", 1024)
+    if redo and engine in {"mysql", "percona"}:
+        statements.append(f"SET GLOBAL innodb_redo_log_capacity={redo}")
+    for key in (
+        "innodb_io_capacity",
+        "innodb_io_capacity_max",
+        "max_connections",
+        "thread_cache_size",
+        "table_open_cache",
+        "table_definition_cache",
+    ):
+        raw = profile.get(key)
+        if raw is None:
+            continue
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val > 0:
+            statements.append(f"SET GLOBAL {key}={val}")
+    for key, default_mb in (
+        ("tmp_table_size_mb", 128),
+        ("max_heap_table_size_mb", 128),
+        ("max_allowed_packet_mb", 64),
+    ):
+        val = _mysql_mb_bytes(profile, key, default_mb)
+        if val:
+            statements.append(f"SET GLOBAL {key[:-3]}={val}")
+
+    if not statements:
+        return {"status": "noop", "applied": []}
+
+    sql = ";\n".join(statements) + ";"
+    proc = subprocess.run(
+        [*cmd, "--batch", "--skip-column-names", "-e", sql],
+        capture_output=True,
+        text=True,
+        timeout=max(5, int(timeout_sec)),
+    )
+    if proc.returncode != 0:
+        return {
+            "status": "error",
+            "reason": (proc.stderr or proc.stdout or f"mysql_rc_{proc.returncode}").strip(),
+            "attempted": statements,
+        }
+    return {"status": "applied", "applied": statements}
 
 
 def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
@@ -497,29 +614,40 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
         }
 
     changed: list[str] = []
+    top_level_before: dict[Path, str | None] = {}
     try:
+        top_level_before = _cleanup_legacy_mysql_top_level_configs()
+        changed.extend(str(p) for p in top_level_before)
         if _write_file(dropin, content):
             changed.append(str(dropin))
 
-        if not changed:
+        dynamic = _apply_mysql_dynamic_profile(profile, engine=engine)
+
+        if not changed and str(dynamic.get("status")) in {"noop", "skipped"}:
             return {
                 "status": "noop",
                 "engine": engine,
                 "service_name": service_name,
                 "changed_files": [],
+                "dynamic": dynamic,
             }
 
         proc_reload = subprocess.run(["systemctl", "reload", service_name], capture_output=True, text=True)
         if proc_reload.returncode != 0:
-            proc_restart = subprocess.run(["systemctl", "restart", service_name], capture_output=True, text=True)
-            if proc_restart.returncode != 0:
-                msg = (proc_restart.stderr or proc_restart.stdout or "mysql restart failed").strip()
-                raise RuntimeError(msg)
+            # Avoid surprise restarts during profile drift correction. The
+            # drop-in is durable and dynamic variables above cover the memory
+            # pressure case immediately; static settings apply on a planned
+            # restart/maintenance window.
+            reload_note = (proc_reload.stderr or proc_reload.stdout or "mysql reload unsupported").strip()
+        else:
+            reload_note = "reloaded"
         return {
             "status": "applied",
             "engine": engine,
             "service_name": service_name,
             "changed_files": changed,
+            "dynamic": dynamic,
+            "reload": reload_note,
         }
     except Exception:
         try:
@@ -529,7 +657,12 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
             else:
                 dropin.parent.mkdir(parents=True, exist_ok=True)
                 dropin.write_text(before, encoding="utf-8")
-            subprocess.run(["systemctl", "restart", service_name], capture_output=True, text=True)
+            for path, content_before in top_level_before.items():
+                if content_before is None:
+                    if path.exists():
+                        path.unlink()
+                else:
+                    path.write_text(content_before, encoding="utf-8")
         except Exception:
             pass
         raise

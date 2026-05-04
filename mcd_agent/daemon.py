@@ -4335,9 +4335,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     import_force_until = max(import_force_until, now + float(import_hold_sec))
                     segment_force_full_scan_until[root] = import_force_until
                 force_segment_full_scan = now < import_force_until
+                periodic_full_scan_enabled = bool(getattr(config, "segment_periodic_full_scan_enabled", False))
                 full_scan_interval_sec = max(0, int(getattr(config, "segment_full_scan_interval_sec", 300) or 0))
                 if (
-                    not force_segment_full_scan
+                    periodic_full_scan_enabled
+                    and not force_segment_full_scan
                     and full_scan_interval_sec > 0
                     and now - float(segment_last_full_scan_ts.get(root, 0.0)) >= float(full_scan_interval_sec)
                 ):

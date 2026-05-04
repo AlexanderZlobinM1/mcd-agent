@@ -210,8 +210,6 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "    LEFT JOIN {prefix}campaign_leads cl "
     "      ON cl.campaign_id = c.id "
     "     AND cl.lead_id = lll.lead_id "
-    "     AND cl.manually_removed = 0 "
-    "     AND cl.date_last_exited IS NULL "
     "    WHERE cx.campaign_id = c.id "
     "      AND cl.lead_id IS NULL "
     "    LIMIT 1"
@@ -356,6 +354,7 @@ class AgentConfig:
     segment_regular_parallel_idle: int
     segment_cycles_per_tick: int
     segment_full_scan_interval_sec: int
+    segment_periodic_full_scan_enabled: bool
     segment_priority_parallel_throttled: int
     segment_regular_parallel_throttled: int
     segment_sql_ring_enabled: bool
@@ -1426,6 +1425,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_priority_parallel_idle": "segment_priority_parallel_idle",
     "segment_regular_parallel_idle": "segment_regular_parallel_idle",
     "segment_full_scan_interval_sec": "segment_full_scan_interval_sec",
+    "segment_periodic_full_scan_enabled": "segment_periodic_full_scan_enabled",
     "segment_cycles_per_tick": "segment_cycles_per_tick",
     "segment_priority_parallel_throttled": "segment_priority_parallel_throttled",
     "segment_regular_parallel_throttled": "segment_regular_parallel_throttled",
@@ -2098,6 +2098,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_priority_parallel_idle=int(runtime.get("segment_priority_parallel_idle", 4)),
         segment_regular_parallel_idle=int(runtime.get("segment_regular_parallel_idle", 1)),
         segment_full_scan_interval_sec=int(runtime.get("segment_full_scan_interval_sec", 300)),
+        segment_periodic_full_scan_enabled=bool(runtime.get("segment_periodic_full_scan_enabled", False)),
         segment_cycles_per_tick=int(runtime.get("segment_cycles_per_tick", 1)),
         segment_priority_parallel_throttled=int(runtime.get("segment_priority_parallel_throttled", 2)),
         segment_regular_parallel_throttled=int(runtime.get("segment_regular_parallel_throttled", 0)),

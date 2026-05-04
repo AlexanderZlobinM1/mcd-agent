@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.8.164 - 2026-05-04
+
+- Fixed: MySQL service-profile apply now removes only legacy MCD-managed top-level MySQL tuning files so profile drop-ins have deterministic precedence.
+- Added: MySQL service-profile apply now pushes dynamic runtime variables immediately and avoids surprise MySQL restarts; static settings remain durable for the next planned restart.
+- Fixed: campaign rebuild due SQL no longer treats manually removed/exited campaign contacts as missing, preventing empty `campaigns:rebuild` loops.
+- Changed: periodic all-published segment full scans are disabled by default; due-segment SQL and import-triggered full scans still prevent missed work.
+
 ## 0.8.163 - 2026-05-04
 
 - Fixed: stale import-pending override warnings are now rate-limited per instance to avoid poll-cycle log spam while still exposing the bad profile SQL.
