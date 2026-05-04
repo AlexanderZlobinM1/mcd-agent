@@ -96,6 +96,13 @@ _DB_DISPATCH_PAUSE_SEC = 120
 _DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD = 50
 _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
+_IMPORT_SETTLE_UNTIL: dict[str, float] = {}
+_IMPORT_PENDING_OVERRIDE_WARN_TS: dict[str, float] = {}
+_SQL_IMPORT_PENDING_STATUS_COUNT = (
+    "SELECT COUNT(*) AS cnt FROM {prefix}imports "
+    "WHERE status IN (1,2) "
+    "OR CAST(status AS CHAR) IN ('pending','in_progress')"
+)
 _SQL_SEGMENTS_ALL_PUBLISHED = (
     "SELECT ll.id "
     "FROM {prefix}lead_lists ll "
@@ -2947,8 +2954,12 @@ def _task_key(root: str, task_type: str, entity_id: int | None) -> str:
 
 
 def _task_repeat_interval_sec(config: AgentConfig, task_type: str) -> int:
+    if task_type == "segment":
+        return max(0, int(getattr(config, "segment_full_scan_interval_sec", 0) or 0))
     if task_type == "segment_sql":
         return max(0, int(getattr(config, "segment_sql_min_repeat_sec", 0)))
+    if task_type == "import":
+        return max(0, int(getattr(config, "import_poll_interval_sec", 0) or 0))
     if task_type == "campaign_trigger":
         return max(0, int(getattr(config, "campaign_trigger_min_repeat_sec", 0)))
     if task_type in {"campaign_rebuild", "campaign_update"}:
@@ -2962,7 +2973,7 @@ def _entity_launch_guard_key(root: str, task_type: str, entity_id: int | None) -
 
 def _launch_allowed(config: AgentConfig, root: str, task_type: str, entity_id: int | None, now_ts: float | None = None) -> bool:
     min_repeat = _task_repeat_interval_sec(config, task_type)
-    if min_repeat <= 0 or entity_id is None:
+    if min_repeat <= 0:
         return True
     ts = float(now_ts if now_ts is not None else time.time())
     key = _entity_launch_guard_key(root, task_type, entity_id)
@@ -2977,6 +2988,59 @@ def _prune_entity_launch_guard(max_age_sec: int = 3600, now_ts: float | None = N
     stale = [k for k, v in _ENTITY_LAUNCH_GUARD.items() if ts - float(v) > float(max_age_sec)]
     for k in stale:
         _ENTITY_LAUNCH_GUARD.pop(k, None)
+
+
+def _mark_import_settle(
+    config: AgentConfig,
+    root: str,
+    now_ts: float | None = None,
+    elapsed_sec: float | None = None,
+) -> None:
+    ts = float(now_ts if now_ts is not None else time.time())
+    base_settle_sec = max(5, int(getattr(config, "import_poll_interval_sec", 15) or 15))
+    # A near-instant import usually means no durable work was available.
+    # Give Mautic time to settle status fields before polling again, otherwise
+    # the daemon can catch its own transient in_progress row and relaunch a
+    # no-op import forever.
+    if elapsed_sec is not None and float(elapsed_sec) < 2.0:
+        settle_sec = max(60, base_settle_sec * 4)
+    else:
+        settle_sec = base_settle_sec
+    _IMPORT_SETTLE_UNTIL[str(root)] = ts + float(settle_sec)
+    logging.info("[%s] import settle active for %ss", root, int(settle_sec))
+
+
+def _import_in_settle(root: str, now_ts: float | None = None) -> bool:
+    ts = float(now_ts if now_ts is not None else time.time())
+    until = float(_IMPORT_SETTLE_UNTIL.get(str(root), 0.0) or 0.0)
+    if until <= 0:
+        return False
+    if ts < until:
+        return True
+    _IMPORT_SETTLE_UNTIL.pop(str(root), None)
+    return False
+
+
+def _fetch_import_pending_count(
+    db: MauticDB,
+    config: AgentConfig,
+    root: str,
+    sql_ctx: dict[str, str],
+) -> int:
+    configured_count = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
+    status_count = db.fetch_count(_SQL_IMPORT_PENDING_STATUS_COUNT, context=sql_ctx)
+    if configured_count > 0 and status_count <= 0:
+        now_ts = time.time()
+        last_warn = float(_IMPORT_PENDING_OVERRIDE_WARN_TS.get(str(root), 0.0) or 0.0)
+        if now_ts - last_warn >= 300.0:
+            _IMPORT_PENDING_OVERRIDE_WARN_TS[str(root)] = now_ts
+            logging.warning(
+                "[%s] import pending override returned %s but status query returned 0; treating import queue as empty",
+                root,
+                configured_count,
+            )
+        return 0
+    return max(0, int(status_count or configured_count or 0))
 
 
 def _running_count(running: dict[str, RunningTask], root: str, task_type_prefix: str) -> int:
@@ -3176,6 +3240,8 @@ def _monitor_running(
                 state = "done" if rc == 0 else "failed"
                 note = None if rc == 0 else "non_zero_exit"
                 store.finish(task.row_id, state=state, rc=rc, note=note)
+                if rc == 0 and task.task_type == "import":
+                    _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
                 running.pop(key, None)
                 popens.pop(key, None)
                 respawned = False
@@ -3237,6 +3303,8 @@ def _monitor_running(
 
         if not alive:
             store.finish(task.row_id, state="lost", rc=None, note="pid_not_alive")
+            if task.task_type == "import":
+                _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
             running.pop(key, None)
             popens.pop(key, None)
             if task.manual_request_id is not None:
@@ -4242,9 +4310,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_ids: list[int] | None = None
                 campaign_trigger_ids: list[int] | None = None
                 campaign_rebuild_ids: list[int] | None = None
-                if cluster_import_allowed and now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
+                import_settling = _import_in_settle(root, now)
+                if import_settling:
+                    import_pending_cache[root] = 0
+                elif cluster_import_allowed and now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
                     try:
-                        import_pending_cache[root] = db.fetch_count(config.sql_import_pending_count, context=sql_ctx)
+                        import_pending_cache[root] = _fetch_import_pending_count(db, config, root, sql_ctx)
                     except Exception as e:
                         logging.warning("[%s] import query failed: %s", root, e)
                         if _is_db_dispatch_pause_error(e):
@@ -4944,6 +5015,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set())
             reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set())
             reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set())
+            if _import_in_settle(root, now):
+                import_pending_cache[root] = 0
             _mark_external_entities_executed(
                 running=running,
                 root=root,
@@ -5318,7 +5391,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             # - then rebuild-due campaigns
             # Import polling must stay independent from campaign slot occupancy.
             if (config.profile_name or "").strip().lower() == "tiny":
-                if cluster_import_allowed and config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+                if (
+                    not _import_in_settle(root, now)
+                    and cluster_import_allowed
+                    and config.enable_import_polling
+                    and import_pending_cache.get(root, 0) > 0
+                ):
                     args = render_mautic_command(
                         php_bin=config.php_bin,
                         run_as_user=config.mautic_run_as_user,
@@ -5548,7 +5626,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
 
-            if cluster_import_allowed and config.enable_import_polling and import_pending_cache.get(root, 0) > 0:
+            if (
+                not _import_in_settle(root, now)
+                and cluster_import_allowed
+                and config.enable_import_polling
+                and import_pending_cache.get(root, 0) > 0
+            ):
                 args = render_mautic_command(
                     php_bin=config.php_bin,
                     run_as_user=config.mautic_run_as_user,

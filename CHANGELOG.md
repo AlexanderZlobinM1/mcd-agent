@@ -1,5 +1,33 @@
 # MCD Changelog
 
+## 0.8.163 - 2026-05-04
+
+- Fixed: stale import-pending override warnings are now rate-limited per instance to avoid poll-cycle log spam while still exposing the bad profile SQL.
+
+## 0.8.162 - 2026-05-04
+
+- Fixed: import pending detection now cross-checks profile/runtime SQL with the status-based Mautic import state. A stale profile query can no longer treat completed/failed historical imports as pending and relaunch empty imports forever.
+
+## 0.8.161 - 2026-05-04
+
+- Fixed: import settle/backoff now clears stale pending-import cache in both planning and dispatch paths. This prevents the lower dispatch loop from launching another no-op import while settle is active.
+
+## 0.8.160 - 2026-05-04
+
+- Fixed: import settle/backoff is now also applied when a short-lived `mautic:import` child has already disappeared before the daemon can collect its return code.
+
+## 0.8.159 - 2026-05-04
+
+- Fixed: near-instant successful `mautic:import` runs now use an extended settle backoff, preventing no-op imports from relaunching every import poll interval while still allowing real long-running imports to continue in normal batches.
+
+## 0.8.158 - 2026-05-04
+
+- Fixed: successful `mautic:import` runs now create a short settle window that clears stale import-pending cache before the next database poll. This prevents MCD from repeatedly re-launching import after it has already drained the queue.
+
+## 0.8.157 - 2026-05-04
+
+- Fixed: segment and import ring launches now have daemon-side cooldown guards. Short-lived `mautic:segments:update` or `mautic:import` commands can no longer be respawned every dispatch tick while planning cache still contains the same due item.
+
 ## 0.8.156 - 2026-05-04
 
 - Fixed: cluster offsite backup now archives the prepared file snapshot as a single `files-snapshot-<ts>.tar.gz` directly into the remote incomplete backup before `mydumper`, avoiding the previous slow `rsync` file stage after the database dump.
