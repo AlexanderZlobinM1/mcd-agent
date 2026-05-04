@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.169 - 2026-05-04
+
+- Added: SendGrid/SNS plugin install now runs a dependency preflight before applying the plugin: installs Composer globally if missing, verifies Composer as `www-data`, ensures `symfony/sendgrid-mailer:*`, and normalizes NodeJS/npm to Node 20.
+- Fixed: Composer package detection now checks package names without version constraints, so `symfony/sendgrid-mailer:*` is not repeatedly reinstalled when already present.
+
 ## 0.8.168 - 2026-05-04
 
 - Fixed: automatic SQL segment detection now supports negative lead text filters (`!like`/`!contains`), allowing mixed page-hit segments such as “visited page in last N days and did not buy category” to move out of the standard Mautic segment ring.

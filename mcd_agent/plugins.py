@@ -21,7 +21,7 @@ import urllib.request
 import zipfile
 
 from mcd_agent import __version__
-from mcd_agent.amazon_mailer_dep import ensure_amazon_mailer_for_bundles
+from mcd_agent.amazon_mailer_dep import ensure_mailer_packages_for_bundles
 from mcd_agent.config import AgentConfig
 from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
@@ -1192,11 +1192,18 @@ def run_plugins_interactive(
             logging.info("[%s] plugin %s skip action=%s status=%s", install_root, bundle, action, status)
             continue
 
-        ensure_amazon_mailer_for_bundles(
+        mailer_preflight_names = {
+            bundle,
+            install_bundle,
+            str(item.get("display_name", "")).strip(),
+            str(item.get("package", "")).strip(),
+            package_url,
+        }
+        ensure_mailer_packages_for_bundles(
             config=config,
             root=install_root,
             console_path=install.console_path,
-            bundles={bundle},
+            bundles={x for x in mailer_preflight_names if x},
             reason="plugins-apply",
         )
 

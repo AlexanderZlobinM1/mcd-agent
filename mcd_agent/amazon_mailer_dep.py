@@ -17,6 +17,17 @@ AMAZON_MAILER_REQUIRED_BUNDLES: set[str] = {
     "MauticAmazonSesBundle",
 }
 
+SENDGRID_MAILER_REQUIRED_BUNDLES: set[str] = {
+    "MauticSendGridSnsBundle",
+    "MauticSendgridSnsBundle",
+    "SendGridSnsBundle",
+    "SendgridSnsBundle",
+    "SendGridBundle",
+    "SendgridBundle",
+    "SendGridMailerBundle",
+    "SendgridMailerBundle",
+}
+
 AMAZON_MAILER_PACKAGE = "symfony/amazon-mailer"
 SENDGRID_MAILER_PACKAGE = "symfony/sendgrid-mailer:*"
 
@@ -32,7 +43,7 @@ def _run(
     full = cmd
     if as_www_data:
         full = ["sudo", "-u", "www-data"] + cmd
-    logging.info("amazon-mailer preflight run: %s", " ".join(full))
+    logging.info("mailer preflight run: %s", " ".join(full))
     proc = subprocess.run(full, cwd=cwd, text=True, capture_output=True, timeout=timeout_sec)
     if check and proc.returncode != 0:
         raise RuntimeError(
@@ -75,6 +86,16 @@ def _resolve_composer_bin() -> str:
     return str(preferred)
 
 
+def _verify_composer_as_www_data(project_root: str, composer_bin: str) -> None:
+    _run(
+        [composer_bin, "-V", "--no-interaction", "--no-ansi"],
+        cwd=project_root,
+        as_www_data=True,
+        check=True,
+        timeout_sec=60,
+    )
+
+
 def _node_major() -> int:
     found = shutil.which("node")
     if not found:
@@ -89,19 +110,44 @@ def _node_major() -> int:
     return int(m.group(1))
 
 
+def _npm_ok() -> bool:
+    found = shutil.which("npm")
+    if not found:
+        return False
+    proc = subprocess.run([found, "-v"], capture_output=True, text=True, timeout=20)
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
 def _ensure_node20() -> None:
-    if _node_major() >= 20:
+    if _node_major() >= 20 and _npm_ok():
         return
-    subprocess.run(["apt-get", "remove", "--purge", "-y", "nodejs", "libnode-dev"], check=False)
-    subprocess.run(["bash", "-lc", "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"], check=True, timeout=300)
-    subprocess.run(["apt-get", "install", "-y", "nodejs"], check=True, timeout=300)
+    if _node_major() < 20:
+        subprocess.run(["apt-get", "remove", "--purge", "-y", "nodejs", "libnode-dev"], check=False)
+        subprocess.run(["bash", "-lc", "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"], check=True, timeout=300)
+        subprocess.run(["apt-get", "install", "-y", "nodejs"], check=True, timeout=300)
+    else:
+        # Node without npm is usually a broken package source state. Refresh
+        # NodeSource first so reinstalling `nodejs` restores npm as well.
+        subprocess.run(["bash", "-lc", "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"], check=True, timeout=300)
+        subprocess.run(["apt-get", "install", "--reinstall", "-y", "nodejs"], check=True, timeout=300)
     if _node_major() < 20:
         raise RuntimeError("Node.js 20 preflight failed (node -v is not v20+)")
+    if not _npm_ok():
+        raise RuntimeError("Node.js 20 preflight failed (npm -v is not available)")
+
+
+def _composer_show_name(package_name: str) -> str:
+    # Composer `require` may include a constraint (e.g. `pkg:*`), but
+    # `composer show` must receive only the package name.
+    return str(package_name or "").split(":", 1)[0].strip()
 
 
 def _composer_has_package(project_root: str, composer_bin: str, package_name: str) -> bool:
+    show_name = _composer_show_name(package_name)
+    if not show_name:
+        return False
     proc = _run(
-        [composer_bin, "show", package_name, "--no-interaction", "--no-ansi"],
+        [composer_bin, "show", show_name, "--no-interaction", "--no-ansi"],
         cwd=project_root,
         as_www_data=True,
         check=False,
@@ -177,6 +223,30 @@ def _required_mailer_packages_from_config(root: str) -> set[str]:
     return out
 
 
+def _normalize_bundle_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _bundle_requires_sendgrid_mailer(bundle: str) -> bool:
+    if bundle in SENDGRID_MAILER_REQUIRED_BUNDLES:
+        return True
+    normalized = _normalize_bundle_name(bundle)
+    return "sendgrid" in normalized or "sengrid" in normalized
+
+
+def _required_mailer_packages_from_bundles(bundles: set[str]) -> set[str]:
+    out: set[str] = set()
+    for bundle in bundles:
+        b = str(bundle or "").strip()
+        if not b:
+            continue
+        if b in AMAZON_MAILER_REQUIRED_BUNDLES:
+            out.add(AMAZON_MAILER_PACKAGE)
+        if _bundle_requires_sendgrid_mailer(b):
+            out.add(SENDGRID_MAILER_PACKAGE)
+    return out
+
+
 def installed_required_bundles(root: str) -> set[str]:
     out: set[str] = set()
     candidates = [
@@ -187,80 +257,41 @@ def installed_required_bundles(root: str) -> set[str]:
     for base in candidates:
         if not base.exists() or not base.is_dir():
             continue
-        for name in AMAZON_MAILER_REQUIRED_BUNDLES:
+        for name in AMAZON_MAILER_REQUIRED_BUNDLES | SENDGRID_MAILER_REQUIRED_BUNDLES:
             if (base / name).exists():
                 out.add(name)
+        for child in base.iterdir():
+            if child.is_dir() and _bundle_requires_sendgrid_mailer(child.name):
+                out.add(child.name)
     return out
 
 
-def ensure_amazon_mailer_for_bundles(
+def _ensure_mailer_packages(
     *,
     config: AgentConfig,
     root: str,
     console_path: str,
-    bundles: set[str],
+    required: set[str],
     reason: str,
+    ensure_node: bool,
 ) -> bool:
-    targets = set(bundles).intersection(AMAZON_MAILER_REQUIRED_BUNDLES)
-    if not targets:
-        return False
-
-    install_type = detect_install_type(root)
-    project_root = _resolve_project_root(root)
-    composer_bin = _resolve_composer_bin()
-
-    if _composer_has_package(project_root, composer_bin, AMAZON_MAILER_PACKAGE):
-        logging.info("[%s] amazon-mailer already installed (%s)", root, reason)
-        return False
-
-    # For zip installs we also normalize Node.js runtime to v20 before composer require.
-    if install_type == "zip":
-        _ensure_node20()
-
-    _run(
-        [composer_bin, "require", AMAZON_MAILER_PACKAGE, "--no-interaction"],
-        cwd=project_root,
-        as_www_data=True,
-        timeout_sec=max(int(config.command_timeout_sec or 900), 900),
-    )
-
-    console_abs = _normalize_console_path(project_root, console_path)
-    _run(
-        [config.php_bin, console_abs, "cache:clear"],
-        cwd=project_root,
-        as_www_data=True,
-        timeout_sec=max(int(config.command_timeout_sec or 900), 600),
-    )
-    logging.info(
-        "[%s] amazon-mailer dependency installed for bundles=%s (%s)",
-        root,
-        ",".join(sorted(targets)),
-        reason,
-    )
-    return True
-
-
-def ensure_mailer_packages_for_sender_config(
-    *,
-    config: AgentConfig,
-    root: str,
-    console_path: str,
-    reason: str,
-) -> bool:
-    required = _required_mailer_packages_from_config(root)
     if not required:
         return False
 
     install_type = detect_install_type(root)
     project_root = _resolve_project_root(root)
     composer_bin = _resolve_composer_bin()
+    _verify_composer_as_www_data(project_root, composer_bin)
+
+    if ensure_node:
+        _ensure_node20()
 
     missing = sorted([pkg for pkg in required if not _composer_has_package(project_root, composer_bin, pkg)])
     if not missing:
-        logging.info("[%s] sender mailer packages already satisfied (%s)", root, reason)
+        logging.info("[%s] mailer packages already installed required=%s (%s)", root, ",".join(sorted(required)), reason)
         return False
 
-    # For zip installs we normalize Node.js runtime before composer require.
+    # For zip installs we also normalize Node.js runtime to v20 before composer require.
     if install_type == "zip":
         _ensure_node20()
 
@@ -280,9 +311,70 @@ def ensure_mailer_packages_for_sender_config(
         timeout_sec=max(int(config.command_timeout_sec or 900), 600),
     )
     logging.info(
-        "[%s] sender mailer packages installed=%s (%s)",
+        "[%s] mailer packages installed=%s (%s)",
         root,
         ",".join(missing),
         reason,
     )
     return True
+
+
+def ensure_mailer_packages_for_bundles(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    bundles: set[str],
+    reason: str,
+) -> bool:
+    required = _required_mailer_packages_from_bundles(bundles)
+    return _ensure_mailer_packages(
+        config=config,
+        root=root,
+        console_path=console_path,
+        required=required,
+        reason=reason,
+        ensure_node=SENDGRID_MAILER_PACKAGE in required,
+    )
+
+
+def ensure_amazon_mailer_for_bundles(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    bundles: set[str],
+    reason: str,
+) -> bool:
+    targets = set(bundles).intersection(AMAZON_MAILER_REQUIRED_BUNDLES)
+    if not targets:
+        return False
+    return _ensure_mailer_packages(
+        config=config,
+        root=root,
+        console_path=console_path,
+        required={AMAZON_MAILER_PACKAGE},
+        reason=reason,
+        ensure_node=False,
+    )
+
+
+def ensure_mailer_packages_for_sender_config(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    reason: str,
+) -> bool:
+    required = _required_mailer_packages_from_config(root)
+    if not required:
+        return False
+
+    return _ensure_mailer_packages(
+        config=config,
+        root=root,
+        console_path=console_path,
+        required=required,
+        reason=reason,
+        ensure_node=SENDGRID_MAILER_PACKAGE in required,
+    )
