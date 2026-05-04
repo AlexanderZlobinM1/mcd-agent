@@ -17,6 +17,23 @@ from mcd_agent.host_identity import resolve_agent_identity
 
 
 _SYSCTL_PATH = Path("/etc/sysctl.d/99-mcd-hw.conf")
+_MYSQL_TOP_LEVEL_CONFIGS = (Path("/etc/mysql/my.cnf"), Path("/etc/mysql/mysql.cnf"))
+_MYSQL_PROFILE_MANAGED_KEYS = {
+    "innodb_buffer_pool_size",
+    "innodb_redo_log_capacity",
+    "innodb_io_capacity",
+    "innodb_io_capacity_max",
+    "max_connections",
+    "thread_cache_size",
+    "table_open_cache",
+    "table_definition_cache",
+    "open_files_limit",
+    "tmp_table_size",
+    "max_heap_table_size",
+    "max_allowed_packet",
+    "skip_name_resolve",
+    "log_queries_not_using_indexes",
+}
 
 
 def _post_json(url: str, payload: dict[str, Any], token: str | None, timeout_sec: int = 12) -> dict[str, Any]:
@@ -320,7 +337,7 @@ def _cleanup_legacy_mysql_top_level_configs() -> dict[Path, str | None]:
     """
     before: dict[Path, str | None] = {}
     replacement = _mysql_include_root_content()
-    for path in (Path("/etc/mysql/my.cnf"), Path("/etc/mysql/mysql.cnf")):
+    for path in _MYSQL_TOP_LEVEL_CONFIGS:
         if not path.exists():
             continue
         try:
@@ -332,6 +349,53 @@ def _cleanup_legacy_mysql_top_level_configs() -> dict[Path, str | None]:
             continue
         before[path] = text
         _write_file(path, replacement)
+    return before
+
+
+def _cleanup_mysql_top_level_profile_overrides() -> dict[Path, str | None]:
+    """
+    Disable only active top-level MySQL settings that MCD now owns through its
+    drop-in. Some old hosts have hand-copied /etc/mysql/my.cnf after includedir
+    statements, so those values win over 99-mcd-hw.cnf after restart.
+
+    We deliberately leave unrelated local settings (timeouts, event scheduler,
+    flush method, etc.) intact and keep the disabled lines in-place as comments.
+    """
+    before: dict[Path, str | None] = {}
+    section = re.compile(r"^\s*\[(?P<section>[^\]]+)\]\s*(?:[#;].*)?$")
+    assignment = re.compile(r"^\s*(?P<key>[A-Za-z0-9_-]+)\s*=")
+    for path in _MYSQL_TOP_LEVEL_CONFIGS:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        current_section = ""
+        changed = False
+        lines: list[str] = []
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            m_section = section.match(line)
+            if m_section:
+                current_section = m_section.group("section").strip().lower()
+                lines.append(line)
+                continue
+            if (
+                current_section == "mysqld"
+                and stripped
+                and not stripped.startswith(("#", ";"))
+            ):
+                m_assignment = assignment.match(line)
+                if m_assignment:
+                    key = m_assignment.group("key").strip().lower().replace("-", "_")
+                    if key in _MYSQL_PROFILE_MANAGED_KEYS:
+                        line = "# mcd-managed duplicate disabled: " + line
+                        changed = True
+            lines.append(line)
+        if changed:
+            before[path] = text
+            _write_file(path, "".join(lines))
     return before
 
 
@@ -396,14 +460,29 @@ def _build_mysql_override(profile: dict[str, Any], *, engine: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _mysql_client_cmd() -> list[str] | None:
+def _mysql_client_cmd_candidates() -> list[list[str]]:
     client = shutil.which("mysql") or shutil.which("mariadb")
     if not client:
-        return None
+        return []
+    candidates: list[list[str]] = []
+    if os.geteuid() == 0:
+        # Root installations commonly grant localhost/socket admin through
+        # auth_socket. Use it for SET GLOBAL because debian.cnf often has
+        # enough rights for status reads but not SYSTEM_VARIABLES_ADMIN/SUPER.
+        candidates.append([client, "-u", "root"])
     debian_cnf = Path("/etc/mysql/debian.cnf")
     if debian_cnf.exists():
-        return [client, "--defaults-extra-file=/etc/mysql/debian.cnf"]
-    return [client]
+        candidates.append([client, "--defaults-extra-file=/etc/mysql/debian.cnf"])
+    candidates.append([client])
+    out: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for cmd in candidates:
+        key = tuple(cmd)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cmd)
+    return out
 
 
 def _mysql_mb_bytes(profile: dict[str, Any], key: str, default_mb: int) -> int | None:
@@ -424,8 +503,8 @@ def _apply_mysql_dynamic_profile(profile: dict[str, Any], *, engine: str, timeou
     Apply dynamic variables immediately. Static settings remain in the drop-in
     and take effect on the next controlled MySQL restart.
     """
-    cmd = _mysql_client_cmd()
-    if not cmd:
+    commands = _mysql_client_cmd_candidates()
+    if not commands:
         return {"status": "skipped", "reason": "mysql_client_not_found"}
 
     statements: list[str] = []
@@ -465,19 +544,23 @@ def _apply_mysql_dynamic_profile(profile: dict[str, Any], *, engine: str, timeou
         return {"status": "noop", "applied": []}
 
     sql = ";\n".join(statements) + ";"
-    proc = subprocess.run(
-        [*cmd, "--batch", "--skip-column-names", "-e", sql],
-        capture_output=True,
-        text=True,
-        timeout=max(5, int(timeout_sec)),
-    )
-    if proc.returncode != 0:
-        return {
-            "status": "error",
-            "reason": (proc.stderr or proc.stdout or f"mysql_rc_{proc.returncode}").strip(),
-            "attempted": statements,
-        }
-    return {"status": "applied", "applied": statements}
+    errors: list[str] = []
+    for cmd in commands:
+        proc = subprocess.run(
+            [*cmd, "--batch", "--skip-column-names", "-e", sql],
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_sec)),
+        )
+        if proc.returncode == 0:
+            return {"status": "applied", "applied": statements, "client": " ".join(cmd)}
+        err = (proc.stderr or proc.stdout or f"mysql_rc_{proc.returncode}").strip()
+        errors.append(f"{' '.join(cmd)}: {err}")
+    return {
+        "status": "error",
+        "reason": " | ".join(errors),
+        "attempted": statements,
+    }
 
 
 def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
@@ -617,13 +700,16 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
     top_level_before: dict[Path, str | None] = {}
     try:
         top_level_before = _cleanup_legacy_mysql_top_level_configs()
+        profile_override_before = _cleanup_mysql_top_level_profile_overrides()
+        top_level_before.update(profile_override_before)
         changed.extend(str(p) for p in top_level_before)
         if _write_file(dropin, content):
             changed.append(str(dropin))
 
         dynamic = _apply_mysql_dynamic_profile(profile, engine=engine)
 
-        if not changed and str(dynamic.get("status")) in {"noop", "skipped"}:
+        dynamic_status = str(dynamic.get("status") or "").strip().lower()
+        if not changed and dynamic_status in {"noop", "skipped"}:
             return {
                 "status": "noop",
                 "engine": engine,
@@ -631,6 +717,12 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
                 "changed_files": [],
                 "dynamic": dynamic,
             }
+        if not changed and dynamic_status == "error":
+            result_status = "deferred"
+        elif dynamic_status == "error":
+            result_status = "partial"
+        else:
+            result_status = "applied"
 
         proc_reload = subprocess.run(["systemctl", "reload", service_name], capture_output=True, text=True)
         if proc_reload.returncode != 0:
@@ -642,7 +734,7 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
         else:
             reload_note = "reloaded"
         return {
-            "status": "applied",
+            "status": result_status,
             "engine": engine,
             "service_name": service_name,
             "changed_files": changed,

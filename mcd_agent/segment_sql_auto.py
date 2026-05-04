@@ -102,6 +102,16 @@ def _compile_like_any(expr: str, values: list[str]) -> str | None:
     return "(" + " OR ".join(parts) + ")"
 
 
+def _compile_not_like_any(expr: str, null_expr: str, values: list[str]) -> str | None:
+    uniq = list(dict.fromkeys([v for v in values if v]))
+    if not uniq:
+        return None
+    parts = [f"{expr} NOT LIKE {_sql_quote('%' + value + '%')}" for value in uniq]
+    if len(parts) == 1:
+        return f"({null_expr} IS NULL OR {parts[0]})"
+    return f"({null_expr} IS NULL OR (" + " AND ".join(parts) + "))"
+
+
 def _compile_lead_clause(clause: dict[str, object]) -> _CompiledClause | None:
     field = _safe_ident(clause.get("field"))
     if not field:
@@ -147,6 +157,12 @@ def _compile_lead_clause(clause: dict[str, object]) -> _CompiledClause | None:
         if not like_sql:
             return None
         return _CompiledClause(sql=like_sql, has_page_hits=False)
+    if operator in {"!like", "!contains", "notlike", "not_contains", "notcontains", "not contains"}:
+        values = _normalize_filter_values(_clause_filter_value(clause))
+        not_like_sql = _compile_not_like_any(cast_expr, col_expr, values)
+        if not not_like_sql:
+            return None
+        return _CompiledClause(sql=not_like_sql, has_page_hits=False)
     if operator in {"eq", "="}:
         values = _normalize_filter_values(_clause_filter_value(clause))
         if not values:

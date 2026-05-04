@@ -87,6 +87,26 @@ class MauticDB:
             raise last_error
         raise RuntimeError("mysql_connection_failed")
 
+    @staticmethod
+    def _safe_column(name: str) -> str:
+        raw = str(name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]+", raw):
+            raise ValueError(f"unsafe column name: {name!r}")
+        return raw
+
+    def _table_columns(self, cur: Any, table: str) -> set[str]:
+        cur.execute(f"SHOW COLUMNS FROM `{table}`")
+        rows = cur.fetchall() or []
+        out: set[str] = set()
+        for row in rows:
+            if isinstance(row, dict):
+                name = row.get("Field")
+            else:
+                name = row[0] if row else None
+            if name:
+                out.add(str(name))
+        return out
+
     def _render_query(self, query_template: str, context: dict[str, str] | None = None) -> str:
         now_utc = datetime.now(timezone.utc)
         params: dict[str, str] = {
@@ -212,6 +232,7 @@ class MauticDB:
         with self._connect() as conn:
             try:
                 with conn.cursor() as cur:
+                    segment_columns = self._table_columns(cur, table_segments)
                     cur.execute(
                         f"CREATE TEMPORARY TABLE IF NOT EXISTS `{temp_table}` ("
                         " `lead_id` BIGINT UNSIGNED NOT NULL,"
@@ -248,22 +269,29 @@ class MauticDB:
                     # date_modified >= last_built_date. Keep the real
                     # definition-modified timestamp if present, but guarantee
                     # the built marker is strictly newer than it.
-                    cur.execute(
-                        f"UPDATE `{table_segments}` "
-                        "SET "
-                        " `checked_out`=NULL,"
-                        " `checked_out_by`=NULL,"
-                        " `checked_out_by_user`=NULL,"
-                        " `date_modified`=CASE "
-                        "   WHEN `date_modified` IS NULL OR `date_modified` >= NOW() "
-                        "   THEN DATE_SUB(NOW(), INTERVAL 1 SECOND) "
-                        "   ELSE `date_modified` "
-                        " END,"
-                        " `last_built_date`=NOW(),"
-                        " `last_built_time`=%s "
-                        "WHERE `id`=%s",
-                        (elapsed_sec, sid),
-                    )
+                    set_clauses: list[str] = []
+                    params: list[Any] = []
+                    for col in ("checked_out", "checked_out_by", "checked_out_by_user"):
+                        if col in segment_columns:
+                            set_clauses.append(f"`{self._safe_column(col)}`=NULL")
+                    if "date_modified" in segment_columns:
+                        set_clauses.append(
+                            "`date_modified`=CASE "
+                            "WHEN `date_modified` IS NULL OR `date_modified` >= NOW() "
+                            "THEN DATE_SUB(NOW(), INTERVAL 1 SECOND) "
+                            "ELSE `date_modified` END"
+                        )
+                    if "last_built_date" in segment_columns:
+                        set_clauses.append("`last_built_date`=NOW()")
+                    if "last_built_time" in segment_columns:
+                        set_clauses.append("`last_built_time`=%s")
+                        params.append(elapsed_sec)
+                    if set_clauses:
+                        params.append(sid)
+                        cur.execute(
+                            f"UPDATE `{table_segments}` SET {', '.join(set_clauses)} WHERE `id`=%s",
+                            tuple(params),
+                        )
                 conn.commit()
             except Exception:
                 try:

@@ -1,5 +1,22 @@
 # MCD Changelog
 
+## 0.8.168 - 2026-05-04
+
+- Fixed: automatic SQL segment detection now supports negative lead text filters (`!like`/`!contains`), allowing mixed page-hit segments such as “visited page in last N days and did not buy category” to move out of the standard Mautic segment ring.
+
+## 0.8.167 - 2026-05-04
+
+- Fixed: MySQL service-profile apply now reports `partial`/`deferred` when durable config is written but runtime `SET GLOBAL` cannot be applied, instead of masking the condition as fully applied.
+
+## 0.8.166 - 2026-05-04
+
+- Fixed: MySQL service-profile dynamic apply now prefers local root socket auth before `debian.cnf`, so runtime `SET GLOBAL` tuning works on hosts where `debian.cnf` lacks `SYSTEM_VARIABLES_ADMIN`/`SUPER`.
+
+## 0.8.165 - 2026-05-04
+
+- Fixed: SQL-driven segment rebuilds now update only metadata columns present in the target Mautic schema, supporting Mautic 4 `last_built_date` without requiring `last_built_time`.
+- Fixed: MySQL service-profile apply now disables only duplicate top-level MySQL keys owned by MCD drop-ins, so old copied `my.cnf` values cannot override current hardware profiles after restart while unrelated local settings remain intact.
+
 ## 0.8.164 - 2026-05-04
 
 - Fixed: MySQL service-profile apply now removes only legacy MCD-managed top-level MySQL tuning files so profile drop-ins have deterministic precedence.
