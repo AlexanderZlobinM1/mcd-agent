@@ -405,8 +405,8 @@ push_alert_poll_interval_sec = 60
 push_alert_window_min = 5
 # APT metrics refresh interval (seconds). Agent refreshes sooner if APT/DPKG state changed.
 push_apt_state_interval_sec = 120
-# Periodic runtime-overrides pull from MCC (disabled by default; MCC trigger still works).
-runtime_overrides_poll_enabled = false
+# Periodic runtime-overrides pull from MCC.
+runtime_overrides_poll_enabled = true
 # Periodic config drift guard via /agent/config-desired (disabled by default).
 profile_guard_enabled = false
 # Optional explicit host name to map this agent in MCC inventory.

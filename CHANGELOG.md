@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.8.171 - 2026-05-05
+
+- Changed: MCC runtime override polling is enabled by default when `[mcc].runtime_overrides_poll_enabled` is not explicitly set, so agents pull hardware-profile runtime changes without MCC push or service restart.
+
 ## 0.8.170 - 2026-05-05
 
 - Fixed: automatic SQL segment detection now validates lead-field filters against the actual `leads` table before moving a segment into the SQL ring, preventing invalid auto-rules for legacy/missing fields.
