@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.170 - 2026-05-05
+
+- Fixed: automatic SQL segment detection now validates lead-field filters against the actual `leads` table before moving a segment into the SQL ring, preventing invalid auto-rules for legacy/missing fields.
+- Changed: auto-generated page-hit SQL segment rules now drive candidate selection from `page_hits` and join back to leads, avoiding correlated per-lead page-hit probes on very large `page_hits` tables.
+
 ## 0.8.169 - 2026-05-04
 
 - Added: SendGrid/SNS plugin install now runs a dependency preflight before applying the plugin: installs Composer globally if missing, verifies Composer as `www-data`, ensures `symfony/sendgrid-mailer:*`, and normalizes NodeJS/npm to Node 20.

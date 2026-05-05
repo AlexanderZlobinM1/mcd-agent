@@ -4431,10 +4431,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     sid = 0
                                 if sid > 0:
                                     row["problem_count"] = int(recent_problem_counts.get(sid, 0) or 0)
+                            try:
+                                lead_columns = db.fetch_lead_columns()
+                            except Exception as e:
+                                lead_columns = None
+                                logging.warning("[%s] segment_sql lead column introspection failed: %s", root, e)
                             detected_rules = detect_auto_sql_segment_rules(
                                 segment_rows,
                                 max_clauses=config.segment_sql_auto_max_clauses,
                                 problem_threshold=config.segment_sql_auto_problem_threshold,
+                                lead_columns=lead_columns,
                             )
                             auto_sql_rules_for_root = {
                                 sid: SQLSegmentRule(

@@ -27,6 +27,7 @@ class DetectedSQLSegmentRule:
 class _CompiledClause:
     sql: str
     has_page_hits: bool
+    page_hit_sql: str | None = None
 
 
 def _safe_ident(name: object) -> str | None:
@@ -112,13 +113,21 @@ def _compile_not_like_any(expr: str, null_expr: str, values: list[str]) -> str |
     return f"({null_expr} IS NULL OR (" + " AND ".join(parts) + "))"
 
 
-def _compile_lead_clause(clause: dict[str, object]) -> _CompiledClause | None:
+def _normalize_lead_columns(raw: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None) -> set[str] | None:
+    if raw is None:
+        return None
+    return {str(x).strip().lower() for x in raw if str(x or "").strip()}
+
+
+def _compile_lead_clause(
+    clause: dict[str, object],
+    *,
+    lead_columns: set[str] | None = None,
+) -> _CompiledClause | None:
     field = _safe_ident(clause.get("field"))
     if not field:
         return None
     operator = str(clause.get("operator") or "").strip().lower()
-    col_expr = f"l.`{field}`"
-    cast_expr = f"CAST({col_expr} AS CHAR CHARACTER SET utf8mb4)"
     if field == "tags":
         values = _normalize_filter_values(_clause_filter_value(clause))
         tag_ids: list[int] = []
@@ -141,6 +150,11 @@ def _compile_lead_clause(clause: dict[str, object]) -> _CompiledClause | None:
             has_page_hits=False,
         )
 
+    if lead_columns is not None and field.lower() not in lead_columns:
+        return None
+
+    col_expr = f"l.`{field}`"
+    cast_expr = f"CAST({col_expr} AS CHAR CHARACTER SET utf8mb4)"
     if operator == "!empty":
         return _CompiledClause(
             sql=f"({col_expr} IS NOT NULL AND {cast_expr} <> '')",
@@ -200,8 +214,10 @@ def _compile_behavior_clause(clause: dict[str, object]) -> _CompiledClause | Non
     if not like_sql:
         return None
     where_parts = ["ph.lead_id = l.id", like_sql]
+    page_hit_where_parts = ["ph.lead_id IS NOT NULL", like_sql]
     if days_expr:
         where_parts.append(days_expr)
+        page_hit_where_parts.append(days_expr)
     return _CompiledClause(
         sql=(
             "EXISTS ("
@@ -210,29 +226,39 @@ def _compile_behavior_clause(clause: dict[str, object]) -> _CompiledClause | Non
             ")"
         ),
         has_page_hits=True,
+        page_hit_sql=" AND ".join(page_hit_where_parts),
     )
 
 
-def _compile_clause(clause: dict[str, object]) -> _CompiledClause | None:
+def _compile_clause(
+    clause: dict[str, object],
+    *,
+    lead_columns: set[str] | None = None,
+) -> _CompiledClause | None:
     obj = str(clause.get("object") or "").strip().lower()
     if obj == "lead":
-        return _compile_lead_clause(clause)
+        return _compile_lead_clause(clause, lead_columns=lead_columns)
     if obj == "behaviors":
         return _compile_behavior_clause(clause)
     return None
 
 
-def _compile_groups(filters_raw: str, *, max_clauses: int) -> tuple[list[str], bool, int] | None:
+def _compile_groups(
+    filters_raw: str,
+    *,
+    max_clauses: int,
+    lead_columns: set[str] | None = None,
+) -> tuple[list[list[_CompiledClause]], bool, int] | None:
     clauses = _decode_filters(filters_raw)
     if not clauses or len(clauses) > max_clauses:
         return None
 
-    groups: list[list[str]] = []
-    current_group: list[str] = []
+    groups: list[list[_CompiledClause]] = []
+    current_group: list[_CompiledClause] = []
     has_page_hits = False
     clause_count = 0
     for idx, clause in enumerate(clauses):
-        compiled = _compile_clause(clause)
+        compiled = _compile_clause(clause, lead_columns=lead_columns)
         if compiled is None:
             return None
         has_page_hits = has_page_hits or compiled.has_page_hits
@@ -241,25 +267,72 @@ def _compile_groups(filters_raw: str, *, max_clauses: int) -> tuple[list[str], b
         if idx > 0 and glue == "or":
             if current_group:
                 groups.append(current_group)
-            current_group = [compiled.sql]
+            current_group = [compiled]
             continue
-        current_group.append(compiled.sql)
+        current_group.append(compiled)
     if current_group:
         groups.append(current_group)
     if not groups:
         return None
 
-    group_sql: list[str] = []
-    for parts in groups:
-        if not parts:
+    return groups, has_page_hits, clause_count
+
+
+def _lead_where_sql(parts: list[str]) -> str:
+    if not parts:
+        return "1=1"
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " AND ".join(parts) + ")"
+
+
+def _page_hit_candidates_sql(ph_parts: list[str]) -> str:
+    subqueries = [
+        (
+            "SELECT DISTINCT ph.lead_id AS lead_id "
+            "FROM {prefix}page_hits ph "
+            f"WHERE {part}"
+        )
+        for part in ph_parts
+        if part
+    ]
+    if not subqueries:
+        return ""
+    if len(subqueries) == 1:
+        return subqueries[0]
+    sql = f"({subqueries[0]}) ph0"
+    for idx, subquery in enumerate(subqueries[1:], start=1):
+        sql += f" INNER JOIN ({subquery}) ph{idx} ON ph{idx}.lead_id = ph0.lead_id"
+    return f"SELECT DISTINCT ph0.lead_id AS lead_id FROM {sql}"
+
+
+def _build_select_sql(groups: list[list[_CompiledClause]]) -> str | None:
+    group_selects: list[str] = []
+    for group in groups:
+        lead_parts = [part.sql for part in group if not part.has_page_hits]
+        ph_parts = [str(part.page_hit_sql or "").strip() for part in group if part.has_page_hits]
+        ph_parts = [part for part in ph_parts if part]
+        if ph_parts:
+            candidates_sql = _page_hit_candidates_sql(ph_parts)
+            if not candidates_sql:
+                return None
+            group_selects.append(
+                "SELECT DISTINCT l.id AS lead_id "
+                f"FROM ({candidates_sql}) phm "
+                "INNER JOIN {prefix}leads l ON l.id = phm.lead_id "
+                f"WHERE {_lead_where_sql(lead_parts)}"
+            )
             continue
-        if len(parts) == 1:
-            group_sql.append(parts[0])
-        else:
-            group_sql.append("(" + " AND ".join(parts) + ")")
-    if not group_sql:
+        group_selects.append(
+            "SELECT l.id AS lead_id "
+            "FROM {prefix}leads l "
+            f"WHERE {_lead_where_sql(lead_parts)}"
+        )
+    if not group_selects:
         return None
-    return group_sql, has_page_hits, clause_count
+    if len(group_selects) == 1:
+        return group_selects[0]
+    return "SELECT DISTINCT lead_id FROM (" + " UNION DISTINCT ".join(group_selects) + ") m"
 
 
 def detect_auto_sql_segment_rules(
@@ -267,7 +340,9 @@ def detect_auto_sql_segment_rules(
     *,
     max_clauses: int,
     problem_threshold: int,
+    lead_columns: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[int, DetectedSQLSegmentRule]:
+    normalized_lead_columns = _normalize_lead_columns(lead_columns)
     out: dict[int, DetectedSQLSegmentRule] = {}
     for row in segment_rows:
         try:
@@ -276,7 +351,11 @@ def detect_auto_sql_segment_rules(
             continue
         if sid <= 0:
             continue
-        compiled = _compile_groups(str(row.get("filters") or ""), max_clauses=max_clauses)
+        compiled = _compile_groups(
+            str(row.get("filters") or ""),
+            max_clauses=max_clauses,
+            lead_columns=normalized_lead_columns,
+        )
         if compiled is None:
             continue
         groups, has_page_hits, clause_count = compiled
@@ -284,9 +363,9 @@ def detect_auto_sql_segment_rules(
         problem_count = int(row.get("problem_count") or 0)
         if not (has_page_hits or checked_out or problem_count >= max(1, problem_threshold)):
             continue
-        where_sql = " OR ".join(groups)
-        if len(groups) > 1:
-            where_sql = "(" + where_sql + ")"
+        select_sql = _build_select_sql(groups)
+        if not select_sql:
+            continue
         reason_parts: list[str] = []
         if has_page_hits:
             reason_parts.append("page_hits")
@@ -296,11 +375,7 @@ def detect_auto_sql_segment_rules(
             reason_parts.append(f"problem_count={problem_count}")
         out[sid] = DetectedSQLSegmentRule(
             segment_id=sid,
-            select_sql=(
-                "SELECT l.id AS lead_id "
-                "FROM {prefix}leads l "
-                "WHERE " + where_sql
-            ),
+            select_sql=select_sql,
             depends_on=(),
             reason=";".join(reason_parts) or "auto",
             clause_count=clause_count,

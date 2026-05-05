@@ -193,6 +193,29 @@ class MauticDB:
                 out.append(row)
         return out
 
+    def fetch_lead_columns(self) -> set[str]:
+        prefix = str(self.cfg.table_prefix or "")
+        table_leads = f"{prefix}leads"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                    """,
+                    (table_leads,),
+                )
+                rows = cur.fetchall()
+        out: set[str] = set()
+        for row in rows:
+            if isinstance(row, dict):
+                raw = str(row.get("COLUMN_NAME") or row.get("column_name") or "").strip()
+                if raw:
+                    out.add(raw)
+        return out
+
     def execute_sql_template(self, query_template: str, context: dict[str, str] | None = None) -> int:
         query = self._render_query(query_template, context=context)
         with self._connect() as conn:
