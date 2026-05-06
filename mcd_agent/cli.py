@@ -89,6 +89,7 @@ from mcd_agent.runtime_overrides import (
     push_runtime_overrides,
     touch_poll_trigger,
 )
+from mcd_agent.shorteners import check_yourls_update, discover_yourls, update_yourls, yourls_version
 from mcd_agent.service_profiles import fetch_service_profile, service_profiles_apply_once
 from mcd_agent.signals import collect_signals, format_signals_json, format_signals_text
 from mcd_agent.state_push import push_state_now, queue_profile_event
@@ -363,11 +364,14 @@ def _is_mysql_auth_error(msg: str) -> bool:
 
 def _ipv6_disabled_now() -> bool | None:
     st = ipv6_status()
-    keys = (
-        "net.ipv6.conf.all.disable_ipv6",
-        "net.ipv6.conf.default.disable_ipv6",
-        "net.ipv6.conf.lo.disable_ipv6",
+    keys = tuple(
+        k
+        for k in st
+        if k.startswith("net.ipv6.conf.")
+        and k.endswith(".disable_ipv6")
     )
+    if not keys:
+        return None
     vals = [str(st.get(k, "?")).strip() for k in keys]
     if any(v == "?" or v == "" for v in vals):
         return None
@@ -1700,6 +1704,14 @@ def _build_parser() -> argparse.ArgumentParser:
     zbx.add_argument("--no-restart", action="store_true", help="Do not restart zabbix-agent2 after config change")
     zbx.add_argument("--json", action="store_true")
 
+    shortner = sub.add_parser("shortner", aliases=["shortener"], help="Detect and manage local YOURLS installs")
+    shortner.add_argument("--config", default=default_cfg)
+    shortner.add_argument("op", choices=["detect", "version", "check-update", "update"], nargs="?", default="detect")
+    shortner.add_argument("--root", help="YOURLS root path")
+    shortner.add_argument("--target-version", help="Target YOURLS version for update")
+    shortner.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    shortner.add_argument("--json", action="store_true")
+
     ro = sub.add_parser("runtime-overrides", help="Runtime overrides sync with MCC")
     ro.add_argument("--config", default=default_cfg)
     ro.add_argument("op", choices=["show", "fetch", "push", "trigger", "status"], nargs="?", default="show")
@@ -2543,6 +2555,60 @@ def main() -> int:
             _push_state_after_change(cfg, "zabbix-bootstrap-mysql-user")
             return 0
         return 1
+
+    if args.cmd in {"shortner", "shortener"}:
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        op = str(args.op or "detect").strip().lower()
+        try:
+            if op == "detect":
+                payload = {"status": "ok", "items": discover_yourls()}
+            elif op == "version":
+                if not args.root:
+                    raise RuntimeError("--root is required for shortner version")
+                payload = {
+                    "status": "ok",
+                    "kind": "yourls",
+                    "root": str(Path(args.root).resolve()),
+                    "version": yourls_version(args.root),
+                }
+            elif op == "check-update":
+                if not args.root:
+                    raise RuntimeError("--root is required for shortner check-update")
+                payload = check_yourls_update(args.root)
+            elif op == "update":
+                if not args.root:
+                    raise RuntimeError("--root is required for shortner update")
+                payload = update_yourls(args.root, target_version=args.target_version, yes=bool(args.yes))
+            else:
+                raise RuntimeError(f"unsupported shortner op: {op}")
+        except Exception as e:
+            payload = {"status": "error", "reason": str(e)}
+            if bool(getattr(args, "json", False)):
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(f"shortner {op} failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            if op == "detect":
+                for item in payload.get("items", []) if isinstance(payload.get("items"), list) else []:
+                    print(
+                        "yourls root={root} version={version} site={site} active_nginx={active}".format(
+                            root=str(item.get("root") or ""),
+                            version=str(item.get("version") or "-"),
+                            site=str(item.get("site_url") or "-"),
+                            active=1 if bool(item.get("active_nginx")) else 0,
+                        )
+                    )
+            else:
+                print(json.dumps(payload, ensure_ascii=True))
+        if op == "update" and payload.get("status") == "ok" and payload.get("changed"):
+            _push_state_after_change(cfg, "shortner-update")
+        return 0
 
     if args.cmd == "runtime-overrides":
         cfg = load_config(args.config)

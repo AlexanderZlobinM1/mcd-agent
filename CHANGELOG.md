@@ -1,5 +1,56 @@
 # MCD Changelog
 
+## 0.8.177 - 2026-05-06
+
+- Added: `mcd-cli shortner` / `mcd-cli shortener` operations for self-hosted YOURLS.
+  - `detect` scans local nginx/web roots and reports YOURLS roots, site URL, version and active nginx binding.
+  - `version` and `check-update` read installed version and compare it with the latest upstream GitHub release.
+  - `update --yes` downloads the target upstream release, creates a local backup under `/var/backups/mcd/shortners`, and updates YOURLS core files while preserving `user/` config/plugins/custom data.
+
+## 0.8.176 - 2026-05-06
+
+- Fixed: `mcd-cli env ipv6 status` now includes all currently visible
+  `/proc/sys/net/ipv6/conf/*/disable_ipv6` interfaces instead of only
+  `all/default/lo`.
+- Fixed: `mcd-cli env ipv6 disable|enable`, including the interactive menu,
+  applies the runtime value to every current interface as well as the
+  persistent `all/default/lo` sysctl file.
+- Result: MCD no longer reports IPv6 disabled while an existing interface
+  such as `eth0` remains enabled and can still affect `apt`.
+
+## 0.8.175 - 2026-05-06
+
+- Fixed: template-clone detection now treats `/opt/mcd/var/template_identity.json`
+  as authoritative even when the cloned local config no longer has
+  `host_template=true`.
+- Fixed: clone startup uses the existing inventory rescan API instead of a
+  missing helper, so clone discovery no longer falls back to stale donor cache.
+- Result: hosts cloned from template images auto-promote under their local
+  hostname, rescan fresh instances, and auto-register in MCC instead of keeping
+  donor identity artifacts.
+
+## 0.8.174 - 2026-05-05
+
+- Fixed: daemon-side backup storage probes now skip while a host or cluster backup lock is active, so MCD does not mount/probe Storage Box in parallel with an active backup.
+- Fixed: cluster backup scheduler now treats existing backup locks, including manually started offsite jobs that survived daemon restart, as busy state before scheduling full/offsite/incremental jobs.
+- Fixed: cluster offsite backup failures now store compact error text in state/history, preventing huge `mydumper` stderr from breaking MCC state push with `HTTP 413`.
+- Fixed: cluster backup state compacts existing history on every update, so old pre-fix oversized failure entries are pruned from future state payloads.
+- Fixed: final cluster offsite markers now rewrite `files_archive_path` after the `.incomplete-*` directory is atomically renamed to the dated backup directory.
+- Result: restarting MCD during a cluster offsite backup no longer creates duplicate sshfs mounts or duplicate cluster backup attempts.
+
+## 0.8.173 - 2026-05-05
+
+- Changed: cluster offsite backups now use the completed local `xtrabackup` full as the default database source.
+- Added: MCD prepares a reflink clone of `current-full`, starts a temporary same-version local read-only MySQL over that clone, and runs `mydumper` from the static snapshot directly to the Storage Box.
+- Changed: cluster offsite `mydumper` defaults to at least 16 threads and `--rows=500000` when no explicit chunking is configured, so large Mautic tracking tables are dumped in parallel instead of one giant single-threaded file.
+- Result: cluster offsite dumps are no longer broken by live replica DDL such as `Table definition has changed`, without requiring a second full local database copy.
+
+## 0.8.172 - 2026-05-05
+
+- Fixed: import polling now treats Mautic numeric status `7` (`DELAYED`) and string `delayed` as pending work.
+- Fixed: default and guard SQL for `sql.import_pending_count` now require a published, unfinished import, so delayed batch imports continue without counting completed imports forever.
+- Result: large CSV imports that pause after the first batch are picked up by MCD automatically instead of requiring manual `mautic:import`.
+
 ## 0.8.171 - 2026-05-05
 
 - Changed: MCC runtime override polling is enabled by default when `[mcc].runtime_overrides_poll_enabled` is not explicitly set, so agents pull hardware-profile runtime changes without MCC push or service restart.
