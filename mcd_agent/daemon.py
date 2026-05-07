@@ -100,8 +100,11 @@ _IMPORT_SETTLE_UNTIL: dict[str, float] = {}
 _IMPORT_PENDING_OVERRIDE_WARN_TS: dict[str, float] = {}
 _SQL_IMPORT_PENDING_STATUS_COUNT = (
     "SELECT COUNT(*) AS cnt FROM {prefix}imports "
-    "WHERE status IN (1,2) "
-    "OR CAST(status AS CHAR) IN ('pending','in_progress')"
+    "WHERE is_published = 1 "
+    "AND (status IN (1,2,7) "
+    "OR CAST(status AS CHAR) IN ('pending','in_progress','delayed')) "
+    "AND (date_started IS NULL "
+    "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
 )
 _SQL_SEGMENTS_ALL_PUBLISHED = (
     "SELECT ll.id "
@@ -3598,12 +3601,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     identity = resolve_agent_identity(config)
     if bool(identity.get("clone_detected", False)):
         try:
-            installs = inventory.refresh_from_discovery(config)
+            count = inventory.rescan(config)
+            installs = inventory.list_instances()
             logging.info(
                 "template clone detected: source=%s local=%s; inventory rescan applied (%s instances)",
                 str(identity.get("source_host_name") or "-"),
                 str(identity.get("local_hostname") or "-"),
-                len(installs),
+                count,
             )
         except Exception as e:
             logging.warning("template clone inventory rescan failed; fallback to cached inventory: %s", e)
@@ -3664,6 +3668,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     backup_dispatch_pause_active = False
     scheduler_dispatch_pause_active = False
     next_plan_refresh_at = 0.0
+    next_passive_notice_at = 0.0
     next_update_check_at = 0.0
     update_deferred_by_backup = False
     last_campaign_console_activity_ts = 0.0
@@ -3839,17 +3844,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             next_zabbix_version_cache_guard_at = now + _ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC
 
         if config.backup_enabled and now >= next_backup_storage_probe_at:
+            probe_backup_locked = False
             try:
-                probe_res = backup_storage_probe(config)
-                probe_status = str(probe_res.get("status", "")).strip().lower()
-                if probe_status == "ok":
-                    logging.info("backup storage probe ok")
-                elif probe_status == "failed":
-                    logging.warning("backup storage probe failed: %s", probe_res.get("error", "unknown"))
-                elif probe_status == "skipped":
-                    logging.info("backup storage probe skipped: %s", probe_res.get("reason", "-"))
+                probe_backup_locked = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(config)
             except Exception as e:
-                logging.warning("backup storage probe failed: %s", e)
+                logging.warning("backup storage probe lock check failed: %s", e)
+            if probe_backup_locked:
+                logging.info("backup storage probe skipped: backup lock active")
+            else:
+                try:
+                    probe_res = backup_storage_probe(config)
+                    probe_status = str(probe_res.get("status", "")).strip().lower()
+                    if probe_status == "ok":
+                        logging.info("backup storage probe ok")
+                    elif probe_status == "failed":
+                        logging.warning("backup storage probe failed: %s", probe_res.get("error", "unknown"))
+                    elif probe_status == "skipped":
+                        logging.info("backup storage probe skipped: %s", probe_res.get("reason", "-"))
+                except Exception as e:
+                    logging.warning("backup storage probe failed: %s", e)
             next_backup_storage_probe_at = now + 7200.0
 
         if config.tasks_compact_enabled:
@@ -4043,6 +4056,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 run_day = dt_local.strftime("%Y-%m-%d")
                 cluster_busy = cluster_backup_thread is not None and cluster_backup_thread.is_alive()
                 if not cluster_busy:
+                    try:
+                        cluster_busy = backup_lock_active(config)
+                    except Exception as e:
+                        logging.warning("cluster backup lock check failed: %s", e)
+                if not cluster_busy:
                     cluster_job = ""
                     if (
                         run_day != last_cluster_full_day
@@ -4224,7 +4242,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
                         reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
                     )
-                logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                if now >= next_passive_notice_at:
+                    logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                    next_passive_notice_at = now + 60
+                # Do not let a low poll_interval spin the passive branch every
+                # loop: MCC state push, config guard and self-update live after
+                # planning and must get regular cycles too.
+                next_plan_refresh_at = now + max(5, config.poll_interval_sec)
                 if single_cycle:
                     return
                 time.sleep(max(0.1, float(config.dispatch_interval_sec)))
@@ -4849,10 +4873,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if str(drift.get("status", "")).strip().lower() == "drift":
                     old_profile = (config.profile_name or "").strip().lower() or None
                     desired_profile = str(drift.get("desired_profile", "")).strip().lower() or None
+                    drift_reason = str(drift.get("reason", "")).strip() or "config_drift"
                     ok, note = recover_config_from_mcc(
                         config.config_file_path,
                         reason=(
-                            "profile_drift"
+                            f"{drift_reason}"
                             f" local={old_profile or '-'} desired={desired_profile or '-'}"
                             f" source={str(drift.get('config_source', '-') or '-')}"
                         ),
@@ -4940,7 +4965,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
                     reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
                 )
-            logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+            if now >= next_passive_notice_at:
+                logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                next_passive_notice_at = now + 60
             if single_cycle:
                 return
             time.sleep(max(0.1, float(config.dispatch_interval_sec)))

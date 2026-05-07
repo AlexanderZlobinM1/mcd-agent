@@ -568,6 +568,7 @@ class AgentConfig:
     backup_cluster_incremental_start_hour: int
     backup_cluster_incremental_end_hour: int
     backup_cluster_incremental_interval_sec: int
+    backup_cluster_offsite_source: str
     backup_cluster_files_snapshot_enabled: bool
     backup_cluster_files_snapshot_paths: list[str]
     backup_cluster_files_snapshot_exclude: list[str]
@@ -1322,8 +1323,11 @@ def check_profile_drift_with_mcc(
     desired_profile = str(payload.get("desired_profile", "")).strip().lower()
     desired_cfg = payload.get("desired_config_toml")
     desired_cfg_text = desired_cfg if isinstance(desired_cfg, str) else ""
-    desired_cfg_sha = hashlib.sha256(desired_cfg_text.encode("utf-8")).hexdigest() if desired_cfg_text else ""
+    desired_cfg_sha = str(payload.get("desired_config_sha256", "")).strip()
+    if not desired_cfg_sha and desired_cfg_text:
+        desired_cfg_sha = hashlib.sha256(desired_cfg_text.encode("utf-8")).hexdigest()
     current_profile_n = (current_profile or "").strip().lower()
+    current_cfg_sha = str(current_config_sha or "").strip()
     out: dict[str, Any] = {
         "status": "ok",
         "desired_profile": desired_profile or None,
@@ -1331,10 +1335,14 @@ def check_profile_drift_with_mcc(
         "config_source": str(payload.get("config_source", "")).strip() or None,
         "desired_config_sha256": desired_cfg_sha or None,
     }
-    if current_config_sha:
-        out["current_config_sha256"] = str(current_config_sha).strip() or None
+    if current_cfg_sha:
+        out["current_config_sha256"] = current_cfg_sha or None
     if desired_profile and current_profile_n and desired_profile != current_profile_n:
         out["status"] = "drift"
+        out["reason"] = "profile_mismatch"
+    if desired_cfg_sha and current_cfg_sha and desired_cfg_sha != current_cfg_sha:
+        out["status"] = "drift"
+        out["reason"] = "config_sha_mismatch"
     return out
 
 
@@ -1596,6 +1604,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_cluster_incremental_start_hour": "backup_cluster_incremental_start_hour",
     "backup_cluster_incremental_end_hour": "backup_cluster_incremental_end_hour",
     "backup_cluster_incremental_interval_sec": "backup_cluster_incremental_interval_sec",
+    "backup_cluster_offsite_source": "backup_cluster_offsite_source",
     "backup_cluster_files_snapshot_enabled": "backup_cluster_files_snapshot_enabled",
     "backup_cluster_files_snapshot_paths": "backup_cluster_files_snapshot_paths",
     "backup_cluster_files_snapshot_exclude": "backup_cluster_files_snapshot_exclude",
@@ -2017,6 +2026,16 @@ def _load_config_inner(path: str) -> AgentConfig:
     if not isinstance(db_watchdog_cfg, dict):
         db_watchdog_cfg = {}
     fs_guard_paths = normalize_guard_paths(runtime.get("fs_permissions_guard_paths", default_guard_paths()))
+    raw_profile_guard = mcc.get("profile_guard_enabled", True)
+    if isinstance(raw_profile_guard, str) and raw_profile_guard.strip().lower() in {"0", "false", "no", "off", "disabled"}:
+        profile_guard_enabled = False
+    elif raw_profile_guard is False and not (mcc.get("url") and mcc.get("token")):
+        profile_guard_enabled = False
+    else:
+        # Old managed configs were generated with boolean false when the guard
+        # was optional. MCC-managed hosts now need config self-healing by
+        # default; use string "off" for an intentional hard-disable.
+        profile_guard_enabled = True
 
     cfg = AgentConfig(
         config_file_path=str(Path(path).resolve()),
@@ -2297,8 +2316,11 @@ def _load_config_inner(path: str) -> AgentConfig:
             sql.get(
                 "import_pending_count",
                 "SELECT COUNT(*) AS cnt FROM {prefix}imports "
-                "WHERE status IN (1,2) "
-                "OR CAST(status AS CHAR) IN ('pending','in_progress')",
+                "WHERE is_published = 1 "
+                "AND (status IN (1,2,7) "
+                "OR CAST(status AS CHAR) IN ('pending','in_progress','delayed')) "
+                "AND (date_started IS NULL "
+                "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)",
             )
         ),
         cmd_segment_update_template=str(
@@ -2348,7 +2370,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcc_push_alert_window_min=int(mcc.get("push_alert_window_min", 5)),
         mcc_push_apt_state_interval_sec=int(mcc.get("push_apt_state_interval_sec", 120)),
         mcc_runtime_overrides_poll_enabled=bool(mcc.get("runtime_overrides_poll_enabled", True)),
-        mcc_profile_guard_enabled=bool(mcc.get("profile_guard_enabled", False)),
+        mcc_profile_guard_enabled=profile_guard_enabled,
         outbound_events_sent_keep_days=int(runtime.get("outbound_events_sent_keep_days", 14)),
         mcc_host_name=str(mcc.get("host_name")).strip() if mcc.get("host_name") else None,
         cluster_id=cluster_id,
@@ -2496,6 +2518,9 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_cluster_incremental_interval_sec=max(
             300,
             int(backup_cluster.get("incremental_interval_sec", 7200)),
+        ),
+        backup_cluster_offsite_source=(
+            str(backup_cluster.get("offsite_source", "xtrabackup")).strip().lower() or "xtrabackup"
         ),
         backup_cluster_files_snapshot_enabled=bool(backup_cluster.get("files_snapshot_enabled", True)),
         backup_cluster_files_snapshot_paths=_normalize_list(

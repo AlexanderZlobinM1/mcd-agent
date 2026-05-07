@@ -55,7 +55,7 @@ push_apt_state_interval_sec = 120
 # Periodic runtime-overrides pull from MCC.
 runtime_overrides_poll_enabled = true
 # Periodic config drift guard via /agent/config-desired (disabled by default).
-profile_guard_enabled = false
+profile_guard_enabled = true
 # Optional explicit host name for MCC inventory mapping.
 host_name = ""
 

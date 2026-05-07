@@ -325,7 +325,7 @@ segment_weights = "SELECT ll.id, UNIX_TIMESTAMP(ll.date_added) AS created_ts, UN
 campaign_weights = "SELECT c.id, UNIX_TIMESTAMP(COALESCE(c.publish_up, c.date_added)) AS publish_ts, COALESCE(p.pending_cnt, 0) AS pending_cnt, COALESCE(r.recent_cnt, 0) AS recent_activity FROM {prefix}campaigns c LEFT JOIN (SELECT campaign_id, COUNT(*) AS pending_cnt FROM {prefix}campaign_leads WHERE manually_removed = 0 AND date_last_exited IS NULL GROUP BY campaign_id) p ON p.campaign_id = c.id LEFT JOIN (SELECT campaign_id, COUNT(*) AS recent_cnt FROM {prefix}campaign_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY campaign_id) r ON r.campaign_id = c.id WHERE c.is_published = 1 AND (c.deleted IS NULL)"
 
 # Import queue metric (must return one numeric value).
-import_pending_count = "SELECT COUNT(*) AS cnt FROM {prefix}imports WHERE is_published = 1 AND (date_started IS NULL OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
+import_pending_count = "SELECT COUNT(*) AS cnt FROM {prefix}imports WHERE is_published = 1 AND (status IN (1,2,7) OR CAST(status AS CHAR) IN ('pending','in_progress','delayed')) AND (date_started IS NULL OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
 
 [commands]
 # Segment by id template.
@@ -408,7 +408,7 @@ push_apt_state_interval_sec = 120
 # Periodic runtime-overrides pull from MCC.
 runtime_overrides_poll_enabled = true
 # Periodic config drift guard via /agent/config-desired (disabled by default).
-profile_guard_enabled = false
+profile_guard_enabled = true
 # Optional explicit host name to map this agent in MCC inventory.
 # If empty, system hostname is used.
 host_name = ""
@@ -610,6 +610,12 @@ full_minute = 0
 # Remote offsite starts only after a successful local full and not before this time.
 offsite_not_before_hour = 2
 offsite_not_before_minute = 0
+# Offsite DB source:
+# - xtrabackup: prepare a reflink clone of current local full and run a
+#   temporary same-version read-only mysqld for mydumper. Preferred for
+#   clusters because live replica DDL cannot break the logical dump.
+# - live_replica: run mydumper directly against the configured DB endpoint.
+offsite_source = "xtrabackup"
 # Local incrementals from current daily full.
 incremental_start_hour = 8
 incremental_end_hour = 20

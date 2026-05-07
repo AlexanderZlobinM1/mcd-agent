@@ -1,5 +1,53 @@
 # MCD Changelog
 
+## 0.8.182 - 2026-05-07
+
+- Fixed: passive-profile daemon no longer logs the passive planning notice on
+  every loop. The notice is rate-limited while manual request dispatch remains
+  active.
+- Result: passive hosts still accept manual commands and run MCC config sync,
+  but logs no longer look like a scheduler storm after self-update.
+
+## 0.8.181 - 2026-05-07
+
+- Fixed: passive-profile planning no longer spins every loop when
+  `poll_interval_sec` is very low. The passive manual-dispatch check now leaves
+  regular cycles for MCC state push, config guard and self-update.
+- Result: passive hosts can actually reach the new MCC config drift guard and
+  self-heal local config after desired state changes.
+
+## 0.8.180 - 2026-05-07
+
+- Added: MCC config guard now treats desired-vs-local config SHA mismatch as
+  drift, not only profile mismatch.
+- Changed: `[mcc].profile_guard_enabled` defaults to enabled for new configs,
+  so registered agents can recover their local config from MCC desired state.
+- Changed: legacy managed configs with boolean `profile_guard_enabled = false`
+  no longer hard-disable the guard when MCC URL/token are present; use string
+  `"off"` only for intentional disable.
+- Result: if an MCC-managed host loses or rolls back `/opt/mcd/etc/mcd.toml`,
+  the daemon restores the current MCC desired config automatically after the
+  state/config sync loop sees the mismatch.
+
+## 0.8.179 - 2026-05-07
+
+- Fixed: passive-profile daemon loops now advance the plan-refresh timer before
+  sleeping, so passive hosts continue to reach periodic MCC state push.
+- Result: locally successful backups on passive hosts are reported back to MCC
+  instead of leaving central backup age stale after an MCD restart/update.
+
+## 0.8.178 - 2026-05-07
+
+- Fixed: `db_watchdog` can now execute explicitly configured `kill_query` and
+  `kill_connection` actions when `observe_only=false`, instead of only
+  reporting matching rules.
+- Safety: destructive watchdog actions still require an explicit matching rule,
+  a valid MySQL process id and a live `Query`; default behavior remains
+  observe-only.
+- Result: hosts can automatically interrupt known pathological long-running
+  read-only report queries, such as stale `page_hits` analytics scans, without
+  manual MySQL intervention.
+
 ## 0.8.177 - 2026-05-06
 
 - Added: `mcd-cli shortner` / `mcd-cli shortener` operations for self-hosted YOURLS.
