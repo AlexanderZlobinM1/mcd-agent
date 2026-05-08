@@ -367,9 +367,13 @@ Important:
   - manual DB bootstrap is available via `mcd-cli state-db init` and is allowed for legacy mode when DB is missing or inaccessible.
   - bootstrap uses temporary admin credentials only for init, creates dedicated `mcd_state` runtime DB user, and persists only runtime credentials.
   - `runtime.tasks_history_keep_days` sets retention depth for non-running task rows
-    (default: 7 days).
+    in the live operational slice (default: 2 days).
   - `runtime.tasks_history_max_rows` sets hard cap for historical non-running rows
-    (default: 50000 rows).
+    in the live operational slice (default: 25000 rows).
+  - `runtime.tasks_archive_enabled`, `runtime.tasks_archive_dir`, and
+    `runtime.tasks_archive_keep_days` control compressed JSONL postmortem
+    archive of task rows removed from live state (default: 14 days). Scheduling
+    logic must not depend on archived rows.
   - runtime-sync snapshots are kept in backend runtime table `runtime_sync`:
   - `local_runtime` (runtime section from local config)
   - `mcc_runtime` (desired runtime payload fetched from MCC)

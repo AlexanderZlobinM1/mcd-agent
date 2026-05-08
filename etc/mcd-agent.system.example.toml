@@ -62,19 +62,25 @@ segment_kill_grace_sec = 10
 # SQLite file for task state / weight cache / inventory.
 state_db_path = "/opt/mcd/var/mcd-state.db"
 # Historical task retention depth in days (non-running rows older than this are purged).
-tasks_history_keep_days = 7
+tasks_history_keep_days = 2
 # Hard cap for historical non-running task rows.
-tasks_history_max_rows = 50000
+tasks_history_max_rows = 25000
 # Enable periodic DB compaction in quiet window.
 tasks_compact_enabled = true
 # Minimum interval between compaction runs (sec).
-tasks_compact_interval_sec = 86400
+tasks_compact_interval_sec = 3600
 # Quiet window start hour for compaction (host local time).
 tasks_compact_quiet_hour = 3
 # Quiet window length in minutes for compaction.
 tasks_compact_quiet_window_min = 60
 # Run SQLite VACUUM after purge (only when no running tasks).
 tasks_compact_vacuum = true
+# Archive task rows removed from live state to compressed JSONL before deletion.
+tasks_archive_enabled = true
+# Directory for short postmortem task archives. Scheduler logic never reads it.
+tasks_archive_dir = "/opt/mcd/var/task-history"
+# Retention for compressed postmortem archives.
+tasks_archive_keep_days = 14
 # Legacy pause file (backward-compatibility only).
 # Primary mode control is profile (`passive` vs others).
 scheduler_pause_flag_path = "/opt/mcd/var/scheduler.pause"

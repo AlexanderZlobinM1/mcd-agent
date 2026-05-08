@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import logging
@@ -2224,6 +2225,9 @@ class TaskStore:
         keep_days: int,
         max_rows: int,
         run_vacuum: bool,
+        archive_enabled: bool = True,
+        archive_dir: str = "/opt/mcd/var/task-history",
+        archive_keep_days: int = 14,
     ) -> tuple[int, int, bool]:
         """Compact historical task rows (non-running only).
 
@@ -2232,6 +2236,80 @@ class TaskStore:
         deleted_rows = 0
         keep_days = max(0, int(keep_days))
         max_rows = max(0, int(max_rows))
+        archive_keep_days = max(1, int(archive_keep_days))
+
+        def _prune_task_archives() -> None:
+            if not archive_enabled:
+                return
+            base = Path(archive_dir)
+            if not base.exists():
+                return
+            cutoff = float(now_ts) - (float(archive_keep_days) * 86400.0)
+            for item in base.glob("tasks-*.jsonl.gz"):
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink()
+                except Exception:
+                    continue
+
+        def _archive_rows(rows_iter: object) -> int:
+            if not archive_enabled:
+                return 0
+            try:
+                base = Path(archive_dir)
+                base.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.fromtimestamp(float(now_ts), tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+                target = base / f"tasks-{stamp}.jsonl.gz"
+                written = 0
+                with gzip.open(target, "at", encoding="utf-8") as fh:
+                    for row in rows_iter:  # type: ignore[union-attr]
+                        fh.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
+                        written += 1
+                if written == 0:
+                    try:
+                        target.unlink()
+                    except Exception:
+                        pass
+                return written
+            except Exception as e:
+                logging.warning("tasks archive failed: %s", e)
+                return 0
+
+        def _archive_sqlite_rows(where_sql: str, params: tuple[object, ...]) -> int:
+            if not archive_enabled:
+                return 0
+            rows = self.conn.execute(
+                f"""
+                SELECT id, root, task_key, task_type, entity_id, command_str,
+                       pid, timeout_sec, attempts, state, note, started_at,
+                       finished_at, rc, manual_request_id
+                FROM tasks
+                WHERE {where_sql}
+                ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                """,
+                params,
+            )
+            return _archive_rows(rows)
+
+        def _archive_mysql_rows(tasks_table: str, where_sql: str, params: tuple[object, ...]) -> int:
+            if not archive_enabled or not tasks_table:
+                return 0
+            try:
+                rows = self._mysql_query(
+                    f"""
+                    SELECT id, host_name, root, task_key, task_type, entity_id,
+                           command_str, pid, timeout_sec, attempts, state, note,
+                           started_at, finished_at, rc, manual_request_id
+                    FROM `{tasks_table}`
+                    WHERE host_name=%s AND {where_sql}
+                    ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                    """,
+                    (self._node_id, *params),
+                )
+                return _archive_rows(rows)
+            except Exception as e:
+                logging.warning("tasks mysql archive failed: %s", e)
+                return 0
 
         if self._mysql_mode:
             tasks_table = self._mysql_tables.get("tasks", "")
@@ -2239,6 +2317,11 @@ class TaskStore:
                 try:
                     if keep_days > 0:
                         cutoff = float(now_ts) - (float(keep_days) * 86400.0)
+                        _archive_mysql_rows(
+                            tasks_table,
+                            "state!='running' AND COALESCE(finished_at, started_at) < %s",
+                            (cutoff,),
+                        )
                         _, cnt = self._mysql_exec(
                             f"""
                             DELETE FROM `{tasks_table}`
@@ -2255,6 +2338,21 @@ class TaskStore:
                     non_running = int((rows[0].get("cnt") if rows else 0) or 0)
                     if max_rows > 0 and non_running > max_rows:
                         overflow = non_running - max_rows
+                        _archive_mysql_rows(
+                            tasks_table,
+                            """
+                            id IN (
+                              SELECT id FROM (
+                                SELECT id
+                                FROM `{tasks_table}`
+                                WHERE host_name=%s AND state!='running'
+                                ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                                LIMIT %s
+                              ) t
+                            )
+                            """.replace("{tasks_table}", tasks_table),
+                            (self._node_id, overflow),
+                        )
                         _, cnt = self._mysql_exec(
                             f"""
                             DELETE FROM `{tasks_table}`
@@ -2278,14 +2376,17 @@ class TaskStore:
                         non_running = int((rows[0].get("cnt") if rows else 0) or 0)
 
                     # Keep sqlite fallback minimal (running only) in mysql mode.
+                    _archive_sqlite_rows("state!='running'", ())
                     self.conn.execute("DELETE FROM tasks WHERE state!='running'")
                     self.conn.commit()
+                    _prune_task_archives()
                     return deleted_rows, non_running, False
                 except Exception:
                     pass
 
         if keep_days > 0:
             cutoff = float(now_ts) - (float(keep_days) * 86400.0)
+            _archive_sqlite_rows("state!='running' AND COALESCE(finished_at, started_at) < ?", (cutoff,))
             cur = self.conn.execute(
                 "DELETE FROM tasks WHERE state!='running' AND COALESCE(finished_at, started_at) < ?",
                 (cutoff,),
@@ -2296,6 +2397,18 @@ class TaskStore:
         non_running = int(row["cnt"] if row else 0)
         if max_rows > 0 and non_running > max_rows:
             overflow = non_running - max_rows
+            _archive_sqlite_rows(
+                """
+                id IN (
+                  SELECT id
+                  FROM tasks
+                  WHERE state!='running'
+                  ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+                  LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
             cur = self.conn.execute(
                 """
                 DELETE FROM tasks
@@ -2319,6 +2432,8 @@ class TaskStore:
         if run_vacuum and deleted_rows > 0:
             self.conn.execute("VACUUM")
             vacuum_done = True
+
+        _prune_task_archives()
 
         return deleted_rows, non_running, vacuum_done
 
@@ -3880,6 +3995,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         keep_days=config.tasks_history_keep_days,
                         max_rows=config.tasks_history_max_rows,
                         run_vacuum=can_vacuum,
+                        archive_enabled=config.tasks_archive_enabled,
+                        archive_dir=config.tasks_archive_dir,
+                        archive_keep_days=config.tasks_archive_keep_days,
                     )
                     if deleted > 0 or vacuum_done:
                         logging.info(

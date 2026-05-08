@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.8.193 - 2026-05-08
+
+- Changed: task history is now treated as a short live operational slice rather
+  than a long archive: defaults are 2 days and 25k non-running rows, compacted
+  hourly inside the quiet window.
+- Added: sqlite task compaction archives rows to compressed JSONL before removal
+  and prunes those postmortem archives after 14 days. Live scheduler logic never
+  depends on archived rows.
+- Fixed: segment due detection now treats recent Mautic audit-log
+  `lead/segment` create/update events as rebuild triggers. This covers Mautic
+  saves that change segment filters but leave `lead_lists.date_modified`
+  unchanged, so edited segments do not silently miss the next MCD ring.
+- Fixed: campaign trigger due detection now ignores already-triggered scheduled
+  event rows (`date_triggered IS NOT NULL`). Published campaigns no longer
+  re-enter the trigger ring only because old scheduled event rows still exist.
+
 ## 0.8.192 - 2026-05-08
 
 - Changed: default MCD task-history retention is now bounded for small and test

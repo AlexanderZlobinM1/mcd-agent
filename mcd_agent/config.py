@@ -87,6 +87,36 @@ _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822 = (
     ") "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
+_LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0192 = (
+    "SELECT ll.id "
+    "FROM {prefix}lead_lists ll "
+    "WHERE ll.is_published = 1 "
+    "AND ("
+    "  ll.last_built_date IS NULL "
+    "  OR ll.last_built_date < '{window_start_utc_24h}' "
+    "  OR COALESCE(ll.date_modified, ll.date_added) > COALESCE(ll.last_built_date, '1970-01-01 00:00:00') "
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_lists_leads lll "
+    "    WHERE lll.leadlist_id = ll.id "
+    "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_lists_leads lll "
+    "    INNER JOIN {prefix}leads l ON l.id = lll.lead_id "
+    "    WHERE lll.leadlist_id = ll.id "
+    "      AND lll.manually_removed = 0 "
+    "      AND ("
+    "        ll.last_built_date IS NULL "
+    "        OR COALESCE(l.date_modified, l.date_added) > ll.last_built_date"
+    "      ) "
+    "    LIMIT 1"
+    "  )"
+    ") "
+    "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
 _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT = (
     "SELECT c.id FROM {prefix}campaigns c "
     "WHERE c.is_published = 1 "
@@ -127,6 +157,16 @@ _DEFAULT_SQL_SEGMENTS_DUE = (
     "  OR COALESCE(ll.date_modified, ll.date_added) > COALESCE(ll.last_built_date, '1970-01-01 00:00:00') "
     "  OR EXISTS ("
     "    SELECT 1 "
+    "    FROM {prefix}audit_log al "
+    "    WHERE al.bundle = 'lead' "
+    "      AND al.object = 'segment' "
+    "      AND al.object_id = ll.id "
+    "      AND al.action IN ('create', 'update') "
+    "      AND (ll.last_built_date IS NULL OR al.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
     "    FROM {prefix}lead_lists_leads lll "
     "    WHERE lll.leadlist_id = ll.id "
     "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
@@ -161,6 +201,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "    FROM {prefix}campaign_lead_event_log el "
     "    WHERE el.campaign_id = c.id "
     "      AND el.is_scheduled = 1 "
+    "      AND el.date_triggered IS NULL "
     "      AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_utc}') "
     "    LIMIT 1"
     "  ) "
@@ -335,6 +376,9 @@ class AgentConfig:
     tasks_compact_quiet_hour: int
     tasks_compact_quiet_window_min: int
     tasks_compact_vacuum: bool
+    tasks_archive_enabled: bool
+    tasks_archive_dir: str
+    tasks_archive_keep_days: int
     scheduler_pause_flag_path: str
     weights_recalc_interval_sec: int
     task_retry_max: int
@@ -1160,7 +1204,11 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
         "sql",
         {
             "segments_due": (
-                {_LEGACY_SQL_SEGMENTS_DUE_DEFAULT, _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822},
+                {
+                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT,
+                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822,
+                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0192,
+                },
                 _DEFAULT_SQL_SEGMENTS_DUE,
             ),
             "campaigns_due": (
@@ -1416,6 +1464,9 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "tasks_compact_quiet_hour": "tasks_compact_quiet_hour",
     "tasks_compact_quiet_window_min": "tasks_compact_quiet_window_min",
     "tasks_compact_vacuum": "tasks_compact_vacuum",
+    "tasks_archive_enabled": "tasks_archive_enabled",
+    "tasks_archive_dir": "tasks_archive_dir",
+    "tasks_archive_keep_days": "tasks_archive_keep_days",
     "scheduler_pause_flag_path": "scheduler_pause_flag_path",
     "weights_recalc_interval_sec": "weights_recalc_interval_sec",
     "task_retry_max": "task_retry_max",
@@ -2100,13 +2151,16 @@ def _load_config_inner(path: str) -> AgentConfig:
         state_mysql_snapshot_enabled=bool(
             runtime.get("state_mysql_snapshot_enabled", state.get("mysql_snapshot_enabled", True))
         ),
-        tasks_history_keep_days=int(runtime.get("tasks_history_keep_days", 7)),
-        tasks_history_max_rows=int(runtime.get("tasks_history_max_rows", 50000)),
+        tasks_history_keep_days=int(runtime.get("tasks_history_keep_days", 2)),
+        tasks_history_max_rows=int(runtime.get("tasks_history_max_rows", 25000)),
         tasks_compact_enabled=bool(runtime.get("tasks_compact_enabled", True)),
-        tasks_compact_interval_sec=int(runtime.get("tasks_compact_interval_sec", 86400)),
+        tasks_compact_interval_sec=int(runtime.get("tasks_compact_interval_sec", 3600)),
         tasks_compact_quiet_hour=int(runtime.get("tasks_compact_quiet_hour", 3)),
         tasks_compact_quiet_window_min=int(runtime.get("tasks_compact_quiet_window_min", 60)),
         tasks_compact_vacuum=bool(runtime.get("tasks_compact_vacuum", True)),
+        tasks_archive_enabled=bool(runtime.get("tasks_archive_enabled", True)),
+        tasks_archive_dir=str(runtime.get("tasks_archive_dir", "/opt/mcd/var/task-history")),
+        tasks_archive_keep_days=int(runtime.get("tasks_archive_keep_days", 14)),
         scheduler_pause_flag_path=str(runtime.get("scheduler_pause_flag_path", "/opt/mcd/var/scheduler.pause")),
         weights_recalc_interval_sec=int(runtime.get("weights_recalc_interval_sec", 86_400)),
         task_retry_max=int(runtime.get("task_retry_max", 1)),
