@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.8.192 - 2026-05-08
+
+- Changed: default MCD task-history retention is now bounded for small and test
+  hosts: 7 days and 50k non-running task rows instead of 14 days and 200k rows.
+  This prevents long-lived segment/campaign/import rings from growing SQLite
+  state into a large local history table while preserving enough evidence for
+  daily diagnostics.
+
 ## 0.8.191 - 2026-05-08
 
 - Changed: release-only rebuild after the 0.8.190 public artifact was found stale

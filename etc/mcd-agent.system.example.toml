@@ -62,9 +62,9 @@ segment_kill_grace_sec = 10
 # SQLite file for task state / weight cache / inventory.
 state_db_path = "/opt/mcd/var/mcd-state.db"
 # Historical task retention depth in days (non-running rows older than this are purged).
-tasks_history_keep_days = 14
+tasks_history_keep_days = 7
 # Hard cap for historical non-running task rows.
-tasks_history_max_rows = 200000
+tasks_history_max_rows = 50000
 # Enable periodic DB compaction in quiet window.
 tasks_compact_enabled = true
 # Minimum interval between compaction runs (sec).

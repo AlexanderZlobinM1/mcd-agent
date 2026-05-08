@@ -2100,8 +2100,8 @@ def _load_config_inner(path: str) -> AgentConfig:
         state_mysql_snapshot_enabled=bool(
             runtime.get("state_mysql_snapshot_enabled", state.get("mysql_snapshot_enabled", True))
         ),
-        tasks_history_keep_days=int(runtime.get("tasks_history_keep_days", 14)),
-        tasks_history_max_rows=int(runtime.get("tasks_history_max_rows", 200000)),
+        tasks_history_keep_days=int(runtime.get("tasks_history_keep_days", 7)),
+        tasks_history_max_rows=int(runtime.get("tasks_history_max_rows", 50000)),
         tasks_compact_enabled=bool(runtime.get("tasks_compact_enabled", True)),
         tasks_compact_interval_sec=int(runtime.get("tasks_compact_interval_sec", 86400)),
         tasks_compact_quiet_hour=int(runtime.get("tasks_compact_quiet_hour", 3)),
