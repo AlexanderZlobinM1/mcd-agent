@@ -351,8 +351,8 @@ def _sanitize_cluster_mysql_profile(profile: dict[str, Any]) -> dict[str, Any]:
     """
     out = dict(profile)
     caps = {
-        "innodb_buffer_pool_size_mb": 65_536,
-        "innodb_redo_log_capacity_mb": 2_048,
+        "innodb_buffer_pool_size_mb": 98_304,
+        "innodb_redo_log_capacity_mb": 4_096,
         "innodb_io_capacity": 12_000,
         "innodb_io_capacity_max": 24_000,
         "max_connections": 600,

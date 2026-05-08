@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.188 - 2026-05-08
+
+- Changed: MCC large-host MySQL defaults now keep the safe 600-connection
+  envelope, reduce table caches to the measured cluster-safe range, and keep
+  I/O/open-file limits high enough for the hardware without reintroducing the
+  previous connection storm profile.
+- Changed: PXC/Galera cluster-safe MySQL profile uses a 96 GB buffer pool on
+  256 GB web+DB nodes while preserving safe connection and table-cache limits.
+
 ## 0.8.187 - 2026-05-08
 
 - Fixed: MySQL service-profile auto-apply now detects Galera/PXC cluster
