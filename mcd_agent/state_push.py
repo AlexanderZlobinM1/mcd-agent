@@ -430,6 +430,13 @@ def _pick_local_socket(password: str | None, host: str | None) -> str | None:
     return None
 
 
+def _configured_or_auto_local_socket(cfg: AgentConfig, *, password: str | None, host: str | None) -> str | None:
+    explicit = str(getattr(cfg, "state_mysql_unix_socket", "") or "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+    return _pick_local_socket(password=password, host=host)
+
+
 def _run_quick(cmd: list[str], *, timeout_sec: int = 3) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
@@ -756,6 +763,7 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
         port: int | None,
         user: str | None,
         password: str | None,
+        unix_socket: str | None = None,
     ) -> None:
         u = str(user or "").strip()
         if not u:
@@ -763,7 +771,7 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
         h = str(host or "").strip() or "localhost"
         p = int(port or 3306)
         pwd = str(password or "")
-        sock = _pick_local_socket(password=pwd, host=h)
+        sock = str(unix_socket or "").strip() or _pick_local_socket(password=pwd, host=h)
         key = "|".join([source, h, str(p), u, sock or "", str(bool(pwd))])
         if key in seen:
             return
@@ -785,6 +793,11 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
         port=getattr(cfg, "state_mysql_port", 3306),
         user=getattr(cfg, "state_mysql_user", None),
         password=getattr(cfg, "state_mysql_password", None),
+        unix_socket=_configured_or_auto_local_socket(
+            cfg,
+            password=getattr(cfg, "state_mysql_password", None),
+            host=getattr(cfg, "state_mysql_host", None),
+        ),
     )
     add_candidate(
         source="backup_mysql",

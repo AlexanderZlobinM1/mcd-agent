@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.8.190 - 2026-05-08
+
+- Fixed: empty remote runtime overrides can no longer erase a configured local
+  `state_mysql_unix_socket` in the daemon process. This keeps cluster nodes on
+  the Galera-backed MCD state backend instead of falling back to sqlite because
+  PyMySQL tried the wrong localhost socket.
+- Fixed: cluster DB state collection now honors the configured state MySQL
+  socket explicitly instead of relying only on auto-detection.
+
 ## 0.8.189 - 2026-05-08
 
 - Fixed: release packaging excludes old nested `mcd-agent-*.tar.*` artifacts

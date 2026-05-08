@@ -1658,6 +1658,12 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
         if not hasattr(cfg, attr):
             continue
         current = getattr(cfg, attr)
+        if attr in {"state_mysql_unix_socket"} and str(raw_value or "").strip() == "" and str(current or "").strip():
+            # Remote runtime payloads may omit local socket details or send an
+            # empty value. Do not erase a working local socket in-memory: the
+            # daemon would fall back to PyMySQL's default localhost socket and
+            # lose the Galera-backed MCD state backend until restart.
+            continue
         if isinstance(current, bool):
             updates[attr] = bool(raw_value)
         elif isinstance(current, int):
