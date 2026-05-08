@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 from datetime import datetime, timedelta, timezone
 import getpass
 import json
@@ -68,6 +69,7 @@ from mcd_agent.executor import (
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.mautic_image_install import install_from_image
 from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
 from mcd_agent.mautic6_core_patch import (
     ensure_m6_plugin_update_metadata_patch,
@@ -1647,6 +1649,16 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--backup", action="store_true")
     up.add_argument("--with-system-upgrade", action="store_true")
 
+    img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
+    img.add_argument("--config", default=default_cfg)
+    img.add_argument("op", choices=["install"], nargs="?", default="install")
+    img.add_argument("--image-ref", required=True)
+    img.add_argument("--domain", required=True)
+    img.add_argument("--php-version", required=True)
+    img.add_argument("--yes", action="store_true")
+    img.add_argument("--no-certbot", action="store_true")
+    img.add_argument("--json", action="store_true")
+
     hub = sub.add_parser("interactive", help="Unified interactive menu")
     hub.add_argument("--config", default=default_cfg)
     hub.add_argument("--root")
@@ -2407,6 +2419,35 @@ def main() -> int:
             print("Removed" if inv.remove(args.name) else "Not found")
             _push_state_after_change(cfg, "instances-remove")
             return 0
+
+    if args.cmd == "mautic-image":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if bool(args.json):
+            with contextlib.redirect_stdout(sys.stderr):
+                result = install_from_image(
+                    cfg,
+                    image_ref=str(args.image_ref),
+                    domain=str(args.domain),
+                    php_version=str(args.php_version),
+                    yes=bool(args.yes),
+                    run_certbot=not bool(args.no_certbot),
+                )
+        else:
+            result = install_from_image(
+                cfg,
+                image_ref=str(args.image_ref),
+                domain=str(args.domain),
+                php_version=str(args.php_version),
+                yes=bool(args.yes),
+                run_certbot=not bool(args.no_certbot),
+            )
+        if bool(args.json):
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        _push_state_after_change(cfg, "mautic-image-install")
+        return 0
 
     if args.cmd == "reload-config":
         cfg = load_config(args.config)

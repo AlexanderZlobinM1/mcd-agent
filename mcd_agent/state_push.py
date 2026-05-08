@@ -31,6 +31,7 @@ from mcd_agent.backup import backup_profile_for_push, backup_state_for_push
 from mcd_agent.cluster_assets import collect_cluster_assets_status
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
+from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.maintenance_mode import collect_maintenance_state
@@ -1531,6 +1532,7 @@ class MCCStatePusher:
             "backup_state": backup_state_for_push(self.cfg),
             "backup_profile": backup_profile_for_push(self.cfg),
             "apt_state": self._apt_state(now_ts),
+            "mautic_install_readiness": collect_mautic_install_readiness(),
             "cluster_db": self._cluster_db_state(now_ts),
             "state_backend": self._state_backend_payload(now_ts),
             "cluster_assets": self._cluster_assets_payload(now_ts, installs),

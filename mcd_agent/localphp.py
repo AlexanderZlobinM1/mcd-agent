@@ -11,6 +11,7 @@ _KEYS = (
     "db_name",
     "db_user",
     "db_password",
+    "site_url",
     "default_timezone",
     "timezone",
 )

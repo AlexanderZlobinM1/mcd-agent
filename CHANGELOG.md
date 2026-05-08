@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.0 - 2026-05-08
+
+- Added: host install-readiness snapshot in the regular MCC state push. MCD now
+  reports IPv6 disabled state, nginx/PHP-FPM/Composer/Node/npm/certbot presence,
+  and local MySQL/MariaDB engine/version for per-Mautic-major compatibility.
+- Added: `mcd-cli mautic-image install` to install a composer-based Mautic
+  instance from an MCC image artifact with preflight guards for existing
+  webroot, nginx vhost, symlink and database artifacts.
+- Added: image install flow downloads MCC-managed files/database artifacts,
+  creates `baza_<short-domain>`, patches `config/local.php`, writes a port-80
+  nginx vhost, runs certbot, rescans instances and pushes fresh state to MCC.
+
 ## 0.8.196 - 2026-05-08
 
 - Fixed: cluster rolling self-update no longer treats nodes that already
