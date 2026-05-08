@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.3 - 2026-05-09
+
+- Fixed: `mcd-cli instance-delete` now drops the selected database using the
+  instance credentials from `config/local.php` instead of trying local MySQL
+  root access without a password. This keeps delete working on hosts where
+  root socket/passwordless access is disabled.
+
 ## 0.9.2 - 2026-05-09
 
 - Added: `mcd-cli instance-delete` safely removes selected Mautic instance

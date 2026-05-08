@@ -27,12 +27,21 @@ class InstanceDeletePlan:
     nginx_paths: list[Path]
     db_name: str
     db_host: str
+    db_port: str
+    db_user: str
+    db_password: str
     delete_files: bool
     delete_vhost: bool
     delete_db: bool
 
 
-def _run(args: list[str], *, timeout_sec: int = 120, input_text: str | None = None) -> tuple[int, str]:
+def _run(
+    args: list[str],
+    *,
+    timeout_sec: int = 120,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     proc = subprocess.run(
         args,
         input=input_text,
@@ -40,6 +49,7 @@ def _run(args: list[str], *, timeout_sec: int = 120, input_text: str | None = No
         text=True,
         timeout=timeout_sec,
         check=False,
+        env=env,
     )
     return int(proc.returncode), ((proc.stdout or "") + (proc.stderr or "")).strip()
 
@@ -52,8 +62,31 @@ def _mysql_bin() -> str:
     raise RuntimeError("mysql/mariadb client is missing")
 
 
-def _mysql_exec(sql: str, *, timeout_sec: int = 120) -> str:
-    rc, out = _run([_mysql_bin(), "-N", "-B", "-e", sql], timeout_sec=timeout_sec)
+def _mysql_exec(
+    sql: str,
+    *,
+    timeout_sec: int = 120,
+    host: str = "",
+    port: str = "",
+    user: str = "",
+    password: str = "",
+) -> str:
+    args = [_mysql_bin(), "-N", "-B"]
+    clean_host = str(host or "").strip()
+    clean_port = str(port or "").strip()
+    clean_user = str(user or "").strip()
+    if clean_user:
+        args.extend(["-u", clean_user])
+    if clean_host and clean_host != "localhost":
+        args.extend(["-h", clean_host])
+    if clean_port and clean_host and clean_host != "localhost":
+        args.extend(["-P", clean_port])
+    args.extend(["-e", sql])
+    env = None
+    if password:
+        env = dict(os.environ)
+        env["MYSQL_PWD"] = str(password)
+    rc, out = _run(args, timeout_sec=timeout_sec, env=env)
     if rc != 0:
         raise RuntimeError(out or "mysql command failed")
     return out
@@ -203,6 +236,9 @@ def build_delete_plan(
 
     final_db_name = str(db_name or local_cfg.get("db_name", "") or "").strip()
     db_host = str(local_cfg.get("db_host", "") or "").strip().lower()
+    db_port = str(local_cfg.get("db_port", "") or "").strip()
+    db_user = str(local_cfg.get("db_user", "") or "").strip()
+    db_password = str(local_cfg.get("db_password", "") or "")
     if delete_db:
         if not final_db_name:
             raise RuntimeError("database name is unavailable; local.php is missing or incomplete")
@@ -210,6 +246,8 @@ def build_delete_plan(
             raise RuntimeError(f"unsafe database name: {final_db_name}")
         if db_host not in _LOCAL_DB_HOSTS:
             raise RuntimeError(f"refusing to drop non-local database host: {db_host}")
+        if not db_user:
+            raise RuntimeError("database user is unavailable; local.php is missing or incomplete")
 
     nginx_paths = _nginx_candidates(target_root, cleaned_domains) if delete_vhost else []
     return InstanceDeletePlan(
@@ -219,6 +257,9 @@ def build_delete_plan(
         nginx_paths=nginx_paths,
         db_name=final_db_name,
         db_host=db_host,
+        db_port=db_port,
+        db_user=db_user,
+        db_password=db_password,
         delete_files=bool(delete_files),
         delete_vhost=bool(delete_vhost),
         delete_db=bool(delete_db),
@@ -233,6 +274,8 @@ def _plan_public(plan: InstanceDeletePlan) -> dict[str, Any]:
         "nginx_paths": [str(p) for p in plan.nginx_paths],
         "db_name": plan.db_name,
         "db_host": plan.db_host or "localhost",
+        "db_port": plan.db_port or "3306",
+        "db_user": plan.db_user,
         "delete_files": plan.delete_files,
         "delete_vhost": plan.delete_vhost,
         "delete_db": plan.delete_db,
@@ -276,7 +319,14 @@ def delete_instance_artifacts(
 
     if plan.delete_db:
         print(f"Dropping database {plan.db_name}")
-        _mysql_exec(f"DROP DATABASE IF EXISTS {_quote_ident(plan.db_name)}", timeout_sec=300)
+        _mysql_exec(
+            f"DROP DATABASE IF EXISTS {_quote_ident(plan.db_name)}",
+            timeout_sec=300,
+            host=plan.db_host,
+            port=plan.db_port,
+            user=plan.db_user,
+            password=plan.db_password,
+        )
         result["deleted"]["db"] = True
 
     if plan.delete_vhost:
