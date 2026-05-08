@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.2 - 2026-05-09
+
+- Added: `mcd-cli instance-delete` safely removes selected Mautic instance
+  artifacts from the local host: application folder, nginx vhost and local
+  database can be selected independently.
+- Safety: deletion requires `--yes`, validates roots under `/var/www`, refuses
+  non-local database hosts, supports `--dry-run --json`, and rescans/pushes
+  state after successful host-side cleanup.
+
 ## 0.9.1 - 2026-05-08
 
 - Fixed: install-readiness now reconciles old MCD IPv6-disable intent with

@@ -74,6 +74,7 @@ from mcd_agent.executor import (
     execute_mautic_command,
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
+from mcd_agent.instance_delete import delete_instance_artifacts
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.mautic_image_install import install_from_image
@@ -1572,6 +1573,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pfix.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
     pfix.add_argument("--run-as-user", help="Target runtime user (defaults to config mautic_run_as_user)")
 
+    inst_delete = sub.add_parser("instance-delete", help="Delete selected Mautic instance artifacts")
+    inst_delete.add_argument("--config", default=default_cfg)
+    inst_delete.add_argument("--root", help="Mautic root or instance uid")
+    inst_delete.add_argument("--domain", action="append", help="Expected instance domain (repeatable)")
+    inst_delete.add_argument("--db-name", help="Expected database name (defaults to local.php db_name)")
+    inst_delete.add_argument("--delete-files", action="store_true", help="Remove the application root directory")
+    inst_delete.add_argument("--delete-vhost", action="store_true", help="Remove matching nginx vhost files/symlinks")
+    inst_delete.add_argument("--delete-db", action="store_true", help="Drop the local database from local.php/--db-name")
+    inst_delete.add_argument("--yes", action="store_true", help="Confirm destructive deletion")
+    inst_delete.add_argument("--dry-run", action="store_true", help="Plan only; do not delete")
+    inst_delete.add_argument("--json", action="store_true")
+
     reset_admin = sub.add_parser("admin:reset-password", help="Reset/create admin Mautic user for one instance")
     reset_admin.add_argument("--config", default=default_cfg)
     reset_admin.add_argument("--root", help="Mautic root or instance uid (optional when one local instance exists)")
@@ -2030,6 +2043,54 @@ def main() -> int:
         if rc == 0:
             _push_state_after_change(cfg, "permissions-fix")
         return rc
+
+    if args.cmd == "instance-delete":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            root = _select_root_for_ops(cfg, args.root)
+        except Exception as e:
+            print(str(e))
+            return 2
+        try:
+            if bool(args.json):
+                with contextlib.redirect_stdout(sys.stderr):
+                    payload = delete_instance_artifacts(
+                        cfg,
+                        root=root,
+                        domains=list(args.domain or []),
+                        db_name=args.db_name,
+                        delete_files=bool(args.delete_files),
+                        delete_vhost=bool(args.delete_vhost),
+                        delete_db=bool(args.delete_db),
+                        yes=bool(args.yes),
+                        dry_run=bool(args.dry_run),
+                    )
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                payload = delete_instance_artifacts(
+                    cfg,
+                    root=root,
+                    domains=list(args.domain or []),
+                    db_name=args.db_name,
+                    delete_files=bool(args.delete_files),
+                    delete_vhost=bool(args.delete_vhost),
+                    delete_db=bool(args.delete_db),
+                    yes=bool(args.yes),
+                    dry_run=bool(args.dry_run),
+                )
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+        except Exception as e:
+            if bool(args.json):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"instance-delete error: {e}")
+            return 1
+        if not bool(args.dry_run):
+            _push_state_after_change(cfg, "instance-delete")
+        return 0 if str(payload.get("status", "")).lower() in {"ok", "warning", "planned"} else 1
 
     if args.cmd == "admin:reset-password":
         cfg = load_config(args.config)
