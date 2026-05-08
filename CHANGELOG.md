@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.8.189 - 2026-05-08
+
+- Fixed: release packaging excludes old nested `mcd-agent-*.tar.*` artifacts
+  from the agent source tree so cluster channel packages stay small and clean.
+
 ## 0.8.188 - 2026-05-08
 
 - Changed: MCC large-host MySQL defaults now keep the safe 600-connection
