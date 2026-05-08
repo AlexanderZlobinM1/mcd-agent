@@ -6,16 +6,30 @@ from pathlib import Path
 from typing import Any
 
 SYSCTL_FILE = Path("/etc/sysctl.d/99-disable-ipv6.conf")
-KEYS = [
+PERSISTENT_KEYS = [
     "net.ipv6.conf.all.disable_ipv6",
     "net.ipv6.conf.default.disable_ipv6",
     "net.ipv6.conf.lo.disable_ipv6",
 ]
 
 
+def _runtime_ipv6_keys() -> list[str]:
+    keys = list(PERSISTENT_KEYS)
+    root = Path("/proc/sys/net/ipv6/conf")
+    try:
+        for p in sorted(root.glob("*/disable_ipv6")):
+            iface = p.parent.name
+            key = f"net.ipv6.conf.{iface}.disable_ipv6"
+            if key not in keys:
+                keys.append(key)
+    except Exception:
+        pass
+    return keys
+
+
 def ipv6_status() -> dict[str, str]:
     out: dict[str, str] = {}
-    for key in KEYS:
+    for key in _runtime_ipv6_keys():
         p = Path("/proc/sys") / Path(key.replace(".", "/"))
         try:
             out[key] = p.read_text(encoding="utf-8").strip()
@@ -28,11 +42,14 @@ def ipv6_status() -> dict[str, str]:
 
 def set_ipv6_disabled(disabled: bool) -> list[str]:
     val = "1" if disabled else "0"
-    lines = [f"{k}={val}" for k in KEYS]
+    lines = [f"{k}={val}" for k in PERSISTENT_KEYS]
     SYSCTL_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     logs: list[str] = [f"wrote {SYSCTL_FILE}"]
-    for key in KEYS:
+    # `all/default/lo` are not enough on every kernel/runtime path: an already
+    # configured interface can stay enabled while MCD reports all/default/lo as
+    # disabled. Apply the same value to all currently visible interfaces too.
+    for key in _runtime_ipv6_keys():
         proc = subprocess.run(["sysctl", "-w", f"{key}={val}"], capture_output=True, text=True)
         msg = (proc.stdout or proc.stderr or "").strip()
         if proc.returncode == 0:

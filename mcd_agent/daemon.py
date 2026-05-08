@@ -746,6 +746,7 @@ def _run_sql_segment_ring(
                 segment_id=sid,
                 select_query_template=rule.select_sql,
                 context=sql_ctx,
+                statement_timeout_sec=int(getattr(config, "segment_sql_statement_timeout_sec", 1800) or 1800),
             )
             done_set.add(sid)
             _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment_sql", sid)] = float(now_ts)

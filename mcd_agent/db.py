@@ -226,12 +226,35 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _apply_statement_timeout(cur: Any, timeout_sec: int | None) -> None:
+        """Best-effort per-session cap for SQL segment rebuild statements."""
+        try:
+            seconds = int(timeout_sec or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds <= 0:
+            return
+
+        # MariaDB supports max_statement_time in seconds; MySQL supports
+        # max_execution_time in milliseconds. Ignore unsupported variables so
+        # mixed fleets keep working.
+        for query, value in (
+            ("SET SESSION max_statement_time=%s", seconds),
+            ("SET SESSION max_execution_time=%s", seconds * 1000),
+        ):
+            try:
+                cur.execute(query, (value,))
+            except Exception:
+                continue
+
     def rebuild_segment_membership(
         self,
         *,
         segment_id: int,
         select_query_template: str,
         context: dict[str, str] | None = None,
+        statement_timeout_sec: int | None = 1800,
     ) -> dict[str, Any]:
         """
         Rebuild one segment directly in DB:
@@ -255,6 +278,7 @@ class MauticDB:
         with self._connect() as conn:
             try:
                 with conn.cursor() as cur:
+                    self._apply_statement_timeout(cur, statement_timeout_sec)
                     segment_columns = self._table_columns(cur, table_segments)
                     cur.execute(
                         f"CREATE TEMPORARY TABLE IF NOT EXISTS `{temp_table}` ("
@@ -607,3 +631,19 @@ class MauticDB:
             if len(out) >= max(1, int(limit)):
                 break
         return out
+
+    def kill_query(self, process_id: int) -> None:
+        pid = int(process_id)
+        if pid <= 0:
+            raise ValueError("invalid_mysql_process_id")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"KILL QUERY {pid}")
+
+    def kill_connection(self, process_id: int) -> None:
+        pid = int(process_id)
+        if pid <= 0:
+            raise ValueError("invalid_mysql_process_id")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"KILL CONNECTION {pid}")

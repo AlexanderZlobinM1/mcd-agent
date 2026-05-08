@@ -1,5 +1,62 @@
 # MCD Changelog
 
+## 0.8.187 - 2026-05-08
+
+- Fixed: MySQL service-profile auto-apply now detects Galera/PXC cluster
+  nodes and refuses to apply standalone MySQL tuning unless the profile is
+  explicitly marked cluster-safe.
+- Fixed: cluster-safe MySQL profiles are clamped to the proven PXC-safe
+  envelope before writing drop-ins or issuing dynamic `SET GLOBAL`, preventing
+  MCC profile drift from pushing aggressive standalone values into a cluster.
+- Fixed: Galera/PXC MySQL profile application no longer rewrites top-level
+  `/etc/mysql/my.cnf` or `/etc/mysql/mysql.cnf`; cluster nodes are managed only
+  through the explicit MCD drop-in.
+- Fixed: MCC resolves cluster web/Galera nodes to a dedicated conservative
+  PXC profile instead of the hardware standalone MySQL profile.
+
+## 0.8.186 - 2026-05-08
+
+- Fixed: SQL technical segment rebuilds now apply a per-session DB statement
+  timeout (`segment_sql_statement_timeout_sec`, default 1800s) before running
+  the expensive temp-table population query.
+- Fixed: DB watchdog now has a built-in safety rule for stale MCD-owned
+  `mcd_tmp_segment_leads` rebuild queries, so orphaned temp segment SQL cannot
+  keep `page_hits` inserts locked after an agent restart or broken connection.
+- Result: a pathological SQL segment cannot block web tracking writes and
+  saturate PHP-FPM indefinitely, as observed on Benu.
+
+## 0.8.185 - 2026-05-08
+
+- Fixed: cluster self-update quorum no longer includes the backup/replica
+  route. Replica nodes can intentionally run sqlite/read-only control state,
+  so they must not block the Galera-backed rolling update coordinator.
+- Result: cluster channel updates are coordinated only across writable
+  web/Galera MCD nodes: all download first, then install one by one.
+
+## 0.8.184 - 2026-05-08
+
+- Fixed: cluster file-layer producer now prunes stale `.incomplete-*`
+  Syncthing layer directories with an age guard, preventing replica backup
+  storage from filling with abandoned temporary snapshots.
+- Result: cluster backup file layers remain atomic (`current` is still swapped
+  only after a completed layer), while old failed temp directories are cleaned
+  by normal MCD runs instead of manual maintenance.
+
+## 0.8.183 - 2026-05-07
+
+- Fixed: Mautic upgrade flow now clears `var/cache/prod` before Composer
+  post-update scripts, preventing stale compiled container state during core
+  upgrades.
+- Fixed: after Doctrine migrations run, MCD verifies
+  `doctrine:migrations:up-to-date` and reconciles metadata when schema changes
+  are already applied but migration rows are not marked executed.
+- Fixed: if Doctrine stops on a migration whose table, column or key already
+  exists, MCD now marks that exact migration version as executed and continues
+  the migration run instead of aborting the whole Mautic upgrade.
+- Fixed: upgrade reconcile removes stale unavailable migration metadata records
+  after pending migrations are marked, so otherwise healthy schemas do not stay
+  formally out-of-date.
+
 ## 0.8.182 - 2026-05-07
 
 - Fixed: passive-profile daemon no longer logs the passive planning notice on

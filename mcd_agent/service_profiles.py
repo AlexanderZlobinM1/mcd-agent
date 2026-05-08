@@ -34,6 +34,12 @@ _MYSQL_PROFILE_MANAGED_KEYS = {
     "skip_name_resolve",
     "log_queries_not_using_indexes",
 }
+_MYSQL_GALERA_MARKERS = (
+    "wsrep_on",
+    "wsrep_provider",
+    "wsrep_cluster_address",
+    "wsrep_cluster_name",
+)
 
 
 def _post_json(url: str, payload: dict[str, Any], token: str | None, timeout_sec: int = 12) -> dict[str, Any]:
@@ -300,6 +306,77 @@ def _detect_mysql_engine() -> str:
         if "mysql" in ver:
             return "mysql"
     return "mysql"
+
+
+def _agent_cluster_mode(cfg: AgentConfig) -> bool:
+    return bool(str(getattr(cfg, "cluster_id", "") or "").strip())
+
+
+def _mysql_galera_config_detected() -> bool:
+    paths = [
+        Path("/etc/mysql/my.cnf"),
+        Path("/etc/mysql/mysql.cnf"),
+        Path("/etc/mysql/conf.d/galera.cnf"),
+        Path("/etc/mysql/mysql.conf.d/galera.cnf"),
+        Path("/etc/mysql/mysql.conf.d/zz-ananas-cluster-role.cnf"),
+    ]
+    try:
+        for path in paths:
+            if not path.exists() or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace").lower()
+            if any(marker in text for marker in _MYSQL_GALERA_MARKERS):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mysql_profile_allows_cluster_apply(profile: dict[str, Any]) -> bool:
+    for key in ("cluster_safe", "galera_safe", "pxc_safe", "allow_cluster_apply"):
+        if _as_bool(profile.get(key), False):
+            return True
+    scope = str(profile.get("scope", profile.get("profile_scope", "")) or "").strip().lower()
+    return scope in {"cluster", "galera", "pxc", "percona-xtradb-cluster"}
+
+
+def _sanitize_cluster_mysql_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep Galera/PXC service-profile writes inside the proven safe envelope.
+
+    Cluster nodes are not standalone MySQL boxes. A too-aggressive profile can
+    amplify certification stalls across every node, so even a profile explicitly
+    marked cluster-safe is bounded here before any file or dynamic SET GLOBAL is
+    attempted.
+    """
+    out = dict(profile)
+    caps = {
+        "innodb_buffer_pool_size_mb": 65_536,
+        "innodb_redo_log_capacity_mb": 2_048,
+        "innodb_io_capacity": 12_000,
+        "innodb_io_capacity_max": 24_000,
+        "max_connections": 600,
+        "thread_cache_size": 128,
+        "table_open_cache": 8_000,
+        "table_definition_cache": 4_000,
+        "open_files_limit": 65_535,
+        "tmp_table_size_mb": 256,
+        "max_heap_table_size_mb": 256,
+        "max_allowed_packet_mb": 64,
+    }
+    for key, cap in caps.items():
+        raw = out.get(key)
+        if raw is None:
+            continue
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val > cap:
+            out[key] = cap
+    out["cluster_safe"] = True
+    out["scope"] = str(out.get("scope") or "pxc").strip() or "pxc"
+    return out
 
 
 def _detect_mysql_dropin(profile: dict[str, Any]) -> Path:
@@ -681,9 +758,19 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
     if os.geteuid() != 0:
         raise RuntimeError("service-profile apply requires root")
 
-    _ = cfg
     service_name = _detect_mysql_service_name()
     engine = _detect_mysql_engine()
+    cluster_mysql = _agent_cluster_mode(cfg) and _mysql_galera_config_detected()
+    if cluster_mysql and not _mysql_profile_allows_cluster_apply(profile):
+        return {
+            "status": "skipped",
+            "reason": "cluster_galera_mysql_profile_not_marked_safe",
+            "engine": engine,
+            "service_name": service_name,
+            "cluster_id": str(getattr(cfg, "cluster_id", "") or "").strip(),
+        }
+    if cluster_mysql:
+        profile = _sanitize_cluster_mysql_profile(profile)
     dropin = _detect_mysql_dropin(profile)
     content = _build_mysql_override(profile, engine=engine)
     before = dropin.read_text(encoding="utf-8") if dropin.exists() else None
@@ -699,10 +786,11 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
     changed: list[str] = []
     top_level_before: dict[Path, str | None] = {}
     try:
-        top_level_before = _cleanup_legacy_mysql_top_level_configs()
-        profile_override_before = _cleanup_mysql_top_level_profile_overrides()
-        top_level_before.update(profile_override_before)
-        changed.extend(str(p) for p in top_level_before)
+        if not cluster_mysql:
+            top_level_before = _cleanup_legacy_mysql_top_level_configs()
+            profile_override_before = _cleanup_mysql_top_level_profile_overrides()
+            top_level_before.update(profile_override_before)
+            changed.extend(str(p) for p in top_level_before)
         if _write_file(dropin, content):
             changed.append(str(dropin))
 

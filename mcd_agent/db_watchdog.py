@@ -18,6 +18,8 @@ _DEFAULT_CFG: dict[str, Any] = {
     "sample_limit": 25,
     "long_query_sec": 900,
     "orphan_query_sec": 1200,
+    "mcd_tmp_segment_query_sec": 1800,
+    "kill_mcd_tmp_segment_queries": True,
     "global_rules": [],
     "host_rules": {},
 }
@@ -171,6 +173,8 @@ def effective_db_watchdog_config(cfg: AgentConfig) -> dict[str, Any]:
     merged["sample_limit"] = max(1, min(200, int(merged.get("sample_limit", 25) or 25)))
     merged["long_query_sec"] = max(1, int(merged.get("long_query_sec", 900) or 900))
     merged["orphan_query_sec"] = max(1, int(merged.get("orphan_query_sec", 1200) or 1200))
+    merged["mcd_tmp_segment_query_sec"] = max(60, int(merged.get("mcd_tmp_segment_query_sec", 1800) or 1800))
+    merged["kill_mcd_tmp_segment_queries"] = bool(merged.get("kill_mcd_tmp_segment_queries", True))
     return merged
 
 
@@ -248,6 +252,61 @@ def _rule_matches(rule: dict[str, Any], row: dict[str, Any], *, errors: list[str
     return True
 
 
+def _apply_rule_action(
+    db: MauticDB,
+    *,
+    rule: dict[str, Any],
+    row: dict[str, Any],
+    observe_only: bool,
+) -> dict[str, Any] | None:
+    action = str(rule.get("action", "observe") or "observe").strip().lower()
+    if action not in {"kill_query", "kill_connection"}:
+        return None
+    pid = int(row.get("id", 0) or 0)
+    rid = str(rule.get("id", "rule")).strip() or "rule"
+    event: dict[str, Any] = {
+        "rule_id": rid,
+        "action": action,
+        "pid": pid,
+        "time_sec": int(row.get("time_sec", 0) or 0),
+        "db": str(row.get("db", "") or ""),
+        "user": str(row.get("user", "") or ""),
+        "info_head": str(row.get("info_head", "") or ""),
+    }
+    if observe_only:
+        event["status"] = "observe_only"
+        return event
+    if pid <= 0:
+        event["status"] = "skipped"
+        event["reason"] = "invalid_pid"
+        return event
+    if str(row.get("command", "") or "").strip().lower() != "query":
+        event["status"] = "skipped"
+        event["reason"] = "not_query"
+        return event
+    try:
+        if action == "kill_query":
+            db.kill_query(pid)
+        else:
+            db.kill_connection(pid)
+    except Exception as e:
+        event["status"] = "error"
+        event["reason"] = str(e)[:220]
+        return event
+    event["status"] = "applied"
+    return event
+
+
+def _is_stale_mcd_tmp_segment_query(row: dict[str, Any], *, min_time_sec: int) -> bool:
+    """Match only MCD-owned SQL segment temp-table rebuild queries."""
+    if str(row.get("command", "") or "").strip().lower() != "query":
+        return False
+    if int(row.get("time_sec", 0) or 0) < int(min_time_sec):
+        return False
+    info = str(row.get("info_head", "") or "").lower()
+    return "mcd_tmp_segment_leads" in info and "insert ignore into" in info
+
+
 def collect_db_watchdog_snapshot(
     *,
     cfg: AgentConfig,
@@ -306,6 +365,30 @@ def collect_db_watchdog_snapshot(
     rules_list = rules if isinstance(rules, list) else []
     hit_counts: dict[str, int] = {}
     rule_samples: list[dict[str, Any]] = []
+    rule_actions: list[dict[str, Any]] = []
+    observe_only = bool(profile.get("observe_only", True))
+    acted_pids: set[int] = set()
+    if bool(profile.get("kill_mcd_tmp_segment_queries", True)):
+        builtin_rule = {
+            "id": "mcd_tmp_segment_leads_stale",
+            "action": "kill_query",
+            "description": "Kill stale MCD SQL-segment temp-table rebuild queries.",
+        }
+        builtin_threshold = int(profile.get("mcd_tmp_segment_query_sec", 1800) or 1800)
+        for row in rows:
+            pid = int(row.get("id", 0) or 0)
+            if pid in acted_pids:
+                continue
+            if not _is_stale_mcd_tmp_segment_query(row, min_time_sec=builtin_threshold):
+                continue
+            hit_counts["mcd_tmp_segment_leads_stale"] = int(hit_counts.get("mcd_tmp_segment_leads_stale", 0) or 0) + 1
+            action_event = _apply_rule_action(db, rule=builtin_rule, row=row, observe_only=False)
+            if action_event is not None:
+                action_event["builtin"] = True
+                action_event["observe_only_overridden"] = observe_only
+                rule_actions.append(action_event)
+                acted_pids.add(pid)
+
     for row in rows:
         matched_ids: list[str] = []
         for rule in rules_list:
@@ -315,6 +398,13 @@ def collect_db_watchdog_snapshot(
                 rid = str(rule.get("id", "rule")).strip() or "rule"
                 matched_ids.append(rid)
                 hit_counts[rid] = int(hit_counts.get(rid, 0) or 0) + 1
+                action = str(rule.get("action", "observe") or "observe").strip().lower()
+                pid = int(row.get("id", 0) or 0)
+                if action in {"kill_query", "kill_connection"} and pid not in acted_pids:
+                    action_event = _apply_rule_action(db, rule=rule, row=row, observe_only=observe_only)
+                    if action_event is not None:
+                        rule_actions.append(action_event)
+                        acted_pids.add(pid)
         if matched_ids:
             sample = {
                 "pid": int(row.get("id", 0) or 0),
@@ -361,6 +451,8 @@ def collect_db_watchdog_snapshot(
             "sample_limit": sample_limit,
             "rules_count": len(rules_list),
             "global_rules_count": len(_normalize_rule_list(profile.get("global_rules"))),
+            "mcd_tmp_segment_query_sec": int(profile.get("mcd_tmp_segment_query_sec", 1800) or 1800),
+            "kill_mcd_tmp_segment_queries": bool(profile.get("kill_mcd_tmp_segment_queries", True)),
         },
         "running": {
             "managed_tasks": running_managed,
@@ -380,7 +472,7 @@ def collect_db_watchdog_snapshot(
             "hit_total": int(sum(hit_counts.values())),
             "hit_counts": hit_counts,
             "samples": rule_samples[:sample_limit],
+            "actions": rule_actions[:sample_limit],
         },
         "errors": errors[:50],
     }
-

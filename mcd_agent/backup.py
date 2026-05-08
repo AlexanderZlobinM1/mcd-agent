@@ -43,6 +43,14 @@ class BackupResult:
     bytes_written: int | None = None
 
 
+@dataclass
+class _PreparedMysqlRuntime:
+    socket_path: Path
+    datadir: Path
+    run_dir: Path
+    process: subprocess.Popen[Any]
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -69,6 +77,27 @@ def _json_read(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _short_error(value: Any, *, limit: int = 4000) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def _compact_backup_history(history: Any, *, keep: int = 20) -> list[dict[str, Any]]:
+    if not isinstance(history, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in history[: max(0, int(keep))]:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        if "error" in row:
+            row["error"] = _short_error(row.get("error"))
+        compact.append(row)
+    return compact
 
 
 def _run(
@@ -194,15 +223,34 @@ def _prune_by_copies(parent: Path, keep: int) -> list[str]:
     return removed
 
 
-def _cleanup_incomplete_dirs(parent: Path) -> tuple[list[str], list[str]]:
+def _cleanup_incomplete_dirs(
+    parent: Path,
+    *,
+    min_age_sec: int = 0,
+    keep: set[Path] | None = None,
+) -> tuple[list[str], list[str]]:
     removed: list[str] = []
     failed: list[str] = []
     if not parent.exists():
         return removed, failed
+    now = time.time()
+    keep_resolved = {p.resolve(strict=False) for p in (keep or set())}
     for child in parent.iterdir():
-        if not child.is_dir():
+        try:
+            child_resolved = child.resolve(strict=False)
+        except Exception:
+            child_resolved = child
+        if child_resolved in keep_resolved:
+            continue
+        if child.is_symlink() or not child.is_dir():
             continue
         if not child.name.startswith(".incomplete-"):
+            continue
+        try:
+            age_sec = max(0.0, now - child.stat().st_mtime)
+        except Exception:
+            age_sec = float(min_age_sec)
+        if age_sec < max(0, int(min_age_sec)):
             continue
         try:
             shutil.rmtree(child)
@@ -911,6 +959,7 @@ def _mysql_defaults_file(
     port: int,
     user: str,
     password: str,
+    socket_path: str | None = None,
 ) -> tempfile.NamedTemporaryFile:
     def opt_value(value: str) -> str:
         # MySQL option files treat leading "#" as comments unless the value is quoted.
@@ -920,8 +969,12 @@ def _mysql_defaults_file(
     tf = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     for group in ("client", "xtrabackup"):
         tf.write(f"[{group}]\n")
-        tf.write(f"host={opt_value(host)}\n")
-        tf.write(f"port={port}\n")
+        if socket_path:
+            tf.write(f"socket={opt_value(socket_path)}\n")
+            tf.write("protocol=socket\n")
+        else:
+            tf.write(f"host={opt_value(host)}\n")
+            tf.write(f"port={port}\n")
         tf.write(f"user={opt_value(user)}\n")
         tf.write(f"password={opt_value(password)}\n")
     tf.flush()
@@ -1093,7 +1146,12 @@ def _effective_long_query_guard(value: int) -> int:
     return 2_147_483_647 if int(value) <= 0 else int(value)
 
 
-def _build_mydumper_cmd(cfg: AgentConfig, db: DBConfig, output_dir: Path, defaults_file: str) -> list[str]:
+def _build_mydumper_cmd(
+    cfg: AgentConfig,
+    db: DBConfig,
+    output_dir: Path,
+    defaults_file: str,
+) -> list[str]:
     extra_args = _effective_mydumper_extra_args(cfg, cfg.backup_mydumper_extra_args)
     cmd = _priority_prefix(cfg) + [
         cfg.backup_mydumper_bin,
@@ -1138,6 +1196,36 @@ def _effective_mydumper_extra_args(cfg: AgentConfig, extra_args: list[str]) -> l
     return out
 
 
+def _has_mydumper_arg(args: list[str], names: set[str]) -> bool:
+    for arg in args:
+        value = str(arg or "").strip()
+        if value in names:
+            return True
+        for name in names:
+            if value.startswith(f"{name}="):
+                return True
+    return False
+
+
+def _cluster_offsite_mydumper_cfg(cfg: AgentConfig) -> AgentConfig:
+    extra_args = [str(x).strip() for x in list(getattr(cfg, "backup_mydumper_extra_args", []) or []) if str(x).strip()]
+    if not _has_mydumper_arg(extra_args, {"--rows", "-r", "--chunk-filesize", "-F"}):
+        # Large Mautic tracking tables otherwise become one huge single-threaded
+        # file. Chunking lets mydumper use the configured parallelism.
+        extra_args.append("--rows=500000")
+    if (
+        not _has_mydumper_arg(extra_args, {"--compress-protocol"})
+        and _mydumper_supports_flag(cfg.backup_mydumper_bin, "--compress-protocol")
+    ):
+        extra_args.append("--compress-protocol")
+    return replace(
+        cfg,
+        backup_method="mydumper",
+        backup_mydumper_threads=max(16, int(getattr(cfg, "backup_mydumper_threads", 6) or 6)),
+        backup_mydumper_extra_args=extra_args,
+    )
+
+
 def _is_long_query_guard_abort(exc: Exception) -> bool:
     msg = str(exc).lower()
     if "long-query-guard" not in msg:
@@ -1148,8 +1236,20 @@ def _is_long_query_guard_abort(exc: Exception) -> bool:
     )
 
 
-def _run_mydumper(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
-    defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
+def _run_mydumper(
+    cfg: AgentConfig,
+    db: DBConfig,
+    output_dir: Path,
+    *,
+    socket_path: str | None = None,
+) -> None:
+    defaults = _mysql_defaults_file(
+        host=db.host,
+        port=db.port,
+        user=db.user,
+        password=db.password,
+        socket_path=socket_path,
+    )
     primary_exc: Exception | None = None
     try:
         cmd = _build_mydumper_cmd(cfg, db, output_dir, defaults.name)
@@ -1184,10 +1284,6 @@ def _run_mydumper(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
             cfg.backup_mydumper_bin,
             "-u",
             db.user,
-            "-h",
-            db.host,
-            "-P",
-            str(db.port),
             "-B",
             db.name,
             "-o",
@@ -1197,6 +1293,10 @@ def _run_mydumper(cfg: AgentConfig, db: DBConfig, output_dir: Path) -> None:
             "--verbose",
             str(cfg.backup_mydumper_verbose),
         ]
+        if socket_path:
+            fallback += ["--socket", socket_path]
+        else:
+            fallback += ["-h", db.host, "-P", str(db.port)]
         fallback += ["--long-query-guard", str(_effective_long_query_guard(guard_value))]
         if cfg.backup_mydumper_kill_long_queries:
             fallback.append("--kill-long-queries")
@@ -1280,6 +1380,165 @@ def _verify_xtrabackup_dir(path: Path) -> tuple[bool, str, int]:
     if total <= 0:
         return False, "xtrabackup output is empty", 0
     return True, "ok", total
+
+
+def _cluster_offsite_mysql_root(cfg: AgentConfig) -> Path:
+    return _cluster_db_root(cfg) / "offsite-mysql"
+
+
+def _clone_xtrabackup_for_offsite_prepare(cfg: AgentConfig, full_dir: Path) -> Path:
+    src = full_dir / "physical-xtrabackup"
+    ok, msg, _ = _verify_xtrabackup_dir(src)
+    if not ok:
+        raise RuntimeError(f"local full xtrabackup is not usable for offsite source: {msg}")
+    root = _cluster_offsite_mysql_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    for old in root.iterdir():
+        if old.is_dir() and old.name.startswith("prepared-"):
+            shutil.rmtree(old, ignore_errors=True)
+    clone_dir = root / f"prepared-{_fmt_local_ts()}"
+    if clone_dir.exists():
+        shutil.rmtree(clone_dir)
+    clone_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        # This must be a reflink clone, not a full local copy: the cluster
+        # replica intentionally has no spare 1.4T cache area for another DB copy.
+        _run(
+            ["cp", "-a", "--reflink=always", f"{src}/.", str(clone_dir)],
+            timeout_sec=cfg.backup_dump_timeout_sec,
+            check=True,
+        )
+    except Exception as e:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+        raise RuntimeError(f"failed to create reflink clone of local xtrabackup source: {e}") from e
+    return clone_dir
+
+
+def _prepare_xtrabackup_clone_for_mysql(cfg: AgentConfig, clone_dir: Path) -> None:
+    checkpoint = _xtrabackup_checkpoint_text(clone_dir).lower()
+    if "full-prepared" not in checkpoint:
+        _run(
+            [cfg.backup_xtrabackup_bin, "--prepare", f"--target-dir={clone_dir}"],
+            timeout_sec=cfg.backup_dump_timeout_sec,
+            check=True,
+        )
+    if shutil.which("chown"):
+        # MySQL refuses to run as root. Chowning the reflink clone changes
+        # metadata only and keeps the source xtrabackup snapshot untouched.
+        _run(["chown", "-R", "mysql:mysql", str(clone_dir)], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+
+
+def _mysqladmin_ping(socket_path: Path) -> bool:
+    defaults = _mysql_defaults_file(host="localhost", port=0, user="root", password="", socket_path=str(socket_path))
+    try:
+        proc = _run(
+            ["mysqladmin", f"--defaults-extra-file={defaults.name}", "ping"],
+            timeout_sec=10,
+            check=False,
+        )
+        text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
+        return proc.returncode == 0 and "mysqld is alive" in text
+    finally:
+        try:
+            os.remove(defaults.name)
+        except Exception:
+            pass
+
+
+def _start_prepared_xtrabackup_mysql(cfg: AgentConfig, datadir: Path) -> _PreparedMysqlRuntime:
+    mysqld = shutil.which("mysqld") or shutil.which("mariadbd")
+    if not mysqld:
+        raise RuntimeError("mysqld/mariadbd binary not found for xtrabackup offsite source")
+    run_dir = Path(tempfile.mkdtemp(prefix="mcd-offsite-mysql-"))
+    socket_path = run_dir / "mysql.sock"
+    tmp_dir = run_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    error_log = run_dir / "error.log"
+    pid_file = run_dir / "mysql.pid"
+    if shutil.which("chown"):
+        _run(["chown", "-R", "mysql:mysql", str(run_dir)], timeout_sec=cfg.backup_mount_timeout_sec, check=True)
+    cmd = [
+        mysqld,
+        "--no-defaults",
+        f"--datadir={datadir}",
+        f"--socket={socket_path}",
+        f"--pid-file={pid_file}",
+        f"--log-error={error_log}",
+        f"--tmpdir={tmp_dir}",
+        "--skip-networking",
+        "--skip-log-bin",
+        "--skip-grant-tables",
+        "--read-only=ON",
+        "--super-read-only=ON",
+        "--user=mysql",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + min(max(cfg.backup_mount_timeout_sec, 60), 300)
+    while time.monotonic() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            err = error_log.read_text(encoding="utf-8", errors="ignore")[-4000:] if error_log.exists() else ""
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise RuntimeError(f"temporary offsite mysqld exited early rc={rc}: {err.strip()}")
+        if socket_path.exists() and _mysqladmin_ping(socket_path):
+            return _PreparedMysqlRuntime(socket_path=socket_path, datadir=datadir, run_dir=run_dir, process=proc)
+        time.sleep(1)
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except Exception:
+        proc.kill()
+    err = error_log.read_text(encoding="utf-8", errors="ignore")[-4000:] if error_log.exists() else ""
+    shutil.rmtree(run_dir, ignore_errors=True)
+    raise RuntimeError(f"temporary offsite mysqld did not become ready: {err.strip()}")
+
+
+def _stop_prepared_xtrabackup_mysql(runtime: _PreparedMysqlRuntime) -> None:
+    proc = runtime.process
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=120)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                pass
+    shutil.rmtree(runtime.run_dir, ignore_errors=True)
+
+
+def _run_mydumper_from_xtrabackup_full(
+    cfg: AgentConfig,
+    db: DBConfig,
+    full_dir: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    clone_dir: Path | None = None
+    runtime: _PreparedMysqlRuntime | None = None
+    try:
+        clone_dir = _clone_xtrabackup_for_offsite_prepare(cfg, full_dir)
+        _prepare_xtrabackup_clone_for_mysql(cfg, clone_dir)
+        runtime = _start_prepared_xtrabackup_mysql(cfg, clone_dir)
+        temp_db = DBConfig(
+            host="localhost",
+            port=0,
+            name=db.name,
+            user="root",
+            password="",
+            table_prefix=db.table_prefix,
+        )
+        _run_mydumper(replace(cfg, backup_method="mydumper"), temp_db, output_dir, socket_path=str(runtime.socket_path))
+        return {
+            "offsite_db_source": "xtrabackup",
+            "offsite_xtrabackup_full_path": str(full_dir),
+            "offsite_temp_mysql": "prepared_reflink_clone",
+        }
+    finally:
+        if runtime is not None:
+            _stop_prepared_xtrabackup_mysql(runtime)
+        if clone_dir is not None:
+            shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _run_mysql_sql(cfg: AgentConfig, db: DBConfig, sql: str) -> None:
@@ -1874,14 +2133,19 @@ def _cluster_latest_incremental_dir(cfg: AgentConfig, chain_id: str) -> Path | N
 def _cluster_update_state(cfg: AgentConfig, updates: dict[str, Any], *, history_item: dict[str, Any] | None = None) -> Path:
     state_path = _cluster_state_path(cfg)
     state = _json_read(state_path)
-    history = state.get("history", [])
-    if not isinstance(history, list):
-        history = []
+    history = _compact_backup_history(state.get("history", []))
     if history_item is not None:
+        history_item = dict(history_item)
+        if "error" in history_item:
+            history_item["error"] = _short_error(history_item.get("error"))
         history = [history_item] + history[:19]
         updates = dict(updates)
         updates["history"] = history
     state.update(updates)
+    if "last_error" in state:
+        state["last_error"] = _short_error(state.get("last_error"))
+    if "history" in state:
+        state["history"] = _compact_backup_history(state.get("history", []))
     _json_write(state_path, state)
     return state_path
 
@@ -2314,8 +2578,18 @@ def cluster_backup_files_produce(config: AgentConfig) -> BackupResult:
     layer_root = _cluster_file_layers_root(cfg) / node_slug
     tmp_dir = layer_root / f".incomplete-{_fmt_local_ts()}"
     current_dir = layer_root / "current"
+    stale_pruned: list[str] = []
+    stale_prune_failed: list[str] = []
     try:
         layer_root.mkdir(parents=True, exist_ok=True)
+        # Syncthing preserves failed producer temp directories on the replica.
+        # Keep fresh dirs to avoid racing an active run; prune older remnants
+        # before creating the next layer and again after a successful publish.
+        stale_pruned, stale_prune_failed = _cleanup_incomplete_dirs(
+            layer_root,
+            min_age_sec=max(3600, int(getattr(cfg, "backup_cluster_files_layer_max_age_sec", 86400) or 86400) // 4),
+            keep={tmp_dir},
+        )
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=False)
@@ -2369,9 +2643,17 @@ def cluster_backup_files_produce(config: AgentConfig) -> BackupResult:
             "bytes_written": int(node_bytes + shared_bytes),
             "node_bytes": int(node_bytes),
             "shared_bytes": int(shared_bytes),
+            "stale_incomplete_pruned": stale_pruned,
+            "stale_incomplete_prune_failed": stale_prune_failed,
         }
         _json_write(_layer_manifest_path(tmp_dir), manifest)
         _replace_dir_atomic(tmp_dir, current_dir)
+        post_pruned, post_prune_failed = _cleanup_incomplete_dirs(
+            layer_root,
+            min_age_sec=max(3600, int(getattr(cfg, "backup_cluster_files_layer_max_age_sec", 86400) or 86400) // 4),
+        )
+        stale_pruned += post_pruned
+        stale_prune_failed += post_prune_failed
         duration = int(time.monotonic() - start_monotonic)
         _cluster_update_state(
             cfg,
@@ -2385,6 +2667,8 @@ def cluster_backup_files_produce(config: AgentConfig) -> BackupResult:
                 "last_files_layer_path": str(current_dir),
                 "last_files_layer_at": manifest["ts_utc"],
                 "last_bytes_written": int(node_bytes + shared_bytes),
+                "last_files_layer_stale_pruned": stale_pruned,
+                "last_files_layer_stale_prune_failed": stale_prune_failed,
             },
             history_item={
                 "ts": _utc_now_iso(),
@@ -3033,6 +3317,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                 raise RuntimeError("offsite backup requires a completed local files snapshot")
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
+        err = _short_error(e)
         _cluster_update_state(
             cfg,
             {
@@ -3040,14 +3325,14 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                 "cluster_name": _cluster_name(cfg),
                 "last_run_at": started_ts,
                 "last_status": "failed",
-                "last_error": str(e),
+                "last_error": err,
                 "last_duration_sec": duration,
                 "job": "backup.cluster.offsite",
                 "method": "mydumper",
             },
-            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.offsite", "error": str(e)},
+            history_item={"ts": started_ts, "status": "failed", "job": "backup.cluster.offsite", "error": err},
         )
-        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+        return BackupResult(ok=False, message=err, state_path=str(state_path), duration_sec=duration)
 
     lock_path = _cluster_lock_path(cfg, "offsite")
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -3121,7 +3406,13 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             files_archive_path = str(archive_path)
         db_dir = tmp_dir / "databases" / f"cluster__{db.name or 'all'}"
         db_dir.mkdir(parents=True, exist_ok=False)
-        _run_mydumper(replace(cfg, backup_method="mydumper"), db, db_dir)
+        dump_cfg = _cluster_offsite_mydumper_cfg(cfg)
+        offsite_source = str(getattr(cfg, "backup_cluster_offsite_source", "xtrabackup") or "xtrabackup").strip().lower()
+        if offsite_source in {"live", "live_replica", "replica"}:
+            db_source_meta = {"offsite_db_source": "live_replica"}
+            _run_mydumper(dump_cfg, db, db_dir)
+        else:
+            db_source_meta = _run_mydumper_from_xtrabackup_full(dump_cfg, db, full_dir, db_dir)
         ok, verify_msg, db_bytes = _verify_dump_dir(db_dir)
         if not ok:
             raise RuntimeError(f"cluster offsite mydumper verification failed: {verify_msg}")
@@ -3135,6 +3426,9 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             "method": "mydumper",
             "path": str(final_dir),
             "database": db.name or "*",
+            **db_source_meta,
+            "mydumper_threads": dump_cfg.backup_mydumper_threads,
+            "mydumper_extra_args": dump_cfg.backup_mydumper_extra_args,
             "bytes_written": bytes_written,
             "db_bytes": db_bytes,
             "files_bytes": files_bytes,
@@ -3147,6 +3441,8 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         }
         _write_marker(tmp_dir, marker)
         os.replace(tmp_dir, final_dir)
+        if files_archive_path:
+            marker["files_archive_path"] = str(final_dir / Path(files_archive_path).name)
         retention_plan = _cluster_remote_retention_plan_for_parent(
             remote_parent,
             keep_daily=max(1, int(getattr(cfg, "backup_cluster_remote_retention_daily", 7) or 7)),
@@ -3203,20 +3499,21 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         )
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
+        err = _short_error(e)
         if tmp_dir is not None and tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         _cluster_update_state(
             cfg,
-            {"last_status": "failed", "last_error": str(e), "last_duration_sec": duration},
+            {"last_status": "failed", "last_error": err, "last_duration_sec": duration},
             history_item={
                 "ts": _utc_now_iso(),
                 "status": "failed",
                 "job": "backup.cluster.offsite",
                 "duration_sec": duration,
-                "error": str(e),
+                "error": err,
             },
         )
-        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+        return BackupResult(ok=False, message=err, state_path=str(state_path), duration_sec=duration)
     finally:
         try:
             _unmount(mount_path, cfg.backup_unmount_timeout_sec)
@@ -3240,7 +3537,9 @@ def cluster_backup_offsite_dry_run(config: AgentConfig) -> dict[str, Any]:
         "cluster_name": _cluster_name(cfg),
         "host_name": _host_name(cfg),
         "method": "mydumper",
+        "offsite_db_source": str(getattr(cfg, "backup_cluster_offsite_source", "xtrabackup") or "xtrabackup").strip().lower(),
         "would_run_mydumper": False,
+        "would_prepare_xtrabackup_mysql": False,
         "would_include_files": False,
         "would_write_remote": False,
     }
@@ -3254,11 +3553,16 @@ def cluster_backup_offsite_dry_run(config: AgentConfig) -> dict[str, Any]:
         result["tools"] = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
+        dump_cfg = _cluster_offsite_mydumper_cfg(cfg)
         result["database"] = db.name or "*"
+        result["mydumper_threads"] = dump_cfg.backup_mydumper_threads
+        result["mydumper_extra_args"] = dump_cfg.backup_mydumper_extra_args
         full_dir = _cluster_current_full_dir(cfg)
         if full_dir is None:
             raise RuntimeError("offsite dry-run requires a completed local full backup")
         result["local_full_path"] = str(full_dir)
+        if str(result["offsite_db_source"]) not in {"live", "live_replica", "replica"}:
+            result["would_prepare_xtrabackup_mysql"] = True
         files_snapshot = None
         if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True)):
             files_snapshot = _cluster_latest_files_snapshot(cfg)

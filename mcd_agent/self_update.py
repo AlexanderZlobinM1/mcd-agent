@@ -578,7 +578,9 @@ def _cluster_expected_update_hosts(cfg: AgentConfig) -> list[str]:
     hosts.extend(cluster_route_targets(cfg, "cache"))
     hosts.extend(cluster_route_targets(cfg, "cron"))
     hosts.extend(cluster_route_targets(cfg, "import"))
-    hosts.extend(cluster_route_targets(cfg, "backup"))
+    # Do not include the backup/replica route in the rolling update quorum.
+    # The replica intentionally may run a sqlite/read-only control state mode,
+    # so it cannot safely write the Galera-backed update coordinator row.
     hosts.append(_cluster_local_host_name(cfg))
     return _dedupe_hosts(hosts)
 

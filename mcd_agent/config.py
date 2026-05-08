@@ -364,6 +364,7 @@ class AgentConfig:
     segment_sql_ring_max_per_tick: int
     segment_sql_min_repeat_sec: int
     segment_sql_lock_heartbeat_sec: int
+    segment_sql_statement_timeout_sec: int
     segment_sql_orphan_policy: str
     segment_sql_orphan_after_sec: int
     segment_sql_page_hits_quiet_only: bool
@@ -1444,6 +1445,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_sql_ring_max_per_tick": "segment_sql_ring_max_per_tick",
     "segment_sql_min_repeat_sec": "segment_sql_min_repeat_sec",
     "segment_sql_lock_heartbeat_sec": "segment_sql_lock_heartbeat_sec",
+    "segment_sql_statement_timeout_sec": "segment_sql_statement_timeout_sec",
     "segment_sql_orphan_policy": "segment_sql_orphan_policy",
     "segment_sql_orphan_after_sec": "segment_sql_orphan_after_sec",
     "segment_sql_page_hits_quiet_only": "segment_sql_page_hits_quiet_only",
@@ -2128,6 +2130,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_ring_max_per_tick=int(runtime.get("segment_sql_ring_max_per_tick", 1)),
         segment_sql_min_repeat_sec=max(0, int(runtime.get("segment_sql_min_repeat_sec", 3600) or 3600)),
         segment_sql_lock_heartbeat_sec=max(5, int(runtime.get("segment_sql_lock_heartbeat_sec", 15) or 15)),
+        segment_sql_statement_timeout_sec=max(60, int(runtime.get("segment_sql_statement_timeout_sec", 1800) or 1800)),
         segment_sql_orphan_policy=segment_sql_orphan_policy,
         segment_sql_orphan_after_sec=max(30, int(runtime.get("segment_sql_orphan_after_sec", 900) or 900)),
         segment_sql_page_hits_quiet_only=bool(runtime.get("segment_sql_page_hits_quiet_only", False)),

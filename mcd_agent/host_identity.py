@@ -70,29 +70,31 @@ def resolve_agent_identity(cfg: AgentConfig) -> dict[str, object]:
     local_hostname = (socket.gethostname() or "").strip() or "localhost"
     local_machine_id = _read_machine_id()
     configured_host_name = (cfg.mcc_host_name or "").strip()
-    is_template = bool(getattr(cfg, "host_template", False))
+    configured_template = bool(getattr(cfg, "host_template", False))
     autopromote_on_clone = bool(getattr(cfg, "template_autopromote_on_clone", True))
-    marker = _read_template_marker() if is_template else {}
+    marker = _read_template_marker()
     marker_source = str(marker.get("source_host_name", "")).strip()
     marker_machine_id = str(marker.get("source_machine_id", "")).strip().lower()
+    marker_present = bool(marker_source or marker_machine_id)
     source_host_name = configured_host_name or marker_source
     source_machine_id = marker_machine_id
-    if is_template and not source_host_name:
+    template_capable = bool(configured_template or marker_present)
+    if configured_template and not source_host_name:
         source_host_name = local_hostname
-    if is_template and source_host_name and (not marker_source or (local_machine_id and not marker_machine_id)):
+    if configured_template and source_host_name and (not marker_source or (local_machine_id and not marker_machine_id)):
         _write_template_marker(source_host_name, local_machine_id)
         if local_machine_id and not source_machine_id:
             source_machine_id = local_machine_id
 
     clone_by_hostname = bool(
-        is_template
+        template_capable
         and autopromote_on_clone
         and source_host_name
         and local_hostname
         and source_host_name != local_hostname
     )
     clone_by_machine_id = bool(
-        is_template
+        template_capable
         and autopromote_on_clone
         and source_machine_id
         and local_machine_id
@@ -112,7 +114,7 @@ def resolve_agent_identity(cfg: AgentConfig) -> dict[str, object]:
         "configured_host_name": configured_host_name or None,
         "effective_hostname": effective_hostname,
         "effective_mcc_host_name": effective_mcc_host_name,
-        "is_template": is_template,
+        "is_template": bool(configured_template and not clone_detected),
         "autopromote_on_clone": autopromote_on_clone,
         "clone_detected": clone_detected,
         "clone_reason": clone_reason or None,

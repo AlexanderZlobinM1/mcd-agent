@@ -242,14 +242,38 @@ def _resolve_update_package(config: AgentConfig, target: str) -> Path:
     return dst
 
 
-def _run(cmd: list[str], *, cwd: str, as_www_data: bool = False) -> None:
+def _command_with_user(cmd: list[str], *, as_www_data: bool = False) -> list[str]:
     full = cmd
     if as_www_data:
         full = ["sudo", "-u", "www-data"] + cmd
+    return full
+
+
+def _run_capture(cmd: list[str], *, cwd: str, as_www_data: bool = False) -> subprocess.CompletedProcess[str]:
+    full = _command_with_user(cmd, as_www_data=as_www_data)
     logging.info("run: %s", " ".join(full))
-    proc = subprocess.run(full, cwd=cwd, text=True, capture_output=True)
+    return subprocess.run(full, cwd=cwd, text=True, capture_output=True)
+
+
+def _run(cmd: list[str], *, cwd: str, as_www_data: bool = False) -> None:
+    full = _command_with_user(cmd, as_www_data=as_www_data)
+    proc = _run_capture(cmd, cwd=cwd, as_www_data=as_www_data)
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(full)}\n{proc.stdout}\n{proc.stderr}")
+
+
+def _hard_clear_prod_cache(root: str) -> None:
+    cache_root = Path(root) / "var" / "cache"
+    prod_cache = cache_root / "prod"
+    if prod_cache.exists():
+        shutil.rmtree(prod_cache)
+    prod_cache.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.chown(cache_root, user="www-data", group="www-data")
+        shutil.chown(prod_cache, user="www-data", group="www-data")
+    except Exception:
+        subprocess.run(["chown", "-R", "www-data:www-data", str(cache_root)], check=False)
+    print("Composer preflight: cleared var/cache/prod")
 
 
 def _backup_install(root: str) -> Path:
@@ -461,6 +485,214 @@ def _doctrine_migrate_command(project_root: str, console_path: str, php_bin: str
     return "doctrine:migrations:migrate"
 
 
+def _doctrine_version_command(project_root: str, console_path: str, php_bin: str) -> str:
+    proc = subprocess.run(
+        ["sudo", "-u", "www-data", php_bin, console_path, "list", "doctrine"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if "doctrine:migrations:version" in output:
+        return "doctrine:migrations:version"
+    if "doctrine:migration:version" in output:
+        return "doctrine:migration:version"
+    return "doctrine:migrations:version"
+
+
+def _doctrine_status_command(project_root: str, console_path: str, php_bin: str) -> str:
+    proc = subprocess.run(
+        ["sudo", "-u", "www-data", php_bin, console_path, "list", "doctrine"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if "doctrine:migrations:status" in output:
+        return "doctrine:migrations:status"
+    if "doctrine:migration:status" in output:
+        return "doctrine:migration:status"
+    return "doctrine:migrations:status"
+
+
+def _doctrine_up_to_date_command(project_root: str, console_path: str, php_bin: str) -> str:
+    proc = subprocess.run(
+        ["sudo", "-u", "www-data", php_bin, console_path, "list", "doctrine"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if "doctrine:migrations:up-to-date" in output:
+        return "doctrine:migrations:up-to-date"
+    if "doctrine:migration:up-to-date" in output:
+        return "doctrine:migration:up-to-date"
+    return "doctrine:migrations:up-to-date"
+
+
+def _migration_status_count(output: str, label: str) -> int | None:
+    m = re.search(rf"\|\s*{re.escape(label)}\s*\|\s*(\d+)\s*\|", output)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _migration_unavailable_count(output: str) -> int:
+    return _migration_status_count(output, "Executed Unavailable") or 0
+
+
+def _migration_new_count(output: str) -> int:
+    return _migration_status_count(output, "New") or 0
+
+
+def _migration_unavailable_versions(output: str) -> list[str]:
+    versions: list[str] = []
+    for match in re.finditer(r"\((Mautic\\Migrations\\Version[0-9A-Za-z_]+)\)", output):
+        version = match.group(1)
+        if version not in versions:
+            versions.append(version)
+    return versions
+
+
+def _migration_failed_version(output: str) -> str | None:
+    patterns = (
+        r"Migration\s+(Mautic\\Migrations\\Version[0-9A-Za-z_]+)\s+failed",
+        r"(Mautic\\Migrations\\Version[0-9A-Za-z_]+)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, output)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _migration_already_in_schema_error(output: str) -> bool:
+    needles = (
+        "SQLSTATE[42S01]",
+        "Base table or view already exists",
+        "Table already exists",
+        "already exists",
+        "SQLSTATE[42S21]",
+        "Duplicate column name",
+        "Duplicate key name",
+        "Can't create table",
+    )
+    lowered = output.lower()
+    return any(x.lower() in lowered for x in needles)
+
+
+def _run_doctrine_migrate_with_reconcile(
+    project_root: str,
+    console_path: str,
+    php_bin: str,
+    migration_cmd: str,
+) -> None:
+    version_cmd = _doctrine_version_command(project_root, console_path, php_bin)
+    marked_versions: set[str] = set()
+    for _attempt in range(50):
+        proc = _run_capture(
+            [php_bin, console_path, migration_cmd, "--no-interaction"],
+            cwd=project_root,
+            as_www_data=True,
+        )
+        if proc.returncode == 0:
+            return
+        output = f"{proc.stdout}\n{proc.stderr}"
+        if not _migration_already_in_schema_error(output):
+            raise RuntimeError(
+                f"Command failed ({proc.returncode}): sudo -u www-data {php_bin} {console_path} {migration_cmd} --no-interaction"
+                f"\n{proc.stdout}\n{proc.stderr}"
+            )
+        version = _migration_failed_version(output)
+        if not version:
+            raise RuntimeError(
+                "Doctrine migration failed with an already-in-schema error, "
+                "but MCD could not identify the migration version to mark executed\n"
+                + output.strip()
+            )
+        if version in marked_versions:
+            raise RuntimeError(
+                "Doctrine migration still fails after marking the same already-in-schema version executed\n"
+                + output.strip()
+            )
+        marked_versions.add(version)
+        print(f"Doctrine migrations reconcile: marking {version} as executed after already-in-schema failure")
+        _run(
+            [php_bin, console_path, version_cmd, "--add", version, "--no-interaction"],
+            cwd=project_root,
+            as_www_data=True,
+        )
+    raise RuntimeError("Doctrine migration reconcile exceeded 50 already-in-schema retries")
+
+
+def _verify_or_reconcile_doctrine_migrations(project_root: str, console_path: str, php_bin: str) -> None:
+    up_to_date_cmd = _doctrine_up_to_date_command(project_root, console_path, php_bin)
+    status_cmd = _doctrine_status_command(project_root, console_path, php_bin)
+    version_cmd = _doctrine_version_command(project_root, console_path, php_bin)
+
+    check = _run_capture([php_bin, console_path, up_to_date_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+    if check.returncode == 0:
+        print("Doctrine migrations post-check: up-to-date")
+        return
+
+    status = _run_capture([php_bin, console_path, status_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+    status_output = f"{status.stdout}\n{status.stderr}"
+    new_count = _migration_new_count(status_output)
+    unavailable_count = _migration_unavailable_count(status_output)
+
+    if new_count > 0:
+        print(f"Doctrine migrations reconcile: marking {new_count} already-applied available migrations as executed")
+        _run(
+            [php_bin, console_path, version_cmd, "--add", "--all", "--no-interaction"],
+            cwd=project_root,
+            as_www_data=True,
+        )
+        check = _run_capture([php_bin, console_path, up_to_date_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+        if check.returncode == 0:
+            print("Doctrine migrations post-check: up-to-date after reconcile")
+            return
+        status = _run_capture([php_bin, console_path, status_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+        status_output = f"{status.stdout}\n{status.stderr}"
+        new_count = _migration_new_count(status_output)
+        unavailable_count = _migration_unavailable_count(status_output)
+
+    if new_count == 0 and unavailable_count > 0:
+        unavailable_versions = _migration_unavailable_versions(status_output)
+        if unavailable_versions:
+            print(
+                "Doctrine migrations reconcile: removing "
+                f"{len(unavailable_versions)} unavailable migration metadata record(s)"
+            )
+            for version in unavailable_versions:
+                _run(
+                    [php_bin, console_path, version_cmd, "--delete", version, "--no-interaction"],
+                    cwd=project_root,
+                    as_www_data=True,
+                )
+            check = _run_capture([php_bin, console_path, up_to_date_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+            if check.returncode == 0:
+                print("Doctrine migrations post-check: up-to-date after unavailable metadata cleanup")
+                return
+
+        print(
+            "Doctrine migrations post-check warning: "
+            f"{unavailable_count} previously executed migration(s) are no longer registered; no pending migrations remain"
+        )
+        return
+
+    output = f"{check.stdout}\n{check.stderr}".strip()
+    raise RuntimeError("Post-migration up-to-date check failed\n" + output)
+
+
 def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str) -> None:
     project_root = _resolve_composer_project_root(root)
     cjson = Path(project_root) / "composer.json"
@@ -477,11 +709,13 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     updated, changes = _replace_version_tokens(text, current, target)
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
+    _hard_clear_prod_cache(project_root)
     _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
     _run([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=project_root, as_www_data=True)
     migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
-    _run([php_bin, console_path, migration_cmd, "--no-interaction"], cwd=project_root, as_www_data=True)
+    _run_doctrine_migrate_with_reconcile(project_root, console_path, php_bin, migration_cmd)
+    _verify_or_reconcile_doctrine_migrations(project_root, console_path, php_bin)
 
 
 def _permissions_check(config: AgentConfig, root: str, *, stage_label: str) -> None:

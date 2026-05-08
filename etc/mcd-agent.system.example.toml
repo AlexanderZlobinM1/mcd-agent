@@ -304,7 +304,7 @@ fs_permissions_guard_console_relpath = "bin/console"
 # Merge model:
 # - global_rules: default/global rule set
 # - host_rules  : per-host override map/list; matching host patch overrides defaults by rule id
-db_watchdog = { enabled = false, interval_sec = 300, observe_only = true, processlist_limit = 500, sample_limit = 25, long_query_sec = 900, orphan_query_sec = 1200, global_rules = [], host_rules = {} }
+db_watchdog = { enabled = false, interval_sec = 300, observe_only = true, processlist_limit = 500, sample_limit = 25, long_query_sec = 900, orphan_query_sec = 1200, mcd_tmp_segment_query_sec = 1800, kill_mcd_tmp_segment_queries = true, global_rules = [], host_rules = {} }
 
 [sql]
 # Queue metric for throttling decision (must return one numeric value).
