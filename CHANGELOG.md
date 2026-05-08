@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.8.191 - 2026-05-08
+
+- Changed: release-only rebuild after the 0.8.190 public artifact was found stale
+  behind Cloudflare cache. Code is identical to 0.8.190 plus the version bump so
+  cluster nodes pull a fresh uncached package URL.
+
 ## 0.8.190 - 2026-05-08
 
 - Fixed: empty remote runtime overrides can no longer erase a configured local
