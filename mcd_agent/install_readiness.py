@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from typing import Any
 
-from mcd_agent.env import ipv6_status
+from mcd_agent.env import ipv6_runtime_disabled, ipv6_status, reconcile_ipv6_runtime_from_intent
 
 
 def _run(args: list[str], *, timeout_sec: int = 8) -> tuple[int, str]:
@@ -57,13 +57,7 @@ def _database_version_tuple(raw: str, engine: str) -> list[int]:
 
 
 def _ipv6_disabled() -> bool:
-    st = ipv6_status()
-    vals = [
-        str(v).strip()
-        for k, v in st.items()
-        if str(k).startswith("net.ipv6.conf.") and str(k).endswith(".disable_ipv6")
-    ]
-    return bool(vals) and all(v == "1" for v in vals)
+    return ipv6_runtime_disabled(ipv6_status()) is True
 
 
 def _php_versions() -> dict[str, Any]:
@@ -132,6 +126,7 @@ def _database_state() -> dict[str, Any]:
 
 
 def collect_mautic_install_readiness() -> dict[str, Any]:
+    reconcile_ipv6_runtime_from_intent()
     composer_exists, composer_version = _cmd_version("composer", ["--version"])
     node_exists, node_version = _cmd_version("node", ["--version"])
     npm_exists, npm_version = _cmd_version("npm", ["--version"])

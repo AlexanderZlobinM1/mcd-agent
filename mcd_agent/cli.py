@@ -60,7 +60,14 @@ from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_script
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
 from mcd_agent.discovery import discover_mautic
-from mcd_agent.env import build_policy_plan, default_policy, ipv6_status, parse_policy_text, set_ipv6_disabled
+from mcd_agent.env import (
+    build_policy_plan,
+    default_policy,
+    ipv6_runtime_disabled,
+    ipv6_status,
+    parse_policy_text,
+    set_ipv6_disabled,
+)
 from mcd_agent.executor import (
     build_mautic_exec_args,
     command_task_type,
@@ -365,23 +372,7 @@ def _is_mysql_auth_error(msg: str) -> bool:
 
 
 def _ipv6_disabled_now() -> bool | None:
-    st = ipv6_status()
-    keys = tuple(
-        k
-        for k in st
-        if k.startswith("net.ipv6.conf.")
-        and k.endswith(".disable_ipv6")
-    )
-    if not keys:
-        return None
-    vals = [str(st.get(k, "?")).strip() for k in keys]
-    if any(v == "?" or v == "" for v in vals):
-        return None
-    if all(v == "1" for v in vals):
-        return True
-    if all(v == "0" for v in vals):
-        return False
-    return None
+    return ipv6_runtime_disabled(ipv6_status())
 
 
 def _state_runtime_bootstrap_defaults(cfg) -> dict[str, object]:

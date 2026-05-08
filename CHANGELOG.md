@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.1 - 2026-05-08
+
+- Fixed: install-readiness now reconciles old MCD IPv6-disable intent with
+  currently visible runtime interfaces before reporting compatibility. Hosts
+  where previous MCD versions wrote `/etc/sysctl.d/99-disable-ipv6.conf` but
+  left interfaces such as `eth0` enabled are now brought to the intended
+  disabled runtime state automatically on the next state push.
+
 ## 0.9.0 - 2026-05-08
 
 - Added: host install-readiness snapshot in the regular MCC state push. MCD now

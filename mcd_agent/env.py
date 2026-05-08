@@ -40,6 +40,50 @@ def ipv6_status() -> dict[str, str]:
     return out
 
 
+def _status_ipv6_keys(st: dict[str, str]) -> list[str]:
+    return sorted(
+        k
+        for k in st
+        if k.startswith("net.ipv6.conf.")
+        and k.endswith(".disable_ipv6")
+    )
+
+
+def ipv6_runtime_disabled(st: dict[str, str] | None = None) -> bool | None:
+    data = st if st is not None else ipv6_status()
+    keys = _status_ipv6_keys(data)
+    if not keys:
+        return None
+    vals = [str(data.get(k, "?")).strip() for k in keys]
+    if any(v == "?" or v == "" for v in vals):
+        return None
+    return all(v == "1" for v in vals)
+
+
+def ipv6_disable_intent_enabled(st: dict[str, str] | None = None) -> bool:
+    data = st if st is not None else ipv6_status()
+    if str(data.get("persistent_exists", "")).strip() != "1":
+        return False
+    return all(str(data.get(k, "")).strip() == "1" for k in PERSISTENT_KEYS)
+
+
+def reconcile_ipv6_runtime_from_intent() -> list[str]:
+    st = ipv6_status()
+    if not ipv6_disable_intent_enabled(st):
+        return []
+    changed: list[str] = []
+    for key in _status_ipv6_keys(st):
+        if str(st.get(key, "")).strip() == "1":
+            continue
+        proc = subprocess.run(["sysctl", "-w", f"{key}=1"], capture_output=True, text=True)
+        msg = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0:
+            changed.append(f"ok {key}=1 {msg}".strip())
+        else:
+            changed.append(f"fail {key}=1 {msg}".strip())
+    return changed
+
+
 def set_ipv6_disabled(disabled: bool) -> list[str]:
     val = "1" if disabled else "0"
     lines = [f"{k}={val}" for k in PERSISTENT_KEYS]
