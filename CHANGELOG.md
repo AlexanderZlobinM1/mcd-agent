@@ -1,5 +1,25 @@
 # MCD Changelog
 
+## 0.8.196 - 2026-05-08
+
+- Fixed: cluster rolling self-update no longer treats nodes that already
+  completed install as stale health blockers. This keeps alias/backward
+  compatibility rows from blocking the real rolling update.
+
+## 0.8.195 - 2026-05-08
+
+- Fixed: cluster rolling self-update now canonicalizes the local node identity
+  to the MCC host key from the ordered cache route when `cluster_node_index` is
+  configured. This prevents duplicate rollout participants like `ananas-xxl`
+  plus `host-37-...` for the same machine and avoids download/install deadlocks.
+
+## 0.8.194 - 2026-05-08
+
+- Fixed: self-update apply now accepts MCC `update_available` decisions as an
+  executable update plan when `target` and `package_url` are present. This fixes
+  old agents that can see a channel update but refuse to apply it with
+  `no update plan (status=update_available)`, including cluster-channel nodes.
+
 ## 0.8.193 - 2026-05-08
 
 - Changed: task history is now treated as a short live operational slice rather

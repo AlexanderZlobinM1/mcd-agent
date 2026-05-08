@@ -559,6 +559,21 @@ def _dedupe_hosts(values: list[str]) -> list[str]:
 
 
 def _cluster_local_host_name(cfg: AgentConfig) -> str:
+    # Prefer the MCC canonical host key for rolling cluster updates. Some older
+    # cluster installs did not persist [mcc].host_name locally, but the cache
+    # route is ordered by cluster_node_index and uses MCC host keys. Using the
+    # local hostname in that case creates duplicate participants such as
+    # host-37-... and ananas-xxl for the same node, which deadlocks the rollout.
+    try:
+        idx = int(getattr(cfg, "cluster_node_index", 0) or 0)
+    except Exception:
+        idx = 0
+    if idx > 0:
+        cache_hosts = cluster_route_targets(cfg, "cache")
+        if 0 < idx <= len(cache_hosts):
+            text = str(cache_hosts[idx - 1] or "").strip()
+            if text:
+                return text
     ident = resolve_agent_identity(cfg)
     for key in (
         "effective_mcc_host_name",
@@ -794,6 +809,8 @@ def _cluster_recent_blockers(payload: dict[str, Any], *, now_s: int) -> list[str
         node = nodes.get(host)
         if not isinstance(node, dict):
             blockers.append(f"{host}: no update health")
+            continue
+        if str(node.get("install_status") or "") == "success":
             continue
         seen = int(node.get("last_seen") or 0)
         if seen <= 0 or now_s - seen > _CLUSTER_UPDATE_HEALTH_STALE_SEC:
@@ -1051,6 +1068,12 @@ def maybe_cluster_auto_update(
 
 def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     status = str(plan.get("status", "")).strip().lower()
+    if status == "update_available":
+        # MCC may return update_available when the host should download/apply
+        # without holding a central update session (notably cluster-channel
+        # coordination). Treat that as an executable plan once target and
+        # package_url are present.
+        status = "update"
     if status != "update":
         return False, f"no update plan (status={status or '-'})"
     target = str(plan.get("target", "")).strip()
