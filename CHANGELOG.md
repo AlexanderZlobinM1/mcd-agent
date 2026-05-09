@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.4 - 2026-05-09
+
+- Fixed: `mcd-cli instance-delete --delete-vhost` now disables only the selected
+  instance vhost by exact `server_name`/domain match in `sites-enabled`.
+- Safety: vhost deletion no longer matches by application root alone and no
+  longer deletes `sites-available` configs; enabled symlinks are removed while
+  available configs are preserved for recovery/audit. Legacy regular files in
+  `sites-enabled` are copied to `sites-available` before being disabled.
+
 ## 0.9.3 - 2026-05-09
 
 - Fixed: `mcd-cli instance-delete` now drops the selected database using the

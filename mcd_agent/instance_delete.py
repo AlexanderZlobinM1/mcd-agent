@@ -19,6 +19,13 @@ _LOCAL_DB_HOSTS = {"", "localhost", "127.0.0.1", "::1"}
 _NGINX_DIRS = (Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/sites-available"))
 
 
+def _nginx_dir(name: str) -> Path:
+    for directory in _NGINX_DIRS:
+        if directory.name == name:
+            return directory
+    return Path("/etc/nginx") / name
+
+
 @dataclass
 class InstanceDeletePlan:
     root: Path
@@ -176,36 +183,81 @@ def _read_nginx_text(path: Path) -> str:
         return ""
 
 
+def _nginx_server_names(text: str) -> set[str]:
+    names: set[str] = set()
+    for match in re.finditer(r"(?im)^\s*server_name\s+([^;]+);", text):
+        for raw in re.split(r"\s+", match.group(1).strip()):
+            name = raw.strip().lower().rstrip(".")
+            if not name or name == "_" or name.startswith("~"):
+                continue
+            names.add(name)
+    return names
+
+
+def _nginx_matches_domain(path: Path, domain_set: set[str]) -> bool:
+    if not domain_set:
+        return False
+    text = _read_nginx_text(path)
+    if text:
+        names = _nginx_server_names(text)
+        if names.intersection(domain_set):
+            return True
+    return path.name.lower() in {f"{domain}.conf" for domain in domain_set}
+
+
 def _nginx_candidates(root: Path, domains: list[str]) -> list[Path]:
     wanted: list[Path] = []
     domain_set = {d.lower() for d in domains if d}
-    root_text = str(root)
+    if not domain_set:
+        return []
+    enabled_root = _nginx_dir("sites-enabled")
+    enabled_dir = enabled_root.resolve(strict=False)
     for domain in sorted(domain_set):
-        for base in _NGINX_DIRS:
-            wanted.append(base / f"{domain}.conf")
+        enabled = enabled_root / f"{domain}.conf"
+        if _nginx_matches_domain(enabled, domain_set):
+            wanted.append(enabled)
 
     for base in _NGINX_DIRS:
+        try:
+            base_resolved = base.resolve(strict=False)
+        except Exception:
+            continue
+        if base_resolved != enabled_dir:
+            continue
         if not base.exists() or not base.is_dir():
             continue
         for item in base.iterdir():
             if not item.is_file() and not item.is_symlink():
                 continue
-            text = _read_nginx_text(item)
-            if not text:
-                continue
-            lower = text.lower()
-            matched_domain = any(d in lower for d in domain_set)
-            matched_root = root_text in text
-            if matched_domain or matched_root:
+            if _nginx_matches_domain(item, domain_set):
                 wanted.append(item)
-                if item.is_symlink():
-                    try:
-                        target = item.resolve(strict=True)
-                        if target.parent.resolve(strict=False) == Path("/etc/nginx/sites-available").resolve(strict=False):
-                            wanted.append(target)
-                    except Exception:
-                        pass
     return [p for p in _dedupe_paths(wanted) if _safe_nginx_child(p)]
+
+
+def _disable_nginx_vhost(path: Path) -> tuple[bool, str]:
+    if not (path.exists() or path.is_symlink()):
+        return False, f"nginx vhost already absent: {path}"
+    enabled_dir = _nginx_dir("sites-enabled").resolve(strict=False)
+    available_dir = _nginx_dir("sites-available")
+    try:
+        parent = path.parent.resolve(strict=False)
+    except Exception:
+        raise RuntimeError(f"unsafe nginx path: {path}")
+    if parent != enabled_dir:
+        return False, f"preserved non-enabled nginx config: {path}"
+    if path.is_symlink():
+        path.unlink()
+        return True, f"removed enabled symlink: {path}"
+
+    # Legacy guard: sites-enabled must contain symlinks only. If an older host
+    # has a regular file there, preserve the config in sites-available first and
+    # then disable the enabled copy.
+    available_dir.mkdir(parents=True, exist_ok=True)
+    target = available_dir / path.name
+    if not target.exists():
+        shutil.copy2(path, target)
+    path.unlink()
+    return True, f"moved regular enabled config to sites-available and disabled: {path}"
 
 
 def build_delete_plan(
@@ -335,12 +387,13 @@ def delete_instance_artifacts(
             result["warnings"].append("no matching nginx vhost files found")
         for path in plan.nginx_paths:
             try:
-                if path.exists() or path.is_symlink():
-                    path.unlink()
+                changed, msg = _disable_nginx_vhost(path)
+                result["warnings"].append(msg)
+                if changed:
                     result["deleted"]["vhost"].append(str(path))
             except Exception as exc:
                 raise RuntimeError(f"failed to remove nginx path {path}: {exc}") from exc
-        if plan.nginx_paths:
+        if result["deleted"]["vhost"]:
             rc, out = _run(["nginx", "-t"], timeout_sec=30)
             if rc != 0:
                 raise RuntimeError("nginx -t failed after vhost removal: " + out)
