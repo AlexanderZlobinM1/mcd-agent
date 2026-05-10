@@ -131,6 +131,59 @@ add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
         self.assertEqual(set(files), {site.resolve(), confd.resolve()})
 
+    def test_normalize_sites_enabled_symlink_requires_conf_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            enabled = root / "sites-enabled"
+            available = root / "sites-available"
+            backup = root / "backup"
+            enabled.mkdir()
+            available.mkdir()
+            site = available / "s.apetit.rs"
+            site.write_text("server { server_name s.apetit.rs; }\n", encoding="utf-8")
+            old_link = enabled / "s.apetit.rs"
+            old_link.symlink_to(site)
+
+            old_enabled = nginx_baseline.SITES_ENABLED
+            try:
+                nginx_baseline.SITES_ENABLED = enabled
+                actions = nginx_baseline._normalize_sites_enabled_conf_suffix(backup, {})
+            finally:
+                nginx_baseline.SITES_ENABLED = old_enabled
+
+            self.assertIn("sites_enabled_conf_suffix:s.apetit.rs->s.apetit.rs.conf", actions)
+            self.assertFalse(old_link.exists())
+            self.assertTrue((enabled / "s.apetit.rs.conf").is_symlink())
+            self.assertEqual((enabled / "s.apetit.rs.conf").resolve(), site.resolve())
+
+    def test_convert_sites_enabled_regular_file_writes_conf_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            enabled = root / "sites-enabled"
+            available = root / "sites-available"
+            backup = root / "backup"
+            enabled.mkdir()
+            available.mkdir()
+            legacy = enabled / "legacy.example.com"
+            legacy.write_text("server { server_name legacy.example.com; }\n", encoding="utf-8")
+
+            old_enabled = nginx_baseline.SITES_ENABLED
+            old_available = nginx_baseline.SITES_AVAILABLE
+            try:
+                nginx_baseline.SITES_ENABLED = enabled
+                nginx_baseline.SITES_AVAILABLE = available
+                actions = nginx_baseline._convert_sites_enabled_regular_files(backup, {})
+            finally:
+                nginx_baseline.SITES_ENABLED = old_enabled
+                nginx_baseline.SITES_AVAILABLE = old_available
+
+            self.assertIn("sites_available_updated:legacy.example.com.conf", actions)
+            self.assertIn("sites_enabled_symlink:legacy.example.com->legacy.example.com.conf", actions)
+            self.assertFalse(legacy.exists())
+            self.assertTrue((available / "legacy.example.com.conf").is_file())
+            self.assertTrue((enabled / "legacy.example.com.conf").is_symlink())
+            self.assertEqual((enabled / "legacy.example.com.conf").resolve(), (available / "legacy.example.com.conf").resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

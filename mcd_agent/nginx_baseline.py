@@ -64,6 +64,10 @@ def _has_sites_enabled_include(text: str) -> bool:
     return False
 
 
+def _conf_name(name: str) -> str:
+    return name if name.endswith(".conf") else f"{name}.conf"
+
+
 def _sites_enabled_has_regular_files() -> bool:
     if not SITES_ENABLED.exists():
         return False
@@ -74,6 +78,20 @@ def _sites_enabled_has_regular_files() -> bool:
             if path.is_symlink():
                 continue
             if path.is_file():
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _sites_enabled_has_non_conf_entries() -> bool:
+    if not SITES_ENABLED.exists():
+        return False
+    try:
+        for path in SITES_ENABLED.iterdir():
+            if path.name.startswith("."):
+                continue
+            if not path.name.endswith(".conf"):
                 return True
     except Exception:
         return True
@@ -91,6 +109,8 @@ def nginx_baseline_satisfied() -> bool:
         if not _has_sites_enabled_include(text):
             return False
     if _sites_enabled_has_regular_files():
+        return False
+    if _sites_enabled_has_non_conf_entries():
         return False
     if _read_text(HARDENING_SNIPPET) != _desired_hardening_snippet():
         return False
@@ -358,9 +378,13 @@ def _convert_sites_enabled_regular_files(backup_dir: Path, snapshots: dict[Path,
         if not enabled.is_file():
             continue
         SITES_AVAILABLE.mkdir(parents=True, exist_ok=True)
-        available = SITES_AVAILABLE / enabled.name
+        enabled_name = _conf_name(enabled.name)
+        available = SITES_AVAILABLE / enabled_name
+        enabled_link = SITES_ENABLED / enabled_name
         _snapshot(enabled, backup_dir, snapshots)
         _snapshot(available, backup_dir, snapshots)
+        if enabled_link != enabled:
+            _snapshot(enabled_link, backup_dir, snapshots)
         try:
             copy_required = True
             if available.exists() and available.is_file():
@@ -372,10 +396,36 @@ def _convert_sites_enabled_regular_files(backup_dir: Path, snapshots: dict[Path,
                 shutil.copy2(enabled, available)
                 actions.append(f"sites_available_updated:{available.name}")
             enabled.unlink()
-            os.symlink(str(available), str(enabled))
-            actions.append(f"sites_enabled_symlink:{enabled.name}")
+            if os.path.lexists(enabled_link):
+                enabled_link.unlink()
+            os.symlink(str(available), str(enabled_link))
+            actions.append(f"sites_enabled_symlink:{enabled.name}->{enabled_link.name}")
         except Exception as e:
             actions.append(f"sites_enabled_symlink_failed:{enabled.name}:{e}")
+    return actions
+
+
+def _normalize_sites_enabled_conf_suffix(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    actions: list[str] = []
+    if not SITES_ENABLED.exists():
+        return actions
+    for enabled in sorted(SITES_ENABLED.iterdir()):
+        if enabled.name.startswith(".") or enabled.name.endswith(".conf"):
+            continue
+        if not enabled.is_symlink():
+            continue
+        target = os.readlink(enabled)
+        normalized = SITES_ENABLED / _conf_name(enabled.name)
+        _snapshot(enabled, backup_dir, snapshots)
+        _snapshot(normalized, backup_dir, snapshots)
+        try:
+            if os.path.lexists(normalized):
+                normalized.unlink()
+            os.symlink(target, normalized)
+            enabled.unlink()
+            actions.append(f"sites_enabled_conf_suffix:{enabled.name}->{normalized.name}")
+        except Exception as e:
+            actions.append(f"sites_enabled_conf_suffix_failed:{enabled.name}:{e}")
     return actions
 
 
@@ -436,6 +486,10 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
             symlink_actions = _convert_sites_enabled_regular_files(backup_dir, snapshots)
             if symlink_actions:
                 actions.extend(symlink_actions)
+                changed = True
+            suffix_actions = _normalize_sites_enabled_conf_suffix(backup_dir, snapshots)
+            if suffix_actions:
+                actions.extend(suffix_actions)
                 changed = True
         hardening_actions = _write_hardening_snippet(backup_dir, snapshots)
         if hardening_actions:

@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.8 - 2026-05-10
+
+- Fixed: nginx baseline now normalizes legacy enabled site entries without a
+  `.conf` suffix into `.conf` symlinks. This keeps vhosts loaded after the
+  Ondrej/Sury nginx package is replaced by official `nginx.org` nginx, where
+  MCD-managed nginx config includes only `/etc/nginx/sites-enabled/*.conf`.
+
 ## 0.9.7 - 2026-05-10
 
 - Added: nginx baseline now installs a shared Mautic hardening snippet and
