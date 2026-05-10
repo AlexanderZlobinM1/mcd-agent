@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.5 - 2026-05-10
+
+- Fixed: cluster non-authority nodes no longer run standalone backup storage
+  probes. In cluster backup mode only the configured backup authority probes
+  Storage Box connectivity, so PXC/web nodes do not log false
+  `backup storage is not configured` warnings when shared cluster backup
+  settings are present.
+
 ## 0.9.4 - 2026-05-09
 
 - Fixed: `mcd-cli instance-delete --delete-vhost` now disables only the selected

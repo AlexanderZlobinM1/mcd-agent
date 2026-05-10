@@ -862,6 +862,21 @@ def _backup_attempted_for_local_date(config: AgentConfig, local_dt: datetime) ->
         return False
 
 
+def _backup_storage_probe_allowed(config: AgentConfig) -> tuple[bool, str]:
+    if not bool(getattr(config, "backup_enabled", False)):
+        return False, "backup disabled"
+    if not bool(getattr(config, "backup_cluster_enabled", False)):
+        return True, ""
+
+    authority = cluster_backup_authority_status(config)
+    if not bool(authority.get("allowed")):
+        reason = str(authority.get("reason") or "not cluster backup authority").strip()
+        return False, f"cluster backup non-authority: {reason}"
+    if not bool(getattr(config, "backup_cluster_remote_enabled", True)):
+        return False, "cluster remote backup disabled"
+    return True, ""
+
+
 def _cluster_state_ts_local_date(value: str, local_dt: datetime) -> bool:
     raw = str(value or "").strip()
     if not raw:
@@ -3960,25 +3975,29 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             next_zabbix_version_cache_guard_at = now + _ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC
 
         if config.backup_enabled and now >= next_backup_storage_probe_at:
-            probe_backup_locked = False
-            try:
-                probe_backup_locked = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(config)
-            except Exception as e:
-                logging.warning("backup storage probe lock check failed: %s", e)
-            if probe_backup_locked:
-                logging.info("backup storage probe skipped: backup lock active")
+            probe_allowed, probe_skip_reason = _backup_storage_probe_allowed(config)
+            if not probe_allowed:
+                logging.info("backup storage probe skipped: %s", probe_skip_reason)
             else:
+                probe_backup_locked = False
                 try:
-                    probe_res = backup_storage_probe(config)
-                    probe_status = str(probe_res.get("status", "")).strip().lower()
-                    if probe_status == "ok":
-                        logging.info("backup storage probe ok")
-                    elif probe_status == "failed":
-                        logging.warning("backup storage probe failed: %s", probe_res.get("error", "unknown"))
-                    elif probe_status == "skipped":
-                        logging.info("backup storage probe skipped: %s", probe_res.get("reason", "-"))
+                    probe_backup_locked = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(config)
                 except Exception as e:
-                    logging.warning("backup storage probe failed: %s", e)
+                    logging.warning("backup storage probe lock check failed: %s", e)
+                if probe_backup_locked:
+                    logging.info("backup storage probe skipped: backup lock active")
+                else:
+                    try:
+                        probe_res = backup_storage_probe(config)
+                        probe_status = str(probe_res.get("status", "")).strip().lower()
+                        if probe_status == "ok":
+                            logging.info("backup storage probe ok")
+                        elif probe_status == "failed":
+                            logging.warning("backup storage probe failed: %s", probe_res.get("error", "unknown"))
+                        elif probe_status == "skipped":
+                            logging.info("backup storage probe skipped: %s", probe_res.get("reason", "-"))
+                    except Exception as e:
+                        logging.warning("backup storage probe failed: %s", e)
             next_backup_storage_probe_at = now + 7200.0
 
         if config.tasks_compact_enabled:
