@@ -520,6 +520,8 @@ class AgentConfig:
     mcc_push_apt_state_interval_sec: int
     mcc_runtime_overrides_poll_enabled: bool
     mcc_profile_guard_enabled: bool
+    inventory_auto_rescan_enabled: bool
+    inventory_auto_rescan_interval_sec: int
     outbound_events_sent_keep_days: int
     mcc_host_name: str | None
     cluster_id: str | None
@@ -1563,6 +1565,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "viber_stats_enabled": "viber_stats_enabled",
     "viber_stats_interval_sec": "viber_stats_interval_sec",
     "viber_stats_instance_settings": "viber_stats_instance_settings",
+    "inventory_auto_rescan_enabled": "inventory_auto_rescan_enabled",
+    "inventory_auto_rescan_interval_sec": "inventory_auto_rescan_interval_sec",
     "empty_leads_cleanup_enabled": "empty_leads_cleanup_enabled",
     "empty_leads_cleanup_interval_sec": "empty_leads_cleanup_interval_sec",
     "empty_leads_cleanup_batch_size": "empty_leads_cleanup_batch_size",
@@ -2459,6 +2463,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         mcc_push_apt_state_interval_sec=int(mcc.get("push_apt_state_interval_sec", 120)),
         mcc_runtime_overrides_poll_enabled=bool(mcc.get("runtime_overrides_poll_enabled", True)),
         mcc_profile_guard_enabled=profile_guard_enabled,
+        inventory_auto_rescan_enabled=bool(runtime.get("inventory_auto_rescan_enabled", True)),
+        inventory_auto_rescan_interval_sec=max(
+            300,
+            int(runtime.get("inventory_auto_rescan_interval_sec", 3600) or 3600),
+        ),
         outbound_events_sent_keep_days=int(runtime.get("outbound_events_sent_keep_days", 14)),
         mcc_host_name=str(mcc.get("host_name")).strip() if mcc.get("host_name") else None,
         cluster_id=cluster_id,

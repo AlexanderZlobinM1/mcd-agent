@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.16 - 2026-05-10
+
+- Added: daemon-side automatic Mautic inventory rescan. By default MCD refreshes
+  autodiscovered instances hourly and forces the next MCC state push when the
+  inventory changes, so instances created from images become visible without a
+  manual MCC rescan.
+- Safety: automatic rescans preserve locally added manual inventory rows; the
+  existing explicit `mcd-cli instances rescan` behavior is unchanged.
+- Added: runtime overrides `inventory_auto_rescan_enabled` and
+  `inventory_auto_rescan_interval_sec` for tuning or disabling this behavior.
+
 ## 0.9.15 - 2026-05-10
 
 - Added: empty contacts cleanup now supports both interval scheduling and

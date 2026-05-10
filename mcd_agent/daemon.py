@@ -3969,6 +3969,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_viber_cron_reconcile_at = 0.0
     next_empty_leads_cleanup_cron_reconcile_at = 0.0
     next_cluster_assets_guard_at = 0.0
+    next_inventory_auto_rescan_at = time.time() + min(300, max(60, int(getattr(config, "poll_interval_sec", 60) or 60)))
+    last_inventory_signature = ""
     runtime_overrides_sync_requested = False
     # Always perform an initial runtime-overrides sync after daemon start/restart.
     # This is required even when periodic polling is disabled to avoid running
@@ -3997,6 +3999,33 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     int(rec.get("shadow_replaced", 0) or 0),
                 )
             next_scheduler_reconcile_at = now + max(15, int(config.scheduler_reconcile_interval_sec or 60))
+
+        if bool(getattr(config, "inventory_auto_rescan_enabled", True)) and now >= next_inventory_auto_rescan_at:
+            interval = max(300, int(getattr(config, "inventory_auto_rescan_interval_sec", 3600) or 3600))
+            try:
+                before = inventory.list_instances()
+                before_sig = "|".join(
+                    sorted(f"{getattr(inst, 'instance_uid', '')}:{getattr(inst, 'root', '')}" for inst in before)
+                )
+                count = inventory.rescan(config, preserve_manual=True)
+                installs = inventory.list_instances()
+                after_sig = "|".join(
+                    sorted(f"{getattr(inst, 'instance_uid', '')}:{getattr(inst, 'root', '')}" for inst in installs)
+                )
+                if after_sig != before_sig and after_sig != last_inventory_signature:
+                    logging.info(
+                        "inventory auto-rescan updated local instances: before=%s after=%s",
+                        len(before),
+                        count,
+                    )
+                    # Force next MCC state push to carry the refreshed inventory immediately.
+                    pusher.last_hash = ""
+                    pusher.last_push_ts = 0.0
+                last_inventory_signature = after_sig
+            except Exception as e:
+                logging.warning("inventory auto-rescan failed: %s", e)
+            next_inventory_auto_rescan_at = now + interval
+
         ext = _sync_external_running_tasks(installs=installs, running=running, popens=popens)
         if any(int(ext.get(k, 0) or 0) > 0 for k in ("adopted", "updated", "released")):
             logging.info(

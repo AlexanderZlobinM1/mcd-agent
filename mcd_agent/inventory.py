@@ -271,14 +271,17 @@ class InstanceInventory:
         row = self.conn.execute("SELECT COUNT(*) AS cnt FROM instances").fetchone()
         return int(row["cnt"]) if row else 0
 
-    def rescan(self, config: AgentConfig) -> int:
+    def rescan(self, config: AgentConfig, *, preserve_manual: bool = False) -> int:
         installs = discover_mautic(
             config.discovery_roots,
             config.exclude_path_contains,
             config.supported_mautic_majors,
             config.custom_instances,
         )
-        self.conn.execute("DELETE FROM instances WHERE source IN ('autodiscovery','manual')")
+        if preserve_manual:
+            self.conn.execute("DELETE FROM instances WHERE source='autodiscovery'")
+        else:
+            self.conn.execute("DELETE FROM instances WHERE source IN ('autodiscovery','manual')")
         for inst in installs:
             self._upsert_install(inst, source=inst.source or "autodiscovery")
         self.conn.commit()
