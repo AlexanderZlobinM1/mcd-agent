@@ -42,6 +42,16 @@ MANAGED_INDEXES: tuple[ManagedIndex, ...] = (
         name="idx_mcd_audit_segment_due",
         columns=("bundle", "object", "object_id", "action", "date_added"),
     ),
+    ManagedIndex(
+        table="leads",
+        name="idx_mcd_leads_email",
+        columns=("email",),
+    ),
+    ManagedIndex(
+        table="campaign_lead_event_log",
+        name="idx_mcd_clel_scheduled_trigger_id",
+        columns=("is_scheduled", "trigger_date", "id"),
+    ),
 )
 
 

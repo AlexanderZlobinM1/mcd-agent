@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.12 - 2026-05-10
+
+- Added: `mautic_db_indexes` now also manages `leads(email)` and
+  `campaign_lead_event_log(is_scheduled, trigger_date, id)` for faster email
+  lookups and scheduled campaign event scans.
+
 ## 0.9.11 - 2026-05-10
 
 - Fixed: `mautic_db_indexes --dry-run` now reports the aggregate result as

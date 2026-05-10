@@ -15,6 +15,15 @@ class MauticDbIndexesTests(unittest.TestCase):
         self.assertIn("`leadlist_id`, `date_added`, `manually_removed`, `lead_id`", sql)
         self.assertIn("ALGORITHM=INPLACE, LOCK=NONE", sql)
 
+    def test_global_profile_contains_email_and_campaign_schedule_indexes(self) -> None:
+        by_name = {idx.name: idx for idx in MANAGED_INDEXES}
+
+        self.assertEqual(by_name["idx_mcd_leads_email"].columns, ("email",))
+        self.assertEqual(
+            by_name["idx_mcd_clel_scheduled_trigger_id"].columns,
+            ("is_scheduled", "trigger_date", "id"),
+        )
+
     def test_existing_index_detected_by_same_columns_under_other_name(self) -> None:
         present, reason = _index_already_present(
             {"custom_idx": ("leadlist_id", "date_added", "manually_removed", "lead_id")},
