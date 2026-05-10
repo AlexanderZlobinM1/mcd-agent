@@ -618,6 +618,75 @@ class MauticDB:
             "batch_size": limit,
         }
 
+    def delete_empty_leads(
+        self,
+        *,
+        mode: str,
+        batch_size: int,
+        max_batches: int,
+    ) -> dict[str, Any]:
+        """
+        Delete contacts that are unusable for import/matching.
+
+        Supported modes are intentionally narrow and mirror MCC UI choices:
+        - both_null: email IS NULL AND mobile IS NULL
+        - email_null: email IS NULL
+        - mobile_null: mobile IS NULL
+        - email_or_mobile_null: email IS NULL OR mobile IS NULL
+        """
+        table = self._safe_table(f"{self.cfg.table_prefix}leads")
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "both_null":
+            predicate = "`email` IS NULL AND `mobile` IS NULL"
+        elif normalized_mode == "email_null":
+            predicate = "`email` IS NULL"
+        elif normalized_mode == "mobile_null":
+            predicate = "`mobile` IS NULL"
+        elif normalized_mode == "email_or_mobile_null":
+            predicate = "(`email` IS NULL OR `mobile` IS NULL)"
+        else:
+            raise ValueError(f"unsupported_empty_leads_cleanup_mode:{normalized_mode}")
+        limit = max(1, int(batch_size))
+        batches_left = max(1, int(max_batches))
+        delete_sql = (
+            f"DELETE FROM `{table}` "
+            "WHERE `id` IN ("
+            "  SELECT doomed.id FROM ("
+            f"    SELECT `id` FROM `{table}` "
+            f"    WHERE {predicate} "
+            "    ORDER BY `id` ASC "
+            "    LIMIT %s"
+            "  ) doomed"
+            ")"
+        )
+        started = time.monotonic()
+        total_deleted = 0
+        batches_run = 0
+        last_deleted = 0
+        stop_reason = "empty"
+        with self._connect() as conn:
+            while batches_run < batches_left:
+                with conn.cursor() as cur:
+                    affected = int(cur.execute(delete_sql, (limit,)) or 0)
+                last_deleted = affected
+                if affected <= 0:
+                    stop_reason = "empty"
+                    break
+                total_deleted += affected
+                batches_run += 1
+                if batches_run >= batches_left:
+                    stop_reason = "max_batches"
+                    break
+        return {
+            "mode": normalized_mode,
+            "batches_run": batches_run,
+            "total_deleted": total_deleted,
+            "last_deleted": last_deleted,
+            "elapsed_sec": max(0.0, float(time.monotonic() - started)),
+            "stop_reason": stop_reason,
+            "batch_size": limit,
+        }
+
     def fetch_processlist(self, *, limit: int = 500) -> list[dict[str, Any]]:
         query = "SHOW FULL PROCESSLIST"
         with self._connect() as conn:

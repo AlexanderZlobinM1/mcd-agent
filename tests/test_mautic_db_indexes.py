@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from mcd_agent.mautic_db_indexes import MANAGED_INDEXES, _add_index_sql, _connect, _index_already_present
+from mcd_agent.mautic_db_indexes import (
+    MANAGED_INDEXES,
+    _add_index_sql,
+    _connect,
+    _fax_indexes_to_drop,
+    _index_already_present,
+    _is_too_many_indexes_error,
+)
+import pymysql
 from mcd_agent.models import DBConfig
 
 
@@ -15,14 +23,26 @@ class MauticDbIndexesTests(unittest.TestCase):
         self.assertIn("`leadlist_id`, `date_added`, `manually_removed`, `lead_id`", sql)
         self.assertIn("ALGORITHM=INPLACE, LOCK=NONE", sql)
 
-    def test_global_profile_contains_email_and_campaign_schedule_indexes(self) -> None:
+    def test_global_profile_contains_email_mobile_and_campaign_schedule_indexes(self) -> None:
         by_name = {idx.name: idx for idx in MANAGED_INDEXES}
 
         self.assertEqual(by_name["idx_mcd_leads_email"].columns, ("email",))
+        self.assertEqual(by_name["idx_mcd_leads_mobile"].columns, ("mobile",))
         self.assertEqual(
             by_name["idx_mcd_clel_scheduled_trigger_id"].columns,
             ("is_scheduled", "trigger_date", "id"),
         )
+
+    def test_fax_indexes_are_prunable_when_mysql_index_limit_is_hit(self) -> None:
+        indexes = {
+            "PRIMARY": ("id",),
+            "fax": ("fax",),
+            "idx_contacts_fax": ("some_other_column",),
+            "idx_email": ("email",),
+        }
+
+        self.assertEqual(_fax_indexes_to_drop(indexes), ["fax", "idx_contacts_fax"])
+        self.assertTrue(_is_too_many_indexes_error(pymysql.err.OperationalError(1069, "Too many keys specified; max 64 keys allowed")))
 
     def test_existing_index_detected_by_same_columns_under_other_name(self) -> None:
         present, reason = _index_already_present(

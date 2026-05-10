@@ -48,6 +48,11 @@ MANAGED_INDEXES: tuple[ManagedIndex, ...] = (
         columns=("email",),
     ),
     ManagedIndex(
+        table="leads",
+        name="idx_mcd_leads_mobile",
+        columns=("mobile",),
+    ),
+    ManagedIndex(
         table="campaign_lead_event_log",
         name="idx_mcd_clel_scheduled_trigger_id",
         columns=("is_scheduled", "trigger_date", "id"),
@@ -123,6 +128,31 @@ def _add_index_sql(prefix: str, index: ManagedIndex) -> str:
     )
 
 
+def _drop_index_sql(table_name: str, index_name: str) -> str:
+    return (
+        f"ALTER TABLE {_quote_ident(table_name)} DROP INDEX {_quote_ident(index_name)}, "
+        "ALGORITHM=INPLACE, LOCK=NONE"
+    )
+
+
+def _is_too_many_indexes_error(exc: pymysql.err.OperationalError) -> bool:
+    code = int(exc.args[0]) if exc.args else 0
+    message = str(exc).lower()
+    return code == 1069 or "too many keys" in message or "max 64 keys" in message
+
+
+def _fax_indexes_to_drop(existing: dict[str, tuple[str, ...]]) -> list[str]:
+    out: list[str] = []
+    for name, columns in existing.items():
+        if name == "PRIMARY":
+            continue
+        lowered_name = str(name or "").lower()
+        lowered_cols = tuple(str(c or "").lower() for c in columns)
+        if lowered_cols == ("fax",) or "fax" in lowered_name:
+            out.append(name)
+    return sorted(set(out))
+
+
 def apply_mautic_db_indexes_to_install(
     install: MauticInstall,
     *,
@@ -135,6 +165,7 @@ def apply_mautic_db_indexes_to_install(
     prefix = str(db.table_prefix or "")
     planned: list[dict[str, Any]] = []
     applied: list[str] = []
+    dropped: list[str] = []
     skipped: list[dict[str, str]] = []
 
     with _connect(db) as conn:
@@ -167,10 +198,40 @@ def apply_mautic_db_indexes_to_install(
                         "reason": "table_busy",
                         "error": str(exc),
                         "applied": applied,
+                        "dropped": dropped,
                         "planned": planned,
                         "skipped": skipped,
                         "root": install.root,
                     }
+                if idx.table == "leads" and _is_too_many_indexes_error(exc):
+                    fax_indexes = _fax_indexes_to_drop(existing)
+                    if not fax_indexes:
+                        raise
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(f"SET SESSION lock_wait_timeout={max(1, int(lock_wait_timeout_sec))}")
+                            cur.execute(f"SET SESSION innodb_lock_wait_timeout={max(1, int(lock_wait_timeout_sec))}")
+                            for fax_idx in fax_indexes:
+                                cur.execute(_drop_index_sql(table_name, fax_idx))
+                                dropped.append(f"{table_name}.{fax_idx}")
+                                existing.pop(fax_idx, None)
+                            cur.execute(sql)
+                        applied.append(idx.name)
+                    except pymysql.err.OperationalError as retry_exc:
+                        retry_code = int(retry_exc.args[0]) if retry_exc.args else 0
+                        if retry_code in {1205, 1213}:
+                            return {
+                                "status": "deferred",
+                                "reason": "table_busy",
+                                "error": str(retry_exc),
+                                "applied": applied,
+                                "dropped": dropped,
+                                "planned": planned,
+                                "skipped": skipped,
+                                "root": install.root,
+                            }
+                        raise
+                    continue
                 raise
 
     if dry_run:
@@ -178,6 +239,7 @@ def apply_mautic_db_indexes_to_install(
     return {
         "status": "applied" if applied else "noop",
         "applied": applied,
+        "dropped": dropped,
         "planned": planned,
         "skipped": skipped,
         "root": install.root,

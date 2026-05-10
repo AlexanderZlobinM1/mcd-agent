@@ -461,6 +461,11 @@ class AgentConfig:
     viber_stats_enabled: bool
     viber_stats_interval_sec: int
     viber_stats_instance_settings: dict[str, Any]
+    empty_leads_cleanup_enabled: bool
+    empty_leads_cleanup_interval_sec: int
+    empty_leads_cleanup_batch_size: int
+    empty_leads_cleanup_max_batches_per_run: int
+    empty_leads_cleanup_instance_settings: dict[str, Any]
     cluster_assets_enabled: bool
     cluster_assets_interval_sec: int
     cluster_assets_state_file: str
@@ -1558,6 +1563,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "viber_stats_enabled": "viber_stats_enabled",
     "viber_stats_interval_sec": "viber_stats_interval_sec",
     "viber_stats_instance_settings": "viber_stats_instance_settings",
+    "empty_leads_cleanup_enabled": "empty_leads_cleanup_enabled",
+    "empty_leads_cleanup_interval_sec": "empty_leads_cleanup_interval_sec",
+    "empty_leads_cleanup_batch_size": "empty_leads_cleanup_batch_size",
+    "empty_leads_cleanup_max_batches_per_run": "empty_leads_cleanup_max_batches_per_run",
+    "empty_leads_cleanup_instance_settings": "empty_leads_cleanup_instance_settings",
     "cluster_assets_enabled": "cluster_assets_enabled",
     "cluster_assets_interval_sec": "cluster_assets_interval_sec",
     "cluster_assets_state_file": "cluster_assets_state_file",
@@ -2290,6 +2300,18 @@ def _load_config_inner(path: str) -> AgentConfig:
         viber_stats_instance_settings=(
             dict(runtime.get("viber_stats_instance_settings", {}))
             if isinstance(runtime.get("viber_stats_instance_settings", {}), dict)
+            else {}
+        ),
+        empty_leads_cleanup_enabled=bool(runtime.get("empty_leads_cleanup_enabled", False)),
+        empty_leads_cleanup_interval_sec=max(60, int(runtime.get("empty_leads_cleanup_interval_sec", 900) or 900)),
+        empty_leads_cleanup_batch_size=max(1, int(runtime.get("empty_leads_cleanup_batch_size", 5000) or 5000)),
+        empty_leads_cleanup_max_batches_per_run=max(
+            1,
+            int(runtime.get("empty_leads_cleanup_max_batches_per_run", 10) or 10),
+        ),
+        empty_leads_cleanup_instance_settings=(
+            dict(runtime.get("empty_leads_cleanup_instance_settings", {}))
+            if isinstance(runtime.get("empty_leads_cleanup_instance_settings", {}), dict)
             else {}
         ),
         cluster_assets_enabled=bool(runtime.get("cluster_assets_enabled", False)),

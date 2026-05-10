@@ -74,6 +74,34 @@ def _is_viber_stats_job(line: str) -> bool:
     return "bin/console" in s and "viber:stats:update" in s
 
 
+def _is_empty_leads_cleanup_job(line: str) -> bool:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return False
+    lowered = s.lower()
+    return (
+        "bin/console" in lowered
+        and "doctrine:query:sql" in lowered
+        and "delete from" in lowered
+        and "_leads" in lowered
+        and "email is null" in lowered
+        and "mobile is null" in lowered
+    )
+
+
+def _cron_interval_sec(line: str, default_sec: int = 900) -> int:
+    parts = line.strip().split()
+    if len(parts) < 6:
+        return default_sec
+    minute = parts[0]
+    m = re.fullmatch(r"\*/(\d+)", minute)
+    if m:
+        return max(60, int(m.group(1)) * 60)
+    if minute == "*":
+        return 60
+    return default_sec
+
+
 def _comment_managed(content: str, stamp: str) -> tuple[str, int]:
     out: list[str] = []
     changed = 0
@@ -100,6 +128,22 @@ def _comment_viber_stats(content: str, stamp: str) -> tuple[str, int]:
             continue
         out.append(line)
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _comment_empty_leads_cleanup(content: str, stamp: str) -> tuple[str, int, int]:
+    out: list[str] = []
+    changed = 0
+    interval_sec = 900
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if _is_empty_leads_cleanup_job(line):
+            interval_sec = _cron_interval_sec(line, interval_sec)
+            out.append(f"# MCD_MANAGED {stamp}: disabled empty leads cleanup by mcd profile=active")
+            out.append("# " + line)
+            changed += 1
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed, interval_sec
 
 
 def _restore_managed_comments(content: str) -> tuple[str, int]:
@@ -176,6 +220,43 @@ def reconcile_viber_stats_cron(*, profile_name: str, install_dir: str) -> ModeRe
             lines.append(f"{user}: failed to write crontab: {out2}")
             return ModeResult(ok=False, lines=lines)
         lines.append(f"{user}: {action}={changed}")
+    return ModeResult(ok=True, lines=lines)
+
+
+def reconcile_empty_leads_cleanup_cron(*, profile_name: str, install_dir: str) -> ModeResult:
+    """
+    Move legacy direct SQL cleanup cron into MCD-owned scheduling.
+
+    Only the safe legacy shape is migrated:
+    DELETE FROM <prefix>leads WHERE email IS NULL AND mobile IS NULL
+    """
+    if os.geteuid() != 0:
+        return ModeResult(ok=False, lines=["empty leads cleanup cron reconcile requires root"])
+    profile = (profile_name or "").strip().lower()
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    migrated_interval = 0
+    for user in ("root", "www-data"):
+        rc, cur = _read_crontab(None if user == "root" else user)
+        if rc != 0:
+            lines.append(f"{user}: crontab not readable, skip")
+            continue
+        if profile == "passive":
+            lines.append(f"{user}: passive profile, empty leads cleanup cron left unchanged")
+            continue
+        _ensure_backup(install_dir, user, cur)
+        updated, changed, interval_sec = _comment_empty_leads_cleanup(cur, stamp)
+        if changed <= 0:
+            lines.append(f"{user}: no empty leads cleanup cron change")
+            continue
+        rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+        if rc2 != 0:
+            lines.append(f"{user}: failed to write crontab: {out2}")
+            return ModeResult(ok=False, lines=lines)
+        migrated_interval = max(migrated_interval, int(interval_sec))
+        lines.append(f"{user}: commented empty leads cleanup cron lines={changed} interval_sec={interval_sec}")
+    if migrated_interval > 0:
+        lines.append(f"MCD_EMPTY_LEADS_MIGRATE interval_sec={migrated_interval} mode=both_null")
     return ModeResult(ok=True, lines=lines)
 
 

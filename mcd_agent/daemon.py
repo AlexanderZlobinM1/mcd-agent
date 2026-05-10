@@ -58,7 +58,7 @@ from mcd_agent.mautic_version_cache import (
     install_zabbix_mautic_version_userparameter,
     refresh_mautic_version_cache,
 )
-from mcd_agent.mode import reconcile_viber_stats_cron
+from mcd_agent.mode import reconcile_empty_leads_cleanup_cron, reconcile_viber_stats_cron
 from mcd_agent.pagehit_cascade_patch import ensure_pagehit_cascade_patch
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
@@ -171,6 +171,13 @@ _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_interval_sec",
     "viber_stats_instance_settings",
 }
+_EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
+    "empty_leads_cleanup_enabled",
+    "empty_leads_cleanup_interval_sec",
+    "empty_leads_cleanup_batch_size",
+    "empty_leads_cleanup_max_batches_per_run",
+    "empty_leads_cleanup_instance_settings",
+}
 _CLUSTER_STABLE_RUNTIME_KEYS = {
     "cluster_id",
     "cluster_name",
@@ -182,7 +189,12 @@ _CLUSTER_STABLE_RUNTIME_KEYS = {
     "cluster_route_backup_host",
     "cluster_route_cache_hosts",
 }
-_STABLE_RUNTIME_KEYS = _BACKUP_STABLE_RUNTIME_KEYS | _VIBER_STATS_STABLE_RUNTIME_KEYS | _CLUSTER_STABLE_RUNTIME_KEYS
+_STABLE_RUNTIME_KEYS = (
+    _BACKUP_STABLE_RUNTIME_KEYS
+    | _VIBER_STATS_STABLE_RUNTIME_KEYS
+    | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
+    | _CLUSTER_STABLE_RUNTIME_KEYS
+)
 
 _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
     r"(too many connections|lost connection to mysql|mysql server has gone away|"
@@ -323,6 +335,62 @@ def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[b
         except Exception:
             return enabled, interval
     return enabled, interval
+
+
+def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, str]:
+    enabled = bool(getattr(config, "empty_leads_cleanup_enabled", False))
+    interval = max(60, int(getattr(config, "empty_leads_cleanup_interval_sec", 900) or 900))
+    mode = "email_or_mobile_null"
+    settings = getattr(config, "empty_leads_cleanup_instance_settings", {})
+    if not isinstance(settings, dict):
+        return enabled, interval, mode
+    for key in _viber_stats_setting_keys(inst) + ["default"]:
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw:
+                enabled = _to_boolish(raw.get("enabled"), enabled)
+            if "interval_sec" in raw:
+                try:
+                    interval = max(60, int(raw.get("interval_sec") or interval))
+                except Exception:
+                    pass
+            raw_mode = str(raw.get("mode", mode) or mode).strip().lower()
+            if raw_mode in {"both_null", "email_null", "mobile_null", "email_or_mobile_null"}:
+                mode = raw_mode
+            return enabled, interval, mode
+        if isinstance(raw, bool):
+            return bool(raw), interval, mode
+    return enabled, interval, mode
+
+
+def _migrate_empty_leads_cleanup_runtime(config: AgentConfig, lines: list[str]) -> bool:
+    interval_sec = 0
+    for line in lines:
+        m = re.search(r"MCD_EMPTY_LEADS_MIGRATE\s+interval_sec=(\d+)", str(line or ""))
+        if m:
+            interval_sec = max(interval_sec, int(m.group(1)))
+    if interval_sec <= 0:
+        return False
+    current = local_runtime_overrides(config)
+    if isinstance(current.get("empty_leads_cleanup_instance_settings"), dict):
+        return False
+    updates = {
+        "empty_leads_cleanup_enabled": True,
+        "empty_leads_cleanup_interval_sec": max(60, interval_sec),
+        "empty_leads_cleanup_instance_settings": {
+            "default": {
+                "enabled": True,
+                "interval_sec": max(60, interval_sec),
+                "mode": "both_null",
+            }
+        },
+    }
+    path, changed = upsert_runtime_values(config.config_file_path, updates)
+    if changed:
+        logging.info("empty leads cleanup runtime migrated from cron into %s", path)
+    return bool(changed)
 
 
 def _persist_stable_backup_runtime_to_config(config: AgentConfig, applied_keys: list[str]) -> None:
@@ -3773,6 +3841,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_cleanup_ts: dict[str, float] = {}
     last_mautic_lock_cleanup_ts: dict[str, float] = {}
     last_page_hits_orphan_cleanup_ts: dict[str, float] = {}
+    last_empty_leads_cleanup_ts: dict[str, float] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
     last_fs_permissions_guard_ts: dict[str, float] = {}
@@ -3809,6 +3878,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_zabbix_version_cache_guard_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     next_viber_cron_reconcile_at = 0.0
+    next_empty_leads_cleanup_cron_reconcile_at = 0.0
     next_cluster_assets_guard_at = 0.0
     runtime_overrides_sync_requested = False
     # Always perform an initial runtime-overrides sync after daemon start/restart.
@@ -5084,6 +5154,29 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("viber stats cron reconcile failed: %s", e)
             next_viber_cron_reconcile_at = now + 60
 
+        if now >= next_empty_leads_cleanup_cron_reconcile_at:
+            try:
+                ecron = reconcile_empty_leads_cleanup_cron(
+                    profile_name=(config.profile_name or ""),
+                    install_dir="/opt/mcd",
+                )
+                changed = [
+                    line
+                    for line in ecron.lines
+                    if "commented empty leads cleanup" in line or "MCD_EMPTY_LEADS_MIGRATE" in line
+                ]
+                migrated = _migrate_empty_leads_cleanup_runtime(config, ecron.lines)
+                if changed:
+                    logging.info("empty leads cleanup cron reconcile: %s", "; ".join(changed))
+                elif not ecron.ok:
+                    logging.warning("empty leads cleanup cron reconcile failed: %s", "; ".join(ecron.lines))
+                if migrated:
+                    runtime_overrides_sync_requested = True
+                    next_runtime_overrides_poll_at = 0.0
+            except Exception as e:
+                logging.warning("empty leads cleanup cron reconcile failed: %s", e)
+            next_empty_leads_cleanup_cron_reconcile_at = now + 60
+
         if (config.profile_name or "").strip().lower() == "passive":
             for inst in installs:
                 root = str(getattr(inst, "root", "") or "").strip()
@@ -6010,6 +6103,39 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     root,
                     page_hits_cleanup_backup_reason or "backup_guard",
                 )
+
+            empty_cleanup_enabled, empty_cleanup_interval, empty_cleanup_mode = _empty_leads_cleanup_effective_setting(
+                config,
+                inst,
+            )
+            last_empty_cleanup = last_empty_leads_cleanup_ts.get(root, 0.0)
+            if (
+                empty_cleanup_enabled
+                and cluster_cron_allowed
+                and (last_empty_cleanup == 0.0 or now - last_empty_cleanup >= max(60, empty_cleanup_interval))
+            ):
+                try:
+                    result = db.delete_empty_leads(
+                        mode=empty_cleanup_mode,
+                        batch_size=int(getattr(config, "empty_leads_cleanup_batch_size", 5000) or 5000),
+                        max_batches=int(getattr(config, "empty_leads_cleanup_max_batches_per_run", 10) or 10),
+                    )
+                    deleted = int(result.get("total_deleted", 0) or 0)
+                    if deleted > 0:
+                        logging.info(
+                            "[%s] empty_leads_cleanup ok mode=%s batches=%s deleted=%s elapsed=%.2fs stop=%s",
+                            root,
+                            str(result.get("mode") or empty_cleanup_mode),
+                            int(result.get("batches_run", 0) or 0),
+                            deleted,
+                            float(result.get("elapsed_sec", 0.0) or 0.0),
+                            str(result.get("stop_reason") or "-"),
+                        )
+                    else:
+                        logging.debug("[%s] empty_leads_cleanup idle mode=%s", root, empty_cleanup_mode)
+                except Exception as e:
+                    logging.warning("[%s] empty_leads_cleanup failed: %s", root, e)
+                last_empty_leads_cleanup_ts[root] = now
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
