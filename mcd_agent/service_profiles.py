@@ -14,6 +14,7 @@ from mcd_agent.apt_profile import apply_apt_profile
 from mcd_agent import __version__
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
+from mcd_agent.mautic_db_indexes import apply_mautic_db_indexes
 
 
 _SYSCTL_PATH = Path("/etc/sysctl.d/99-mcd-hw.conf")
@@ -64,7 +65,7 @@ def fetch_service_profile(cfg: AgentConfig, component: str) -> dict[str, Any]:
     if not base:
         return {"status": "disabled", "reason": "mcc_url_not_set"}
     comp = (component or "").strip().lower().replace("-", "_")
-    if comp not in {"php_fpm", "mysql", "apt"}:
+    if comp not in {"php_fpm", "mysql", "apt", "mautic_db_indexes", "db_indexes"}:
         return {"status": "error", "reason": f"unsupported component: {component}"}
     ident = resolve_agent_identity(cfg)
     payload = {
@@ -856,8 +857,16 @@ def service_profiles_apply_once(
     force_apt_repo_rescan: bool = False,
 ) -> dict[str, Any]:
     comp = (component or "php_fpm").strip().lower().replace("-", "_")
-    if comp not in {"php_fpm", "mysql", "apt"}:
+    if comp not in {"php_fpm", "mysql", "apt", "mautic_db_indexes", "db_indexes"}:
         return {"status": "skipped", "reason": f"unsupported component: {component}"}
+    if comp in {"mautic_db_indexes", "db_indexes"}:
+        applied = apply_mautic_db_indexes(cfg, dry_run=dry_run)
+        status = str(applied.get("status") or "").strip().lower()
+        if status in {"applied", "noop", "planned"}:
+            return {"status": "ok", "fetch": {"status": "ok", "source": "builtin"}, "apply": applied}
+        if status == "deferred":
+            return {"status": "skipped", "reason": applied.get("reason", "deferred"), "apply": applied}
+        return {"status": "error", "reason": applied.get("reason", status or "apply_failed"), "apply": applied}
     fetched = fetch_service_profile(cfg, comp)
     status = str(fetched.get("status", "")).strip().lower()
     if status != "ok":

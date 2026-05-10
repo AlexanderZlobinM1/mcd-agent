@@ -181,6 +181,22 @@ def _resolved_mysql_unix_socket(cfg: AgentConfig, *, host: str | None, password:
     return None
 
 
+def _mysql_runtime_credentials_usable(cfg: AgentConfig) -> tuple[bool, str, str | None]:
+    if normalized_state_backend(cfg) != "mysql_hybrid":
+        return False, "mysql_state_disabled", None
+    host = str(getattr(cfg, "state_mysql_host", "") or "").strip()
+    user = str(getattr(cfg, "state_mysql_user", "") or "").strip()
+    pwd = str(getattr(cfg, "state_mysql_password", "") or "")
+    sock = _resolved_mysql_unix_socket(cfg, host=host, password=pwd)
+    if not (host or sock):
+        return False, "mysql_host_missing", sock
+    if not user:
+        return False, "mysql_user_missing", sock
+    if user.lower() == "root" and pwd == "":
+        return False, "mysql_root_without_password_disabled", sock
+    return True, "ok", sock
+
+
 def _resolved_local_unix_socket_auto(host: str | None) -> str | None:
     if not _is_local_mysql_host(host):
         return None
@@ -265,15 +281,8 @@ def _state_database_name(cfg: AgentConfig) -> str:
 
 
 def mysql_state_enabled(cfg: AgentConfig) -> bool:
-    if normalized_state_backend(cfg) != "mysql_hybrid":
-        return False
-    host = str(getattr(cfg, "state_mysql_host", "") or "").strip()
-    pwd = str(getattr(cfg, "state_mysql_password", "") or "")
-    sock = _resolved_mysql_unix_socket(cfg, host=host, password=pwd)
-    return bool(
-        (host or sock)
-        and str(getattr(cfg, "state_mysql_user", "") or "").strip()
-    )
+    ok, _reason, _sock = _mysql_runtime_credentials_usable(cfg)
+    return ok
 
 
 def _safe_prefix(raw: str | None) -> str:
@@ -420,11 +429,9 @@ def state_backend_status(cfg: AgentConfig, *, probe: bool = True) -> dict[str, A
     if desired != "mysql_hybrid":
         return status
     host = str(getattr(cfg, "state_mysql_host", "") or "").strip()
-    user = str(getattr(cfg, "state_mysql_user", "") or "").strip()
-    pwd = str(getattr(cfg, "state_mysql_password", "") or "")
-    sock = _resolved_mysql_unix_socket(cfg, host=host, password=pwd)
-    if not ((host or sock) and user):
-        status["reason"] = "mysql_config_missing"
+    ok_creds, reason, sock = _mysql_runtime_credentials_usable(cfg)
+    if not ok_creds:
+        status["reason"] = reason
         return status
     if sock:
         status["unix_socket"] = sock

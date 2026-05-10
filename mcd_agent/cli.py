@@ -1699,7 +1699,20 @@ def _build_parser() -> argparse.ArgumentParser:
     svc = sub.add_parser("service-profile", help="Fetch/apply MCC-managed service profiles (hardware-aware)")
     svc.add_argument("--config", default=default_cfg)
     svc.add_argument("op", choices=["fetch", "apply", "status", "rescan"])
-    svc.add_argument("--component", choices=["php_fpm", "php-fpm", "mysql", "apt"], default="php_fpm")
+    svc.add_argument(
+        "--component",
+        choices=[
+            "php_fpm",
+            "php-fpm",
+            "mysql",
+            "apt",
+            "mautic_db_indexes",
+            "mautic-db-indexes",
+            "db_indexes",
+            "db-indexes",
+        ],
+        default="php_fpm",
+    )
     svc.add_argument("--dry-run", action="store_true")
     svc.add_argument("--json", action="store_true")
 
@@ -2567,9 +2580,13 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
         if args.op == "fetch":
-            if comp not in {"php_fpm", "php-fpm", "mysql", "apt"}:
+            if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
                 print(json.dumps({"status": "error", "reason": f"unsupported component: {comp}"}, ensure_ascii=True))
                 return 2
+            if comp.replace("-", "_") in {"mautic_db_indexes", "db_indexes"}:
+                res = service_profiles_apply_once(cfg, component=comp, dry_run=True)
+                print(json.dumps(res, ensure_ascii=True, indent=2))
+                return 0 if str(res.get("status", "")).strip().lower() in {"ok", "skipped"} else 1
             res = fetch_service_profile(cfg, comp)
             print(json.dumps(res, ensure_ascii=True, indent=2))
             return 0 if str(res.get("status", "")).strip().lower() == "ok" else 1

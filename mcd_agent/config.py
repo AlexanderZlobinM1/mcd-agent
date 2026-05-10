@@ -849,13 +849,16 @@ def _normalize_list(value: object) -> list[str]:
 def _normalize_service_profile_components(value: object) -> list[str]:
     components = _normalize_list(value)
     if not components:
-        components = ["php_fpm", "mysql", "apt"]
+        components = ["php_fpm", "mysql", "apt", "mautic_db_indexes"]
     seen = {str(x).strip().lower().replace("-", "_") for x in components if str(x).strip()}
     # MCC runtime overrides created before apt profiles existed often contain
     # exactly ["php_fpm", "mysql"]. Treat that as the old default, not as an
     # operator decision to disable apt profile convergence.
     if seen == {"php_fpm", "mysql"}:
         components.append("apt")
+        components.append("mautic_db_indexes")
+    elif seen == {"php_fpm", "mysql", "apt"}:
+        components.append("mautic_db_indexes")
     return components
 
 
@@ -2658,7 +2661,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         service_profiles_auto_apply=bool(runtime.get("service_profiles_auto_apply", True)),
         service_profiles_poll_interval_sec=int(runtime.get("service_profiles_poll_interval_sec", 3600)),
         service_profiles_components=_normalize_service_profile_components(
-            runtime.get("service_profiles_components", ["php_fpm", "mysql", "apt"])
+            runtime.get("service_profiles_components", ["php_fpm", "mysql", "apt", "mautic_db_indexes"])
         ),
         mautic6_core_patch_policy=m6_patch_policy,
         mautic6_core_patch_version_min=m6_patch_min,

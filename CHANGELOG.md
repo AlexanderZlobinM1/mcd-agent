@@ -1,5 +1,29 @@
 # MCD Changelog
 
+## 0.9.11 - 2026-05-10
+
+- Fixed: `mautic_db_indexes --dry-run` now reports the aggregate result as
+  `planned` instead of `applied`, while still showing already-present indexes
+  per instance.
+
+## 0.9.10 - 2026-05-10
+
+- Fixed: `mautic_db_indexes` connects to local Mautic databases through the
+  MySQL unix socket when `local.php` uses `localhost`, matching the behavior of
+  the `mysql` CLI and avoiding false TCP access-denied failures.
+
+## 0.9.9 - 2026-05-10
+
+- Added: built-in `mautic_db_indexes` service-profile component for Mautic DB
+  indexes used by segment due/ring queries:
+  `lead_lists_leads(leadlist_id, date_added, manually_removed, lead_id)`,
+  `lead_lists_leads(leadlist_id, manually_removed, date_added, lead_id)`, and
+  `audit_log(bundle, object, object_id, action, date_added)`. The apply path
+  uses online DDL and defers instead of blocking when tables are busy.
+- Fixed: MySQL state backend no longer treats `root` without a password as a
+  valid runtime backend. If state MySQL credentials are missing or unsafe, MCD
+  stays on sqlite and does not repeatedly attempt passwordless MySQL root.
+
 ## 0.9.8 - 2026-05-10
 
 - Fixed: nginx baseline now normalizes legacy enabled site entries without a
