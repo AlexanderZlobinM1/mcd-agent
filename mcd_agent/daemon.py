@@ -340,7 +340,7 @@ def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[b
 def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, str]:
     enabled = bool(getattr(config, "empty_leads_cleanup_enabled", False))
     interval = max(60, int(getattr(config, "empty_leads_cleanup_interval_sec", 900) or 900))
-    mode = "email_or_mobile_null"
+    mode = "both_null"
     settings = getattr(config, "empty_leads_cleanup_instance_settings", {})
     if not isinstance(settings, dict):
         return enabled, interval, mode
@@ -357,7 +357,9 @@ def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) ->
                 except Exception:
                     pass
             raw_mode = str(raw.get("mode", mode) or mode).strip().lower()
-            if raw_mode in {"both_null", "email_null", "mobile_null", "email_or_mobile_null"}:
+            if raw_mode == "email_or_mobile_null":
+                raw_mode = "both_null"
+            if raw_mode in {"both_null", "email_null", "mobile_null"}:
                 mode = raw_mode
             return enabled, interval, mode
         if isinstance(raw, bool):

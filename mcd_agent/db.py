@@ -632,18 +632,17 @@ class MauticDB:
         - both_null: email IS NULL AND mobile IS NULL
         - email_null: email IS NULL
         - mobile_null: mobile IS NULL
-        - email_or_mobile_null: email IS NULL OR mobile IS NULL
         """
         table = self._safe_table(f"{self.cfg.table_prefix}leads")
         normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "email_or_mobile_null":
+            normalized_mode = "both_null"
         if normalized_mode == "both_null":
             predicate = "`email` IS NULL AND `mobile` IS NULL"
         elif normalized_mode == "email_null":
             predicate = "`email` IS NULL"
         elif normalized_mode == "mobile_null":
             predicate = "`mobile` IS NULL"
-        elif normalized_mode == "email_or_mobile_null":
-            predicate = "(`email` IS NULL OR `mobile` IS NULL)"
         else:
             raise ValueError(f"unsupported_empty_leads_cleanup_mode:{normalized_mode}")
         limit = max(1, int(batch_size))

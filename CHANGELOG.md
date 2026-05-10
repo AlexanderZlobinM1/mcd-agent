@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.14 - 2026-05-10
+
+- Fixed: empty contacts cleanup no longer exposes or executes the broad
+  `email IS NULL OR mobile IS NULL` mode. When both conditions are selected,
+  MCD uses the original safe predicate:
+  `email IS NULL AND mobile IS NULL`.
+- Safety: stale runtime settings saved with the temporary
+  `email_or_mobile_null` mode are interpreted as `both_null`.
+
 ## 0.9.13 - 2026-05-10
 
 - Added: `mautic_db_indexes` now also manages `leads(mobile)` globally for
@@ -7,8 +16,8 @@
   managed leads index, MCD safely drops existing fax-only/fax-named indexes and
   retries the managed index add.
 - Added: per-instance empty contacts cleanup. MCD can periodically delete
-  contacts with `email IS NULL`, `mobile IS NULL`, or either condition selected
-  by MCC runtime settings. Legacy direct SQL crons for
+  contacts with `email IS NULL`, `mobile IS NULL`, or both conditions selected
+  as `email IS NULL AND mobile IS NULL` by MCC runtime settings. Legacy direct SQL crons for
   `email IS NULL AND mobile IS NULL` are commented on active profiles and
   migrated into MCD-owned scheduling.
 
