@@ -13,7 +13,14 @@ from typing import Any
 NGINX_CONF = Path("/etc/nginx/nginx.conf")
 SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+CONF_D = Path("/etc/nginx/conf.d")
+SNIPPETS_DIR = Path("/etc/nginx/snippets")
+HARDENING_SNIPPET = SNIPPETS_DIR / "mcd-mautic-hardening.conf"
+SECURITY_HEADERS_SNIPPET = SNIPPETS_DIR / "security-headers.conf"
+HARDENING_INCLUDE = "include /etc/nginx/snippets/mcd-mautic-hardening.conf;"
 BACKUP_ROOT = Path("/var/backups/mcd-nginx-baseline")
+SECURITY_HEADERS_START = "# mcd-security-headers-extra start"
+SECURITY_HEADERS_END = "# mcd-security-headers-extra end"
 
 
 @dataclass
@@ -85,6 +92,13 @@ def nginx_baseline_satisfied() -> bool:
             return False
     if _sites_enabled_has_regular_files():
         return False
+    if _read_text(HARDENING_SNIPPET) != _desired_hardening_snippet():
+        return False
+    if SECURITY_HEADERS_SNIPPET.exists() and SECURITY_HEADERS_START not in _read_text(SECURITY_HEADERS_SNIPPET):
+        return False
+    for path in _active_server_config_files():
+        if HARDENING_INCLUDE not in _read_text(path):
+            return False
     return True
 
 
@@ -162,6 +176,174 @@ def _desired_nginx_conf(text: str) -> tuple[str, list[str]]:
     if inserted:
         actions.append("sites_enabled_include")
     return "\n".join(final).rstrip("\n") + "\n", actions
+
+
+def _desired_hardening_snippet() -> str:
+    return """# Managed by MCD. Deny project internals for zip/root and composer/docroot Mautic installs.
+autoindex off;
+
+# Never expose Mautic/runtime internals even when nginx root points at project root.
+location ~* ^/(?:config|vendor|node_modules|tests|var|\\.git)(?:/|$) {
+    return 403;
+}
+
+# Deny dependency, build, test and policy files that reveal implementation details.
+location ~* ^/(?:composer\\.(?:json|lock)|package(?:-lock)?\\.json|yarn\\.lock|pnpm-lock\\.yaml|symfony\\.lock|webpack\\.config\\.js|tsconfig\\.json|phpunit\\.xml(?:\\.dist)?|codeception\\.yml|SECURITY\\.md|README(?:\\..*)?|CHANGELOG(?:\\..*)?)$ {
+    return 403;
+}
+
+# Deny dotfiles except ACME challenge paths.
+location ~* /\\.(?!well-known/) {
+    return 403;
+}
+
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+add_header Strict-Transport-Security "max-age=31536000" always;
+"""
+
+
+def _write_hardening_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    desired = _desired_hardening_snippet()
+    current = _read_text(HARDENING_SNIPPET)
+    if current == desired:
+        return []
+    SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
+    _snapshot(HARDENING_SNIPPET, backup_dir, snapshots)
+    HARDENING_SNIPPET.write_text(desired, encoding="utf-8")
+    return ["mautic_hardening_snippet"]
+
+
+def _active_add_header_present(text: str, header: str) -> bool:
+    pattern = re.compile(r"^\s*add_header\s+" + re.escape(header) + r"\b", re.IGNORECASE)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if pattern.search(raw):
+            return True
+    return False
+
+
+def _strip_managed_security_header_block(text: str) -> str:
+    pattern = re.compile(
+        r"\n?" + re.escape(SECURITY_HEADERS_START) + r".*?" + re.escape(SECURITY_HEADERS_END) + r"\n?",
+        re.DOTALL,
+    )
+    return pattern.sub("\n", text).rstrip("\n") + ("\n" if text else "")
+
+
+def _desired_security_headers_snippet(text: str) -> str:
+    base = _strip_managed_security_header_block(text)
+    additions: list[str] = []
+    if not _active_add_header_present(base, "X-Frame-Options"):
+        additions.append('add_header X-Frame-Options "SAMEORIGIN" always;')
+    if not _active_add_header_present(base, "Strict-Transport-Security"):
+        additions.append('add_header Strict-Transport-Security "max-age=31536000" always;')
+    if not _active_add_header_present(base, "Permissions-Policy"):
+        additions.append('add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;')
+    if not additions:
+        return base
+    block = "\n".join([SECURITY_HEADERS_START, *additions, SECURITY_HEADERS_END])
+    return base.rstrip("\n") + "\n" + block + "\n"
+
+
+def _ensure_security_headers_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    if not SECURITY_HEADERS_SNIPPET.exists():
+        return []
+    original = _read_text(SECURITY_HEADERS_SNIPPET)
+    desired = _desired_security_headers_snippet(original)
+    if desired == original:
+        return []
+    _snapshot(SECURITY_HEADERS_SNIPPET, backup_dir, snapshots)
+    SECURITY_HEADERS_SNIPPET.write_text(desired, encoding="utf-8")
+    return ["security_headers_snippet"]
+
+
+def _active_server_config_files() -> list[Path]:
+    files: dict[Path, None] = {}
+    if SITES_ENABLED.exists():
+        try:
+            for path in sorted(SITES_ENABLED.iterdir()):
+                if path.name.startswith(".") or not path.name.endswith(".conf"):
+                    continue
+                real = path.resolve() if path.is_symlink() else path
+                if real.is_file():
+                    files[real] = None
+        except Exception:
+            pass
+    if CONF_D.exists():
+        try:
+            for path in sorted(CONF_D.glob("*.conf")):
+                if path.name.startswith("zz-mcd-"):
+                    continue
+                if path.is_file():
+                    files[path.resolve()] = None
+        except Exception:
+            pass
+    return list(files.keys())
+
+
+def _insert_hardening_include(text: str) -> tuple[str, bool]:
+    lines = text.splitlines()
+    out: list[str] = []
+    depth = 0
+    in_server = False
+    server_start_depth = 0
+    block: list[str] = []
+    changed = False
+
+    def flush_block(items: list[str]) -> list[str]:
+        nonlocal changed
+        if any(HARDENING_INCLUDE in x for x in items):
+            return items
+        insert_at = 1 if len(items) > 1 else len(items)
+        for idx, item in enumerate(items):
+            if re.match(r"^\s*server_name\s+.+;", item.strip()):
+                insert_at = idx + 1
+                break
+        ref = items[insert_at - 1] if items else ""
+        indent = ref[: len(ref) - len(ref.lstrip())] if ref else "    "
+        items = [*items[:insert_at], f"{indent}{HARDENING_INCLUDE}", *items[insert_at:]]
+        changed = True
+        return items
+
+    for raw in lines:
+        stripped = raw.strip()
+        starts_server = (not in_server) and re.match(r"^server\s*\{", stripped)
+        if starts_server:
+            in_server = True
+            server_start_depth = depth
+            block = [raw]
+        elif in_server:
+            block.append(raw)
+        else:
+            out.append(raw)
+
+        depth += raw.count("{") - raw.count("}")
+        if in_server and depth <= server_start_depth:
+            out.extend(flush_block(block))
+            in_server = False
+            block = []
+
+    return "\n".join(out).rstrip("\n") + ("\n" if text.endswith("\n") or out else ""), changed
+
+
+def _ensure_hardening_includes(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    actions: list[str] = []
+    for path in _active_server_config_files():
+        original = _read_text(path)
+        if not original or "server" not in original:
+            continue
+        desired, changed = _insert_hardening_include(original)
+        if not changed or desired == original:
+            continue
+        _snapshot(path, backup_dir, snapshots)
+        path.write_text(desired, encoding="utf-8")
+        actions.append(f"mautic_hardening_include:{path.name}")
+    return actions
 
 
 def _convert_sites_enabled_regular_files(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
@@ -255,6 +437,18 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
             if symlink_actions:
                 actions.extend(symlink_actions)
                 changed = True
+        hardening_actions = _write_hardening_snippet(backup_dir, snapshots)
+        if hardening_actions:
+            actions.extend(hardening_actions)
+            changed = True
+        header_actions = _ensure_security_headers_snippet(backup_dir, snapshots)
+        if header_actions:
+            actions.extend(header_actions)
+            changed = True
+        include_actions = _ensure_hardening_includes(backup_dir, snapshots)
+        if include_actions:
+            actions.extend(include_actions)
+            changed = True
 
         if not changed:
             return {"status": "ok", "changed": False, "actions": ["nginx_baseline:already_ok"]}

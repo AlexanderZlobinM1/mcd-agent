@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.9.7 - 2026-05-10
+
+- Added: nginx baseline now installs a shared Mautic hardening snippet and
+  includes it in active server blocks. The snippet denies direct access to
+  project internals such as `config`, `vendor`, `node_modules`, `.git`,
+  dependency lockfiles and build/test metadata, protecting both zip/root and
+  composer/docroot installations.
+- Added: nginx baseline safely supplements the existing security headers
+  snippet with `X-Frame-Options`, `Strict-Transport-Security`, and
+  `Permissions-Policy` when they are missing, so PHP/static locations that
+  include `security-headers.conf` do not bypass server-level hardening.
+- Fixed: hardening include insertion is idempotent per `server {}` block, so
+  multi-vhost files with one already-hardened server are completed without
+  duplicating includes.
+
 ## 0.9.5 - 2026-05-10
 
 - Fixed: cluster non-authority nodes no longer run standalone backup storage
