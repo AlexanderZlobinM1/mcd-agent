@@ -337,13 +337,65 @@ def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[b
     return enabled, interval
 
 
-def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, str]:
+def _cron_field_matches(field: str, value: int) -> bool:
+    field = str(field or "").strip()
+    if field == "*":
+        return True
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            try:
+                step = max(1, int(step_s))
+            except Exception:
+                return False
+        else:
+            base = part
+        if base == "*":
+            start, end = 0, max(value, 59)
+        elif "-" in base:
+            try:
+                start_s, end_s = base.split("-", 1)
+                start, end = int(start_s), int(end_s)
+            except Exception:
+                return False
+        else:
+            try:
+                return value == int(base)
+            except Exception:
+                return False
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def _cron_expr_due(expr: str, now_dt: datetime) -> bool:
+    parts = str(expr or "").strip().split()
+    if len(parts) != 5:
+        return False
+    minute, hour, dom, month, dow = parts
+    cron_dow = (now_dt.weekday() + 1) % 7
+    return (
+        _cron_field_matches(minute, now_dt.minute)
+        and _cron_field_matches(hour, now_dt.hour)
+        and _cron_field_matches(dom, now_dt.day)
+        and _cron_field_matches(month, now_dt.month)
+        and _cron_field_matches(dow, cron_dow)
+    )
+
+
+def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, str, str, str]:
     enabled = bool(getattr(config, "empty_leads_cleanup_enabled", False))
     interval = max(60, int(getattr(config, "empty_leads_cleanup_interval_sec", 900) or 900))
     mode = "both_null"
+    schedule_type = "interval"
+    cron_expr = ""
     settings = getattr(config, "empty_leads_cleanup_instance_settings", {})
     if not isinstance(settings, dict):
-        return enabled, interval, mode
+        return enabled, interval, mode, schedule_type, cron_expr
     for key in _viber_stats_setting_keys(inst) + ["default"]:
         if key not in settings:
             continue
@@ -356,38 +408,72 @@ def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) ->
                     interval = max(60, int(raw.get("interval_sec") or interval))
                 except Exception:
                     pass
+            raw_schedule_type = str(raw.get("schedule_type", schedule_type) or schedule_type).strip().lower()
+            raw_cron_expr = str(raw.get("cron_expr", cron_expr) or "").strip()
+            if raw_schedule_type == "cron" and raw_cron_expr:
+                schedule_type = "cron"
+                cron_expr = raw_cron_expr
+            else:
+                schedule_type = "interval"
+                cron_expr = ""
             raw_mode = str(raw.get("mode", mode) or mode).strip().lower()
             if raw_mode == "email_or_mobile_null":
                 raw_mode = "both_null"
             if raw_mode in {"both_null", "email_null", "mobile_null"}:
                 mode = raw_mode
-            return enabled, interval, mode
+            return enabled, interval, mode, schedule_type, cron_expr
         if isinstance(raw, bool):
-            return bool(raw), interval, mode
-    return enabled, interval, mode
+            return bool(raw), interval, mode, schedule_type, cron_expr
+    return enabled, interval, mode, schedule_type, cron_expr
 
 
 def _migrate_empty_leads_cleanup_runtime(config: AgentConfig, lines: list[str]) -> bool:
     interval_sec = 0
+    cron_expr = ""
     for line in lines:
         m = re.search(r"MCD_EMPTY_LEADS_MIGRATE\s+interval_sec=(\d+)", str(line or ""))
         if m:
             interval_sec = max(interval_sec, int(m.group(1)))
-    if interval_sec <= 0:
+        cm = re.search(r"MCD_EMPTY_LEADS_MIGRATE\s+.*cron_expr='([^']+)'", str(line or ""))
+        if cm:
+            cron_expr = cm.group(1).strip()
+    if interval_sec <= 0 and not cron_expr:
         return False
     current = local_runtime_overrides(config)
-    if isinstance(current.get("empty_leads_cleanup_instance_settings"), dict):
-        return False
+    schedule_type = "cron" if cron_expr else "interval"
+    interval_sec = max(60, interval_sec or int(getattr(config, "empty_leads_cleanup_interval_sec", 900) or 900))
+    default_setting = {
+        "enabled": True,
+        "interval_sec": interval_sec,
+        "mode": "both_null",
+        "schedule_type": schedule_type,
+    }
+    if cron_expr:
+        default_setting["cron_expr"] = cron_expr
+    current_settings = current.get("empty_leads_cleanup_instance_settings")
+    next_settings: dict[str, object] = {}
+    if isinstance(current_settings, dict) and current_settings:
+        changed_any = False
+        for key, value in current_settings.items():
+            if isinstance(value, dict):
+                merged = dict(value)
+                if not merged.get("schedule_type"):
+                    merged["schedule_type"] = schedule_type
+                    merged["interval_sec"] = int(merged.get("interval_sec") or interval_sec)
+                    if cron_expr:
+                        merged["cron_expr"] = cron_expr
+                    changed_any = True
+                next_settings[str(key)] = merged
+            else:
+                next_settings[str(key)] = value
+        if not changed_any:
+            return False
+    else:
+        next_settings = {"default": default_setting}
     updates = {
         "empty_leads_cleanup_enabled": True,
-        "empty_leads_cleanup_interval_sec": max(60, interval_sec),
-        "empty_leads_cleanup_instance_settings": {
-            "default": {
-                "enabled": True,
-                "interval_sec": max(60, interval_sec),
-                "mode": "both_null",
-            }
-        },
+        "empty_leads_cleanup_interval_sec": interval_sec,
+        "empty_leads_cleanup_instance_settings": next_settings,
     }
     path, changed = upsert_runtime_values(config.config_file_path, updates)
     if changed:
@@ -3844,6 +3930,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_mautic_lock_cleanup_ts: dict[str, float] = {}
     last_page_hits_orphan_cleanup_ts: dict[str, float] = {}
     last_empty_leads_cleanup_ts: dict[str, float] = {}
+    last_empty_leads_cleanup_cron_minute: dict[str, str] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
     last_fs_permissions_guard_ts: dict[str, float] = {}
@@ -6106,15 +6193,35 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     page_hits_cleanup_backup_reason or "backup_guard",
                 )
 
-            empty_cleanup_enabled, empty_cleanup_interval, empty_cleanup_mode = _empty_leads_cleanup_effective_setting(
+            (
+                empty_cleanup_enabled,
+                empty_cleanup_interval,
+                empty_cleanup_mode,
+                empty_cleanup_schedule_type,
+                empty_cleanup_cron_expr,
+            ) = _empty_leads_cleanup_effective_setting(
                 config,
                 inst,
             )
             last_empty_cleanup = last_empty_leads_cleanup_ts.get(root, 0.0)
+            empty_cleanup_due = False
+            if empty_cleanup_schedule_type == "cron":
+                cron_now = datetime.now().replace(second=0, microsecond=0)
+                cron_minute_key = cron_now.isoformat(timespec="minutes")
+                cron_state_key = f"{root}:{empty_cleanup_cron_expr}"
+                empty_cleanup_due = (
+                    bool(empty_cleanup_cron_expr)
+                    and _cron_expr_due(empty_cleanup_cron_expr, cron_now)
+                    and last_empty_leads_cleanup_cron_minute.get(cron_state_key) != cron_minute_key
+                )
+            else:
+                empty_cleanup_due = (
+                    last_empty_cleanup == 0.0 or now - last_empty_cleanup >= max(60, empty_cleanup_interval)
+                )
             if (
                 empty_cleanup_enabled
                 and cluster_cron_allowed
-                and (last_empty_cleanup == 0.0 or now - last_empty_cleanup >= max(60, empty_cleanup_interval))
+                and empty_cleanup_due
             ):
                 try:
                     result = db.delete_empty_leads(
@@ -6138,6 +6245,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     logging.warning("[%s] empty_leads_cleanup failed: %s", root, e)
                 last_empty_leads_cleanup_ts[root] = now
+                if empty_cleanup_schedule_type == "cron":
+                    last_empty_leads_cleanup_cron_minute[f"{root}:{empty_cleanup_cron_expr}"] = datetime.now().replace(
+                        second=0,
+                        microsecond=0,
+                    ).isoformat(timespec="minutes")
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (

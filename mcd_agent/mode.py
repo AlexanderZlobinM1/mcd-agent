@@ -89,17 +89,42 @@ def _is_empty_leads_cleanup_job(line: str) -> bool:
     )
 
 
-def _cron_interval_sec(line: str, default_sec: int = 900) -> int:
+def _cron_fields(line: str) -> str:
     parts = line.strip().split()
     if len(parts) < 6:
+        return ""
+    return " ".join(parts[:5])
+
+
+def _cron_interval_sec(line: str, default_sec: int = 900) -> int:
+    fields = _cron_fields(line).split()
+    if len(fields) != 5:
         return default_sec
-    minute = parts[0]
+    minute = fields[0]
+    hour, dom, month, dow = fields[1:]
+    if hour != "*" or dom != "*" or month != "*" or dow != "*":
+        return default_sec
     m = re.fullmatch(r"\*/(\d+)", minute)
     if m:
         return max(60, int(m.group(1)) * 60)
     if minute == "*":
         return 60
     return default_sec
+
+
+def _cron_migration_schedule(line: str, default_sec: int = 900) -> tuple[str, int, str]:
+    fields = _cron_fields(line)
+    if not fields:
+        return "interval", int(default_sec), ""
+    parts = fields.split()
+    minute, hour, dom, month, dow = parts
+    if hour == "*" and dom == "*" and month == "*" and dow == "*":
+        m = re.fullmatch(r"\*/(\d+)", minute)
+        if m:
+            return "interval", max(60, int(m.group(1)) * 60), ""
+        if minute == "*":
+            return "interval", 60, ""
+    return "cron", int(default_sec), fields
 
 
 def _comment_managed(content: str, stamp: str) -> tuple[str, int]:
@@ -130,20 +155,43 @@ def _comment_viber_stats(content: str, stamp: str) -> tuple[str, int]:
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
 
 
-def _comment_empty_leads_cleanup(content: str, stamp: str) -> tuple[str, int, int]:
+def _comment_empty_leads_cleanup(content: str, stamp: str) -> tuple[str, int, list[str]]:
     out: list[str] = []
     changed = 0
     interval_sec = 900
+    cron_exprs: list[str] = []
     for raw in content.splitlines():
         line = raw.rstrip("\n")
         if _is_empty_leads_cleanup_job(line):
-            interval_sec = _cron_interval_sec(line, interval_sec)
+            schedule_type, parsed_interval, cron_expr = _cron_migration_schedule(line, interval_sec)
+            if schedule_type == "cron" and cron_expr:
+                cron_exprs.append(cron_expr)
+            else:
+                interval_sec = parsed_interval
             out.append(f"# MCD_MANAGED {stamp}: disabled empty leads cleanup by mcd profile=active")
             out.append("# " + line)
             changed += 1
             continue
         out.append(line)
-    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed, interval_sec
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed, interval_sec, cron_exprs
+
+
+def _managed_empty_leads_cleanup_schedules(content: str) -> tuple[int, list[str]]:
+    interval_sec = 0
+    cron_exprs: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line.startswith("# "):
+            continue
+        legacy = line[2:].strip()
+        if not _is_empty_leads_cleanup_job(legacy):
+            continue
+        schedule_type, parsed_interval, cron_expr = _cron_migration_schedule(legacy, 0)
+        if schedule_type == "cron" and cron_expr:
+            cron_exprs.append(cron_expr)
+        elif parsed_interval > 0:
+            interval_sec = max(interval_sec, parsed_interval)
+    return interval_sec, cron_exprs
 
 
 def _restore_managed_comments(content: str) -> tuple[str, int]:
@@ -236,6 +284,7 @@ def reconcile_empty_leads_cleanup_cron(*, profile_name: str, install_dir: str) -
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines: list[str] = []
     migrated_interval = 0
+    migrated_cron_expr = ""
     for user in ("root", "www-data"):
         rc, cur = _read_crontab(None if user == "root" else user)
         if rc != 0:
@@ -245,18 +294,34 @@ def reconcile_empty_leads_cleanup_cron(*, profile_name: str, install_dir: str) -
             lines.append(f"{user}: passive profile, empty leads cleanup cron left unchanged")
             continue
         _ensure_backup(install_dir, user, cur)
-        updated, changed, interval_sec = _comment_empty_leads_cleanup(cur, stamp)
+        updated, changed, interval_sec, cron_exprs = _comment_empty_leads_cleanup(cur, stamp)
         if changed <= 0:
-            lines.append(f"{user}: no empty leads cleanup cron change")
+            managed_interval, managed_crons = _managed_empty_leads_cleanup_schedules(cur)
+            if managed_crons:
+                migrated_cron_expr = managed_crons[-1]
+                lines.append(f"{user}: existing managed empty leads cleanup cron_expr='{migrated_cron_expr}'")
+            elif managed_interval > 0:
+                migrated_interval = max(migrated_interval, managed_interval)
+                lines.append(f"{user}: existing managed empty leads cleanup interval_sec={managed_interval}")
+            else:
+                lines.append(f"{user}: no empty leads cleanup cron change")
             continue
         rc2, out2 = _write_crontab(updated, None if user == "root" else user)
         if rc2 != 0:
             lines.append(f"{user}: failed to write crontab: {out2}")
             return ModeResult(ok=False, lines=lines)
         migrated_interval = max(migrated_interval, int(interval_sec))
-        lines.append(f"{user}: commented empty leads cleanup cron lines={changed} interval_sec={interval_sec}")
-    if migrated_interval > 0:
-        lines.append(f"MCD_EMPTY_LEADS_MIGRATE interval_sec={migrated_interval} mode=both_null")
+        if cron_exprs:
+            migrated_cron_expr = cron_exprs[-1]
+            lines.append(
+                f"{user}: commented empty leads cleanup cron lines={changed} cron_expr='{migrated_cron_expr}'"
+            )
+        else:
+            lines.append(f"{user}: commented empty leads cleanup cron lines={changed} interval_sec={interval_sec}")
+    if migrated_cron_expr:
+        lines.append(f"MCD_EMPTY_LEADS_MIGRATE schedule_type=cron cron_expr='{migrated_cron_expr}' mode=both_null")
+    elif migrated_interval > 0:
+        lines.append(f"MCD_EMPTY_LEADS_MIGRATE schedule_type=interval interval_sec={migrated_interval} mode=both_null")
     return ModeResult(ok=True, lines=lines)
 
 

@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.15 - 2026-05-10
+
+- Added: empty contacts cleanup now supports both interval scheduling and
+  five-field cron-style scheduling.
+- Fixed: legacy monthly cron cleanup such as `0 2 1 * *` is migrated as a cron
+  schedule instead of being flattened to the default 900-second interval.
+- Fixed: existing MCD-managed commented legacy cleanup cron lines can repair
+  older runtime settings that were migrated before cron scheduling existed.
+
 ## 0.9.14 - 2026-05-10
 
 - Fixed: empty contacts cleanup no longer exposes or executes the broad
