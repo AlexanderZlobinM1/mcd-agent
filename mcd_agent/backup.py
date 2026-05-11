@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import gzip
 import json
 import os
 import re
@@ -197,8 +198,16 @@ def _backup_manifest_from_marker(
     first = dumped[0] if isinstance(dumped, list) and dumped and isinstance(dumped[0], dict) else {}
     db_asset: dict[str, Any] = {}
     files_asset: dict[str, Any] = {}
+    db_archive_raw = str(marker.get("db_archive_path") or "").strip()
+    db_archive = backup_dir / Path(db_archive_raw).name if db_archive_raw else Path()
+    if db_archive_raw and db_archive.exists() and db_archive.is_file():
+        db_asset = {
+            "path": _path_rel_to(backup_dir, db_archive),
+            "bytes": _asset_bytes(db_archive),
+            "type": "sql.gz",
+        }
     db_root = backup_dir / "databases"
-    if db_root.exists():
+    if not db_asset and db_root.exists():
         db_asset = {
             "path": _path_rel_to(backup_dir, db_root),
             "bytes": _asset_bytes(db_root),
@@ -223,6 +232,8 @@ def _backup_manifest_from_marker(
         "source_domain": str(first.get("instance_name") or ""),
         "source_webroot": str(first.get("root") or ""),
         "source_database": str(marker.get("database") or first.get("database") or ""),
+        "mautic_major": int(marker.get("mautic_major") or 0),
+        "mautic_version": str(marker.get("mautic_version") or ""),
         "method": str(marker.get("method") or ""),
         "backup_path": _path_rel_to(mount_path, backup_dir),
         "bytes_written": int(marker.get("bytes_written") or 0),
@@ -315,6 +326,27 @@ def _archive_files(cfg: AgentConfig, out_dir: Path) -> None:
     target = out_dir / cfg.backup_archive_name
     cmd = ["tar", "-czf", str(target)] + src
     _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+
+
+def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path) -> Path:
+    root = Path(inst.root)
+    if not root.exists() or not root.is_dir():
+        raise RuntimeError(f"instance root not found: {inst.root}")
+    target = out_dir / "files.tar.gz"
+    cmd = [
+        "tar",
+        "--exclude=var/cache",
+        "--exclude=var/logs",
+        "--exclude=app/cache",
+        "--exclude=app/logs",
+        "-czf",
+        str(target),
+        "-C",
+        str(root),
+        ".",
+    ]
+    _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    return target
 
 
 def _prune_by_copies(parent: Path, keep: int) -> list[str]:
@@ -1175,6 +1207,44 @@ def _backup_db_from_config_or_instances(cfg: AgentConfig, db_instances: list[Mau
     if db_instances and db_instances[0].db:
         return _effective_db_for_instance(cfg, db_instances[0])
     raise RuntimeError("No DB credentials found for backup")
+
+
+def _mysqldump_bin() -> str:
+    for name in ("mariadb-dump", "mysqldump"):
+        path = shutil.which(name)
+        if path:
+            return path
+    raise RuntimeError("mysqldump/mariadb-dump client is missing")
+
+
+def _run_mysqldump_gz(cfg: AgentConfig, db: DBConfig, output_path: Path) -> int:
+    defaults = _mysql_defaults_file(host=db.host, port=db.port, user=db.user, password=db.password)
+    dump_cmd = [
+        _mysqldump_bin(),
+        f"--defaults-extra-file={defaults.name}",
+        "--single-transaction",
+        "--quick",
+        "--routines",
+        "--triggers",
+        "--events",
+        db.name,
+    ]
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdout is not None
+        with gzip.open(output_path, "wb") as gz:
+            shutil.copyfileobj(proc.stdout, gz)
+        _out, err = proc.communicate(timeout=cfg.backup_dump_timeout_sec)
+        if proc.returncode != 0:
+            msg = (err or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"mysqldump failed for {db.name}: {msg or proc.returncode}")
+        return int(output_path.stat().st_size)
+    finally:
+        try:
+            os.remove(defaults.name)
+        except Exception:
+            pass
 
 
 def _mysql_capture(cfg: AgentConfig, db: DBConfig, sql: str) -> str:
@@ -3751,6 +3821,239 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
         }
     )
     return state
+
+
+def _instance_slug(inst: MauticInstall) -> str:
+    raw = inst.primary_domain or inst.name or inst.instance_uid or Path(inst.root).name
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(raw or "").strip()).strip(".-")
+    return slug or "instance"
+
+
+def _select_instance_for_backup(instances: list[MauticInstall], selector: str | None) -> MauticInstall:
+    raw = str(selector or "").strip()
+    if not raw:
+        raise RuntimeError("instance root selector is required for instance backup")
+    for inst in instances:
+        if str(inst.root or "").strip() == raw:
+            return inst
+    low = raw.lower()
+    for inst in instances:
+        candidates = [
+            inst.instance_uid,
+            inst.name,
+            inst.primary_domain or "",
+            *(inst.domains or []),
+        ]
+        if any(str(x or "").strip().lower() == low for x in candidates):
+            return inst
+    raise RuntimeError(f"instance not found for backup selector: {raw}")
+
+
+def _instance_remote_parent(cfg: AgentConfig, mount_path: Path, host_name: str, inst: MauticInstall) -> Path:
+    base = str(cfg.backup_remote_root_dir or "backup").strip().strip("/")
+    parts = [p for p in [base, host_name, "instances", _instance_slug(inst)] if p]
+    current = mount_path
+    for part in parts:
+        current = current / part
+    return current
+
+
+def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupResult:
+    cfg = _effective_cfg(replace(config, backup_method="mydumper"))
+    state_path = _state_path(cfg)
+    state = _json_read(state_path)
+    start_monotonic = time.monotonic()
+    started_ts = _utc_now_iso()
+    host_name = _host_name(cfg)
+    lock_path = _lock_path(cfg)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return BackupResult(ok=False, message="backup is already running for this host", state_path=str(state_path))
+
+    tmp_dir: Path | None = None
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    run_state = dict(state)
+    try:
+        if not cfg.backup_ssh_host or not cfg.backup_ssh_user:
+            raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
+        if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
+            raise RuntimeError("backup storage auth is not configured (key_file or password required)")
+        if cfg.backup_ssh_host and cfg.backup_ssh_user:
+            required = [("sshfs", cfg.backup_sshfs_package)]
+            missing = [(bin_path, pkg) for bin_path, pkg in required if not shutil.which(bin_path)]
+            if missing:
+                packages = [pkg for _bin, pkg in missing if str(pkg or "").strip()]
+                if not cfg.backup_auto_install_packages:
+                    raise RuntimeError("missing required backup tools: " + ", ".join(bin_path for bin_path, _ in missing))
+                _apt_install_packages(packages)
+        if not shutil.which("tar") or not shutil.which("gzip"):
+            raise RuntimeError("tar/gzip are required for instance backup")
+        _mysqldump_bin()
+        instances = _list_instances(cfg)
+        inst = _select_instance_for_backup(instances, root)
+        if not inst.db:
+            raise RuntimeError(f"instance has no DB credentials: {inst.name}")
+        effective_db = _effective_db_for_instance(cfg, inst)
+        remote_parent = _instance_remote_parent(cfg, mount_path, host_name, inst)
+        backup_name = _fmt_local_ts()
+        tmp_dir = remote_parent / f".incomplete-{backup_name}"
+        final_dir = remote_parent / backup_name
+        run_state.update(
+            {
+                "host_name": host_name,
+                "selected_root": inst.root,
+                "selected_instance": inst.name,
+                "last_run_at": started_ts,
+                "last_status": "running",
+                "last_error": "",
+                "job": "backup.instance_run",
+                "method": "mysqldump",
+            }
+        )
+        _json_write(state_path, run_state)
+
+        _mount(cfg, mount_path)
+        remote_parent.mkdir(parents=True, exist_ok=True)
+        _removed_incomplete, failed_incomplete = _cleanup_incomplete_dirs(remote_parent)
+        if failed_incomplete:
+            raise RuntimeError(
+                "failed to cleanup stale incomplete instance backup dirs: "
+                + ", ".join(sorted(failed_incomplete))
+            )
+        if final_dir.exists():
+            raise RuntimeError(f"backup target already exists: {final_dir}")
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        files_archive = _archive_instance_files(cfg, inst, tmp_dir)
+        db_archive = tmp_dir / "db.sql.gz"
+        db_bytes = _run_mysqldump_gz(cfg, effective_db, db_archive)
+        file_bytes = _asset_bytes(files_archive)
+        bytes_written = int(db_bytes) + int(file_bytes)
+        os.replace(tmp_dir, final_dir)
+        tmp_dir = None
+        storage_usage = _storage_usage(mount_path)
+        marker = {
+            "status": "ok",
+            "ts_utc": _utc_now_iso(),
+            "host_name": host_name,
+            "path": str(final_dir),
+            "bytes_written": bytes_written,
+            "instances_total": len(instances),
+            "instances_with_db": 1,
+            "dumped_instances": [
+                {
+                    "instance_uid": inst.instance_uid,
+                    "instance_name": inst.name,
+                    "root": inst.root,
+                    "primary_domain": inst.primary_domain or "",
+                    "database": effective_db.name,
+                    "method": "mysqldump",
+                    "bytes": db_bytes,
+                }
+            ],
+            "method": "mysqldump",
+            "files_archive_path": str(final_dir / files_archive.name),
+            "db_archive_path": str(final_dir / db_archive.name),
+            "restorable_as_image": True,
+        }
+        if inst.mautic_major:
+            marker["mautic_major"] = int(inst.mautic_major)
+        if isinstance(storage_usage, dict):
+            marker["storage"] = {
+                "total_bytes": int(storage_usage.get("total_bytes") or 0),
+                "used_bytes": int(storage_usage.get("used_bytes") or 0),
+                "free_bytes": int(storage_usage.get("free_bytes") or 0),
+                "used_pct": float(storage_usage.get("used_pct") or 0.0),
+                "checked_at": str(storage_usage.get("checked_at") or ""),
+            }
+        _write_marker(final_dir, marker)
+        _write_storage_backup_manifest_and_index(
+            mount_path=mount_path,
+            backup_dir=final_dir,
+            marker=marker,
+            kind="mcc.instance_backup.mysqldump",
+        )
+        duration = int(time.monotonic() - start_monotonic)
+        history = state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        success_state = dict(run_state)
+        success_state.update(
+            {
+                "last_status": "ok",
+                "last_error": "",
+                "last_success_at": _utc_now_iso(),
+                "last_duration_sec": duration,
+                "last_backup_path": str(final_dir),
+                "last_bytes_written": bytes_written,
+                "history": [
+                    {
+                        "ts": _utc_now_iso(),
+                        "status": "ok",
+                        "duration_sec": duration,
+                        "backup_path": str(final_dir),
+                        "bytes_written": bytes_written,
+                        "instances_with_db": 1,
+                        "instance": inst.name,
+                    }
+                ]
+                + history[:19],
+            }
+        )
+        if isinstance(storage_usage, dict):
+            success_state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
+            success_state["last_storage_used_bytes"] = int(storage_usage.get("used_bytes") or 0)
+            success_state["last_storage_free_bytes"] = int(storage_usage.get("free_bytes") or 0)
+            success_state["last_storage_used_pct"] = float(storage_usage.get("used_pct") or 0.0)
+            success_state["last_storage_checked_at"] = str(storage_usage.get("checked_at") or "")
+        _json_write(state_path, success_state)
+        return BackupResult(
+            ok=True,
+            message=f"instance backup completed: {final_dir}",
+            state_path=str(state_path),
+            backup_path=str(final_dir),
+            duration_sec=duration,
+            bytes_written=bytes_written,
+        )
+    except Exception as e:
+        duration = int(time.monotonic() - start_monotonic)
+        history = state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        fail_state = dict(run_state)
+        fail_state.update(
+            {
+                "last_status": "failed",
+                "last_error": str(e),
+                "last_duration_sec": duration,
+                "history": [
+                    {
+                        "ts": started_ts,
+                        "status": "failed",
+                        "duration_sec": duration,
+                        "error": str(e),
+                        "instance_selector": root or "",
+                    }
+                ]
+                + history[:19],
+            }
+        )
+        _json_write(state_path, fail_state)
+        if tmp_dir is not None and tmp_dir.exists():
+            subprocess.run(["rm", "-rf", str(tmp_dir)], check=False)
+        return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
+    finally:
+        try:
+            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+        except Exception:
+            pass
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
 
 
 def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:

@@ -25,6 +25,7 @@ from mcd_agent.backup import (
     backup_profile_set,
     backup_prune,
     backup_restore,
+    backup_instance_run,
     backup_run,
     backup_status,
     cluster_backup_files_assemble,
@@ -1855,6 +1856,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "dry-run",
             "status",
             "history",
+            "instance-run",
             "prune",
             "restore",
             "profile-show",
@@ -3472,6 +3474,30 @@ def main() -> int:
                 if res.backup_path:
                     print(f"path={res.backup_path}")
             _push_state_after_change(cfg, "backup-run")
+            return 0 if res.ok else 1
+        if args.op == "instance-run":
+            res = backup_instance_run(cfg, args.root)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": res.ok,
+                            "message": res.message,
+                            "state_path": res.state_path,
+                            "backup_path": res.backup_path,
+                            "duration_sec": res.duration_sec,
+                            "bytes_written": res.bytes_written,
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+            else:
+                print(res.message)
+                print(f"state={res.state_path}")
+                if res.backup_path:
+                    print(f"path={res.backup_path}")
+            _push_state_after_change(cfg, "backup-instance-run")
             return 0 if res.ok else 1
         if args.op == "prune":
             res = backup_prune(cfg, args.root)

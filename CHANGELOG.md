@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.22 - 2026-05-11
+
+- Added: per-instance backup command `mcd-cli backup instance-run --root ...`
+  that writes one restorable artifact: selected instance files, selected
+  database dump, `mcc-backup-manifest.json`, and a storage-box index card.
+- Changed: instance backup artifacts are image-compatible, so MCC can import
+  them into the image catalog and restore them on another supported host with a
+  newly generated database name such as `baza_<short_name>`.
+
 ## 0.9.21 - 2026-05-11
 
 - Added: successful host and cluster offsite backups now write
