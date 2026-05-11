@@ -113,6 +113,7 @@ class MauticDB:
             "prefix": self.cfg.table_prefix,
             "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+            "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
         }
         if context:
             params.update(context)

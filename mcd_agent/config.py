@@ -195,14 +195,15 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "  WHERE c.is_published = 1 "
     "  AND (c.deleted IS NULL) "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
     "  AND EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_lead_event_log el "
     "    WHERE el.campaign_id = c.id "
-    "      AND el.is_scheduled = 1 "
     "      AND el.date_triggered IS NULL "
-    "      AND (el.trigger_date IS NULL OR el.trigger_date <= '{now_utc}') "
+    "      AND ("
+    "        (el.trigger_date IS NOT NULL AND el.trigger_date >= '{window_start_utc_7d}' AND el.trigger_date <= '{now_utc}') "
+    "        OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)"
+    "      ) "
     "    LIMIT 1"
     "  ) "
     "  UNION "
@@ -229,20 +230,22 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "ORDER BY q.id"
 )
 _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
-    "SELECT DISTINCT c.id "
-    "FROM {prefix}campaigns c "
-    "WHERE c.is_published = 1 "
-    "AND (c.deleted IS NULL) "
-    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
-    "AND EXISTS ("
-    "  SELECT 1 "
-    "  FROM {prefix}campaign_leadlist_xref cx0 "
-    "  WHERE cx0.campaign_id = c.id "
-    "  LIMIT 1"
-    ") "
-    "AND ("
-    "  EXISTS ("
+    "SELECT DISTINCT q.id "
+    "FROM ("
+    "  SELECT c.id "
+    "  FROM {prefix}campaigns c "
+    "  WHERE c.is_published = 1 "
+    "  AND (c.deleted IS NULL) "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}campaign_leadlist_xref cx0 "
+    "    WHERE cx0.campaign_id = c.id "
+    "    LIMIT 1"
+    "  ) "
+    "  AND ("
+    "    EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_leadlist_xref cx "
     "    INNER JOIN {prefix}lead_lists_leads lll "
@@ -254,8 +257,8 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "    WHERE cx.campaign_id = c.id "
     "      AND cl.lead_id IS NULL "
     "    LIMIT 1"
-    "  ) "
-    "  OR EXISTS ("
+    "    ) "
+    "    OR EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_leads cl "
     "    WHERE cl.campaign_id = c.id "
@@ -272,8 +275,21 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "        LIMIT 1"
     "      ) "
     "    LIMIT 1"
+    "    )"
     "  ) "
-    "  OR EXISTS ("
+    "  UNION "
+    "  SELECT c.id "
+    "  FROM {prefix}campaigns c "
+    "  WHERE c.is_published = 1 "
+    "  AND (c.deleted IS NULL) "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}campaign_leadlist_xref cx0 "
+    "    WHERE cx0.campaign_id = c.id "
+    "    LIMIT 1"
+    "  ) "
+    "  AND EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_events ce "
     "    INNER JOIN {prefix}campaign_leads cld "
@@ -284,6 +300,7 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "      AND ce.event_type = 'action' "
     "      AND ce.trigger_mode = 'date' "
     "      AND ce.trigger_date IS NOT NULL "
+    "      AND ce.trigger_date >= '{window_start_utc_7d}' "
     "      AND ce.trigger_date <= '{now_utc}' "
     "      AND NOT EXISTS ("
     "        SELECT 1 "
@@ -295,8 +312,8 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "      ) "
     "    LIMIT 1"
     "  )"
-    ") "
-    "ORDER BY c.id"
+    ") q "
+    "ORDER BY q.id"
 )
 _DEFAULT_SQL_CAMPAIGNS_DUE = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
 _LEGACY_CAMPAIGNS_DUE_SQLS = {
@@ -947,9 +964,27 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
     return all(sig in normalized for sig in signatures)
 
 
+def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
+    normalized = _normalize_sql_signature(value)
+    if not normalized:
+        return False
+    signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_leadlist_xref",
+        "{prefix}campaign_events ce",
+        "ce.trigger_mode = 'date'",
+        "ce.trigger_date <= '{now_utc}'",
+        "c.publish_down is null or c.publish_down >= '{now_local}'",
+        "el3.rotation <=> cld.rotation",
+    )
+    return all(sig in normalized for sig in signatures)
+
+
 def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
     explicit = sql_section.get("campaign_triggers_due")
     if explicit is not None:
+        if _is_legacy_campaigns_due_sql(explicit):
+            return _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
         return str(explicit)
     legacy = sql_section.get("campaigns_due")
     if legacy is not None and not _is_legacy_campaigns_due_sql(legacy):
@@ -961,6 +996,8 @@ def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
 def _campaign_rebuilds_due_sql(sql_section: dict[str, Any]) -> str:
     explicit = sql_section.get("campaign_rebuilds_due")
     if explicit is not None:
+        if _is_legacy_campaign_rebuilds_due_sql(explicit):
+            return _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE
         return str(explicit)
     return _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE
 
@@ -1224,6 +1261,14 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
             "campaigns_due": (
                 _is_legacy_campaigns_due_sql,
                 _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+            ),
+            "campaign_triggers_due": (
+                _is_legacy_campaigns_due_sql,
+                _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+            ),
+            "campaign_rebuilds_due": (
+                _is_legacy_campaign_rebuilds_due_sql,
+                _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE,
             ),
         },
     )

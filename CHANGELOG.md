@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.20 - 2026-05-11
+
+- Fixed: date-based campaign trigger detection now catches due event-log rows
+  by `date_triggered IS NULL` + due `trigger_date`, even when Mautic does not
+  keep `is_scheduled=1` in the expected shape.
+- Fixed: due date-based campaign work can be recovered for up to seven days
+  after `publish_down`. This prevents short campaign windows from being missed
+  permanently when MCD only performed the early scheduling pass before the
+  actual trigger time.
+- Fixed: legacy explicit `campaigns_due`, `campaign_triggers_due`, and
+  `campaign_rebuilds_due` SQL overrides with old trigger-date semantics are
+  migrated back to the current safe defaults.
+
 ## 0.9.19 - 2026-05-11
 
 - Fixed: successful cluster-channel self-update now finalizes the Galera-backed

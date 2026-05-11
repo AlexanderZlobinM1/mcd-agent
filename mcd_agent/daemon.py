@@ -4682,7 +4682,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
                     "now_local": inst_now.strftime("%Y-%m-%d %H:%M:%S"),
                     "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
                     "window_start_local_24h": (inst_now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "window_start_local_7d": (inst_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 sql_ring_enabled_for_root = bool(
                     config.segment_sql_ring_enabled and config.segment_mode != "classic_loop"
@@ -5413,7 +5415,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
                 "now_local": inst_now.strftime("%Y-%m-%d %H:%M:%S"),
                 "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
                 "window_start_local_24h": (inst_now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                "window_start_local_7d": (inst_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
             }
             seg_sql_ring = segment_sql_rings.setdefault(root, deque())
             seg_sql_rules = segment_sql_rules_by_root.setdefault(root, {})
