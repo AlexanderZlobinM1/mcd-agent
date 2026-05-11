@@ -161,6 +161,112 @@ def _write_marker(path: Path, payload: dict[str, Any]) -> None:
     _json_write(path / ".mcd-backup.json", payload)
 
 
+def _path_rel_to(base: Path, path: Path) -> str:
+    try:
+        return str(path.resolve(strict=False).relative_to(base.resolve(strict=False)))
+    except Exception:
+        return str(path)
+
+
+def _asset_bytes(path: Path) -> int:
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        if path.is_dir():
+            total = 0
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    try:
+                        total += int((Path(root) / name).stat().st_size)
+                    except Exception:
+                        pass
+            return total
+    except Exception:
+        pass
+    return 0
+
+
+def _backup_manifest_from_marker(
+    *,
+    mount_path: Path,
+    backup_dir: Path,
+    marker: dict[str, Any],
+    kind: str,
+) -> dict[str, Any]:
+    dumped = marker.get("dumped_instances")
+    first = dumped[0] if isinstance(dumped, list) and dumped and isinstance(dumped[0], dict) else {}
+    db_asset: dict[str, Any] = {}
+    files_asset: dict[str, Any] = {}
+    db_root = backup_dir / "databases"
+    if db_root.exists():
+        db_asset = {
+            "path": _path_rel_to(backup_dir, db_root),
+            "bytes": _asset_bytes(db_root),
+            "type": "directory",
+        }
+    archive_name = "files.tar.gz"
+    archive = backup_dir / archive_name
+    if not archive.exists():
+        archive = backup_dir / str(marker.get("files_archive_path") or "").split("/")[-1]
+    if archive.exists() and archive.is_file():
+        files_asset = {
+            "path": _path_rel_to(backup_dir, archive),
+            "bytes": _asset_bytes(archive),
+            "type": "tar.gz",
+        }
+    manifest = {
+        "schema": "mcc.backup.manifest.v1",
+        "kind": kind,
+        "label": str(marker.get("cluster_name") or marker.get("host_name") or first.get("instance_name") or backup_dir.name),
+        "created_at_utc": str(marker.get("ts_utc") or _utc_now_iso()),
+        "source_host": str(marker.get("host_name") or ""),
+        "source_domain": str(first.get("instance_name") or ""),
+        "source_webroot": str(first.get("root") or ""),
+        "source_database": str(marker.get("database") or first.get("database") or ""),
+        "method": str(marker.get("method") or ""),
+        "backup_path": _path_rel_to(mount_path, backup_dir),
+        "bytes_written": int(marker.get("bytes_written") or 0),
+        "files_asset": files_asset,
+        "db_asset": db_asset,
+        "restorable_as_image": bool(files_asset.get("path") and db_asset.get("path")),
+    }
+    if marker.get("cluster_backup"):
+        manifest["cluster_backup"] = True
+        manifest["cluster_name"] = str(marker.get("cluster_name") or "")
+    return manifest
+
+
+def _write_storage_backup_manifest_and_index(
+    *,
+    mount_path: Path,
+    backup_dir: Path,
+    marker: dict[str, Any],
+    kind: str,
+) -> None:
+    try:
+        manifest = _backup_manifest_from_marker(
+            mount_path=mount_path,
+            backup_dir=backup_dir,
+            marker=marker,
+            kind=kind,
+        )
+        manifest_path = backup_dir / "mcc-backup-manifest.json"
+        _json_write(manifest_path, manifest)
+        manifest_rel = _path_rel_to(mount_path, manifest_path)
+        index_entry = dict(manifest)
+        index_entry["manifest_path"] = manifest_rel
+        index_entry["backup_dir"] = _path_rel_to(mount_path, backup_dir)
+        digest = re.sub(r"[^A-Za-z0-9_.-]+", "-", index_entry["backup_dir"]).strip(".-")
+        if not digest:
+            digest = f"backup-{int(time.time())}"
+        index_dir = mount_path / "mcc-backups-index.d"
+        index_dir.mkdir(parents=True, exist_ok=True)
+        _json_write(index_dir / f"{digest[:160]}.json", index_entry)
+    except Exception:
+        # Indexing must never turn a completed backup into a failed backup.
+        return
+
+
 def _verify_dump_dir(path: Path) -> tuple[bool, str, int]:
     if not path.exists() or not path.is_dir():
         return False, "dump directory missing", 0
@@ -3459,6 +3565,12 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         if retention_plan.get("problems"):
             marker["retention_skipped_reason"] = "problems_detected_no_delete"
         _write_marker(final_dir, marker)
+        _write_storage_backup_manifest_and_index(
+            mount_path=mount_path,
+            backup_dir=final_dir,
+            marker=marker,
+            kind="mcc.cluster_offsite.mydumper",
+        )
         usage = _storage_usage(mount_path)
         duration = int(time.monotonic() - start_monotonic)
         state_updates = {
@@ -3944,6 +4056,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             if retention_removed:
                 marker["retention_removed"] = retention_removed
                 _write_marker(final_dir, marker)
+        _write_storage_backup_manifest_and_index(
+            mount_path=mount_path,
+            backup_dir=final_dir,
+            marker=marker,
+            kind=f"mcc.host_backup.{method}",
+        )
 
         duration = int(time.monotonic() - start_monotonic)
         success_state = dict(run_state)

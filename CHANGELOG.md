@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.21 - 2026-05-11
+
+- Added: successful host and cluster offsite backups now write
+  `mcc-backup-manifest.json` next to the backup and a root
+  `mcc-backups-index.d/*.json` card on the storage box. MCC can list backups
+  instantly without walking the whole storage tree.
+
 ## 0.9.20 - 2026-05-11
 
 - Fixed: date-based campaign trigger detection now catches due event-log rows
