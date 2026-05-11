@@ -1174,6 +1174,25 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 "last_session_id": session_id,
             }
         )
+        if _cluster_update_enabled(cfg):
+            local_host = _cluster_local_host_name(cfg)
+            try:
+                _cluster_update_finalize_download(
+                    cfg,
+                    local_host=local_host,
+                    ok=True,
+                    message=f"cluster update: package downloaded on {local_host}: {archive_path}",
+                    now_s=now_s,
+                )
+                _cluster_update_finalize_install(
+                    cfg,
+                    local_host=local_host,
+                    ok=True,
+                    message=f"updated to {target}",
+                    now_s=now_s,
+                )
+            except Exception as ce:
+                logging.warning("cluster update coordinator finalize after local apply failed: %s", ce)
         if bool(cfg.mcd_update_cleanup_enabled):
             try:
                 state["last_cleanup_removed"] = _cleanup_update_artifacts(cfg, now_s=now_s)

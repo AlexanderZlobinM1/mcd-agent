@@ -1,5 +1,30 @@
 # MCD Changelog
 
+## 0.9.19 - 2026-05-11
+
+- Fixed: successful cluster-channel self-update now finalizes the Galera-backed
+  rollout coordinator for the local node. This prevents peers from waiting on a
+  node that already installed the target version after a retry or coordinator
+  deadlock.
+
+## 0.9.18 - 2026-05-11
+
+- Fixed: cluster local full scheduling now treats a recent successful full as
+  already done even when the replica host timezone differs from the cluster
+  business timezone. This prevents a daemon restart from launching a second
+  same-day xtrabackup and pre-pruning the freshly completed full.
+
+## 0.9.17 - 2026-05-11
+
+- Fixed: cluster file-layer producer identity now includes local IP-derived MCC
+  host ids such as `host-37-27-135-183`. This makes nodes whose local hostname
+  differs from the MCC host id produce the expected Syncthing backup layer
+  instead of being skipped as an unexpected node.
+- Fixed: MCC state push change detection ignores volatile probe timestamps
+  (`maintenance_state.checked_at_utc` and
+  `mautic_install_readiness.checked_at_utc`) so agents do not push every
+  dispatch tick when no real state changed.
+
 ## 0.9.16 - 2026-05-10
 
 - Added: daemon-side automatic Mautic inventory rescan. By default MCD refreshes

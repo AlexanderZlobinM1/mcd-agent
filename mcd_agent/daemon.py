@@ -1046,12 +1046,44 @@ def _cluster_state_ts_local_date(value: str, local_dt: datetime) -> bool:
         return False
 
 
+def _cluster_state_ts_age_sec(value: str, *, now: datetime | None = None) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ref = now or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        return max(0.0, (ref.astimezone(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
 def _cluster_local_full_done_for_date(config: AgentConfig, local_dt: datetime) -> bool:
     try:
         st = cluster_backup_status(config)
     except Exception:
         return False
-    return _cluster_state_ts_local_date(str(st.get("last_local_full_at") or ""), local_dt)
+    last_full_at = str(st.get("last_local_full_at") or "")
+    if _cluster_state_ts_local_date(last_full_at, local_dt):
+        return True
+    age_sec = _cluster_state_ts_age_sec(last_full_at)
+    if age_sec is None:
+        return False
+    # Cluster full backups are daily and can cross UTC/local date boundaries.
+    # A daemon restart must not launch a second full shortly after a successful
+    # nightly full just because the host timezone differs from the business TZ.
+    min_interval = max(
+        3600,
+        min(
+            23 * 3600,
+            int(getattr(config, "backup_xtrabackup_full_interval_days", 1) or 1) * 86400 - 3600,
+        ),
+    )
+    return age_sec < min_interval
 
 
 def _cluster_local_full_ready_for_offsite(config: AgentConfig, local_dt: datetime) -> bool:

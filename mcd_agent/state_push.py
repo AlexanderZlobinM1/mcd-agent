@@ -112,6 +112,20 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def stable_change_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return payload copy used for change detection, without volatile sample timestamps."""
+    out = dict(payload)
+    out.pop("sent_at_utc", None)
+    for key in ("maintenance_state", "mautic_install_readiness"):
+        raw = out.get(key)
+        if isinstance(raw, dict):
+            cleaned = dict(raw)
+            cleaned.pop("checked_at_utc", None)
+            out[key] = cleaned
+    out.pop("signals_collected_at_ts", None)
+    return out
+
+
 def _read_config_text(path: str) -> str | None:
     try:
         p = Path(path)
@@ -1409,7 +1423,7 @@ class MCCStatePusher:
 
     def should_push(self, now_ts: float, payload_no_ts: dict[str, Any]) -> tuple[bool, bool]:
         force_alert = False
-        new_hash = _hash_payload(payload_no_ts)
+        new_hash = _hash_payload(stable_change_payload(payload_no_ts))
         changed = new_hash != self.last_hash
 
         if self.latest_signals:
@@ -1430,7 +1444,7 @@ class MCCStatePusher:
 
     def mark_pushed(self, now_ts: float, payload_no_ts: dict[str, Any]) -> None:
         self.last_push_ts = now_ts
-        self.last_hash = _hash_payload(payload_no_ts)
+        self.last_hash = _hash_payload(stable_change_payload(payload_no_ts))
         self._fs_permissions_fix_pending = 0
         self._fs_permissions_events_pending = []
         self._db_watchdog_pending = {

@@ -1978,6 +1978,12 @@ def _cluster_file_layers_root(cfg: AgentConfig) -> Path:
 
 
 def _cluster_node_slug(cfg: AgentConfig) -> str:
+    expected = set(_cluster_expected_file_nodes(cfg))
+    if expected:
+        local = {_safe_slug(item) for item in cluster_local_identity_values(cfg) if item}
+        matches = sorted(expected & local)
+        if matches:
+            return matches[0]
     node_id = str(getattr(cfg, "mcc_host_name", "") or getattr(cfg, "backup_host_name", "") or "").strip()
     if not node_id:
         node_id = _host_name(cfg)

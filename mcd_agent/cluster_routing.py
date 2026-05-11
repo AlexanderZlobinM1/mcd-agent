@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import subprocess
 from typing import Any
 
 from mcd_agent.config import AgentConfig
@@ -9,6 +11,23 @@ from mcd_agent.host_identity import resolve_agent_identity
 CRON_TASK_TYPES = {"segment", "segment_sql", "campaign_trigger", "campaign_rebuild", "campaign_update"}
 IMPORT_TASK_TYPES = {"import"}
 CACHE_TASK_TYPES = {"cache_clear", "cache_warm", "cache_warmup", "cache_hard"}
+
+
+def _local_ip_identity_values() -> set[str]:
+    vals: set[str] = set()
+    try:
+        out = subprocess.check_output(["hostname", "-I"], text=True, timeout=2)
+    except Exception:
+        out = ""
+    for token in re.split(r"\s+", out.strip()):
+        ip = token.strip().split("%", 1)[0]
+        if not ip or ":" in ip:
+            continue
+        if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
+            continue
+        vals.add(ip.lower())
+        vals.add("host-" + ip.replace(".", "-").lower())
+    return vals
 
 
 def cluster_local_identity_values(cfg: AgentConfig) -> set[str]:
@@ -32,6 +51,7 @@ def cluster_local_identity_values(cfg: AgentConfig) -> set[str]:
             text = str(ident.get(key) or "").strip().lower()
             if text:
                 vals.add(text)
+    vals.update(_local_ip_identity_values())
     return vals
 
 
