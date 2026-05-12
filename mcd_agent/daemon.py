@@ -178,6 +178,17 @@ _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
     "empty_leads_cleanup_max_batches_per_run",
     "empty_leads_cleanup_instance_settings",
 }
+_PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS = {
+    "enable_page_hits_orphan_cleanup",
+    "page_hits_orphan_cleanup_interval_sec",
+    "page_hits_orphan_cleanup_quiet_hour",
+    "page_hits_orphan_cleanup_quiet_window_min",
+    "page_hits_orphan_cleanup_batch_size",
+    "page_hits_orphan_cleanup_batches_per_run",
+    "page_hits_orphan_cleanup_sleep_sec",
+    "page_hits_orphan_cleanup_grace_min",
+    "page_hits_orphan_cleanup_max_run_sec",
+}
 _CLUSTER_STABLE_RUNTIME_KEYS = {
     "cluster_id",
     "cluster_name",
@@ -193,6 +204,7 @@ _STABLE_RUNTIME_KEYS = (
     _BACKUP_STABLE_RUNTIME_KEYS
     | _VIBER_STATS_STABLE_RUNTIME_KEYS
     | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
+    | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
     | _CLUSTER_STABLE_RUNTIME_KEYS
 )
 

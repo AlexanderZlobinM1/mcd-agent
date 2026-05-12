@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.23 - 2026-05-12
+
+- Fixed: `page_hits_orphan_cleanup_*` runtime overrides are now persisted into
+  `mcd.toml` together with other stable cleanup settings. This prevents orphan
+  page-hit cleanup from being lost after runtime sync, daemon reload, or a
+  cleanup deadlock/retry cycle.
+
 ## 0.9.22 - 2026-05-11
 
 - Added: per-instance backup command `mcd-cli backup instance-run --root ...`
