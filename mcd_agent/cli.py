@@ -1227,6 +1227,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     root=active_root,
                     selection=None,
                     bundles=None,
+                    plugin_uids=None,
                     action=None,
                     no_color=bool(no_color),
                     yes=False,
@@ -1634,6 +1635,7 @@ def _build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--select", help="Selection expression, e.g. '1-3 6 10'")
         p.add_argument("--bundle", action="append", help="Select plugin by bundle name (repeatable)")
+        p.add_argument("--plugin-uid", action="append", help="Select plugin by stable manifest plugin_uid (repeatable)")
         p.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
         p.add_argument("--no-color", action="store_true")
         p.add_argument("--list-available", action="store_true", help="Show plugins available in server manifest")
@@ -1715,6 +1717,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default="php_fpm",
     )
     svc.add_argument("--dry-run", action="store_true")
+    svc.add_argument(
+        "--allow-cluster-db-maintenance",
+        action="store_true",
+        help=(
+            "Allow cluster DB-heavy profile apply for explicit maintenance windows. "
+            "Without this flag, mysql and mautic_db_indexes are skipped on Galera/PXC nodes."
+        ),
+    )
     svc.add_argument("--json", action="store_true")
 
     zbx = sub.add_parser("zabbix", help="Zabbix helper operations")
@@ -2326,6 +2336,7 @@ def main() -> int:
             root=args.root,
             selection=args.select,
             bundles=list(args.bundle or []),
+            plugin_uids=list(args.plugin_uid or []),
             action=args.action,
             no_color=bool(args.no_color),
             yes=bool(args.yes),
@@ -2586,7 +2597,12 @@ def main() -> int:
                 print(json.dumps({"status": "error", "reason": f"unsupported component: {comp}"}, ensure_ascii=True))
                 return 2
             if comp.replace("-", "_") in {"mautic_db_indexes", "db_indexes"}:
-                res = service_profiles_apply_once(cfg, component=comp, dry_run=True)
+                res = service_profiles_apply_once(
+                    cfg,
+                    component=comp,
+                    dry_run=True,
+                    allow_cluster_db_maintenance=bool(args.allow_cluster_db_maintenance),
+                )
                 print(json.dumps(res, ensure_ascii=True, indent=2))
                 return 0 if str(res.get("status", "")).strip().lower() in {"ok", "skipped"} else 1
             res = fetch_service_profile(cfg, comp)
@@ -2610,7 +2626,12 @@ def main() -> int:
                 _push_state_after_change(cfg, "service-profile-apt-rescan")
             return 0 if ok else 1
         # apply
-        res = service_profiles_apply_once(cfg, component=comp, dry_run=bool(args.dry_run))
+        res = service_profiles_apply_once(
+            cfg,
+            component=comp,
+            dry_run=bool(args.dry_run),
+            allow_cluster_db_maintenance=bool(args.allow_cluster_db_maintenance),
+        )
         print(json.dumps(res, ensure_ascii=True, indent=2))
         ok = str(res.get("status", "")).strip().lower() == "ok"
         if ok and not bool(args.dry_run):

@@ -637,6 +637,7 @@ class AgentConfig:
     backup_cluster_incremental_start_hour: int
     backup_cluster_incremental_end_hour: int
     backup_cluster_incremental_interval_sec: int
+    backup_cluster_incremental_min_free_bytes: int
     backup_cluster_offsite_source: str
     backup_cluster_files_snapshot_enabled: bool
     backup_cluster_files_snapshot_paths: list[str]
@@ -1719,6 +1720,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "backup_cluster_incremental_start_hour": "backup_cluster_incremental_start_hour",
     "backup_cluster_incremental_end_hour": "backup_cluster_incremental_end_hour",
     "backup_cluster_incremental_interval_sec": "backup_cluster_incremental_interval_sec",
+    "backup_cluster_incremental_min_free_bytes": "backup_cluster_incremental_min_free_bytes",
     "backup_cluster_offsite_source": "backup_cluster_offsite_source",
     "backup_cluster_files_snapshot_enabled": "backup_cluster_files_snapshot_enabled",
     "backup_cluster_files_snapshot_paths": "backup_cluster_files_snapshot_paths",
@@ -2660,6 +2662,10 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_cluster_incremental_interval_sec=max(
             300,
             int(backup_cluster.get("incremental_interval_sec", 7200)),
+        ),
+        backup_cluster_incremental_min_free_bytes=max(
+            0,
+            int(backup_cluster.get("incremental_min_free_bytes", 300 * 1024 * 1024 * 1024)),
         ),
         backup_cluster_offsite_source=(
             str(backup_cluster.get("offsite_source", "xtrabackup")).strip().lower() or "xtrabackup"

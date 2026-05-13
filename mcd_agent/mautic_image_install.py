@@ -200,11 +200,12 @@ def _patch_local_php(path: Path, plan: ImageInstallPlan) -> None:
 def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
     site = Path("/etc/nginx/sites-available") / f"{plan.domain}.conf"
     site.parent.mkdir(parents=True, exist_ok=True)
+    web_root = _nginx_web_root(plan.webroot)
     content = f"""server {{
     listen 80;
     listen [::]:80;
     server_name {plan.domain};
-    root {plan.webroot};
+    root {web_root};
     index index.php index.html;
     client_max_body_size 128M;
 
@@ -217,7 +218,15 @@ def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
         fastcgi_pass unix:/run/php/php{plan.php_version}-fpm.sock;
     }}
 
-    location ~* ^/(?:var|vendor|config/local\\.php|app/config/local\\.php) {{
+    location ~* ^/(?:config|vendor|node_modules|tests|var|\\.git)(?:/|$) {{
+        deny all;
+    }}
+
+    location ~* ^/(?:composer\\.(?:json|lock)|package(?:-lock)?\\.json|yarn\\.lock|pnpm-lock\\.yaml|symfony\\.lock|webpack\\.config\\.js|tsconfig\\.json|phpunit\\.xml(?:\\.dist)?|codeception\\.yml|SECURITY\\.md|README(?:\\..*)?|CHANGELOG(?:\\..*)?|\\.env(?:\\..*)?)$ {{
+        deny all;
+    }}
+
+    location ~* /\\.(?!well-known/) {{
         deny all;
     }}
 }}
@@ -227,6 +236,16 @@ def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
     enabled.parent.mkdir(parents=True, exist_ok=True)
     enabled.symlink_to(site)
     return site
+
+
+def _nginx_web_root(project_root: Path) -> Path:
+    """Return the actual nginx root for extracted zip/composer image layouts."""
+    root = Path(project_root)
+    for child in ("docroot", "public"):
+        candidate = root / child
+        if (candidate / "index.php").exists():
+            return candidate
+    return root
 
 
 def _safe_extract(tar: tarfile.TarFile, dst: Path) -> None:

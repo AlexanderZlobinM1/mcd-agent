@@ -194,6 +194,25 @@ class MauticDB:
                 out.append(row)
         return out
 
+    def fetch_published_segment_filters(self) -> list[dict[str, Any]]:
+        prefix = str(self.cfg.table_prefix or "")
+        table_segments = self._safe_table(f"{prefix}lead_lists")
+        query = (
+            f"SELECT id, name, filters, date_modified, last_built_date "
+            f"FROM `{table_segments}` "
+            f"WHERE is_published = 1 "
+            f"ORDER BY id ASC"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
     def fetch_lead_columns(self) -> set[str]:
         prefix = str(self.cfg.table_prefix or "")
         table_leads = f"{prefix}leads"

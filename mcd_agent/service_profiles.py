@@ -246,6 +246,11 @@ def _build_pool_override(profile: dict[str, Any]) -> str:
 
 def _build_opcache_override(profile: dict[str, Any]) -> str:
     opcache_mem = int(profile.get("opcache_memory_mb", 128) or 128)
+    php_profile = profile.get("php")
+    if not isinstance(php_profile, dict):
+        php_profile = {}
+    realpath_cache_size_kb = int(php_profile.get("realpath_cache_size_kb", 16384) or 16384)
+    realpath_cache_ttl_sec = int(php_profile.get("realpath_cache_ttl_sec", 600) or 600)
     return (
         "; managed by mcd service profile (php-fpm hardware tuning)\n"
         "opcache.enable=1\n"
@@ -254,6 +259,8 @@ def _build_opcache_override(profile: dict[str, Any]) -> str:
         "opcache.max_accelerated_files=20000\n"
         "opcache.revalidate_freq=2\n"
         "opcache.validate_timestamps=1\n"
+        f"realpath_cache_size={realpath_cache_size_kb}K\n"
+        f"realpath_cache_ttl={realpath_cache_ttl_sec}\n"
     )
 
 
@@ -311,6 +318,39 @@ def _detect_mysql_engine() -> str:
 
 def _agent_cluster_mode(cfg: AgentConfig) -> bool:
     return bool(str(getattr(cfg, "cluster_id", "") or "").strip())
+
+
+def _cluster_db_maintenance_guard(
+    cfg: AgentConfig,
+    component: str,
+    *,
+    allow_cluster_db_maintenance: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Cluster DB/schema changes must not be daemon side effects.
+
+    Galera/PXC can turn even "online" ALTERs into cluster-wide TOI/NBO stalls.
+    In cluster mode, DB-heavy service-profile components are therefore skipped
+    unless an operator explicitly runs a maintenance command with the dedicated
+    override flag.
+    """
+    comp = (component or "").strip().lower().replace("-", "_")
+    if comp not in {"mysql", "mautic_db_indexes", "db_indexes"}:
+        return None
+    if not (_agent_cluster_mode(cfg) or _mysql_galera_config_detected()):
+        return None
+    if allow_cluster_db_maintenance:
+        return None
+    return {
+        "status": "skipped",
+        "reason": "cluster_db_maintenance_requires_explicit_operator_flag",
+        "component": comp,
+        "cluster_id": str(getattr(cfg, "cluster_id", "") or "").strip(),
+        "manual_command": (
+            "mcd-cli service-profile apply --component "
+            f"{comp} --allow-cluster-db-maintenance"
+        ),
+    }
 
 
 def _mysql_galera_config_detected() -> bool:
@@ -855,10 +895,18 @@ def service_profiles_apply_once(
     component: str = "php_fpm",
     dry_run: bool = False,
     force_apt_repo_rescan: bool = False,
+    allow_cluster_db_maintenance: bool = False,
 ) -> dict[str, Any]:
     comp = (component or "php_fpm").strip().lower().replace("-", "_")
     if comp not in {"php_fpm", "mysql", "apt", "mautic_db_indexes", "db_indexes"}:
         return {"status": "skipped", "reason": f"unsupported component: {component}"}
+    guard = _cluster_db_maintenance_guard(
+        cfg,
+        comp,
+        allow_cluster_db_maintenance=allow_cluster_db_maintenance,
+    )
+    if guard is not None:
+        return guard
     if comp in {"mautic_db_indexes", "db_indexes"}:
         applied = apply_mautic_db_indexes(cfg, dry_run=dry_run)
         status = str(applied.get("status") or "").strip().lower()

@@ -2570,6 +2570,15 @@ def cluster_backup_local_incremental(config: AgentConfig) -> BackupResult:
         base_dir = (latest_incr or full_dir) / "physical-xtrabackup"
         if not base_dir.exists():
             raise RuntimeError(f"incremental base xtrabackup dir missing: {base_dir}")
+        min_free = int(getattr(cfg, "backup_cluster_incremental_min_free_bytes", 0) or 0)
+        if min_free > 0:
+            usage = _storage_usage(_cluster_local_root(cfg))
+            free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+            if free < min_free:
+                raise RuntimeError(
+                    "cluster incremental skipped: insufficient free space "
+                    f"({free} bytes free, need at least {min_free})"
+                )
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)
         _cluster_update_state(
@@ -3304,6 +3313,30 @@ def _cluster_remote_parent(cfg: AgentConfig, mount_path: Path) -> Path:
     return mount_path / _format_remote_dir(cfg.backup_remote_root_dir, _cluster_name(cfg))
 
 
+def _cluster_offsite_state_from_marker(marker: dict[str, Any], backup_path: Path | str) -> dict[str, Any]:
+    """Build stable offsite-specific state fields.
+
+    Generic last_backup_* fields are updated by every cluster backup job
+    (local full, incremental, files assemble, offsite). Offsite file archive
+    health must survive later local jobs, so it is stored under last_offsite_*.
+    """
+    archive_path = str(marker.get("files_archive_path") or "").strip()
+    out: dict[str, Any] = {
+        "last_offsite_backup_path": str(backup_path),
+        "last_offsite_backup_at": str(marker.get("ts_utc") or ""),
+        "last_offsite_files_archive_path": archive_path,
+        "last_offsite_files_bytes": int(marker.get("files_bytes") or 0),
+        "last_offsite_bytes_written": int(marker.get("bytes_written") or 0),
+        "last_offsite_db_bytes": int(marker.get("db_bytes") or 0),
+        "last_offsite_method": str(marker.get("method") or ""),
+    }
+    if archive_path:
+        out["last_offsite_files_archive_ok"] = Path(archive_path).exists()
+    else:
+        out["last_offsite_files_archive_ok"] = False
+    return out
+
+
 def _cluster_is_protected_archive(path: Path) -> tuple[bool, str]:
     lname = path.name.lower()
     manual_tokens = ("manual", "dont-touch", "do-not-touch", "do_not_touch", "do-not-prune", "do_not_prune")
@@ -3553,6 +3586,8 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").lower() == "ok":
                 duration = int(time.monotonic() - start_monotonic)
+                existing_files_archive = str(marker.get("files_archive_path") or "").strip()
+                existing_offsite_state = _cluster_offsite_state_from_marker(marker, final_dir)
                 _cluster_update_state(
                     cfg,
                     {
@@ -3562,6 +3597,9 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                         "last_duration_sec": duration,
                         "last_backup_path": str(final_dir),
                         "last_backup_kind": "cluster_offsite",
+                        "last_files_archive_path": existing_files_archive,
+                        "last_files_bytes": int(existing_offsite_state.get("last_offsite_files_bytes") or 0),
+                        **existing_offsite_state,
                     },
                     history_item={
                         "ts": _utc_now_iso(),
@@ -3569,6 +3607,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                         "job": "backup.cluster.offsite",
                         "duration_sec": duration,
                         "backup_path": str(final_dir),
+                        "files_archive_path": existing_files_archive,
                     },
                 )
                 return BackupResult(
@@ -3651,7 +3690,10 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             "last_backup_path": str(final_dir),
             "last_bytes_written": bytes_written,
             "last_backup_kind": "cluster_offsite",
+            "last_files_archive_path": str(marker.get("files_archive_path") or ""),
+            "last_files_bytes": files_bytes,
             "last_remote_retention_plan": retention_plan,
+            **_cluster_offsite_state_from_marker(marker, final_dir),
         }
         if isinstance(usage, dict):
             state_updates.update(
@@ -3673,6 +3715,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                 "duration_sec": duration,
                 "backup_path": str(final_dir),
                 "bytes_written": bytes_written,
+                "files_archive_path": str(marker.get("files_archive_path") or ""),
                 "retention_removed": retention_plan.get("removed", []),
                 "retention_problems": retention_plan.get("problems", []),
             },
@@ -3820,6 +3863,20 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")) or bool(_cluster_offsite_processes(cfg)),
         }
     )
+    offsite_path_raw = str(state.get("last_offsite_backup_path") or "").strip()
+    if not offsite_path_raw and str(state.get("last_backup_kind") or "") == "cluster_offsite":
+        offsite_path_raw = str(state.get("last_backup_path") or "").strip()
+    if offsite_path_raw:
+        offsite_path = Path(offsite_path_raw)
+        marker = _read_backup_marker(offsite_path)
+        if marker:
+            offsite_state = _cluster_offsite_state_from_marker(marker, offsite_path)
+            archive_path = str(offsite_state.get("last_offsite_files_archive_path") or "").strip()
+            state.update(offsite_state)
+            state["last_files_archive_path"] = archive_path
+            state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
+        else:
+            state["last_offsite_files_archive_ok"] = False
     return state
 
 

@@ -1,5 +1,90 @@
 # MCD Changelog
 
+## 0.9.33 - 2026-05-13
+
+- Changed: cluster backup policy is deliberately simple and deterministic:
+  start local full at the configured full window, assemble files after success,
+  then start the Storage Box offsite stage immediately.
+- Changed: cluster daytime incrementals can be scheduled hourly and now have a
+  hard local free-space guard. By default, incrementals are skipped with a
+  warning if the local backup filesystem has less than 300 GiB free.
+
+## 0.9.32 - 2026-05-13
+
+- Fixed: cluster local full backup scheduling is calendar-window based again.
+  A late full from the previous day no longer pushes the next day's 01:00 full
+  forward by the old 23-hour duplicate guard.
+- Fixed: cluster offsite backup scheduler no longer skips a valid same-day
+  local full just because the full completed after the daytime incremental
+  window started. This prevents missing Storage Box backups after delayed full
+  runs, incidents, or agent restarts.
+## 0.9.31 - 2026-05-13
+
+- Fixed: segment dependency follow-up no longer re-queues children for the
+  whole "recently finished parent" window after the child has already been
+  rebuilt after that parent. This prevents repeated empty dependent segment
+  runs from starving unrelated due segments.
+
+## 0.9.30 - 2026-05-13
+
+- Fixed: newly discovered due segments are inserted at the front of segment
+  rings instead of waiting at the tail of an already half-consumed cycle. This
+  makes new or newly-due segments start on the next available segment slot when
+  dependency rules allow it.
+
+## 0.9.29 - 2026-05-12
+
+- Fixed: segment rings now understand segment-to-segment dependencies from
+  Mautic leadlist filters. When a base segment is rebuilt, dependent segments
+  are queued as follow-up work and are blocked from launching in parallel with
+  their parent segment.
+- Result: changing a base segment no longer leaves include/exclude child
+  segments with stale membership counts until a manual rebuild.
+
+## 0.9.28 - 2026-05-12
+
+- Fixed: `php_fpm` service-profile apply now writes the profile's
+  `realpath_cache_size_kb` and `realpath_cache_ttl_sec` into the managed PHP
+  ini override. Large Mautic web nodes no longer keep the PHP defaults
+  (`4096K`/`120s`) after hardware tuning, which reduces path lookup pressure
+  under high tracking traffic.
+
+## 0.9.27 - 2026-05-12
+
+- Fixed: Mautic image installs now generate nginx vhosts against the actual
+  extracted web root. Composer/recommended-project images use `docroot` (or
+  `public`) instead of exposing the project root.
+- Hardened: image-created vhosts now deny dotfiles and project internals such
+  as `.env`, `composer.lock`, `vendor`, `config`, `var`, and test/build files.
+
+## 0.9.26 - 2026-05-12
+
+- Fixed: `mcd-cli instance-delete --dry-run` no longer reports a synthetic
+  `/etc/nginx/sites-enabled/<domain>.conf` path when that symlink/file does not
+  exist. Delete planning now lists only real enabled vhost entries matched by
+  exact file name or `server_name`, while preserving `sites-available` configs.
+
+## 0.9.25 - 2026-05-12
+
+- Safety: cluster-mode agents now refuse automatic DB-heavy service-profile
+  components (`mysql`, `mautic_db_indexes`) unless an operator explicitly runs
+  `mcd-cli service-profile apply --allow-cluster-db-maintenance` in a planned
+  maintenance window.
+- Result: standalone hosts still receive MySQL/index profile automation, while
+  Galera/PXC clusters cannot be put into TOI/NBO DDL pressure by daemon
+  auto-apply.
+
+## 0.9.24 - 2026-05-12
+
+- Fixed: cluster offsite backup success now persists `last_files_archive_path`
+  and `last_files_bytes` in MCD state. Existing offsite directories also refresh
+  those fields from their marker instead of leaving a stale archive path from an
+  older backup.
+- Added: `backup cluster-status` verifies the latest offsite file archive path
+  from the final marker and reports stable `last_offsite_*` fields, preventing
+  later local full/incremental jobs from making the offsite file archive marker
+  look stale or healthy incorrectly.
+
 ## 0.9.23 - 2026-05-12
 
 - Fixed: `page_hits_orphan_cleanup_*` runtime overrides are now persisted into

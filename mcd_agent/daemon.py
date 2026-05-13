@@ -68,9 +68,15 @@ from mcd_agent.runtime_overrides import (
     overrides_fingerprint,
     push_runtime_overrides,
 )
+from mcd_agent.ring_utils import reconcile_ring as _reconcile_ring
 from mcd_agent.service_profiles import service_profiles_apply_once
 from mcd_agent.self_update import maybe_auto_update
 from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
+from mcd_agent.segment_dependencies import (
+    segment_dependency_blocked_ids,
+    segment_dependency_maps,
+    stale_dependent_segment_closure,
+)
 from mcd_agent.signals import collect_signals
 from mcd_agent.state_push import (
     MCCStatePusher,
@@ -96,7 +102,9 @@ _SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
 _DB_DISPATCH_PAUSE_SEC = 120
 _DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD = 50
 _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
+_SEGMENT_DEPENDENCY_FINISH_WINDOW_SEC = 2 * 3600
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
+_SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
 _IMPORT_SETTLE_UNTIL: dict[str, float] = {}
 _IMPORT_PENDING_OVERRIDE_WARN_TS: dict[str, float] = {}
 _SQL_IMPORT_PENDING_STATUS_COUNT = (
@@ -149,6 +157,7 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_cluster_incremental_start_hour",
     "backup_cluster_incremental_end_hour",
     "backup_cluster_incremental_interval_sec",
+    "backup_cluster_incremental_min_free_bytes",
     "backup_cluster_files_snapshot_enabled",
     "backup_cluster_files_snapshot_paths",
     "backup_cluster_files_snapshot_exclude",
@@ -230,6 +239,31 @@ class SQLSegmentRule:
     segment_id: int
     select_sql: str
     depends_on: tuple[int, ...]
+
+
+def _recent_finished_segment_ids(root: str, now_ts: float) -> set[int]:
+    cutoff = float(now_ts) - float(_SEGMENT_DEPENDENCY_FINISH_WINDOW_SEC)
+    out: set[int] = set()
+    for (row_root, sid), ts in list(_SEGMENT_FINISHED_AT.items()):
+        if ts < cutoff:
+            _SEGMENT_FINISHED_AT.pop((row_root, sid), None)
+            continue
+        if row_root == root:
+            out.add(int(sid))
+    return out
+
+
+def _mark_segment_finished(root: str, segment_id: int | None, now_ts: float | None = None) -> None:
+    if segment_id is None:
+        return
+    try:
+        sid = int(segment_id)
+    except Exception:
+        return
+    if sid <= 0:
+        return
+    _SEGMENT_FINISHED_AT[(str(root), sid)] = float(now_ts or time.time())
+
 
 
 def _to_int(value: object) -> int | None:
@@ -917,6 +951,7 @@ def _run_sql_segment_ring(
                 context=sql_ctx,
                 statement_timeout_sec=int(getattr(config, "segment_sql_statement_timeout_sec", 1800) or 1800),
             )
+            _mark_segment_finished(root, sid, now_ts=now_ts)
             done_set.add(sid)
             _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment_sql", sid)] = float(now_ts)
             # Keep shared cooldown in sync with regular `segment` task type.
@@ -1080,22 +1115,12 @@ def _cluster_local_full_done_for_date(config: AgentConfig, local_dt: datetime) -
     except Exception:
         return False
     last_full_at = str(st.get("last_local_full_at") or "")
-    if _cluster_state_ts_local_date(last_full_at, local_dt):
-        return True
-    age_sec = _cluster_state_ts_age_sec(last_full_at)
-    if age_sec is None:
-        return False
-    # Cluster full backups are daily and can cross UTC/local date boundaries.
-    # A daemon restart must not launch a second full shortly after a successful
-    # nightly full just because the host timezone differs from the business TZ.
-    min_interval = max(
-        3600,
-        min(
-            23 * 3600,
-            int(getattr(config, "backup_xtrabackup_full_interval_days", 1) or 1) * 86400 - 3600,
-        ),
-    )
-    return age_sec < min_interval
+    # Cluster full backups are calendar-window driven. A late full from the
+    # previous day must not push the next day's 01:00 full forward; otherwise a
+    # single incident causes permanent schedule drift and the offsite tier misses
+    # its expected 02:00 chain. Same-day protection is still enough to prevent
+    # duplicate full runs after daemon restarts.
+    return _cluster_state_ts_local_date(last_full_at, local_dt)
 
 
 def _cluster_local_full_ready_for_offsite(config: AgentConfig, local_dt: datetime) -> bool:
@@ -1115,10 +1140,11 @@ def _cluster_local_full_ready_for_offsite(config: AgentConfig, local_dt: datetim
         return False
     if full_local.date() != local_dt.date():
         return False
-    daytime_start = max(0, min(23, int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8)))
-    # Offsite belongs to the nightly chain. A full completed after the daytime
-    # window starts is treated as manual/test and must not trigger offsite.
-    return full_local.hour < daytime_start
+    # Offsite belongs to the latest successful local full for the same
+    # business date. Do not reject late local full backups here: after incidents,
+    # restarts, or long full runs the backup can complete after the daytime
+    # incremental window starts, but it is still the correct offsite source.
+    return True
 
 
 def _cluster_offsite_done_for_date(config: AgentConfig, local_dt: datetime) -> bool:
@@ -1456,17 +1482,6 @@ def _needs_weight_recalc(ids: list[int], cached: dict[int, float]) -> bool:
     return set(ids) != set(cached.keys())
 
 
-def _reconcile_ring(old_ring: deque[int] | None, ordered_ids: list[int]) -> deque[int]:
-    if old_ring is None or not old_ring:
-        return deque(ordered_ids)
-    old = list(old_ring)
-    new_set = set(ordered_ids)
-    keep = [x for x in old if x in new_set]
-    keep_set = set(keep)
-    tail = [x for x in ordered_ids if x not in keep_set]
-    return deque(keep + tail)
-
-
 def _mark_ring_entity_executed(ring: deque[int], entity_id: int | None) -> None:
     if entity_id is None or not ring:
         return
@@ -1554,6 +1569,7 @@ def _fill_from_ring(
     store: TaskStore,
     popens: dict[str, subprocess.Popen[bytes]],
     build_args,
+    blocked_entities: set[int] | None = None,
 ) -> None:
     if not ring or ring_limit <= 0 or total_limit <= 0:
         return
@@ -1561,6 +1577,9 @@ def _fill_from_ring(
     while _running_count_for_entities(running, root, task_type, ring_entities) < ring_limit and scans > 0:
         eid = ring[0]
         scans -= 1
+        if blocked_entities and eid in blocked_entities:
+            ring.rotate(-1)
+            continue
         if _is_running(running, root, task_type, eid):
             ring.rotate(-1)
             continue
@@ -3558,6 +3577,8 @@ def _monitor_running(
                 continue
             running.pop(key, None)
             popens.pop(key, None)
+            if task.task_type == "segment":
+                _mark_segment_finished(task.root, task.entity_id, now_ts=now)
             logging.info(
                 "[%s] external %s entity=%s pid=%s released",
                 task.root,
@@ -3574,6 +3595,8 @@ def _monitor_running(
                 state = "done" if rc == 0 else "failed"
                 note = None if rc == 0 else "non_zero_exit"
                 store.finish(task.row_id, state=state, rc=rc, note=note)
+                if rc == 0 and task.task_type == "segment":
+                    _mark_segment_finished(task.root, task.entity_id, now_ts=now)
                 if rc == 0 and task.task_type == "import":
                     _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
                 running.pop(key, None)
@@ -3950,6 +3973,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_sql_active_sets: dict[str, set[int]] = {}
     segment_sql_done_sets: dict[str, set[int]] = {}
     segment_sql_auto_signatures: dict[str, tuple[int, ...]] = {}
+    segment_dependencies_by_root: dict[str, dict[int, set[int]]] = {}
+    segment_parents_by_root: dict[str, dict[int, set[int]]] = {}
     segment_prio_rings: dict[str, deque[int]] = {}
     segment_reg_rings: dict[str, deque[int]] = {}
     campaign_trigger_prio_rings: dict[str, deque[int]] = {}
@@ -4448,11 +4473,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         and now >= next_cluster_offsite_retry_at
                         and bool(getattr(config, "backup_cluster_remote_enabled", True))
                         and _cluster_local_full_ready_for_offsite(config, dt_local)
-                        and _local_time_reached(
-                            dt_local,
-                            int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 2),
-                            int(getattr(config, "backup_cluster_offsite_not_before_minute", 0) or 0),
-                        )
                         and not _cluster_offsite_done_for_date(config, dt_local)
                     ):
                         cluster_job = "offsite"
@@ -4476,13 +4496,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             try:
                                 if job == "local-full":
                                     res = cluster_backup_local_full(config)
+                                    files_ok = True
                                     if res.ok and bool(getattr(config, "backup_cluster_files_snapshot_enabled", True)):
                                         files_res = cluster_backup_files_snapshot(config)
+                                        files_ok = bool(files_res.ok)
                                         if not files_res.ok:
                                             logging.warning("cluster files snapshot failed after local full: %s", files_res.message)
                                     if res.ok:
                                         last_cluster_full_day = job_day
                                         next_cluster_full_retry_at = 0.0
+                                        if (
+                                            files_ok
+                                            and bool(getattr(config, "backup_cluster_remote_enabled", True))
+                                            and not _cluster_offsite_done_for_date(config, dt_local)
+                                        ):
+                                            offsite_res = cluster_backup_offsite(config)
+                                            if offsite_res.ok:
+                                                last_cluster_offsite_day = job_day
+                                                next_cluster_offsite_retry_at = 0.0
+                                                logging.info("cluster offsite: %s", offsite_res.message)
+                                            else:
+                                                next_cluster_offsite_retry_at = time.monotonic() + 600
+                                                logging.warning("cluster offsite failed: %s", offsite_res.message)
                                     else:
                                         next_cluster_full_retry_at = time.monotonic() + 900
                                     logging.info("cluster local full: %s", res.message)
@@ -4811,6 +4846,34 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                 if segment_ids is not None:
                     standard_segment_ids = list(dict.fromkeys(segment_ids))
+                    dependency_children: dict[int, set[int]] = {}
+                    dependency_parents: dict[int, set[int]] = {}
+                    try:
+                        dep_rows = db.fetch_published_segment_filters()
+                        dependency_children, dependency_parents = segment_dependency_maps(dep_rows)
+                        segment_dependencies_by_root[root] = dependency_children
+                        segment_parents_by_root[root] = dependency_parents
+                        recently_finished = _recent_finished_segment_ids(root, now)
+                        dependent_ids = stale_dependent_segment_closure(
+                            recently_finished,
+                            dep_rows,
+                            dependency_children,
+                        )
+                        if dependent_ids:
+                            before = set(standard_segment_ids)
+                            standard_segment_ids = list(dict.fromkeys(standard_segment_ids + sorted(dependent_ids)))
+                            added = sorted(set(standard_segment_ids) - before)
+                            if added:
+                                logging.info(
+                                    "[%s] segment dependency follow-up planned parents=%s children=%s",
+                                    root,
+                                    ",".join(str(x) for x in sorted(recently_finished)[:30]),
+                                    ",".join(str(x) for x in added[:50]),
+                                )
+                    except Exception as e:
+                        dependency_children = segment_dependencies_by_root.get(root, {})
+                        dependency_parents = segment_parents_by_root.get(root, {})
+                        logging.warning("[%s] segment dependency planning failed: %s", root, e)
                     auto_sql_rules_for_root: dict[int, SQLSegmentRule] = {}
                     if sql_ring_enabled_for_root and config.segment_sql_auto_enabled and standard_segment_ids:
                         try:
@@ -4873,10 +4936,23 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if sql_ring_enabled_for_root:
                         sql_rules_for_root = dict(auto_sql_rules_for_root)
                         sql_rules_for_root.update(dict(sql_segment_rules_cfg))
+                        if dependency_parents:
+                            for sid, rule in list(sql_rules_for_root.items()):
+                                deps = tuple(sorted(set(rule.depends_on) | set(dependency_parents.get(int(sid), set()))))
+                                if deps != rule.depends_on:
+                                    sql_rules_for_root[sid] = SQLSegmentRule(
+                                        segment_id=rule.segment_id,
+                                        select_sql=rule.select_sql,
+                                        depends_on=deps,
+                                    )
                     if sql_ring_enabled_for_root and sql_rules_for_root:
                         sql_ring_plan = _plan_sql_segment_ring(standard_segment_ids, sql_rules_for_root)
                         active_sql_set = set(sql_ring_plan)
-                        segment_sql_rings[root] = _reconcile_ring(segment_sql_rings.get(root), sql_ring_plan)
+                        segment_sql_rings[root] = _reconcile_ring(
+                            segment_sql_rings.get(root),
+                            sql_ring_plan,
+                            new_to_front=True,
+                        )
                         segment_sql_rules_by_root[root] = sql_rules_for_root
                         segment_sql_active_sets[root] = active_sql_set
                         prev_done = set(segment_sql_done_sets.get(root, set()))
@@ -4924,8 +5000,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if not _partition_complete(standard_segment_ids, seg_prio, seg_reg):
                         logging.warning("[%s] invalid segment partition, forcing single ring", root)
                         seg_prio, seg_reg = [], sorted(list(dict.fromkeys(standard_segment_ids)))
-                    segment_prio_rings[root] = _reconcile_ring(segment_prio_rings.get(root), seg_prio)
-                    segment_reg_rings[root] = _reconcile_ring(segment_reg_rings.get(root), seg_reg)
+                    segment_prio_rings[root] = _reconcile_ring(
+                        segment_prio_rings.get(root),
+                        seg_prio,
+                        new_to_front=True,
+                    )
+                    segment_reg_rings[root] = _reconcile_ring(
+                        segment_reg_rings.get(root),
+                        seg_reg,
+                        new_to_front=True,
+                    )
                     segment_prio_sets[root] = set(seg_prio)
                     segment_reg_sets[root] = set(seg_reg)
                 else:
@@ -5447,6 +5531,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set())
             reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set())
             reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set())
+            segment_blocked_ids = segment_dependency_blocked_ids(
+                root=root,
+                candidate_ids=set(seg_prio_set) | set(seg_reg_set) | set(seg_sql_active),
+                parents_by_child=segment_parents_by_root.get(root, {}),
+                running=running,
+                recently_finished=_recent_finished_segment_ids(root, now),
+            )
             if _import_in_settle(root, now):
                 import_pending_cache[root] = 0
             _mark_external_entities_executed(
@@ -5616,6 +5707,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             id=sid,
                             batch_limit=config.segment_batch_limit,
                         ),
+                        blocked_entities=segment_blocked_ids,
                     )
 
                 if throttled.get(root, False) and config.segment_throttle_whitelist_only:
@@ -5640,6 +5732,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             id=sid,
                             batch_limit=config.segment_batch_limit,
                         ),
+                        blocked_entities=segment_blocked_ids,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
@@ -5667,6 +5760,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             id=sid,
                             batch_limit=config.segment_batch_limit,
                         ),
+                        blocked_entities=segment_blocked_ids,
                     )
                     _fill_from_ring(
                         ring=seg_reg_ring,
@@ -5687,6 +5781,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             id=sid,
                             batch_limit=config.segment_batch_limit,
                         ),
+                        blocked_entities=segment_blocked_ids,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total < seg_total_limit:
@@ -5711,6 +5806,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     id=sid,
                                     batch_limit=config.segment_batch_limit,
                                 ),
+                                blocked_entities=segment_blocked_ids,
                             )
                         elif seg_reg_ring:
                             _fill_from_ring(
@@ -5732,6 +5828,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     id=sid,
                                     batch_limit=config.segment_batch_limit,
                                 ),
+                                blocked_entities=segment_blocked_ids,
                             )
                         elif seg_prio_ring and spill > 0:
                             # If regular ring is empty, keep total segment concurrency at target
@@ -5755,6 +5852,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     id=sid,
                                     batch_limit=config.segment_batch_limit,
                                 ),
+                                blocked_entities=segment_blocked_ids,
                             )
 
             # `mautic:campaigns:update` is treated as synonym of

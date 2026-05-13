@@ -214,7 +214,7 @@ def _nginx_candidates(root: Path, domains: list[str]) -> list[Path]:
     enabled_dir = enabled_root.resolve(strict=False)
     for domain in sorted(domain_set):
         enabled = enabled_root / f"{domain}.conf"
-        if _nginx_matches_domain(enabled, domain_set):
+        if (enabled.exists() or enabled.is_symlink()) and _nginx_matches_domain(enabled, domain_set):
             wanted.append(enabled)
 
     for base in _NGINX_DIRS:

@@ -35,6 +35,7 @@ _C_YELLOW = "\033[33m"
 _C_RED = "\033[31m"
 _C_GRAY = "\033[90m"
 _BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle(?:Dev)?$")
+_PLUGIN_UID_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{2,127}$")
 _EXCLUSIVE_BUNDLE_PAIRS: dict[str, str] = {
     "AmazonSesBundle": "AmazonSesBundleDev",
     "AmazonSesBundleDev": "AmazonSesBundle",
@@ -52,6 +53,17 @@ def _is_valid_bundle_name(name: str) -> bool:
     if n.lower() in {"plugin", "plugins"}:
         return False
     return bool(_BUNDLE_NAME_RE.match(n))
+
+
+def _normalize_plugin_uid(uid: str) -> str:
+    raw = str(uid or "").strip().lower()
+    raw = re.sub(r"[^a-z0-9_.:-]+", "-", raw)
+    raw = raw.strip("-._:")
+    return raw[:128]
+
+
+def _valid_plugin_uid(uid: str) -> bool:
+    return bool(_PLUGIN_UID_RE.match(str(uid or "").strip()))
 
 
 def _install_bundle_for_manifest_bundle(bundle: str, item: dict[str, Any] | None = None) -> str:
@@ -504,6 +516,7 @@ def _build_plugin_rows(
             rows.append(
                 {
                     "idx": selectable_idx,
+                    "plugin_uid": "",
                     "bundle": bundle,
                     "display_name": bundle,
                     "install_bundle": bundle,
@@ -531,6 +544,7 @@ def _build_plugin_rows(
         rows.append(
             {
                 "idx": selectable_idx,
+                "plugin_uid": _normalize_plugin_uid(str(item.get("plugin_uid", "")).strip()),
                 "bundle": bundle,
                 "display_name": str(item.get("display_name", "")).strip() or bundle,
                 "install_bundle": install_bundle,
@@ -894,6 +908,7 @@ def run_plugins_interactive(
     root: str | None,
     selection: str | None,
     bundles: list[str] | None = None,
+    plugin_uids: list[str] | None = None,
     action: str | None,
     no_color: bool,
     yes: bool,
@@ -920,6 +935,7 @@ def run_plugins_interactive(
                     root=inst.root,
                     selection=selection,
                     bundles=bundles,
+                    plugin_uids=plugin_uids,
                     action=action,
                     no_color=no_color,
                     yes=yes,
@@ -992,6 +1008,7 @@ def run_plugins_interactive(
             payload_rows.append(
                 {
                     "idx": row.get("idx"),
+                    "plugin_uid": str(row.get("plugin_uid", "")).strip(),
                     "bundle": str(row.get("bundle", "")).strip(),
                     "display_name": str(row.get("display_name", "")).strip(),
                     "install_bundle": str(row.get("install_bundle", "")).strip(),
@@ -1053,22 +1070,40 @@ def run_plugins_interactive(
             return 0
         chosen_action = normalized
 
-        if selection is None and not bundles:
+        if selection is None and not bundles and not plugin_uids:
             selection_in = _ask("Select plugins to apply (e.g. 1-3 6 10), empty=back: ").strip()
-        elif bundles:
+        elif bundles or plugin_uids:
             selection_in = ""
         else:
             selection_in = selection.strip()
             selection = None
 
-        if not selection_in and not bundles:
+        if not selection_in and not bundles and not plugin_uids:
             if not sys.stdin.isatty():
                 print("No selection provided in non-interactive mode, exit")
                 return 0
             print("Back to action selection")
             continue
 
-        if bundles:
+        if plugin_uids:
+            requested_uids = {
+                _normalize_plugin_uid(str(x or ""))
+                for x in (plugin_uids or [])
+                if _normalize_plugin_uid(str(x or ""))
+            }
+            requested_uids = {x for x in requested_uids if _valid_plugin_uid(x)}
+            if not requested_uids:
+                print("No valid plugin uid values, try again")
+                continue
+            selected = [
+                row for row in rows
+                if bool(row.get("selectable", False)) and str(row.get("plugin_uid", "")).strip() in requested_uids
+            ]
+            found = {str(row.get("plugin_uid", "")).strip() for row in selected}
+            missing = sorted(requested_uids - found)
+            if missing:
+                raise RuntimeError(f"plugin uid(s) not found in manifest for this instance: {', '.join(missing)}")
+        elif bundles:
             requested = {str(x or "").strip() for x in (bundles or []) if str(x or "").strip()}
             if not requested:
                 print("No valid plugin bundle names, try again")
