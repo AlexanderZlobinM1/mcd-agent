@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.34 - 2026-05-14
+
+- Fixed: cluster offsite backup now detects stale temporary prepared MySQL
+  processes from previous `mcd-offsite-mysql-*` runs, terminates them when their
+  prepared datadir is already gone, and refuses to delete a prepared datadir
+  that is still held by a live temp MySQL process.
+- Result: deleted prepared offsite backup files cannot keep local backup disk
+  space pinned and break the next local full backup with `No space left on
+  device`.
+
 ## 0.9.33 - 2026-05-13
 
 - Changed: cluster backup policy is deliberately simple and deterministic:

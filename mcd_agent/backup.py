@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -1569,8 +1570,17 @@ def _clone_xtrabackup_for_offsite_prepare(cfg: AgentConfig, full_dir: Path) -> P
         raise RuntimeError(f"local full xtrabackup is not usable for offsite source: {msg}")
     root = _cluster_offsite_mysql_root(cfg)
     root.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_prepared_mysql_processes(cfg)
+    active_prepared = {
+        item["datadir"].resolve(strict=False): int(item["pid"])
+        for item in _cluster_prepared_mysql_processes(cfg)
+        if isinstance(item.get("datadir"), Path)
+    }
     for old in root.iterdir():
         if old.is_dir() and old.name.startswith("prepared-"):
+            pid = active_prepared.get(old.resolve(strict=False))
+            if pid:
+                raise RuntimeError(f"refusing to remove prepared offsite mysql datadir still used by pid {pid}: {old}")
             shutil.rmtree(old, ignore_errors=True)
     clone_dir = root / f"prepared-{_fmt_local_ts()}"
     if clone_dir.exists():
@@ -2005,7 +2015,96 @@ def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
             continue
         if "/databases/cluster__" in cmdline or "/files-snapshot-" in cmdline:
             matches.append(int(pid_dir.name))
-    return sorted(matches)
+    matches.extend(item["pid"] for item in _cluster_prepared_mysql_processes(cfg))
+    return sorted(set(matches))
+
+
+_MYSQL_DATADIR_ARG_RE = re.compile(r"(?:^|\s)--datadir=([^\s]+)")
+
+
+def _cluster_prepared_mysql_datadir_from_cmdline(cfg: AgentConfig, cmdline: str) -> Path | None:
+    if "mcd-offsite-mysql-" not in cmdline:
+        return None
+    if "--skip-networking" not in cmdline or "--skip-grant-tables" not in cmdline:
+        return None
+    match = _MYSQL_DATADIR_ARG_RE.search(cmdline)
+    if not match:
+        return None
+    datadir = Path(match.group(1))
+    if not datadir.is_absolute():
+        return None
+    root = _cluster_offsite_mysql_root(cfg)
+    try:
+        rel = datadir.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return None
+    if not rel.parts or not rel.parts[0].startswith("prepared-"):
+        return None
+    return datadir
+
+
+def _cluster_prepared_mysql_processes(cfg: AgentConfig) -> list[dict[str, Any]]:
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    matches: list[dict[str, Any]] = []
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        cmdline = _proc_cmdline(pid_dir)
+        if not cmdline:
+            continue
+        datadir = _cluster_prepared_mysql_datadir_from_cmdline(cfg, cmdline)
+        if datadir is None:
+            continue
+        matches.append({"pid": int(pid_dir.name), "datadir": datadir, "cmdline": cmdline})
+    matches.sort(key=lambda x: int(x["pid"]))
+    return matches
+
+
+def _pid_exists(pid: int) -> bool:
+    return Path(f"/proc/{int(pid)}").exists()
+
+
+def _terminate_pid(pid: int, *, timeout_sec: int = 20) -> bool:
+    pid = int(pid)
+    if not _pid_exists(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    deadline = time.monotonic() + max(1, int(timeout_sec))
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.5)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.25)
+    return not _pid_exists(pid)
+
+
+def _cleanup_stale_prepared_mysql_processes(cfg: AgentConfig) -> list[int]:
+    stopped: list[int] = []
+    for item in _cluster_prepared_mysql_processes(cfg):
+        pid = int(item["pid"])
+        datadir = item["datadir"]
+        if isinstance(datadir, Path) and datadir.exists():
+            continue
+        if _terminate_pid(pid):
+            stopped.append(pid)
+    return stopped
 
 
 def _cluster_archive_files_snapshot_to_remote(
@@ -3487,6 +3586,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
     try:
         _validate_cluster_cfg(cfg, remote=True)
         _ensure_cluster_backup_authority(cfg)
+        stopped_prepared_mysql = _cleanup_stale_prepared_mysql_processes(cfg)
         active_pids = _cluster_offsite_processes(cfg)
         if active_pids:
             _cluster_update_state(
@@ -3500,6 +3600,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                     "job": "backup.cluster.offsite",
                     "method": "mydumper",
                     "active_offsite_pids": active_pids,
+                    "stale_prepared_mysql_stopped": stopped_prepared_mysql,
                 },
             )
             return BackupResult(
@@ -3572,6 +3673,7 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
                 "job": "backup.cluster.offsite",
                 "method": "mydumper",
                 "tool_state": tool_state,
+                "stale_prepared_mysql_stopped": stopped_prepared_mysql,
             },
         )
         _mount(cfg, mount_path)
@@ -3777,6 +3879,13 @@ def cluster_backup_offsite_dry_run(config: AgentConfig) -> dict[str, Any]:
     try:
         _validate_cluster_cfg(cfg, remote=True)
         _ensure_cluster_backup_authority(cfg)
+        prepared_mysql = _cluster_prepared_mysql_processes(cfg)
+        result["prepared_mysql_pids"] = [int(item["pid"]) for item in prepared_mysql]
+        result["stale_prepared_mysql_pids"] = [
+            int(item["pid"])
+            for item in prepared_mysql
+            if isinstance(item.get("datadir"), Path) and not item["datadir"].exists()
+        ]
         active_pids = _cluster_offsite_processes(cfg)
         result["active_offsite_pids"] = active_pids
         if active_pids:
