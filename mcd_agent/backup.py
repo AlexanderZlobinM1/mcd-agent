@@ -34,6 +34,44 @@ _PROFILE_ROW_ID = 1
 _MYDUMPER_FLAG_CACHE: dict[tuple[str, str], bool] = {}
 _XTRABACKUP_FLAG_CACHE: dict[tuple[str, str], bool] = {}
 
+_CLUSTER_FILE_FORBIDDEN_PREFIXES = (
+    "/dev",
+    "/proc",
+    "/run",
+    "/sys",
+    "/tmp",
+    "/var/cache",
+    "/var/lib/glusterd",
+    "/var/lib/mysql",
+    "/var/log",
+    "/var/run",
+    "/var/tmp",
+    "/root",
+)
+
+_CLUSTER_FILE_FORBIDDEN_EXACT = {
+    "/",
+    "/boot",
+    "/home",
+    "/mnt",
+    "/opt",
+    "/usr",
+    "/var",
+    "/var/lib",
+}
+
+_CLUSTER_FILE_RSYNC_EXCLUDES = (
+    "/etc/.pwd.lock",
+    "/etc/gshadow",
+    "/etc/gshadow-",
+    "/etc/mysql/debian.cnf",
+    "/etc/security/opasswd",
+    "/etc/shadow",
+    "/etc/shadow-",
+    "/etc/ssh/ssh_host_*_key",
+    "/var/lib/glusterd/***",
+)
+
 
 @dataclass(frozen=True)
 class BackupResult:
@@ -847,8 +885,21 @@ def _profile_archive_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _profile_backup_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if "remote_root_dir" in payload:
+        remote_root = str(payload.get("remote_root_dir") or "").strip().strip("/")
+        if remote_root:
+            out["remote_root_dir"] = remote_root
+    return out
+
+
 def _sync_profile_payload_to_config(cfg: AgentConfig, payload: dict[str, Any]) -> bool:
     changed = False
+    backup = _profile_backup_payload(payload)
+    if backup:
+        _, c = upsert_section_values(cfg.config_file_path, "backup", backup)
+        changed = changed or c
     storage = _profile_storage_payload(payload)
     if storage:
         _, c = upsert_section_values(cfg.config_file_path, "backup.storage", storage)
@@ -889,6 +940,9 @@ def _config_profile_payload(cfg: AgentConfig) -> dict[str, Any]:
     archive = _profile_archive_payload({"archive": backup.get("archive", {})})
     if archive:
         out["archive"] = archive
+    backup_settings = _profile_backup_payload(backup)
+    if backup_settings:
+        out.update(backup_settings)
     return out
 
 
@@ -967,7 +1021,15 @@ def _effective_cfg(cfg: AgentConfig) -> AgentConfig:
     storage = p.get("storage") if isinstance(p.get("storage"), dict) else {}
     mysql = p.get("mysql") if isinstance(p.get("mysql"), dict) else {}
     archive = p.get("archive") if isinstance(p.get("archive"), dict) else {}
+    backup = _profile_backup_payload(p)
     out = cfg
+    if backup:
+        out = replace(
+            out,
+            backup_remote_root_dir=str(backup.get("remote_root_dir")).strip()
+            if backup.get("remote_root_dir")
+            else out.backup_remote_root_dir,
+        )
     if storage:
         out = replace(
             out,
@@ -2300,11 +2362,28 @@ def _cluster_file_source_paths(cfg: AgentConfig, attr_name: str, fallback: list[
             if not path.exists():
                 continue
             key = str(path)
+            if _cluster_file_source_path_forbidden(key):
+                continue
             if key in seen:
                 continue
             seen.add(key)
             out.append(key)
     return out
+
+
+def _cluster_file_source_path_forbidden(path: str) -> bool:
+    raw = str(path or "").strip()
+    if not raw:
+        return True
+    normalized = os.path.normpath(raw)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized.lstrip("/")
+    if normalized in _CLUSTER_FILE_FORBIDDEN_EXACT:
+        return True
+    for prefix in _CLUSTER_FILE_FORBIDDEN_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
 
 
 def _cluster_should_produce_shared(cfg: AgentConfig) -> bool:
@@ -2348,11 +2427,13 @@ def _rsync_tree(
     if not src_paths:
         return 0
     dst.mkdir(parents=True, exist_ok=True)
-    cmd = ["rsync", "-a", "--delete", "--numeric-ids"]
+    cmd = ["rsync", "-a", "--delete", "--numeric-ids", "--chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r"]
     if relative:
         cmd.append("--relative")
     if link_dest is not None and link_dest.exists():
         cmd.append(f"--link-dest={link_dest}")
+    for pattern in _CLUSTER_FILE_RSYNC_EXCLUDES:
+        cmd.append(f"--exclude={pattern}")
     for pattern in list(getattr(cfg, "backup_cluster_files_snapshot_exclude", []) or []):
         pattern = str(pattern or "").strip()
         if pattern:
@@ -3436,6 +3517,28 @@ def _cluster_offsite_state_from_marker(marker: dict[str, Any], backup_path: Path
     return out
 
 
+def _cluster_backup_integrity_problem(state: dict[str, Any]) -> str:
+    archive_path = str(state.get("last_offsite_files_archive_path") or "").strip()
+    archive_ok = state.get("last_offsite_files_archive_ok")
+    if archive_path and archive_ok is False:
+        return f"last offsite files archive missing: {archive_path}"
+    return ""
+
+
+def _apply_cluster_backup_integrity_status(state: dict[str, Any]) -> None:
+    problem = _cluster_backup_integrity_problem(state)
+    if not problem:
+        state.setdefault("cluster_integrity_status", "ok")
+        state.setdefault("cluster_integrity_error", "")
+        return
+    state["cluster_integrity_status"] = "failed"
+    state["cluster_integrity_error"] = problem
+    last_status = str(state.get("last_status") or "").strip().lower()
+    if last_status in {"", "ok", "ok_skip_existing"}:
+        state["last_status"] = "failed"
+        state["last_error"] = problem
+
+
 def _cluster_is_protected_archive(path: Path) -> tuple[bool, str]:
     lname = path.name.lower()
     manual_tokens = ("manual", "dont-touch", "do-not-touch", "do_not_touch", "do-not-prune", "do_not_prune")
@@ -3986,6 +4089,7 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
         else:
             state["last_offsite_files_archive_ok"] = False
+    _apply_cluster_backup_integrity_status(state)
     return state
 
 
@@ -4047,17 +4151,9 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
             raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
         if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
             raise RuntimeError("backup storage auth is not configured (key_file or password required)")
-        if cfg.backup_ssh_host and cfg.backup_ssh_user:
-            required = [("sshfs", cfg.backup_sshfs_package)]
-            missing = [(bin_path, pkg) for bin_path, pkg in required if not shutil.which(bin_path)]
-            if missing:
-                packages = [pkg for _bin, pkg in missing if str(pkg or "").strip()]
-                if not cfg.backup_auto_install_packages:
-                    raise RuntimeError("missing required backup tools: " + ", ".join(bin_path for bin_path, _ in missing))
-                _apt_install_packages(packages)
+        tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
         if not shutil.which("tar") or not shutil.which("gzip"):
             raise RuntimeError("tar/gzip are required for instance backup")
-        _mysqldump_bin()
         instances = _list_instances(cfg)
         inst = _select_instance_for_backup(instances, root)
         if not inst.db:
@@ -4076,7 +4172,8 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
                 "last_status": "running",
                 "last_error": "",
                 "job": "backup.instance_run",
-                "method": "mysqldump",
+                "method": "mydumper",
+                "tools": tool_state,
             }
         )
         _json_write(state_path, run_state)
@@ -4093,8 +4190,12 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
             raise RuntimeError(f"backup target already exists: {final_dir}")
         tmp_dir.mkdir(parents=True, exist_ok=False)
         files_archive = _archive_instance_files(cfg, inst, tmp_dir)
-        db_archive = tmp_dir / "db.sql.gz"
-        db_bytes = _run_mysqldump_gz(cfg, effective_db, db_archive)
+        db_dir = tmp_dir / "databases" / effective_db.name
+        db_dir.mkdir(parents=True, exist_ok=False)
+        _run_mydumper(cfg, effective_db, db_dir)
+        ok, verify_msg, db_bytes = _verify_dump_dir(db_dir)
+        if not ok:
+            raise RuntimeError(f"instance backup verification failed for {effective_db.name}: {verify_msg}")
         file_bytes = _asset_bytes(files_archive)
         bytes_written = int(db_bytes) + int(file_bytes)
         os.replace(tmp_dir, final_dir)
@@ -4115,13 +4216,15 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
                     "root": inst.root,
                     "primary_domain": inst.primary_domain or "",
                     "database": effective_db.name,
-                    "method": "mysqldump",
+                    "method": "mydumper",
                     "bytes": db_bytes,
+                    "path": _path_rel_to(final_dir, final_dir / "databases" / effective_db.name),
                 }
             ],
-            "method": "mysqldump",
+            "method": "mydumper",
+            "mydumper_threads": cfg.backup_mydumper_threads,
+            "mydumper_compress": cfg.backup_mydumper_compress,
             "files_archive_path": str(final_dir / files_archive.name),
-            "db_archive_path": str(final_dir / db_archive.name),
             "restorable_as_image": True,
         }
         if inst.mautic_major:
@@ -4139,7 +4242,7 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
             mount_path=mount_path,
             backup_dir=final_dir,
             marker=marker,
-            kind="mcc.instance_backup.mysqldump",
+            kind="mcc.instance_backup.mydumper",
         )
         duration = int(time.monotonic() - start_monotonic)
         history = state.get("history", [])
@@ -4954,9 +5057,19 @@ def backup_state_for_push(config: AgentConfig) -> dict[str, Any]:
                     "last_local_incremental_at": cst.get("last_local_incremental_at"),
                     "last_files_snapshot_path": cst.get("last_files_snapshot_path") or cst.get("latest_files_snapshot"),
                     "last_files_snapshot_at": cst.get("last_files_snapshot_at"),
+                    "last_offsite_backup_path": cst.get("last_offsite_backup_path"),
+                    "last_offsite_backup_at": cst.get("last_offsite_backup_at"),
+                    "last_offsite_files_archive_path": cst.get("last_offsite_files_archive_path"),
+                    "last_offsite_files_archive_ok": cst.get("last_offsite_files_archive_ok"),
+                    "last_offsite_files_bytes": cst.get("last_offsite_files_bytes"),
+                    "cluster_integrity_status": cst.get("cluster_integrity_status"),
+                    "cluster_integrity_error": cst.get("cluster_integrity_error"),
                     "last_remote_retention_plan": cst.get("last_remote_retention_plan"),
                 }
             )
+            if str(cst.get("cluster_integrity_status") or "").strip().lower() == "failed":
+                out["last_status"] = "failed"
+                out["last_error"] = str(cst.get("cluster_integrity_error") or "").strip() or out.get("last_error")
         except Exception:
             pass
     return out

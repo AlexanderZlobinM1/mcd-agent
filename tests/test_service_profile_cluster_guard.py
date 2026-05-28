@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 import mcd_agent.service_profiles as service_profiles
 
@@ -86,6 +89,55 @@ class ServiceProfileClusterGuardTests(unittest.TestCase):
 
         self.assertEqual(res.get("status"), "ok")
         self.assertEqual(res.get("apply", {}).get("status"), "planned")
+
+    def test_cluster_mysql_profile_does_not_cleanup_top_level_configs(self) -> None:
+        cfg = SimpleNamespace(cluster_id="ananasrs-prod")
+        old_euid = service_profiles.os.geteuid
+        old_detect_service = service_profiles._detect_mysql_service_name
+        old_detect_engine = service_profiles._detect_mysql_engine
+        old_detect_galera = service_profiles._mysql_galera_config_detected
+        old_detect_dropin = service_profiles._detect_mysql_dropin
+        old_build = service_profiles._build_mysql_override
+        old_write = service_profiles._write_file
+        old_dynamic = service_profiles._apply_mysql_dynamic_profile
+        old_cleanup_legacy = service_profiles._cleanup_legacy_mysql_top_level_configs
+        old_cleanup_profile = service_profiles._cleanup_mysql_top_level_profile_overrides
+        old_run = service_profiles.subprocess.run
+
+        with TemporaryDirectory() as tmp:
+            dropin = Path(tmp) / "99-mcd.cnf"
+            cleanup_legacy = Mock(return_value={})
+            cleanup_profile = Mock(return_value={})
+            try:
+                service_profiles.os.geteuid = lambda: 0
+                service_profiles._detect_mysql_service_name = lambda: "mysql"
+                service_profiles._detect_mysql_engine = lambda: "mysql"
+                service_profiles._mysql_galera_config_detected = lambda: True
+                service_profiles._detect_mysql_dropin = lambda _profile: dropin
+                service_profiles._build_mysql_override = lambda _profile, engine="mysql": "[mysqld]\n"
+                service_profiles._write_file = lambda _path, _content: True
+                service_profiles._apply_mysql_dynamic_profile = lambda _profile, engine="mysql": {"status": "skipped"}
+                service_profiles._cleanup_legacy_mysql_top_level_configs = cleanup_legacy
+                service_profiles._cleanup_mysql_top_level_profile_overrides = cleanup_profile
+                service_profiles.subprocess.run = lambda *a, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                res = service_profiles.apply_mysql_profile(cfg, {"cluster_safe": True}, dry_run=False)
+            finally:
+                service_profiles.os.geteuid = old_euid
+                service_profiles._detect_mysql_service_name = old_detect_service
+                service_profiles._detect_mysql_engine = old_detect_engine
+                service_profiles._mysql_galera_config_detected = old_detect_galera
+                service_profiles._detect_mysql_dropin = old_detect_dropin
+                service_profiles._build_mysql_override = old_build
+                service_profiles._write_file = old_write
+                service_profiles._apply_mysql_dynamic_profile = old_dynamic
+                service_profiles._cleanup_legacy_mysql_top_level_configs = old_cleanup_legacy
+                service_profiles._cleanup_mysql_top_level_profile_overrides = old_cleanup_profile
+                service_profiles.subprocess.run = old_run
+
+        self.assertEqual(res.get("status"), "applied")
+        cleanup_legacy.assert_not_called()
+        cleanup_profile.assert_not_called()
 
 
 if __name__ == "__main__":

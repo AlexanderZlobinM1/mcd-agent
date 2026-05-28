@@ -122,8 +122,11 @@ campaign_whitelist_file = "/etc/mcd/campaign-whitelist.txt"
 segment_batch_limit = 1000
 # Batch for mautic:campaigns:trigger.
 campaign_batch_limit = 1000
-# Campaign limit for trigger command. Set to 0/off/unlimited to omit --campaign-limit.
-campaign_limit = 60000
+# Campaign limit for trigger command. 0/off/unlimited omits --campaign-limit.
+campaign_limit = 0
+# Safety audit: periodically enqueue published campaigns as explicit
+# `mautic:campaigns:trigger -i ID` runs, bounded per campaign by this interval.
+campaign_trigger_audit_interval_sec = 300
 # Limit for mautic:import.
 import_limit = 1000
 
@@ -205,10 +208,9 @@ mautic6_core_patch_version_max = ""
 # - false => skip patch until version is known
 mautic6_core_patch_apply_if_version_unknown = true
 
-# Page-hit cascade patch policy:
-# - required : keep page-hit cascade patch applied automatically
-# - off      : do not patch automatically
-pagehit_cascade_patch_policy = "required"
+# Deprecated: page-hit cascade core patch is retired. MCD handles stale page-hit
+# queue cleanup in daemon housekeeping instead of patching Mautic core.
+pagehit_cascade_patch_policy = "off"
 
 # Enable campaign rebuild worker.
 enable_campaign_rebuild = false
@@ -236,6 +238,18 @@ contacts_cleanup_mode = "email_and_mobile"
 # Max rows deleted per cleanup run.
 contacts_cleanup_max_delete_per_run = 10000
 
+# MCC-managed per-instance empty leads cleanup. The instance settings map is
+# normally written by MCC from the Clean Empty Contacts tile.
+empty_leads_cleanup_enabled = false
+empty_leads_cleanup_interval_sec = 900
+empty_leads_cleanup_batch_size = 50000
+empty_leads_cleanup_max_batches_per_run = 10
+# Default cron-window length for legacy cron schedules, e.g. 22:00 + 660 min.
+empty_leads_cleanup_quiet_window_min = 660
+# 0 means unlimited cleanup cycles inside the active nightly/cron window.
+empty_leads_cleanup_max_runs_per_window = 0
+empty_leads_cleanup_instance_settings = {}
+
 # Enable orphan page_hits cleanup task.
 enable_page_hits_orphan_cleanup = false
 # Minimum interval between orphan cleanup runs, sec.
@@ -254,6 +268,18 @@ page_hits_orphan_cleanup_sleep_sec = 0.2
 page_hits_orphan_cleanup_grace_min = 60
 # Max runtime budget of one orphan cleanup run, sec.
 page_hits_orphan_cleanup_max_run_sec = 180
+page_hits_orphan_cleanup_instance_settings = {}
+
+# Leuchtfeuer Housekeeping plugin scheduling for Mautic 4/5/6/7 instances.
+housekeeping_plugin_enabled = false
+housekeeping_plugin_interval_sec = 86400
+housekeeping_plugin_quiet_hour = 3
+housekeeping_plugin_quiet_window_min = 120
+housekeeping_plugin_days_old = 365
+housekeeping_plugin_flags = []
+housekeeping_plugin_optimize_tables = false
+housekeeping_plugin_dry_run = true
+housekeeping_plugin_instance_settings = {}
 
 # Enable daily cache:clear task (MCD-managed, runtime-dynamic).
 enable_cache_clear = false
@@ -281,6 +307,19 @@ cache_warm_quiet_window_min = 60
 viber_stats_enabled = true
 viber_stats_interval_sec = 600
 viber_stats_instance_settings = {}
+
+# Monitored mailbox parser (MCD-managed replacement for mautic:email:fetch).
+# Per-instance overrides are keyed by instance_uid/root/domain and normally
+# written by MCC Web.
+monitored_email_parser_enabled = false
+monitored_email_parser_interval_sec = 900
+monitored_email_parser_batch_size = 100
+monitored_email_parser_force_seen = false
+monitored_email_parser_delete_processed = false
+monitored_email_parser_disable_mautic_fetch = true
+monitored_email_parser_types = ["feedback_loop"]
+monitored_email_parser_whitelist = []
+monitored_email_parser_instance_settings = {}
 
 # Filesystem permissions watchdog (MCD-managed, runtime-dynamic).
 # Keeps critical Mautic writable paths owned by `mautic_run_as_user`.
@@ -318,11 +357,11 @@ mail_queue_count = "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE stat
 
 # Segment source ids (published).
 segments_due = "SELECT ll.id FROM {prefix}lead_lists ll WHERE ll.is_published = 1 AND (  ll.last_built_date IS NULL   OR ll.last_built_date < '{window_start_utc_24h}'   OR COALESCE(ll.date_modified, ll.date_added) > COALESCE(ll.last_built_date, '1970-01-01 00:00:00')   OR EXISTS (    SELECT 1     FROM {prefix}lead_lists_leads lll     WHERE lll.leadlist_id = ll.id       AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date)     LIMIT 1  )  OR EXISTS (    SELECT 1     FROM {prefix}lead_lists_leads lll     INNER JOIN {prefix}leads l ON l.id = lll.lead_id     WHERE lll.leadlist_id = ll.id       AND lll.manually_removed = 0       AND (        ll.last_built_date IS NULL         OR COALESCE(l.date_modified, l.date_added) > ll.last_built_date      )     LIMIT 1  )) ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
-# Campaign source ids. Due date-action event logs use a short catch-up window
-# even after publish_down; new unscheduled contacts still honor active window.
+# Campaign source ids. Trigger workers only launch campaigns with due event-log
+# rows; rebuild workers create missing event logs for newly eligible contacts.
 # Note: for Mautic 4 the agent auto-removes `c.deleted` predicate at runtime
 # because some M4 schemas do not have this column.
-campaigns_due = "SELECT DISTINCT q.id FROM (  SELECT c.id   FROM {prefix}campaigns c   WHERE c.is_published = 1   AND (c.deleted IS NULL)   AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}')   AND EXISTS (    SELECT 1     FROM {prefix}campaign_lead_event_log el     WHERE el.campaign_id = c.id       AND el.date_triggered IS NULL       AND (        (el.trigger_date IS NOT NULL AND el.trigger_date >= '{window_start_utc_7d}' AND el.trigger_date <= '{now_utc}')         OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)      )     LIMIT 1  )   UNION   SELECT c.id   FROM {prefix}campaigns c   INNER JOIN {prefix}campaign_leads cl     ON cl.campaign_id = c.id    AND cl.manually_removed = 0    AND cl.date_last_exited IS NULL    AND cl.date_added >= '{window_start_local_24h}' WHERE c.is_published = 1 AND (c.deleted IS NULL) AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') AND NOT EXISTS (  SELECT 1   FROM {prefix}campaign_lead_event_log el2   WHERE el2.campaign_id = cl.campaign_id     AND el2.lead_id = cl.lead_id     AND el2.rotation <=> cl.rotation     LIMIT 1  )) q ORDER BY q.id"
+campaigns_due = "SELECT DISTINCT c.id FROM {prefix}campaigns c WHERE c.is_published = 1 AND (c.deleted IS NULL) AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') AND EXISTS (  SELECT 1   FROM {prefix}campaign_lead_event_log el   WHERE el.campaign_id = c.id     AND el.date_triggered IS NULL     AND (      (el.trigger_date IS NOT NULL AND el.trigger_date >= '{window_start_utc_7d}' AND el.trigger_date <= '{now_utc}')       OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)    )   LIMIT 1) ORDER BY c.id"
 
 # Segment weight source rows.
 segment_weights = "SELECT ll.id, UNIX_TIMESTAMP(ll.date_added) AS created_ts, UNIX_TIMESTAMP(ll.date_modified) AS modified_ts, UNIX_TIMESTAMP(ll.last_built_date) AS built_ts, COALESCE(a.recent_cnt, 0) AS recent_activity FROM {prefix}lead_lists ll LEFT JOIN (SELECT leadlist_id, COUNT(*) AS recent_cnt FROM {prefix}lead_lists_leads WHERE manually_removed = 0 AND date_added >= '{window_start_utc_24h}' GROUP BY leadlist_id) a ON a.leadlist_id = ll.id WHERE ll.is_published = 1"
@@ -438,6 +477,11 @@ post_cache_clear = true
 post_plugin_install = true
 # Metadata filename placed in plugin directory.
 state_filename = ".mcd-plugin.json"
+# Cluster plugin operations: reference node waits this long for Syncthing/file
+# propagation before cache clear fan-out.
+cluster_file_sync_wait_sec = 900
+# Cluster plugin operations: max wait for per-node cache:clear requests.
+cluster_cache_clear_wait_sec = 600
 
 [custom]
 # Base URL for custom scripts manifest/files.
@@ -642,22 +686,26 @@ files_sync_dir = "/opt/mcd/var/cluster-backup-files"
 # scripts. Do not put Mautic code here; the application tree is a shared
 # cluster artifact.
 files_node_paths = [
-  "/etc",
-  "/var/spool/cron/crontabs",
+  "/etc/cron.d",
+  "/etc/crontab",
+  "/etc/fstab",
+  "/etc/haproxy",
+  "/etc/hostname",
+  "/etc/hosts",
+  "/etc/mcd",
+  "/etc/mysql",
+  "/etc/netplan",
+  "/etc/nginx",
+  "/etc/php",
+  "/etc/systemd/system",
+  "/etc/timezone",
   "/opt/mcd/etc",
   "/opt/mcd/var/state",
-  "/etc/mcd",
   "/usr/local/bin",
   "/usr/local/sbin",
-  "/var/lib/glusterd",
   "/var/lib/syncthing-mcd/config.xml",
   "/var/lib/syncthing-mcd/cert.pem",
   "/var/lib/syncthing-mcd/key.pem",
-  "/root/.ssh",
-  "/root/*.sh",
-  "/root/*.py",
-  "/root/*.toml",
-  "/root/*.cnf",
 ]
 # Shared paths are produced by one node only (files_shared_producer_host, or node #1 by default).
 files_shared_paths = ["/var/www/mautic"]

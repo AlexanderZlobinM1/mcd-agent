@@ -334,6 +334,9 @@ Important:
 - Runtime tuning for large campaigns:
   - `runtime.campaign_limit` controls per-run trigger batch size.
   - `runtime.campaign_limit = 0` (or `off` / `unlimited` via MCC runtime override) omits `--campaign-limit`, so one trigger run can process the whole campaign.
+  - `runtime.campaign_trigger_audit_interval_sec` bounds the safety audit that
+    periodically enqueues published campaigns as explicit
+    `mautic:campaigns:trigger -i ID` runs. Set to `0` to disable.
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.
 - Runtime tuning for Viber stats:
   - `runtime.viber_stats_enabled = true` enables the built-in `viber:stats:update` scheduler for instances where a Viber plugin is installed.
@@ -493,6 +496,19 @@ Important:
   - `contacts_cleanup_interval_sec = 86400`
   - `contacts_cleanup_quiet_hour = 2`
   - `contacts_cleanup_quiet_window_min = 60`
+- MCC-managed Clean Empty Contacts can run per instance inside a nightly window:
+  - `empty_leads_cleanup_instance_settings[<instance>].schedule_type = "nightly_window"`
+  - `window_start = "22:00"`, `window_end = "09:00"`
+  - `batch_size = 50000`
+  - `max_runs_per_window = 0` for no limit while the window is open
+- MCC-managed Monitored Email Parser can replace `mautic:email:fetch` per instance:
+  - `monitored_email_parser_interval_sec = 900`
+  - `monitored_email_parser_batch_size = 100` (agent caps at 5000)
+  - `monitored_email_parser_types = ["feedback_loop", "bounce", "unsubscribe"]`
+  - `monitored_email_parser_delete_processed = true` deletes mailbox messages only
+    after a matching contact is found and email DNC is present or inserted
+  - `monitored_email_parser_whitelist = ["support@example.com"]` skips exact
+    internal emails and removes existing email-DNC rows for those contacts
 
 ## Benchmark notes (current host)
 - Baseline standard command (scheduler paused):  

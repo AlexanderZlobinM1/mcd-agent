@@ -14,3 +14,25 @@ def reconcile_ring(old_ring: deque[int] | None, ordered_ids: list[int], *, new_t
     if new_to_front:
         return deque(new_items + keep)
     return deque(keep + new_items)
+
+
+def mark_ring_entity_executed(ring: deque[int], entity_id: int | None) -> None:
+    if entity_id is None or not ring:
+        return
+    try:
+        ring.remove(int(entity_id))
+        ring.append(int(entity_id))
+    except ValueError:
+        return
+
+
+def advance_ring_after_launch(ring: deque[int], entity_id: int | None, *, remove_on_launch: bool = False) -> None:
+    if entity_id is None or not ring:
+        return
+    if remove_on_launch:
+        try:
+            ring.remove(int(entity_id))
+        except ValueError:
+            return
+        return
+    mark_ring_entity_executed(ring, entity_id)

@@ -1214,6 +1214,25 @@ def mysql_state_connection(cfg: AgentConfig) -> pymysql.connections.Connection:
     return _mysql_conn(cfg)
 
 
+def mysql_state_existing_connection(cfg: AgentConfig) -> pymysql.connections.Connection:
+    """Open state DB without creating/upgrading database schema.
+
+    Cluster runtime coordination must never create or alter Galera-backed state
+    schema as a side effect. Use this only for code paths that require the
+    state schema to exist already and should fail closed if it does not.
+    """
+    ok, reason = _mysql_preflight(cfg)
+    if not ok:
+        raise RuntimeError(reason)
+    try:
+        conn = _mysql_conn(cfg)
+        _mysql_backoff_clear(cfg)
+        return conn
+    except Exception as e:
+        _mysql_backoff_set(cfg, e)
+        raise
+
+
 def mysql_state_table_names(cfg: AgentConfig) -> dict[str, str]:
     """Return fully-qualified state table names map for current prefix."""
     return dict(_table_name_map(cfg))

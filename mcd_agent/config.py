@@ -29,22 +29,26 @@ LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
 )
 
 _DEFAULT_CLUSTER_FILE_NODE_PATHS = [
-    "/etc",
-    "/var/spool/cron/crontabs",
+    "/etc/cron.d",
+    "/etc/crontab",
+    "/etc/fstab",
+    "/etc/haproxy",
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/mcd",
+    "/etc/mysql",
+    "/etc/netplan",
+    "/etc/nginx",
+    "/etc/php",
+    "/etc/systemd/system",
+    "/etc/timezone",
     "/opt/mcd/etc",
     "/opt/mcd/var/state",
-    "/etc/mcd",
     "/usr/local/bin",
     "/usr/local/sbin",
-    "/var/lib/glusterd",
     "/var/lib/syncthing-mcd/config.xml",
     "/var/lib/syncthing-mcd/cert.pem",
     "/var/lib/syncthing-mcd/key.pem",
-    "/root/.ssh",
-    "/root/*.sh",
-    "/root/*.py",
-    "/root/*.toml",
-    "/root/*.cnf",
 ]
 
 _DEFAULT_CLUSTER_FILE_SHARED_PATHS = [
@@ -84,6 +88,13 @@ _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822 = (
     "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
     "    LIMIT 1"
     "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_donotcontact dnc "
+    "    WHERE ll.filters LIKE '%dnc_%' "
+    "      AND (ll.last_built_date IS NULL OR dnc.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
     ") "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
@@ -112,6 +123,13 @@ _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0192 = (
     "        ll.last_built_date IS NULL "
     "        OR COALESCE(l.date_modified, l.date_added) > ll.last_built_date"
     "      ) "
+    "    LIMIT 1"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_donotcontact dnc "
+    "    WHERE ll.filters LIKE '%dnc_%' "
+    "      AND (ll.last_built_date IS NULL OR dnc.date_added > ll.last_built_date) "
     "    LIMIT 1"
     "  )"
     ") "
@@ -184,47 +202,71 @@ _DEFAULT_SQL_SEGMENTS_DUE = (
     "      ) "
     "    LIMIT 1"
     "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
+    "    FROM {prefix}lead_donotcontact dnc "
+    "    WHERE ll.filters LIKE '%dnc_%' "
+    "      AND (ll.last_built_date IS NULL OR dnc.date_added > ll.last_built_date) "
+    "    LIMIT 1"
+    "  )"
     ") "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
 )
 _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "SELECT DISTINCT q.id "
     "FROM ("
-    "  SELECT c.id "
-    "  FROM {prefix}campaigns c "
+    "SELECT c.id "
+    "FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.deleted IS NULL) "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
     "  AND EXISTS ("
-    "    SELECT 1 "
-    "    FROM {prefix}campaign_lead_event_log el "
-    "    WHERE el.campaign_id = c.id "
-    "      AND el.date_triggered IS NULL "
-    "      AND ("
-    "        (el.trigger_date IS NOT NULL AND el.trigger_date >= '{window_start_utc_7d}' AND el.trigger_date <= '{now_utc}') "
-    "        OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)"
-    "      ) "
-    "    LIMIT 1"
-    "  ) "
-    "  UNION "
-    "  SELECT c.id "
-    "  FROM {prefix}campaigns c "
-    "  INNER JOIN {prefix}campaign_leads cl "
-    "    ON cl.campaign_id = c.id "
-    "   AND cl.manually_removed = 0 "
-    "   AND cl.date_last_exited IS NULL "
-    "   AND cl.date_added >= '{window_start_local_24h}' "
-    "WHERE c.is_published = 1 "
-    "AND (c.deleted IS NULL) "
-    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
-    "AND NOT EXISTS ("
     "  SELECT 1 "
-    "  FROM {prefix}campaign_lead_event_log el2 "
-    "  WHERE el2.campaign_id = cl.campaign_id "
-    "    AND el2.lead_id = cl.lead_id "
-    "    AND el2.rotation <=> cl.rotation "
-    "    LIMIT 1"
+    "  FROM {prefix}campaign_lead_event_log el "
+    "  WHERE el.campaign_id = c.id "
+    "    AND el.date_triggered IS NULL "
+    "    AND ("
+    "      (el.trigger_date IS NOT NULL AND ("
+    "        el.trigger_date <= '{now_utc}' "
+    "        OR el.trigger_date <= '{now_local}'"
+    "      )) "
+    "      OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)"
+    "    ) "
+    "  LIMIT 1"
+    "  )"
+    "UNION "
+    "SELECT c.id "
+    "FROM {prefix}campaigns c "
+    "  WHERE c.is_published = 1 "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND EXISTS ("
+    "  SELECT 1 "
+    "  FROM {prefix}campaign_events ce "
+    "  INNER JOIN {prefix}campaign_leads cld "
+    "    ON cld.campaign_id = c.id "
+    "   AND cld.manually_removed = 0 "
+    "   AND cld.date_last_exited IS NULL "
+    "  WHERE ce.campaign_id = c.id "
+    "    AND ce.event_type = 'action' "
+    "    AND ce.parent_id IS NULL "
+    "    AND ("
+    "      ce.trigger_mode IN ('immediate', 'interval') "
+    "      OR ce.trigger_mode IS NULL "
+    "      OR ("
+    "        ce.trigger_mode = 'date' "
+    "        AND ce.trigger_date IS NOT NULL "
+    "        AND (ce.trigger_date <= '{now_utc}' OR ce.trigger_date <= '{now_local}')"
+    "      )"
+    "    ) "
+    "    AND NOT EXISTS ("
+    "      SELECT 1 "
+    "      FROM {prefix}campaign_lead_event_log el0 "
+    "      WHERE el0.campaign_id = cld.campaign_id "
+    "        AND el0.lead_id = cld.lead_id "
+    "        AND el0.rotation <=> cld.rotation "
+    "      LIMIT 1"
+    "    ) "
+    "  LIMIT 1"
     "  )"
     ") q "
     "ORDER BY q.id"
@@ -235,7 +277,6 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "  SELECT c.id "
     "  FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.deleted IS NULL) "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
     "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
     "  AND EXISTS ("
@@ -281,7 +322,6 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "  SELECT c.id "
     "  FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.deleted IS NULL) "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
     "  AND EXISTS ("
     "    SELECT 1 "
@@ -298,10 +338,13 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "     AND cld.date_last_exited IS NULL "
     "    WHERE ce.campaign_id = c.id "
     "      AND ce.event_type = 'action' "
+    "      AND ce.parent_id IS NOT NULL "
     "      AND ce.trigger_mode = 'date' "
     "      AND ce.trigger_date IS NOT NULL "
-    "      AND ce.trigger_date >= '{window_start_utc_7d}' "
-    "      AND ce.trigger_date <= '{now_utc}' "
+    "      AND ("
+    "        ce.trigger_date <= '{now_utc}' "
+    "        OR ce.trigger_date <= '{now_local}'"
+    "      ) "
     "      AND NOT EXISTS ("
     "        SELECT 1 "
     "        FROM {prefix}campaign_lead_event_log el3 "
@@ -461,6 +504,16 @@ class AgentConfig:
     page_hits_orphan_cleanup_sleep_sec: float
     page_hits_orphan_cleanup_grace_min: int
     page_hits_orphan_cleanup_max_run_sec: int
+    page_hits_orphan_cleanup_instance_settings: dict[str, Any]
+    housekeeping_plugin_enabled: bool
+    housekeeping_plugin_interval_sec: int
+    housekeeping_plugin_quiet_hour: int
+    housekeeping_plugin_quiet_window_min: int
+    housekeeping_plugin_days_old: int
+    housekeeping_plugin_flags: list[str]
+    housekeeping_plugin_optimize_tables: bool
+    housekeeping_plugin_dry_run: bool
+    housekeeping_plugin_instance_settings: dict[str, Any]
     enable_mautic_lock_cleanup: bool
     mautic_lock_cleanup_interval_sec: int
     mautic_lock_cleanup_quiet_hour: int
@@ -478,10 +531,21 @@ class AgentConfig:
     viber_stats_enabled: bool
     viber_stats_interval_sec: int
     viber_stats_instance_settings: dict[str, Any]
+    monitored_email_parser_enabled: bool
+    monitored_email_parser_interval_sec: int
+    monitored_email_parser_batch_size: int
+    monitored_email_parser_force_seen: bool
+    monitored_email_parser_delete_processed: bool
+    monitored_email_parser_disable_mautic_fetch: bool
+    monitored_email_parser_types: list[str]
+    monitored_email_parser_whitelist: list[str]
+    monitored_email_parser_instance_settings: dict[str, Any]
     empty_leads_cleanup_enabled: bool
     empty_leads_cleanup_interval_sec: int
     empty_leads_cleanup_batch_size: int
     empty_leads_cleanup_max_batches_per_run: int
+    empty_leads_cleanup_quiet_window_min: int
+    empty_leads_cleanup_max_runs_per_window: int
     empty_leads_cleanup_instance_settings: dict[str, Any]
     cluster_assets_enabled: bool
     cluster_assets_interval_sec: int
@@ -559,6 +623,8 @@ class AgentConfig:
     plugins_post_cache_clear: bool
     plugins_post_install: bool
     plugins_state_filename: str
+    plugins_cluster_file_sync_wait_sec: int
+    plugins_cluster_cache_clear_wait_sec: int
     custom_repo_base_url: str | None
     custom_manifest_path: str
     custom_cache_dir: str
@@ -698,6 +764,7 @@ class AgentConfig:
     campaign_trigger_priority_parallel: int
     campaign_trigger_regular_parallel: int
     campaign_trigger_min_repeat_sec: int
+    campaign_trigger_audit_interval_sec: int
     campaign_rebuild_min_repeat_sec: int
 
 
@@ -914,6 +981,24 @@ def _normalize_runtime_limit(value: object, *, default: int) -> int:
         return int(default)
 
 
+def _normalize_campaign_limit(value: object) -> int:
+    limit = _normalize_runtime_limit(value, default=0)
+    # 60000 was the historical package default. Treat it as unlimited during
+    # config/runtime migration so large campaigns are not silently truncated on
+    # hosts that never intentionally customized the value.
+    return 0 if limit == 60000 else limit
+
+
+def _normalize_campaign_trigger_template(value: object) -> str:
+    default = "mautic:campaigns:trigger -i {id}{campaign_limit_arg} --batch-limit={batch_limit}"
+    text = str(value or default).strip() or default
+    legacy_limit = "--campaign-limit={campaign_limit}"
+    if legacy_limit in text and "{campaign_limit_arg}" not in text:
+        text = text.replace(f" {legacy_limit}", "{campaign_limit_arg}")
+        text = text.replace(legacy_limit, "{campaign_limit_arg}")
+    return " ".join(text.split())
+
+
 def _normalize_json_dict(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -950,6 +1035,12 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
     normalized = _normalize_sql_signature(raw)
     if not normalized:
         return False
+    if "{prefix}campaigns c" in normalized and "c.deleted is null" in normalized:
+        # Mautic campaign schema is not stable across supported majors; Mautic
+        # 4 installations do not have campaigns.deleted. Any persisted due SQL
+        # referencing it is unsafe and must be regenerated from the packaged
+        # compatibility-safe default.
+        return True
     # MCC used to persist the generated campaign trigger SQL under the legacy
     # campaigns_due key. Match that shape structurally so hosts with old
     # variants migrate instead of keeping stale trigger-date semantics forever.
@@ -962,13 +1053,93 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
         "window_start_local_24h",
         "el2.rotation <=> cl.rotation",
     )
-    return all(sig in normalized for sig in signatures)
+    if all(sig in normalized for sig in signatures):
+        return True
+    old_trigger_only_signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_lead_event_log el",
+        "el.date_triggered is null",
+        "el.trigger_date <= '{now_utc}'",
+        "el.is_scheduled = 1",
+    )
+    if all(sig in normalized for sig in old_trigger_only_signatures):
+        if "campaign_events ce" not in normalized or "el0.event_id = ce.id" not in normalized:
+            return True
+    old_event_log_lower_bound = (
+        "{prefix}campaign_lead_event_log el",
+        "el.date_triggered is null",
+        "el.trigger_date >= '{window_start_utc_7d}'",
+        "el.trigger_date >= '{window_start_local_7d}'",
+    )
+    if all(sig in normalized for sig in old_event_log_lower_bound):
+        return True
+    old_campaign_event_lower_bound = (
+        "{prefix}campaign_events ce",
+        "ce.trigger_date >= '{window_start_utc_7d}'",
+        "ce.trigger_date >= '{window_start_local_7d}'",
+    )
+    if all(sig in normalized for sig in old_campaign_event_lower_bound):
+        return True
+    old_root_action_date_semantics = (
+        "campaign_events ce",
+        "el0.event_id = ce.id",
+        "ce.parent_id is null",
+        "ce.trigger_mode in ('immediate', 'interval')",
+        "ce.trigger_mode = 'date'",
+    )
+    if all(sig in normalized for sig in old_root_action_date_semantics):
+        return "ce.trigger_date is null" not in normalized
+    old_root_action_event_specific_log = (
+        "campaign_events ce",
+        "el0.event_id = ce.id",
+        "ce.parent_id is null",
+        "el0.rotation <=> cld.rotation",
+    )
+    if all(sig in normalized for sig in old_root_action_event_specific_log):
+        return True
+    old_root_action_bootstrap_branch = (
+        "campaign_events ce",
+        "campaign_leads cld",
+        "ce.parent_id is null",
+        "campaign_lead_event_log el0",
+        "el0.rotation <=> cld.rotation",
+    )
+    if all(sig in normalized for sig in old_root_action_bootstrap_branch):
+        return True
+    return False
+
+
+def _is_legacy_segments_due_sql(value: object) -> bool:
+    normalized = _normalize_sql_signature(value)
+    if not normalized:
+        return False
+    if normalized in {_normalize_sql_signature(v) for v in {
+        _LEGACY_SQL_SEGMENTS_DUE_DEFAULT,
+        _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822,
+        _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0192,
+    }}:
+        return True
+    default_shape = (
+        "{prefix}lead_lists ll",
+        "ll.last_built_date",
+        "{prefix}lead_lists_leads lll",
+        "{prefix}leads l",
+    )
+    if all(sig in normalized for sig in default_shape) and "{prefix}lead_donotcontact dnc" not in normalized:
+        # DNC-backed segments such as dnc_unsubscribed depend on
+        # lead_donotcontact, not only leads/lead_lists_leads. Old generated
+        # defaults can mark those segments built while fresh unsubscribe rows
+        # remain invisible until the next 24h full scan.
+        return True
+    return False
 
 
 def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
     normalized = _normalize_sql_signature(value)
     if not normalized:
         return False
+    if "{prefix}campaigns c" in normalized and "c.deleted is null" in normalized:
+        return True
     signatures = (
         "{prefix}campaigns c",
         "{prefix}campaign_leadlist_xref",
@@ -978,7 +1149,27 @@ def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
         "c.publish_down is null or c.publish_down >= '{now_local}'",
         "el3.rotation <=> cld.rotation",
     )
-    return all(sig in normalized for sig in signatures)
+    if all(sig in normalized for sig in signatures):
+        return True
+    old_rebuild_event_lower_bound = (
+        "{prefix}campaign_events ce",
+        "ce.trigger_mode = 'date'",
+        "ce.trigger_date >= '{window_start_utc_7d}'",
+        "ce.trigger_date >= '{window_start_local_7d}'",
+    )
+    if all(sig in normalized for sig in old_rebuild_event_lower_bound):
+        return True
+    old_rebuild_signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_events ce",
+        "ce.trigger_mode = 'date'",
+        "ce.trigger_date <= '{now_utc}'",
+        "el3.rotation <=> cld.rotation",
+    )
+    return (
+        all(sig in normalized for sig in old_rebuild_signatures)
+        and "ce.parent_id is not null" not in normalized
+    )
 
 
 def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
@@ -1001,6 +1192,15 @@ def _campaign_rebuilds_due_sql(sql_section: dict[str, Any]) -> str:
             return _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE
         return str(explicit)
     return _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE
+
+
+def _segments_due_sql(sql_section: dict[str, Any]) -> str:
+    explicit = sql_section.get("segments_due")
+    if explicit is not None:
+        if _is_legacy_segments_due_sql(explicit):
+            return _DEFAULT_SQL_SEGMENTS_DUE
+        return str(explicit)
+    return _DEFAULT_SQL_SEGMENTS_DUE
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1252,11 +1452,7 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
         "sql",
         {
             "segments_due": (
-                {
-                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT,
-                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0822,
-                    _LEGACY_SQL_SEGMENTS_DUE_DEFAULT_V0192,
-                },
+                _is_legacy_segments_due_sql,
                 _DEFAULT_SQL_SEGMENTS_DUE,
             ),
             "campaigns_due": (
@@ -1571,6 +1767,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "campaign_trigger_priority_parallel": "campaign_trigger_priority_parallel",
     "campaign_trigger_regular_parallel": "campaign_trigger_regular_parallel",
     "campaign_trigger_min_repeat_sec": "campaign_trigger_min_repeat_sec",
+    "campaign_trigger_audit_interval_sec": "campaign_trigger_audit_interval_sec",
     "campaign_rebuild_min_repeat_sec": "campaign_rebuild_min_repeat_sec",
     "enable_campaign_rebuild": "enable_campaign_rebuild",
     "campaign_rebuild_poll_interval_sec": "campaign_rebuild_poll_interval_sec",
@@ -1594,6 +1791,16 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "page_hits_orphan_cleanup_sleep_sec": "page_hits_orphan_cleanup_sleep_sec",
     "page_hits_orphan_cleanup_grace_min": "page_hits_orphan_cleanup_grace_min",
     "page_hits_orphan_cleanup_max_run_sec": "page_hits_orphan_cleanup_max_run_sec",
+    "page_hits_orphan_cleanup_instance_settings": "page_hits_orphan_cleanup_instance_settings",
+    "housekeeping_plugin_enabled": "housekeeping_plugin_enabled",
+    "housekeeping_plugin_interval_sec": "housekeeping_plugin_interval_sec",
+    "housekeeping_plugin_quiet_hour": "housekeeping_plugin_quiet_hour",
+    "housekeeping_plugin_quiet_window_min": "housekeeping_plugin_quiet_window_min",
+    "housekeeping_plugin_days_old": "housekeeping_plugin_days_old",
+    "housekeeping_plugin_flags": "housekeeping_plugin_flags",
+    "housekeeping_plugin_optimize_tables": "housekeeping_plugin_optimize_tables",
+    "housekeeping_plugin_dry_run": "housekeeping_plugin_dry_run",
+    "housekeeping_plugin_instance_settings": "housekeeping_plugin_instance_settings",
     "enable_mautic_lock_cleanup": "enable_mautic_lock_cleanup",
     "mautic_lock_cleanup_interval_sec": "mautic_lock_cleanup_interval_sec",
     "mautic_lock_cleanup_quiet_hour": "mautic_lock_cleanup_quiet_hour",
@@ -1611,12 +1818,23 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "viber_stats_enabled": "viber_stats_enabled",
     "viber_stats_interval_sec": "viber_stats_interval_sec",
     "viber_stats_instance_settings": "viber_stats_instance_settings",
+    "monitored_email_parser_enabled": "monitored_email_parser_enabled",
+    "monitored_email_parser_interval_sec": "monitored_email_parser_interval_sec",
+    "monitored_email_parser_batch_size": "monitored_email_parser_batch_size",
+    "monitored_email_parser_force_seen": "monitored_email_parser_force_seen",
+    "monitored_email_parser_delete_processed": "monitored_email_parser_delete_processed",
+    "monitored_email_parser_disable_mautic_fetch": "monitored_email_parser_disable_mautic_fetch",
+    "monitored_email_parser_types": "monitored_email_parser_types",
+    "monitored_email_parser_whitelist": "monitored_email_parser_whitelist",
+    "monitored_email_parser_instance_settings": "monitored_email_parser_instance_settings",
     "inventory_auto_rescan_enabled": "inventory_auto_rescan_enabled",
     "inventory_auto_rescan_interval_sec": "inventory_auto_rescan_interval_sec",
     "empty_leads_cleanup_enabled": "empty_leads_cleanup_enabled",
     "empty_leads_cleanup_interval_sec": "empty_leads_cleanup_interval_sec",
     "empty_leads_cleanup_batch_size": "empty_leads_cleanup_batch_size",
     "empty_leads_cleanup_max_batches_per_run": "empty_leads_cleanup_max_batches_per_run",
+    "empty_leads_cleanup_quiet_window_min": "empty_leads_cleanup_quiet_window_min",
+    "empty_leads_cleanup_max_runs_per_window": "empty_leads_cleanup_max_runs_per_window",
     "empty_leads_cleanup_instance_settings": "empty_leads_cleanup_instance_settings",
     "cluster_assets_enabled": "cluster_assets_enabled",
     "cluster_assets_interval_sec": "cluster_assets_interval_sec",
@@ -1783,7 +2001,7 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
             updates[attr] = bool(raw_value)
         elif isinstance(current, int):
             if attr == "campaign_limit":
-                updates[attr] = _normalize_runtime_limit(raw_value, default=current)
+                updates[attr] = _normalize_campaign_limit(raw_value)
             else:
                 updates[attr] = int(raw_value)
         elif isinstance(current, float):
@@ -2041,6 +2259,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     campaign_trigger_priority_parallel = int(runtime.get("campaign_trigger_priority_parallel", campaign_priority_parallel))
     campaign_trigger_regular_parallel = int(runtime.get("campaign_trigger_regular_parallel", campaign_regular_parallel))
     campaign_trigger_min_repeat_sec = int(runtime.get("campaign_trigger_min_repeat_sec", 10))
+    campaign_trigger_audit_interval_sec = int(runtime.get("campaign_trigger_audit_interval_sec", 300))
     campaign_rebuild_min_repeat_sec = int(runtime.get("campaign_rebuild_min_repeat_sec", 15))
     segment_sql_orphan_policy = str(runtime.get("segment_sql_orphan_policy", "reclaim_stale")).strip().lower() or "reclaim_stale"
     if segment_sql_orphan_policy not in {"manual", "reclaim_stale"}:
@@ -2136,9 +2355,9 @@ def _load_config_inner(path: str) -> AgentConfig:
     m6_patch_min = str(runtime.get("mautic6_core_patch_version_min", "")).strip() or None
     m6_patch_max = str(runtime.get("mautic6_core_patch_version_max", "")).strip() or None
     m6_patch_unknown = bool(runtime.get("mautic6_core_patch_apply_if_version_unknown", True))
-    pagehit_patch_policy = str(runtime.get("pagehit_cascade_patch_policy", "required")).strip().lower() or "required"
+    pagehit_patch_policy = str(runtime.get("pagehit_cascade_patch_policy", "off")).strip().lower() or "off"
     if pagehit_patch_policy not in {"required", "off"}:
-        pagehit_patch_policy = "required"
+        pagehit_patch_policy = "off"
 
     cleanup_mode = str(runtime.get("contacts_cleanup_mode", "email_and_mobile")).strip().lower()
     if cleanup_mode in {"email_only", "email"}:
@@ -2317,6 +2536,37 @@ def _load_config_inner(path: str) -> AgentConfig:
             30,
             int(runtime.get("page_hits_orphan_cleanup_max_run_sec", 180) or 180),
         ),
+        page_hits_orphan_cleanup_instance_settings=(
+            dict(runtime.get("page_hits_orphan_cleanup_instance_settings", {}))
+            if isinstance(runtime.get("page_hits_orphan_cleanup_instance_settings", {}), dict)
+            else {}
+        ),
+        housekeeping_plugin_enabled=bool(runtime.get("housekeeping_plugin_enabled", False)),
+        housekeeping_plugin_interval_sec=max(
+            60,
+            int(runtime.get("housekeeping_plugin_interval_sec", 86400) or 86400),
+        ),
+        housekeeping_plugin_quiet_hour=max(
+            0,
+            min(23, int(runtime.get("housekeeping_plugin_quiet_hour", 3) or 3)),
+        ),
+        housekeeping_plugin_quiet_window_min=max(
+            1,
+            min(720, int(runtime.get("housekeeping_plugin_quiet_window_min", 120) or 120)),
+        ),
+        housekeeping_plugin_days_old=max(1, int(runtime.get("housekeeping_plugin_days_old", 365) or 365)),
+        housekeeping_plugin_flags=(
+            [str(x).strip() for x in runtime.get("housekeeping_plugin_flags", []) if str(x).strip()]
+            if isinstance(runtime.get("housekeeping_plugin_flags", []), list)
+            else []
+        ),
+        housekeeping_plugin_optimize_tables=bool(runtime.get("housekeeping_plugin_optimize_tables", False)),
+        housekeeping_plugin_dry_run=bool(runtime.get("housekeeping_plugin_dry_run", True)),
+        housekeeping_plugin_instance_settings=(
+            dict(runtime.get("housekeeping_plugin_instance_settings", {}))
+            if isinstance(runtime.get("housekeeping_plugin_instance_settings", {}), dict)
+            else {}
+        ),
         enable_mautic_lock_cleanup=bool(runtime.get("enable_mautic_lock_cleanup", True)),
         mautic_lock_cleanup_interval_sec=max(
             300,
@@ -2353,12 +2603,54 @@ def _load_config_inner(path: str) -> AgentConfig:
             if isinstance(runtime.get("viber_stats_instance_settings", {}), dict)
             else {}
         ),
+        monitored_email_parser_enabled=bool(runtime.get("monitored_email_parser_enabled", False)),
+        monitored_email_parser_interval_sec=max(60, int(runtime.get("monitored_email_parser_interval_sec", 900) or 900)),
+        monitored_email_parser_batch_size=min(
+            5000,
+            max(1, int(runtime.get("monitored_email_parser_batch_size", 100) or 100)),
+        ),
+        monitored_email_parser_force_seen=bool(runtime.get("monitored_email_parser_force_seen", False)),
+        monitored_email_parser_delete_processed=bool(runtime.get("monitored_email_parser_delete_processed", False)),
+        monitored_email_parser_disable_mautic_fetch=bool(
+            runtime.get("monitored_email_parser_disable_mautic_fetch", True)
+        ),
+        monitored_email_parser_types=(
+            [
+                str(x).strip()
+                for x in runtime.get("monitored_email_parser_types", ["feedback_loop"])
+                if str(x).strip()
+            ]
+            if isinstance(runtime.get("monitored_email_parser_types", ["feedback_loop"]), list)
+            else ["feedback_loop"]
+        ),
+        monitored_email_parser_whitelist=(
+            [
+                str(x).strip().lower()
+                for x in runtime.get("monitored_email_parser_whitelist", [])
+                if str(x).strip()
+            ]
+            if isinstance(runtime.get("monitored_email_parser_whitelist", []), list)
+            else []
+        ),
+        monitored_email_parser_instance_settings=(
+            dict(runtime.get("monitored_email_parser_instance_settings", {}))
+            if isinstance(runtime.get("monitored_email_parser_instance_settings", {}), dict)
+            else {}
+        ),
         empty_leads_cleanup_enabled=bool(runtime.get("empty_leads_cleanup_enabled", False)),
         empty_leads_cleanup_interval_sec=max(60, int(runtime.get("empty_leads_cleanup_interval_sec", 900) or 900)),
         empty_leads_cleanup_batch_size=max(1, int(runtime.get("empty_leads_cleanup_batch_size", 5000) or 5000)),
         empty_leads_cleanup_max_batches_per_run=max(
             1,
             int(runtime.get("empty_leads_cleanup_max_batches_per_run", 10) or 10),
+        ),
+        empty_leads_cleanup_quiet_window_min=max(
+            1,
+            min(1440, int(runtime.get("empty_leads_cleanup_quiet_window_min", 660) or 660)),
+        ),
+        empty_leads_cleanup_max_runs_per_window=max(
+            0,
+            int(runtime.get("empty_leads_cleanup_max_runs_per_window", 0) or 0),
         ),
         empty_leads_cleanup_instance_settings=(
             dict(runtime.get("empty_leads_cleanup_instance_settings", {}))
@@ -2398,14 +2690,14 @@ def _load_config_inner(path: str) -> AgentConfig:
         db_watchdog=dict(db_watchdog_cfg),
         segment_batch_limit=int(runtime.get("segment_batch_limit", 1000)),
         campaign_batch_limit=int(runtime.get("campaign_batch_limit", 1000)),
-        campaign_limit=_normalize_runtime_limit(runtime.get("campaign_limit", 60000), default=60000),
+        campaign_limit=_normalize_campaign_limit(runtime.get("campaign_limit", 0)),
         import_limit=int(runtime.get("import_limit", 1000)),
         enable_import_polling=bool(runtime.get("enable_import_polling", True)),
         import_poll_interval_sec=int(runtime.get("import_poll_interval_sec", 15)),
         queue_throttle_threshold=int(runtime.get("queue_throttle_threshold", 200)),
         queue_throttle_window_min=int(runtime.get("queue_throttle_window_min", 5)),
         sql_mail_queue_count=str(sql.get("mail_queue_count", "SELECT COUNT(*) AS cnt FROM {prefix}message_queue WHERE status = 'pending'")),
-        sql_segments_due=str(sql.get("segments_due", _DEFAULT_SQL_SEGMENTS_DUE)),
+        sql_segments_due=_segments_due_sql(sql),
         sql_segment_weights=str(
             sql.get(
                 "segment_weights",
@@ -2447,8 +2739,7 @@ def _load_config_inner(path: str) -> AgentConfig:
                 "  FROM {prefix}campaign_leads "
                 "  GROUP BY campaign_id"
                 ") w ON w.campaign_id = c.id "
-                "WHERE c.is_published = 1 "
-                "AND (c.deleted IS NULL) ",
+                "WHERE c.is_published = 1",
             )
         ),
         sql_import_pending_count=str(
@@ -2480,7 +2771,7 @@ def _load_config_inner(path: str) -> AgentConfig:
                 "mautic:campaigns:update -i {id}",
             )
         ),
-        cmd_campaign_trigger_template=str(
+        cmd_campaign_trigger_template=_normalize_campaign_trigger_template(
             commands.get(
                 "campaign_trigger_template",
                 "mautic:campaigns:trigger -i {id}{campaign_limit_arg} --batch-limit={batch_limit}",
@@ -2537,6 +2828,14 @@ def _load_config_inner(path: str) -> AgentConfig:
         plugins_post_cache_clear=bool(plugins.get("post_cache_clear", True)),
         plugins_post_install=bool(plugins.get("post_plugin_install", True)),
         plugins_state_filename=str(plugins.get("state_filename", ".mcd-plugin.json")),
+        plugins_cluster_file_sync_wait_sec=max(
+            30,
+            int(plugins.get("cluster_file_sync_wait_sec", 900) or 900),
+        ),
+        plugins_cluster_cache_clear_wait_sec=max(
+            60,
+            int(plugins.get("cluster_cache_clear_wait_sec", 600) or 600),
+        ),
         custom_repo_base_url=str(custom.get("repo_base_url")).rstrip("/") if custom.get("repo_base_url") else (
             str(mcc.get("url")).rstrip("/") if mcc.get("url") else None
         ),
@@ -2762,6 +3061,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         campaign_trigger_priority_parallel=campaign_trigger_priority_parallel,
         campaign_trigger_regular_parallel=campaign_trigger_regular_parallel,
         campaign_trigger_min_repeat_sec=max(0, campaign_trigger_min_repeat_sec),
+        campaign_trigger_audit_interval_sec=max(0, campaign_trigger_audit_interval_sec),
         campaign_rebuild_min_repeat_sec=max(0, campaign_rebuild_min_repeat_sec),
     )
     if cfg.disable_whitelist:

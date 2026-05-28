@@ -20,6 +20,7 @@ from mcd_agent.cluster_routing import cluster_route_targets
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.state_backend import mysql_state_connection, mysql_state_enabled, mysql_state_table_names
+from mcd_agent.version_identity import agent_version_payload, installed_agent_version
 
 try:
     import fcntl
@@ -182,12 +183,12 @@ def check_with_mcc(cfg: AgentConfig, *, auto_update_enabled: bool) -> dict[str, 
         "mcc_host_name": str(ident.get("effective_mcc_host_name") or ""),
         "agent_hostname": str(ident.get("local_hostname") or ""),
         "configured_host_name": str(ident.get("configured_host_name") or ""),
-        "agent_version": __version__,
         "auto_update_enabled": bool(auto_update_enabled),
         "update_policy": _update_policy(cfg),
         "allow_test_build": bool(cfg.mcd_update_allow_test_build),
         "config_sha256": cfg.config_sha256,
     }
+    payload.update(agent_version_payload())
     url = base + "/api/v1/agent/update/check"
     try:
         out = _post_json(url, payload, cfg.mcc_token, timeout_sec=12)
@@ -613,7 +614,7 @@ def _cluster_plan_from_decision(cfg: AgentConfig, decision: dict[str, Any], *, n
     package_url = str(decision.get("package_url", "")).strip()
     if not target or not package_url:
         return None
-    if _semver(target) <= _semver(__version__):
+    if _semver(target) <= _semver(installed_agent_version()):
         return None
     return {
         "status": "update",
@@ -765,7 +766,12 @@ def _cluster_update_seed_or_refresh(
                     plan[field] = str(candidate_plan.get(field) or "").strip()
             payload["plan"] = plan
             current_plan = plan
-    elif not current_plan:
+    else:
+        phase = str(payload.get("phase", "") or "").strip().lower()
+        if current_plan and phase in {"done", "failed"}:
+            return None
+
+    if not current_plan:
         return None
 
     payload["expected_hosts"] = _dedupe_hosts(list(payload.get("expected_hosts") or []) + expected_hosts)
@@ -792,7 +798,7 @@ def _cluster_update_seed_or_refresh(
         }
     )
     target = str((current_plan or {}).get("target", "") or "").strip()
-    if target and _semver(__version__) >= _semver(target):
+    if target and _semver(installed_agent_version()) >= _semver(target):
         local_node["download_status"] = "downloaded"
         local_node["install_status"] = "success"
         local_node.setdefault("downloaded_at", now_s)
@@ -1080,12 +1086,46 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     package_url = str(plan.get("package_url", "")).strip()
     if not target or not package_url:
         return False, "invalid plan: target/package_url is required"
-    if _semver(target) <= _semver(__version__):
-        return False, f"already up-to-date ({__version__})"
-
     state = _read_state(cfg)
     session_id = str(plan.get("session_id", "")).strip()
     now_s = int(time.time())
+    current_installed = installed_agent_version()
+    if _semver(target) <= _semver(current_installed):
+        if current_installed != __version__:
+            msg = (
+                f"source/running version mismatch repaired: source={current_installed} "
+                f"running={__version__}; service restart scheduled"
+            )
+            state.update(
+                {
+                    "last_status": "version_mismatch_restart",
+                    "last_result": msg,
+                    "last_target": target,
+                    "last_attempt_ts": now_s,
+                    "last_session_id": session_id,
+                }
+            )
+            _write_state(cfg, state)
+            if session_id:
+                release_session(
+                    cfg,
+                    session_id,
+                    result_status="success",
+                    result_message=msg,
+                    new_version=current_installed,
+                )
+            _restart_service_async()
+            return True, msg
+        if session_id:
+            release_session(
+                cfg,
+                session_id,
+                result_status="success",
+                result_message=f"already up-to-date ({current_installed})",
+                new_version=current_installed,
+            )
+        return False, f"already up-to-date ({current_installed})"
+
     if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
         active_campaigns = _active_campaign_processes()
         if active_campaigns:
@@ -1107,7 +1147,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                     session_id,
                     result_status="deferred",
                     result_message=msg,
-                    new_version=__version__,
+                    new_version=installed_agent_version(),
                 )
             return False, msg
 
@@ -1128,7 +1168,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 session_id,
                 result_status="failed",
                 result_message="another update is already running",
-                new_version=__version__,
+                new_version=installed_agent_version(),
             )
         return False, "another update is already running"
 
@@ -1234,7 +1274,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
             session_id,
             result_status="failed",
             result_message=msg,
-            new_version=__version__,
+            new_version=installed_agent_version(),
         )
         state.update(
             {
@@ -1263,14 +1303,35 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
     state = _read_state(cfg)
     now_s = int(time.time())
     cleanup_state_changed = _maybe_run_update_cleanup(cfg, state, now_s=now_s)
+    auto = bool(cfg.mcd_auto_update_enabled) and _update_policy(cfg) != "off"
+    cluster_update_mode = auto and _cluster_update_enabled(cfg)
     next_allowed = int(state.get("next_check_ts", 0) or 0)
     if not force and now_s < next_allowed:
+        # A cluster rollout is coordinated through the shared Galera state and
+        # can be advanced by another node while this node's local MCC check is
+        # still sleeping. Keep reconciling active shared plans so nodes that are
+        # already on the target version mark themselves done immediately, and
+        # peers do not wait up to the full MCC check interval.
+        if cluster_update_mode:
+            try:
+                handled, cluster_msg, cluster_retry = maybe_cluster_auto_update(cfg, {}, now_s=now_s)
+            except Exception as e:
+                logging.warning("MCD cluster update coordinator unavailable during reconcile: %s", e)
+                handled, cluster_msg, cluster_retry = False, None, 0
+            if handled:
+                state2 = _read_state(cfg)
+                state2["last_cluster_update_result"] = cluster_msg or ""
+                state2["next_check_ts"] = now_s + max(60, int(cluster_retry or cfg.mcd_update_wait_retry_sec or 60))
+                if cleanup_state_changed:
+                    state2["last_cleanup_ts"] = state.get("last_cleanup_ts")
+                    state2["last_cleanup_status"] = state.get("last_cleanup_status")
+                    state2["last_cleanup_removed"] = state.get("last_cleanup_removed")
+                    state2["next_cleanup_ts"] = state.get("next_cleanup_ts")
+                _write_state(cfg, state2)
+                return cluster_msg, int(state2["next_check_ts"]) - now_s
         if cleanup_state_changed:
             _write_state(cfg, state)
         return None, max(1, next_allowed - now_s)
-
-    auto = bool(cfg.mcd_auto_update_enabled) and _update_policy(cfg) != "off"
-    cluster_update_mode = auto and _cluster_update_enabled(cfg)
 
     if cfg.backup_enabled and not cluster_update_mode:
         try:
@@ -1328,6 +1389,17 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
             return msg, retry_sec
 
     if status in {"up_to_date", "disabled"}:
+        current_installed = installed_agent_version()
+        if current_installed != __version__:
+            _restart_service_async()
+            state["last_status"] = "version_mismatch_restart"
+            state["last_result"] = (
+                f"source/running version mismatch repaired: source={current_installed} "
+                f"running={__version__}; service restart scheduled"
+            )
+            state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))
+            _write_state(cfg, state)
+            return str(state["last_result"]), int(state["next_check_ts"]) - now_s
         state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
         _write_state(cfg, state)
         return None, int(state["next_check_ts"]) - now_s
@@ -1339,14 +1411,25 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
 
     if status in {"update", "update_available"}:
         target = str(decision.get("target", "")).strip()
-        if _semver(target) <= _semver(__version__):
+        current_installed = installed_agent_version()
+        if _semver(target) <= _semver(current_installed):
+            if current_installed != __version__:
+                _restart_service_async()
+                state["last_status"] = "version_mismatch_restart"
+                state["last_result"] = (
+                    f"source/running version mismatch repaired: source={current_installed} "
+                    f"running={__version__}; service restart scheduled"
+                )
+                state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))
+                _write_state(cfg, state)
+                return str(state["last_result"]), int(state["next_check_ts"]) - now_s
             state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
             _write_state(cfg, state)
             return None, int(state["next_check_ts"]) - now_s
         if status == "update_available" and not auto:
             state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
             _write_state(cfg, state)
-            return f"MCD update available: current={__version__} target={target}", int(state["next_check_ts"]) - now_s
+            return f"MCD update available: current={current_installed} target={target}", int(state["next_check_ts"]) - now_s
         ok, msg = apply_update(cfg, decision)
         # apply_update() persists result fields (last_status/last_result/...).
         # Re-read to avoid overwriting them with stale pre-apply state.
@@ -1368,7 +1451,11 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
 
 def update_status(cfg: AgentConfig) -> dict[str, Any]:
     out = _read_state(cfg)
-    out.setdefault("current_version", __version__)
+    versions = agent_version_payload()
+    out["current_version"] = versions.get("agent_version") or __version__
+    out["running_version"] = versions.get("agent_running_version") or __version__
+    out["source_version"] = versions.get("agent_source_version") or ""
+    out["version_mismatch"] = bool(versions.get("agent_version_mismatch"))
     out.setdefault("policy", _update_policy(cfg))
     out.setdefault("auto_update_enabled", bool(cfg.mcd_auto_update_enabled))
     return out

@@ -76,6 +76,20 @@ from mcd_agent.executor import (
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.instance_delete import delete_instance_artifacts
+from mcd_agent.instance_migrate import (
+    collect_source_probe,
+    finalize_target_relay,
+    format_source_probe_json,
+    format_source_probe_text,
+    import_target_db_stream,
+    preflight_target_relay,
+    receive_target_letsencrypt,
+    receive_target_files,
+    run_target_pull_migration,
+    stream_source_db,
+    stream_source_files,
+    stream_source_letsencrypt,
+)
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.mautic_image_install import install_from_image
@@ -108,6 +122,7 @@ from mcd_agent.state_backend import create_state_database_with_admin, state_back
 from mcd_agent.self_update import apply_update, check_with_mcc, update_status
 from mcd_agent.tuner import format_tune_result, tune_segments
 from mcd_agent.uninstall import run_uninstall
+from mcd_agent.version_identity import agent_version_payload, installed_agent_version
 from mcd_agent.version_check import maybe_notify_update
 
 _MANUAL_CMD_SEP = "\x1f"
@@ -1493,7 +1508,7 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MCD Agent", prog="mcd-cli")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {installed_agent_version()}")
     parser.add_argument("--log-level", default="INFO")
 
     sub = parser.add_subparsers(dest="cmd", required=False)
@@ -1641,6 +1656,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--list-available", action="store_true", help="Show plugins available in server manifest")
         p.add_argument("--list-installed", action="store_true", help="Show plugins currently installed on host")
         p.add_argument("--catalog-json", action="store_true", help="Print plugin catalog/status as JSON")
+        p.add_argument("--cluster-sync-check-key", help=argparse.SUPPRESS)
+        p.add_argument("--cluster-sync-check-digest", help=argparse.SUPPRESS)
 
     plugins = sub.add_parser("plugins", help="Interactive plugin sync/install from MCC repo")
     _add_plugins_args(plugins)
@@ -1824,6 +1841,40 @@ def _build_parser() -> argparse.ArgumentParser:
     signals.add_argument("--window-min", type=int, default=15)
     signals.add_argument("--json", action="store_true")
 
+    inst_migrate = sub.add_parser("instance-migrate", help="Instance migration preflight and relay helpers")
+    inst_migrate.add_argument("--config", default=default_cfg)
+    inst_migrate.add_argument(
+        "op",
+        choices=[
+            "source-probe",
+            "target-pull",
+            "source-stream-files",
+            "source-stream-db",
+            "source-stream-letsencrypt",
+            "target-preflight",
+            "target-receive-files",
+            "target-receive-letsencrypt",
+            "target-import-db",
+            "target-finalize",
+        ],
+        nargs="?",
+        default="source-probe",
+    )
+    inst_migrate.add_argument("--root", help="Instance root/name/domain selector")
+    inst_migrate.add_argument("--source-address")
+    inst_migrate.add_argument("--source-ssh-user", default="root")
+    inst_migrate.add_argument("--source-ssh-port", type=int, default=22)
+    inst_migrate.add_argument("--source-ssh-key-file")
+    inst_migrate.add_argument("--source-root")
+    inst_migrate.add_argument("--target-root")
+    inst_migrate.add_argument("--target-db-name")
+    inst_migrate.add_argument("--target-db-user")
+    inst_migrate.add_argument("--target-db-password")
+    inst_migrate.add_argument("--domains-json", default="[]")
+    inst_migrate.add_argument("--php-version")
+    inst_migrate.add_argument("--wipe-target", action="store_true")
+    inst_migrate.add_argument("--json", action="store_true")
+
     upd = sub.add_parser("self-update", help="MCD self-update via MCC approved/test/lts/cluster channels")
     upd.add_argument("--config", default=default_cfg)
     upd.add_argument("op", choices=["check", "apply", "status"], nargs="?", default="status")
@@ -1937,7 +1988,13 @@ def main() -> int:
         return _run_interactive_hub(cfg, None, False)
 
     if args.cmd == "health":
-        payload = {"service": "mcd-agent", "version": __version__, "status": "ok"}
+        versions = agent_version_payload()
+        payload = {
+            "service": "mcd-agent",
+            "version": str(versions.get("agent_version") or __version__),
+            "status": "ok",
+            **versions,
+        }
         if args.json:
             print(json.dumps(payload))
         else:
@@ -2343,6 +2400,8 @@ def main() -> int:
             list_available=bool(args.list_available),
             list_installed=bool(args.list_installed),
             catalog_json=bool(args.catalog_json),
+            cluster_sync_check_key=getattr(args, "cluster_sync_check_key", None),
+            cluster_sync_check_digest=getattr(args, "cluster_sync_check_digest", None),
         )
         if rc == 0:
             _push_state_after_change(cfg, "plugins")
@@ -3227,6 +3286,131 @@ def main() -> int:
         else:
             print(format_signals_text(payload))
         return 0
+
+    if args.cmd == "instance-migrate":
+        cfg = load_config(args.config)
+        if args.op == "source-stream-files":
+            return stream_source_files(cfg, selector=args.root, output=sys.stdout.buffer)
+        if args.op == "source-stream-db":
+            return stream_source_db(cfg, selector=args.root, output=sys.stdout.buffer)
+        if args.op == "source-stream-letsencrypt":
+            return stream_source_letsencrypt(domains_json=str(args.domains_json or "[]"), output=sys.stdout.buffer)
+        if args.op == "target-preflight":
+            missing = [
+                name
+                for name, value in {
+                    "target-root": args.target_root,
+                    "target-db-name": args.target_db_name,
+                }.items()
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError("missing required target-preflight arguments: " + ", ".join(missing))
+            payload = preflight_target_relay(
+                target_root=str(args.target_root or "").strip(),
+                target_db_name=str(args.target_db_name or "").strip(),
+            )
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) else 1
+        if args.op == "target-receive-files":
+            if not str(args.target_root or "").strip():
+                raise RuntimeError("missing required target-receive-files argument: target-root")
+            payload = receive_target_files(
+                target_root=str(args.target_root or "").strip(),
+                input_stream=sys.stdin.buffer,
+                wipe_target=bool(args.wipe_target),
+            )
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) else 1
+        if args.op == "target-receive-letsencrypt":
+            payload = receive_target_letsencrypt(input_stream=sys.stdin.buffer)
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) else 1
+        if args.op == "target-import-db":
+            target_db_password = str(args.target_db_password or os.environ.get("MCD_MIGRATION_TARGET_DB_PASSWORD", ""))
+            missing = [
+                name
+                for name, value in {
+                    "target-db-name": args.target_db_name,
+                    "target-db-user": args.target_db_user,
+                    "target-db-password": target_db_password,
+                }.items()
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError("missing required target-import-db arguments: " + ", ".join(missing))
+            payload = import_target_db_stream(
+                target_db_name=str(args.target_db_name or "").strip(),
+                target_db_user=str(args.target_db_user or "").strip(),
+                target_db_password=target_db_password,
+                input_stream=sys.stdin.buffer,
+            )
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) else 1
+        if args.op == "target-finalize":
+            target_db_password = str(args.target_db_password or os.environ.get("MCD_MIGRATION_TARGET_DB_PASSWORD", ""))
+            missing = [
+                name
+                for name, value in {
+                    "target-root": args.target_root,
+                    "target-db-name": args.target_db_name,
+                    "target-db-user": args.target_db_user,
+                    "target-db-password": target_db_password,
+                }.items()
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError("missing required target-finalize arguments: " + ", ".join(missing))
+            payload = finalize_target_relay(
+                cfg,
+                target_root=str(args.target_root or "").strip(),
+                target_db_name=str(args.target_db_name or "").strip(),
+                target_db_user=str(args.target_db_user or "").strip(),
+                target_db_password=target_db_password,
+                domains_json=str(args.domains_json or "[]"),
+                php_version=str(args.php_version or "").strip() or None,
+            )
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) and bool(payload.get("catchup_ok", False)) else 1
+        if args.op == "target-pull":
+            target_db_password = str(args.target_db_password or os.environ.get("MCD_MIGRATION_TARGET_DB_PASSWORD", ""))
+            missing = [
+                name
+                for name, value in {
+                    "source-address": args.source_address,
+                    "source-ssh-key-file": args.source_ssh_key_file,
+                    "source-root": args.source_root,
+                    "target-root": args.target_root,
+                }.items()
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError("missing required target-pull arguments: " + ", ".join(missing))
+            payload = run_target_pull_migration(
+                cfg,
+                source_address=str(args.source_address or "").strip(),
+                source_ssh_user=str(args.source_ssh_user or "root").strip() or "root",
+                source_ssh_port=int(args.source_ssh_port or 22),
+                source_ssh_key_file=str(args.source_ssh_key_file or "").strip(),
+                source_root=str(args.source_root or "").strip(),
+                target_root=str(args.target_root or "").strip(),
+                domains_json=str(args.domains_json or "[]"),
+                target_db_name=str(args.target_db_name or "").strip() or None,
+                target_db_user=str(args.target_db_user or "").strip() or None,
+                target_db_password=target_db_password.strip() or None,
+                php_version=str(args.php_version or "").strip() or None,
+            )
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if bool(payload.get("ok", False)) and bool(payload.get("catchup_ok", False)) else 1
+        payload = collect_source_probe(cfg, selector=args.root)
+        if args.json:
+            print(format_source_probe_json(payload))
+        else:
+            print(format_source_probe_text(payload))
+        return 0 if bool(payload.get("ok", False)) else 1
 
     if args.cmd == "self-update":
         cfg = load_config(args.config)

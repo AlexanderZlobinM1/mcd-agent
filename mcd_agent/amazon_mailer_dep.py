@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 import re
@@ -31,6 +32,12 @@ SENDGRID_MAILER_REQUIRED_BUNDLES: set[str] = {
 AMAZON_MAILER_PACKAGE = "symfony/amazon-mailer"
 SENDGRID_MAILER_PACKAGE = "symfony/sendgrid-mailer:*"
 
+_MAUTIC_COMPOSER_REQUIRE_MARKERS = {
+    "mautic/core-lib",
+    "mautic/core-composer-scaffold",
+    "mautic/recommended-project",
+}
+
 
 def _run(
     cmd: list[str],
@@ -60,6 +67,50 @@ def _resolve_project_root(root: str) -> str:
         if (c / "composer.json").exists() and (c / "bin" / "console").exists():
             return str(c)
     return root
+
+
+def _load_composer_json(project_root: str) -> dict[str, object]:
+    path = Path(project_root) / "composer.json"
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _composer_project_is_mautic(project_root: str) -> bool:
+    data = _load_composer_json(project_root)
+    if not data:
+        return False
+    name = str(data.get("name", "") or "").strip().lower()
+    if name in {"mautic/mautic", "mautic/recommended-project"}:
+        return True
+    if name.startswith("mautic/"):
+        return True
+    req = data.get("require", {})
+    req_keys = set(str(k).strip().lower() for k in req.keys()) if isinstance(req, dict) else set()
+    return bool(req_keys.intersection(_MAUTIC_COMPOSER_REQUIRE_MARKERS))
+
+
+def _mautic_console_healthy(
+    *,
+    project_root: str,
+    console_path: str,
+    php_bin: str,
+    run_as_user: str = "www-data",
+) -> bool:
+    console_abs = _normalize_console_path(project_root, console_path)
+    proc = _run(
+        [php_bin, console_abs, "--version"],
+        cwd=project_root,
+        as_www_data=bool(run_as_user == "www-data"),
+        check=False,
+        timeout_sec=90,
+    )
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return proc.returncode == 0 and bool(re.search(r"\bMautic\s+\d+\.\d+\.\d+\b", out, re.IGNORECASE))
 
 
 def _resolve_composer_bin() -> str:
@@ -280,6 +331,16 @@ def _ensure_mailer_packages(
 
     install_type = detect_install_type(root)
     project_root = _resolve_project_root(root)
+    if not _composer_project_is_mautic(project_root):
+        logging.warning(
+            "[%s] skip mailer package composer preflight: %s/composer.json is not a valid Mautic composer project (%s)",
+            root,
+            project_root,
+            reason,
+        )
+        return False
+    if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
+        raise RuntimeError(f"Mautic console is not healthy before mailer package preflight: {project_root}")
     composer_bin = _resolve_composer_bin()
     _verify_composer_as_www_data(project_root, composer_bin)
 
@@ -303,6 +364,8 @@ def _ensure_mailer_packages(
             timeout_sec=max(int(config.command_timeout_sec or 900), 900),
         )
 
+    if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
+        raise RuntimeError(f"Mautic console is not healthy after mailer package composer require: {project_root}")
     console_abs = _normalize_console_path(project_root, console_path)
     _run(
         [config.php_bin, console_abs, "cache:clear"],

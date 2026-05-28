@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+from mcd_agent import __version__
+
+_VERSION_RE = re.compile(r"__version__\s*=\s*['\"]([^'\"]+)['\"]")
+
+
+def source_version(source_dir: Path | str | None = None) -> str | None:
+    src = Path(source_dir) if source_dir is not None else Path("/opt/mcd/src")
+    init_py = src / "mcd_agent" / "__init__.py"
+    try:
+        text = init_py.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    match = _VERSION_RE.search(text)
+    if not match:
+        return None
+    version = match.group(1).strip()
+    return version or None
+
+
+def installed_agent_version(source_dir: Path | str | None = None) -> str:
+    return source_version(source_dir) or __version__
+
+
+def agent_version_payload(source_dir: Path | str | None = None) -> dict[str, Any]:
+    installed = installed_agent_version(source_dir)
+    source = source_version(source_dir) or ""
+    return {
+        "agent_version": installed,
+        "agent_running_version": __version__,
+        "agent_source_version": source,
+        "agent_version_mismatch": bool(source and source != __version__),
+    }

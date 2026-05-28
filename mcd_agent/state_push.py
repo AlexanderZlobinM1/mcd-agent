@@ -46,6 +46,7 @@ from mcd_agent.state_backend import (
     state_backend_status,
     upsert_state_snapshot_mysql,
 )
+from mcd_agent.version_identity import agent_version_payload
 
 _BUNDLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Bundle$")
 _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
@@ -1517,7 +1518,6 @@ class MCCStatePusher:
 
         payload: dict[str, Any] = {
             "schema": "mcd-state-v1",
-            "agent_version": __version__,
             "hostname": str(identity.get("effective_hostname") or ""),
             "mcc_host_name": str(identity.get("effective_mcc_host_name") or ""),
             "agent_hostname": str(identity.get("local_hostname") or ""),
@@ -1553,6 +1553,7 @@ class MCCStatePusher:
             "instances": instances,
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        payload.update(agent_version_payload())
         if include_signals:
             payload["signals"] = self._signals_payload()
             payload["signals_collected_at_ts"] = int(self.latest_signals_ts or 0)

@@ -93,6 +93,29 @@ page_hits_orphan_cleanup_sleep_sec = 0.2
 page_hits_orphan_cleanup_grace_min = 60
 # Max runtime budget of one orphan cleanup run, sec.
 page_hits_orphan_cleanup_max_run_sec = 180
+page_hits_orphan_cleanup_instance_settings = {}
+
+# Leuchtfeuer Housekeeping plugin scheduling for Mautic 4/5/6/7 instances.
+housekeeping_plugin_enabled = false
+housekeeping_plugin_interval_sec = 86400
+housekeeping_plugin_quiet_hour = 3
+housekeeping_plugin_quiet_window_min = 120
+housekeeping_plugin_days_old = 365
+housekeeping_plugin_flags = []
+housekeeping_plugin_optimize_tables = false
+housekeeping_plugin_dry_run = true
+housekeeping_plugin_instance_settings = {}
+
+# Monitored mailbox parser (MCD-managed replacement for mautic:email:fetch).
+monitored_email_parser_enabled = false
+monitored_email_parser_interval_sec = 900
+monitored_email_parser_batch_size = 100
+monitored_email_parser_force_seen = false
+monitored_email_parser_delete_processed = false
+monitored_email_parser_disable_mautic_fetch = true
+monitored_email_parser_types = ["feedback_loop"]
+monitored_email_parser_whitelist = []
+monitored_email_parser_instance_settings = {}
 # JSON map/list of SQL segment rules.
 # Rule format (must return `lead_id` column):
 # segment_sql_ring_rules = { "188" = { select_sql = "SELECT l.id AS lead_id FROM {prefix}leads l WHERE l.email IS NOT NULL AND l.email <> ''", depends_on = [] } }
@@ -146,10 +169,9 @@ mautic6_core_patch_version_min = ""
 mautic6_core_patch_version_max = ""
 # If local version is unknown, apply patch by default.
 mautic6_core_patch_apply_if_version_unknown = true
-# Page-hit cascade patch policy:
-# - required : daemon auto-applies page-hit cascade guard
-# - off      : do not apply automatically
-pagehit_cascade_patch_policy = "required"
+# Deprecated: page-hit cascade core patch is retired. MCD handles stale page-hit
+# queue cleanup in daemon housekeeping instead of patching Mautic core.
+pagehit_cascade_patch_policy = "off"
 
 # Note:
 # - segment_cycles_per_tick and segment_kill_* are system-level parameters

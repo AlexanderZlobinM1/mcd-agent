@@ -45,6 +45,11 @@ from mcd_agent.cluster_routing import (
     cluster_route_allows,
     cluster_route_authority_status,
 )
+from mcd_agent.cleanup_schedule import (
+    cleanup_session_key as _cleanup_session_key,
+    select_fair_cleanup_task as _select_fair_cleanup_task,
+    window_minutes as _window_minutes,
+)
 from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
@@ -54,12 +59,22 @@ from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
 from mcd_agent.mautic_version_cache import (
     install_zabbix_mautic_version_userparameter,
     refresh_mautic_version_cache,
 )
-from mcd_agent.mode import reconcile_empty_leads_cleanup_cron, reconcile_viber_stats_cron
-from mcd_agent.pagehit_cascade_patch import ensure_pagehit_cascade_patch
+from mcd_agent.mode import (
+    reconcile_empty_leads_cleanup_cron,
+    reconcile_mautic_email_fetch_cron,
+    reconcile_viber_stats_cron,
+)
+from mcd_agent.monitored_email import (
+    ALLOWED_TYPES as MONITORED_EMAIL_ALLOWED_TYPES,
+    MonitoredEmailParserSettings,
+    monitored_email_state_key,
+    process_monitored_email,
+)
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
     consume_poll_trigger,
@@ -68,9 +83,12 @@ from mcd_agent.runtime_overrides import (
     overrides_fingerprint,
     push_runtime_overrides,
 )
+from mcd_agent.ring_utils import advance_ring_after_launch as _advance_ring_after_launch
+from mcd_agent.ring_utils import mark_ring_entity_executed as _mark_ring_entity_executed
 from mcd_agent.ring_utils import reconcile_ring as _reconcile_ring
 from mcd_agent.service_profiles import service_profiles_apply_once
 from mcd_agent.self_update import maybe_auto_update
+from mcd_agent.segment_filter_safety import format_segment_filter_issues, segment_invalid_filter_issues
 from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
 from mcd_agent.segment_dependencies import (
     segment_dependency_blocked_ids,
@@ -87,6 +105,7 @@ from mcd_agent.state_push import (
     read_pending_profile_event,
     should_poll_alert,
 )
+from mcd_agent.sql_time import campaign_sql_time_context, mautic_local_datetime
 from mcd_agent.state_backend import (
     ensure_mysql_state_schema,
     mysql_state_connection,
@@ -99,12 +118,17 @@ _CMD_SEP = "\x1f"
 _M4_CAMPAIGN_DELETED_CLAUSE_RE = re.compile(r"\s+AND\s*\(?\s*c\.deleted\s+IS\s+NULL\s*\)?", re.IGNORECASE)
 _SEGMENT_STALE_PRIORITY_SEC = 24 * 3600
 _SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
+_SEGMENT_FAILURE_COOLDOWN_SEC = 3600
+_SEGMENT_FAILURE_COOLDOWN_THRESHOLD = 3
+_SEGMENT_AUTOMATIC_RETRY_CAP = 3
 _DB_DISPATCH_PAUSE_SEC = 120
 _DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD = 50
 _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
 _SEGMENT_DEPENDENCY_FINISH_WINDOW_SEC = 2 * 3600
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
+_SEGMENT_FILTER_WARN_TS: dict[tuple[str, str], float] = {}
+_SEGMENT_FAILURE_WARN_TS: dict[tuple[str, int], float] = {}
 _IMPORT_SETTLE_UNTIL: dict[str, float] = {}
 _IMPORT_PENDING_OVERRIDE_WARN_TS: dict[str, float] = {}
 _SQL_IMPORT_PENDING_STATUS_COUNT = (
@@ -120,6 +144,14 @@ _SQL_SEGMENTS_ALL_PUBLISHED = (
     "FROM {prefix}lead_lists ll "
     "WHERE ll.is_published = 1 "
     "ORDER BY COALESCE(ll.last_built_date, '1970-01-01 00:00:00') ASC, ll.id ASC"
+)
+_SQL_CAMPAIGNS_ALL_PUBLISHED = (
+    "SELECT c.id "
+    "FROM {prefix}campaigns c "
+    "WHERE c.is_published = 1 "
+    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "ORDER BY c.id"
 )
 
 _BACKUP_STABLE_RUNTIME_KEYS = {
@@ -185,6 +217,8 @@ _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
     "empty_leads_cleanup_interval_sec",
     "empty_leads_cleanup_batch_size",
     "empty_leads_cleanup_max_batches_per_run",
+    "empty_leads_cleanup_quiet_window_min",
+    "empty_leads_cleanup_max_runs_per_window",
     "empty_leads_cleanup_instance_settings",
 }
 _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS = {
@@ -197,6 +231,29 @@ _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS = {
     "page_hits_orphan_cleanup_sleep_sec",
     "page_hits_orphan_cleanup_grace_min",
     "page_hits_orphan_cleanup_max_run_sec",
+    "page_hits_orphan_cleanup_instance_settings",
+}
+_HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS = {
+    "housekeeping_plugin_enabled",
+    "housekeeping_plugin_interval_sec",
+    "housekeeping_plugin_quiet_hour",
+    "housekeeping_plugin_quiet_window_min",
+    "housekeeping_plugin_days_old",
+    "housekeeping_plugin_flags",
+    "housekeeping_plugin_optimize_tables",
+    "housekeeping_plugin_dry_run",
+    "housekeeping_plugin_instance_settings",
+}
+_MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS = {
+    "monitored_email_parser_enabled",
+    "monitored_email_parser_interval_sec",
+    "monitored_email_parser_batch_size",
+    "monitored_email_parser_force_seen",
+    "monitored_email_parser_delete_processed",
+    "monitored_email_parser_disable_mautic_fetch",
+    "monitored_email_parser_types",
+    "monitored_email_parser_whitelist",
+    "monitored_email_parser_instance_settings",
 }
 _CLUSTER_STABLE_RUNTIME_KEYS = {
     "cluster_id",
@@ -214,7 +271,15 @@ _STABLE_RUNTIME_KEYS = (
     | _VIBER_STATS_STABLE_RUNTIME_KEYS
     | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
     | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
+    | _HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS
+    | _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS
     | _CLUSTER_STABLE_RUNTIME_KEYS
+)
+_SERVICE_CLEANUP_RUNTIME_KEYS = (
+    _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
+    | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
+    | _HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS
+    | _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS
 )
 
 _DB_DISPATCH_PAUSE_ERROR_RE = re.compile(
@@ -263,6 +328,48 @@ def _mark_segment_finished(root: str, segment_id: int | None, now_ts: float | No
     if sid <= 0:
         return
     _SEGMENT_FINISHED_AT[(str(root), sid)] = float(now_ts or time.time())
+
+
+def _segment_failure_blocked_ids(store: "TaskStore", root: str) -> set[int]:
+    counts = store.recent_task_problem_counts(
+        root=root,
+        task_type="segment",
+        since_sec=_SEGMENT_FAILURE_COOLDOWN_SEC,
+    )
+    return {
+        int(segment_id)
+        for segment_id, count in counts.items()
+        if int(segment_id) > 0 and int(count) >= _SEGMENT_FAILURE_COOLDOWN_THRESHOLD
+    }
+
+
+def _log_segment_failure_cooldown(root: str, segment_id: int, count: int | None = None) -> None:
+    key = (str(root), int(segment_id))
+    now_ts = time.time()
+    last = float(_SEGMENT_FAILURE_WARN_TS.get(key, 0.0) or 0.0)
+    if now_ts - last < 300.0:
+        return
+    _SEGMENT_FAILURE_WARN_TS[key] = now_ts
+    detail = f" failures={count}" if count is not None else ""
+    logging.warning(
+        "[%s] segment entity=%s cooldown active after repeated failures%s cooldown=%ss",
+        root,
+        int(segment_id),
+        detail,
+        _SEGMENT_FAILURE_COOLDOWN_SEC,
+    )
+
+
+def _log_invalid_segment_filters(root: str, details: str) -> None:
+    if not details:
+        return
+    key = (str(root), details)
+    now_ts = time.time()
+    last = float(_SEGMENT_FILTER_WARN_TS.get(key, 0.0) or 0.0)
+    if now_ts - last < 300.0:
+        return
+    _SEGMENT_FILTER_WARN_TS[key] = now_ts
+    logging.warning("[%s] segment skipped due invalid date filter: %s", root, details)
 
 
 
@@ -383,65 +490,136 @@ def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[b
     return enabled, interval
 
 
-def _cron_field_matches(field: str, value: int) -> bool:
-    field = str(field or "").strip()
-    if field == "*":
-        return True
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        step = 1
-        if "/" in part:
-            base, step_s = part.split("/", 1)
-            try:
-                step = max(1, int(step_s))
-            except Exception:
-                return False
-        else:
-            base = part
-        if base == "*":
-            start, end = 0, max(value, 59)
-        elif "-" in base:
-            try:
-                start_s, end_s = base.split("-", 1)
-                start, end = int(start_s), int(end_s)
-            except Exception:
-                return False
-        else:
-            try:
-                return value == int(base)
-            except Exception:
-                return False
-        if start <= value <= end and (value - start) % step == 0:
-            return True
-    return False
-
-
-def _cron_expr_due(expr: str, now_dt: datetime) -> bool:
-    parts = str(expr or "").strip().split()
-    if len(parts) != 5:
-        return False
-    minute, hour, dom, month, dow = parts
-    cron_dow = (now_dt.weekday() + 1) % 7
-    return (
-        _cron_field_matches(minute, now_dt.minute)
-        and _cron_field_matches(hour, now_dt.hour)
-        and _cron_field_matches(dom, now_dt.day)
-        and _cron_field_matches(month, now_dt.month)
-        and _cron_field_matches(dow, cron_dow)
+def _monitored_email_parser_effective_setting(config: AgentConfig, inst: object) -> MonitoredEmailParserSettings:
+    enabled = bool(getattr(config, "monitored_email_parser_enabled", False))
+    interval = max(60, int(getattr(config, "monitored_email_parser_interval_sec", 900) or 900))
+    batch_size = min(5000, max(1, int(getattr(config, "monitored_email_parser_batch_size", 100) or 100)))
+    force_seen = bool(getattr(config, "monitored_email_parser_force_seen", False))
+    delete_processed = bool(getattr(config, "monitored_email_parser_delete_processed", False))
+    disable_mautic_fetch = bool(getattr(config, "monitored_email_parser_disable_mautic_fetch", True))
+    raw_types = getattr(config, "monitored_email_parser_types", ["feedback_loop"]) or ["feedback_loop"]
+    types = _normalize_monitored_email_types(raw_types)
+    whitelist = _normalize_monitored_email_whitelist(getattr(config, "monitored_email_parser_whitelist", []))
+    settings = getattr(config, "monitored_email_parser_instance_settings", {})
+    if isinstance(settings, dict):
+        for key in _viber_stats_setting_keys(inst) + ["default"]:
+            if key not in settings:
+                continue
+            raw = settings.get(key)
+            if isinstance(raw, dict):
+                if "enabled" in raw:
+                    enabled = _to_boolish(raw.get("enabled"), enabled)
+                if "interval_sec" in raw:
+                    try:
+                        interval = max(60, int(raw.get("interval_sec") or interval))
+                    except Exception:
+                        pass
+                if "batch_size" in raw:
+                    try:
+                        batch_size = min(5000, max(1, int(raw.get("batch_size") or batch_size)))
+                    except Exception:
+                        pass
+                if "force_seen" in raw:
+                    force_seen = _to_boolish(raw.get("force_seen"), force_seen)
+                if "delete_processed" in raw:
+                    delete_processed = _to_boolish(raw.get("delete_processed"), delete_processed)
+                if "disable_mautic_fetch" in raw:
+                    disable_mautic_fetch = _to_boolish(raw.get("disable_mautic_fetch"), disable_mautic_fetch)
+                if "types" in raw:
+                    types = _normalize_monitored_email_types(raw.get("types"))
+                if "whitelist" in raw:
+                    whitelist = _normalize_monitored_email_whitelist(raw.get("whitelist"))
+                break
+            if isinstance(raw, bool):
+                enabled = bool(raw)
+                break
+    return MonitoredEmailParserSettings(
+        enabled=enabled,
+        interval_sec=interval,
+        batch_size=batch_size,
+        force_seen=force_seen,
+        delete_processed=delete_processed,
+        disable_mautic_fetch=disable_mautic_fetch,
+        types=types,
+        whitelist=whitelist,
     )
 
 
-def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, str, str, str]:
+def _normalize_monitored_email_types(raw: object) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw]
+    else:
+        items = []
+    out: list[str] = []
+    for item in items:
+        key = item.lower()
+        if key in {"fbl", "feedback", "spam_complaint"}:
+            key = "feedback_loop"
+        if key not in MONITORED_EMAIL_ALLOWED_TYPES or key in out:
+            continue
+        out.append(key)
+    return tuple(out or ["feedback_loop"])
+
+
+def _normalize_monitored_email_whitelist(raw: object) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        items = re.split(r"[\s,;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw]
+    else:
+        items = []
+    out: list[str] = []
+    for item in items:
+        email = str(item or "").strip().strip("<>.,;:()[]{}'\"").lower()
+        if not email or "@" not in email or email in out:
+            continue
+        out.append(email)
+    return tuple(out[:200])
+
+
+def _is_mautic_email_fetch_template(template: str) -> bool:
+    return bool(re.search(r"\bmautic:emails?:fetch\b", str(template or "")))
+
+
+def _monitored_email_fetch_replaces_mautic(config: AgentConfig, inst: object) -> bool:
+    setting = _monitored_email_parser_effective_setting(config, inst)
+    return bool(setting.enabled and setting.disable_mautic_fetch)
+
+
+def _any_monitored_email_fetch_replaces_mautic(config: AgentConfig, installs: list[object]) -> bool:
+    return any(_monitored_email_fetch_replaces_mautic(config, inst) for inst in installs)
+
+
+def _empty_leads_cleanup_effective_setting(
+    config: AgentConfig,
+    inst: object,
+) -> tuple[bool, int, str, str, str, int, int, str, str, int]:
     enabled = bool(getattr(config, "empty_leads_cleanup_enabled", False))
     interval = max(60, int(getattr(config, "empty_leads_cleanup_interval_sec", 900) or 900))
+    batch_size = max(1, int(getattr(config, "empty_leads_cleanup_batch_size", 5000) or 5000))
+    max_runs_per_window = max(0, int(getattr(config, "empty_leads_cleanup_max_runs_per_window", 0) or 0))
+    window_start = "22:00"
+    window_end = "09:00"
+    window_min = max(1, min(1440, int(getattr(config, "empty_leads_cleanup_quiet_window_min", 660) or 660)))
     mode = "both_null"
     schedule_type = "interval"
     cron_expr = ""
     settings = getattr(config, "empty_leads_cleanup_instance_settings", {})
     if not isinstance(settings, dict):
-        return enabled, interval, mode, schedule_type, cron_expr
+        return (
+            enabled,
+            interval,
+            mode,
+            schedule_type,
+            cron_expr,
+            batch_size,
+            window_min,
+            window_start,
+            window_end,
+            max_runs_per_window,
+        )
     for key in _viber_stats_setting_keys(inst) + ["default"]:
         if key not in settings:
             continue
@@ -454,12 +632,38 @@ def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) ->
                     interval = max(60, int(raw.get("interval_sec") or interval))
                 except Exception:
                     pass
+            if "batch_size" in raw:
+                try:
+                    batch_size = max(1, int(raw.get("batch_size") or batch_size))
+                except Exception:
+                    pass
+            if "max_runs_per_window" in raw:
+                try:
+                    max_runs_per_window = max(0, int(raw.get("max_runs_per_window") or 0))
+                except Exception:
+                    pass
+            if "window_start" in raw:
+                window_start = str(raw.get("window_start") or window_start).strip() or window_start
+            if "window_end" in raw:
+                window_end = str(raw.get("window_end") or window_end).strip() or window_end
+            if "window_min" in raw or "quiet_window_min" in raw:
+                try:
+                    window_min = max(1, min(1440, int(raw.get("window_min", raw.get("quiet_window_min")) or window_min)))
+                except Exception:
+                    pass
             raw_schedule_type = str(raw.get("schedule_type", schedule_type) or schedule_type).strip().lower()
             raw_cron_expr = str(raw.get("cron_expr", cron_expr) or "").strip()
+            if raw_schedule_type in {"nightly", "nightly_window", "window"}:
+                schedule_type = "nightly_window"
+                cron_expr = ""
+                window_min = _window_minutes(window_start, window_end)
+            elif raw_schedule_type == "cron_window" and raw_cron_expr:
+                schedule_type = "cron"
+                cron_expr = raw_cron_expr
             if raw_schedule_type == "cron" and raw_cron_expr:
                 schedule_type = "cron"
                 cron_expr = raw_cron_expr
-            else:
+            elif schedule_type not in {"nightly_window", "cron"}:
                 schedule_type = "interval"
                 cron_expr = ""
             raw_mode = str(raw.get("mode", mode) or mode).strip().lower()
@@ -467,10 +671,184 @@ def _empty_leads_cleanup_effective_setting(config: AgentConfig, inst: object) ->
                 raw_mode = "both_null"
             if raw_mode in {"both_null", "email_null", "mobile_null"}:
                 mode = raw_mode
-            return enabled, interval, mode, schedule_type, cron_expr
+            return (
+                enabled,
+                interval,
+                mode,
+                schedule_type,
+                cron_expr,
+                batch_size,
+                window_min,
+                window_start,
+                window_end,
+                max_runs_per_window,
+            )
         if isinstance(raw, bool):
-            return bool(raw), interval, mode, schedule_type, cron_expr
-    return enabled, interval, mode, schedule_type, cron_expr
+            return (
+                bool(raw),
+                interval,
+                mode,
+                schedule_type,
+                cron_expr,
+                batch_size,
+                window_min,
+                window_start,
+                window_end,
+                max_runs_per_window,
+            )
+    return (
+        enabled,
+        interval,
+        mode,
+        schedule_type,
+        cron_expr,
+        batch_size,
+        window_min,
+        window_start,
+        window_end,
+        max_runs_per_window,
+    )
+
+
+def _page_hits_orphan_cleanup_effective_setting(
+    config: AgentConfig,
+    inst: object,
+) -> tuple[bool, int, str, str, int, str, str, int, int, float, int, int]:
+    enabled = bool(getattr(config, "enable_page_hits_orphan_cleanup", False))
+    interval = max(60, int(getattr(config, "page_hits_orphan_cleanup_interval_sec", 3600) or 3600))
+    quiet_hour = max(0, min(23, int(getattr(config, "page_hits_orphan_cleanup_quiet_hour", 2) or 2)))
+    window_min = max(1, min(720, int(getattr(config, "page_hits_orphan_cleanup_quiet_window_min", 180) or 180)))
+    window_start = f"{quiet_hour:02d}:00"
+    end_min = quiet_hour * 60 + window_min
+    window_end = f"{(end_min // 60) % 24:02d}:{end_min % 60:02d}"
+    schedule_type = "nightly_window"
+    cron_expr = ""
+    batch_size = max(100, int(getattr(config, "page_hits_orphan_cleanup_batch_size", 5000) or 5000))
+    batches = max(1, int(getattr(config, "page_hits_orphan_cleanup_batches_per_run", 12) or 12))
+    sleep_sec = max(0.0, float(getattr(config, "page_hits_orphan_cleanup_sleep_sec", 0.2) or 0.2))
+    grace_min = max(5, int(getattr(config, "page_hits_orphan_cleanup_grace_min", 60) or 60))
+    max_run_sec = max(30, int(getattr(config, "page_hits_orphan_cleanup_max_run_sec", 180) or 180))
+    settings = getattr(config, "page_hits_orphan_cleanup_instance_settings", {})
+    if not isinstance(settings, dict):
+        return enabled, interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
+    for key in _viber_stats_setting_keys(inst) + ["default"]:
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw:
+                enabled = _to_boolish(raw.get("enabled"), enabled)
+            for field, assign in (
+                ("interval_sec", "interval"),
+                ("quiet_hour", "quiet_hour"),
+                ("quiet_window_min", "window_min"),
+                ("batch_size", "batch_size"),
+                ("batches_per_run", "batches"),
+            ):
+                if field not in raw:
+                    continue
+                try:
+                    value = int(raw.get(field))
+                except Exception:
+                    continue
+                if assign == "interval":
+                    interval = max(60, value)
+                elif assign == "quiet_hour":
+                    quiet_hour = max(0, min(23, value))
+                elif assign == "window_min":
+                    window_min = max(1, min(720, value))
+                elif assign == "batch_size":
+                    batch_size = max(100, value)
+                elif assign == "batches":
+                    batches = max(1, value)
+            if "max_runs_per_window" in raw:
+                try:
+                    batches = max(0, int(raw.get("max_runs_per_window") or 0))
+                except Exception:
+                    pass
+            raw_schedule_type = str(raw.get("schedule_type", schedule_type) or schedule_type).strip().lower()
+            raw_cron_expr = str(raw.get("cron_expr", "") or "").strip()
+            if "window_start" in raw:
+                window_start = str(raw.get("window_start") or window_start).strip() or window_start
+            if "window_end" in raw:
+                window_end = str(raw.get("window_end") or window_end).strip() or window_end
+            if raw_schedule_type in {"nightly", "nightly_window", "window"}:
+                schedule_type = "nightly_window"
+                cron_expr = ""
+                window_min = _window_minutes(window_start, window_end)
+            elif raw_schedule_type == "cron" and raw_cron_expr:
+                schedule_type = "cron"
+                cron_expr = raw_cron_expr
+            else:
+                schedule_type = "interval"
+                cron_expr = ""
+            return enabled, interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
+        if isinstance(raw, bool):
+            return bool(raw), interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
+    return enabled, interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
+
+
+_HOUSEKEEPING_ALLOWED_FLAGS = {
+    "campaign_lead": "--campaign-lead",
+    "email_stats": "--email-stats",
+    "email_stats_tokens": "--email-stats-tokens",
+    "lead": "--lead",
+    "page_hits": "--page-hits",
+}
+
+
+def _housekeeping_plugin_installed(root: str) -> bool:
+    base = Path(root)
+    for p in (base / "plugins", base / "docroot" / "plugins", base / "public" / "plugins"):
+        if (p / "LeuchtfeuerHousekeepingBundle").is_dir():
+            return True
+    return False
+
+
+def _housekeeping_plugin_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, int, int, int, list[str], bool, bool]:
+    enabled = bool(getattr(config, "housekeeping_plugin_enabled", False))
+    interval = max(60, int(getattr(config, "housekeeping_plugin_interval_sec", 86400) or 86400))
+    quiet_hour = max(0, min(23, int(getattr(config, "housekeeping_plugin_quiet_hour", 3) or 3)))
+    window_min = max(1, min(720, int(getattr(config, "housekeeping_plugin_quiet_window_min", 120) or 120)))
+    days_old = max(1, int(getattr(config, "housekeeping_plugin_days_old", 365) or 365))
+    flags = [str(x).strip() for x in (getattr(config, "housekeeping_plugin_flags", []) or []) if str(x).strip()]
+    optimize = bool(getattr(config, "housekeeping_plugin_optimize_tables", False))
+    dry_run = bool(getattr(config, "housekeeping_plugin_dry_run", True))
+    settings = getattr(config, "housekeeping_plugin_instance_settings", {})
+    if not isinstance(settings, dict):
+        return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
+    for key in _viber_stats_setting_keys(inst) + ["default"]:
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw:
+                enabled = _to_boolish(raw.get("enabled"), enabled)
+            for field in ("interval_sec", "quiet_hour", "quiet_window_min", "days_old"):
+                if field not in raw:
+                    continue
+                try:
+                    value = int(raw.get(field))
+                except Exception:
+                    continue
+                if field == "interval_sec":
+                    interval = max(60, value)
+                elif field == "quiet_hour":
+                    quiet_hour = max(0, min(23, value))
+                elif field == "quiet_window_min":
+                    window_min = max(1, min(720, value))
+                elif field == "days_old":
+                    days_old = max(1, value)
+            if isinstance(raw.get("flags"), list):
+                flags = [str(x).strip() for x in raw.get("flags", []) if str(x).strip()]
+            if "optimize_tables" in raw:
+                optimize = _to_boolish(raw.get("optimize_tables"), optimize)
+            if "dry_run" in raw:
+                dry_run = _to_boolish(raw.get("dry_run"), dry_run)
+            return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
+        if isinstance(raw, bool):
+            return bool(raw), interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
+    return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
 
 
 def _migrate_empty_leads_cleanup_runtime(config: AgentConfig, lines: list[str]) -> bool:
@@ -1482,16 +1860,6 @@ def _needs_weight_recalc(ids: list[int], cached: dict[int, float]) -> bool:
     return set(ids) != set(cached.keys())
 
 
-def _mark_ring_entity_executed(ring: deque[int], entity_id: int | None) -> None:
-    if entity_id is None or not ring:
-        return
-    try:
-        ring.remove(int(entity_id))
-        ring.append(int(entity_id))
-    except ValueError:
-        return
-
-
 def _partition_complete(ids: list[int], p1: list[int], p2: list[int]) -> bool:
     base = set(ids)
     return base == (set(p1) | set(p2))
@@ -1570,6 +1938,7 @@ def _fill_from_ring(
     popens: dict[str, subprocess.Popen[bytes]],
     build_args,
     blocked_entities: set[int] | None = None,
+    remove_on_launch: bool = False,
 ) -> None:
     if not ring or ring_limit <= 0 or total_limit <= 0:
         return
@@ -1600,7 +1969,7 @@ def _fill_from_ring(
             popens=popens,
         )
         if launched:
-            ring.rotate(-1)
+            _advance_ring_after_launch(ring, eid, remove_on_launch=remove_on_launch)
         else:
             break
 
@@ -1696,6 +2065,7 @@ class TaskStore:
         self._ensure_sqlite_column("tasks", "manual_request_id", "ALTER TABLE tasks ADD COLUMN manual_request_id INTEGER")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_running ON tasks(state, root, task_type)")
         self.conn.execute("DROP INDEX IF EXISTS idx_tasks_task_key_running")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_task_key_started ON tasks(task_key, started_at)")
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS weight_cache (
@@ -2320,6 +2690,28 @@ class TaskStore:
             (str(task_key),),
         ).fetchone()
         return bool(row)
+
+    def last_task_started_at(self, task_key: str) -> float:
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(
+                        f"""
+                        SELECT MAX(started_at) AS started_at
+                        FROM `{tasks_table}`
+                        WHERE host_name=%s AND task_key=%s
+                        """,
+                        (self._node_id, str(task_key)),
+                    )
+                    return float((rows[0].get("started_at") if rows else 0.0) or 0.0)
+                except Exception:
+                    pass
+        row = self.conn.execute(
+            "SELECT MAX(started_at) AS started_at FROM tasks WHERE task_key=?",
+            (str(task_key),),
+        ).fetchone()
+        return float((row["started_at"] if row else 0.0) or 0.0)
 
     def recent_task_problem_counts(
         self,
@@ -3314,7 +3706,13 @@ def _task_repeat_interval_sec(config: AgentConfig, task_type: str) -> int:
     if task_type == "import":
         return max(0, int(getattr(config, "import_poll_interval_sec", 0) or 0))
     if task_type == "campaign_trigger":
-        return max(0, int(getattr(config, "campaign_trigger_min_repeat_sec", 0)))
+        min_repeat = max(0, int(getattr(config, "campaign_trigger_min_repeat_sec", 0)))
+        audit_interval = max(0, int(getattr(config, "campaign_trigger_audit_interval_sec", 0) or 0))
+        # One per-campaign trigger pass processes all currently available
+        # batches. If SQL still sees the campaign as due immediately after
+        # that pass, relaunching the same ID every daemon tick creates a
+        # no-op storm. Keep retries aligned with the audit/planner cadence.
+        return max(min_repeat, audit_interval)
     if task_type in {"campaign_rebuild", "campaign_update"}:
         return max(0, int(getattr(config, "campaign_rebuild_min_repeat_sec", 0)))
     return 0
@@ -3423,6 +3821,93 @@ def _running_count_for_entities(
     )
 
 
+def _effective_segment_slot_limit(config: AgentConfig, throttled_active: bool) -> int:
+    if config.segment_mode == "classic_loop":
+        return 1
+    if throttled_active:
+        if config.segment_throttle_whitelist_only:
+            return max(0, int(config.segment_throttle_whitelist_parallel or 0))
+        return max(0, int(config.segment_priority_parallel_throttled or 0)) + max(
+            0,
+            int(config.segment_regular_parallel_throttled or 0),
+        )
+    return max(0, int(config.segment_priority_parallel_idle or 0)) + max(
+        0,
+        int(config.segment_regular_parallel_idle or 0),
+    )
+
+
+def _segment_shared_slots_used(running: dict[str, RunningTask], root: str) -> int:
+    return _running_count(running, root, "segment") + _running_count(running, root, "import")
+
+
+def _segment_shared_slots_available(
+    running: dict[str, RunningTask],
+    root: str,
+    segment_slot_limit: int,
+) -> int:
+    return max(0, max(0, int(segment_slot_limit or 0)) - _segment_shared_slots_used(running, root))
+
+
+def _segment_task_limit_after_import(
+    running: dict[str, RunningTask],
+    root: str,
+    segment_slot_limit: int,
+) -> int:
+    return max(0, max(0, int(segment_slot_limit or 0)) - _running_count(running, root, "import"))
+
+
+def _submit_import_if_segment_slot(
+    *,
+    config: AgentConfig,
+    store: "TaskStore",
+    running: dict[str, RunningTask],
+    popens: dict[str, subprocess.Popen[bytes]],
+    root: str,
+    cluster_import_allowed: bool,
+    import_pending_count: int,
+    segment_slot_limit: int,
+    now_ts: float,
+) -> bool:
+    if (
+        not cluster_import_allowed
+        or not config.enable_import_polling
+        or int(import_pending_count or 0) <= 0
+        or _import_in_settle(root, now_ts)
+        or _running_count(running, root, "import") > 0
+    ):
+        return False
+    if _segment_shared_slots_available(running, root, segment_slot_limit) <= 0:
+        return False
+    args = render_mautic_command(
+        php_bin=config.php_bin,
+        run_as_user=config.mautic_run_as_user,
+        root=root,
+        template=config.cmd_import_template,
+        import_limit=config.import_limit,
+    )
+    launched = _submit_if_slot(
+        config=config,
+        store=store,
+        running=running,
+        root=root,
+        task_type="import",
+        entity_id=None,
+        args=args,
+        timeout_sec=config.command_timeout_sec,
+        max_parallel_for_type=1,
+        popens=popens,
+    )
+    if launched:
+        logging.info(
+            "[%s] import claimed shared segment slot pending=%s slot_limit=%s",
+            root,
+            int(import_pending_count or 0),
+            max(0, int(segment_slot_limit or 0)),
+        )
+    return launched
+
+
 def _is_running(running: dict[str, RunningTask], root: str, task_type: str, entity_id: int | None) -> bool:
     for t in running.values():
         if t.root == root and t.task_type == task_type and t.entity_id == entity_id:
@@ -3487,6 +3972,12 @@ def _submit_if_slot(
         return False
     if manual_request_id is None and not _launch_allowed(config, root, task_type, entity_id):
         return False
+    if manual_request_id is None:
+        min_repeat = _task_repeat_interval_sec(config, task_type)
+        if min_repeat > 0:
+            prev = store.last_task_started_at(key)
+            if prev > 0 and time.time() - float(prev) < float(min_repeat):
+                return False
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
         return False
 
@@ -3526,6 +4017,18 @@ def _respawn_task(
     # - 1    : no retry (initial run only)
     # - > 1  : bounded retries up to configured attempt cap
     retry_max = int(config.task_retry_max)
+    if task.manual_request_id is None and task.task_type == "segment" and task.entity_id is not None:
+        if retry_max <= 0:
+            retry_max = _SEGMENT_AUTOMATIC_RETRY_CAP
+        problem_counts = store.recent_task_problem_counts(
+            root=task.root,
+            task_type="segment",
+            since_sec=_SEGMENT_FAILURE_COOLDOWN_SEC,
+        )
+        count = int(problem_counts.get(int(task.entity_id), 0) or 0)
+        if count >= _SEGMENT_FAILURE_COOLDOWN_THRESHOLD:
+            _log_segment_failure_cooldown(task.root, int(task.entity_id), count)
+            return False
     if retry_max > 0 and task.attempts >= retry_max:
         return False
     try:
@@ -3975,6 +4478,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_sql_auto_signatures: dict[str, tuple[int, ...]] = {}
     segment_dependencies_by_root: dict[str, dict[int, set[int]]] = {}
     segment_parents_by_root: dict[str, dict[int, set[int]]] = {}
+    segment_invalid_filter_sets: dict[str, set[int]] = {}
+    segment_failure_blocked_sets: dict[str, set[int]] = {}
     segment_prio_rings: dict[str, deque[int]] = {}
     segment_reg_rings: dict[str, deque[int]] = {}
     campaign_trigger_prio_rings: dict[str, deque[int]] = {}
@@ -3998,10 +4503,23 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_cleanup_ts: dict[str, float] = {}
     last_mautic_lock_cleanup_ts: dict[str, float] = {}
     last_page_hits_orphan_cleanup_ts: dict[str, float] = {}
+    page_hits_orphan_cleanup_active: dict[str, bool] = {}
+    page_hits_orphan_cleanup_window_counts: dict[str, int] = {}
+    page_hits_orphan_cleanup_window_keys: dict[str, str] = {}
+    page_hits_orphan_cleanup_done_window_keys: dict[str, str] = {}
+    last_housekeeping_plugin_ts: dict[str, float] = {}
     last_empty_leads_cleanup_ts: dict[str, float] = {}
+    last_empty_leads_cleanup_idle_ts: dict[str, float] = {}
+    last_empty_leads_cleanup_skip_ts: dict[str, float] = {}
+    last_campaign_trigger_audit_ts: dict[str, float] = {}
     last_empty_leads_cleanup_cron_minute: dict[str, str] = {}
+    empty_leads_cleanup_window_counts: dict[str, int] = {}
+    empty_leads_cleanup_window_keys: dict[str, str] = {}
+    empty_leads_cleanup_done_window_keys: dict[str, str] = {}
+    maintenance_cleanup_rr_index: dict[str, int] = {}
     last_cache_clear_ts: dict[str, float] = {}
     last_cache_warm_ts: dict[str, float] = {}
+    last_monitored_email_parser_ts: dict[str, float] = {}
     last_fs_permissions_guard_ts: dict[str, float] = {}
     last_db_watchdog_ts: dict[str, float] = {}
     last_tasks_compact_ts = 0.0
@@ -4036,6 +4554,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_zabbix_version_cache_guard_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     next_viber_cron_reconcile_at = 0.0
+    next_email_fetch_cron_reconcile_at = 0.0
     next_empty_leads_cleanup_cron_reconcile_at = 0.0
     next_cluster_assets_guard_at = 0.0
     next_inventory_auto_rescan_at = time.time() + min(300, max(60, int(getattr(config, "poll_interval_sec", 60) or 60)))
@@ -4145,7 +4664,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 store.put_runtime_sync("mcc_runtime", overrides)
                 fp = overrides_fingerprint(overrides)
                 if fp != last_runtime_overrides_fp:
-                    applied = apply_remote_overrides(base_config, overrides)
+                    # Apply new MCC runtime over the currently effective
+                    # daemon config. Using the startup baseline here makes
+                    # operator saves look persisted on disk while scheduler
+                    # decisions can continue from stale in-memory values until
+                    # a restart.
+                    applied = apply_remote_overrides(config, overrides)
                     next_cfg = applied["config"]
                     applied_keys = list(applied.get("applied_keys", []))
                     unsupported_keys = list(applied.get("unsupported_keys", []))
@@ -4163,6 +4687,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if next_cfg != config:
                         old_profile = (config.profile_name or "").strip().lower()
                         config = next_cfg
+                        base_config = config
                         pusher.cfg = config
                         next_plan_refresh_at = 0.0
                         next_update_check_at = 0.0
@@ -4184,7 +4709,27 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "runtime-overrides synced from MCC: no effective change (keys=%s)",
                             ",".join(applied_keys) if applied_keys else "-",
                         )
+                    if set(applied_keys) & _SERVICE_CLEANUP_RUNTIME_KEYS:
+                        # A Save in MCC must be visible to the next scheduler
+                        # tick. Drop per-process cleanup cursors so newly
+                        # enabled/changed service cleanups do not wait for an
+                        # old interval/window key or a previous idle marker.
+                        last_page_hits_orphan_cleanup_ts.clear()
+                        page_hits_orphan_cleanup_window_counts.clear()
+                        page_hits_orphan_cleanup_window_keys.clear()
+                        page_hits_orphan_cleanup_done_window_keys.clear()
+                        last_empty_leads_cleanup_ts.clear()
+                        last_empty_leads_cleanup_idle_ts.clear()
+                        last_empty_leads_cleanup_skip_ts.clear()
+                        empty_leads_cleanup_window_counts.clear()
+                        empty_leads_cleanup_window_keys.clear()
+                        empty_leads_cleanup_done_window_keys.clear()
+                        last_housekeeping_plugin_ts.clear()
+                        last_monitored_email_parser_ts.clear()
+                        maintenance_cleanup_rr_index.clear()
+                        logging.info("runtime-overrides cleanup schedules refreshed for immediate scheduler apply")
                     _persist_stable_backup_runtime_to_config(next_cfg if isinstance(next_cfg, AgentConfig) else config, applied_keys)
+                    base_config = config
                     last_runtime_overrides_fp = fp
                     store.put_runtime_sync(
                         "active_runtime",
@@ -4695,44 +5240,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     logging.warning("[%s] mautic6 core patch check failed: %s", inst.root, e)
 
-                if str(getattr(config, "pagehit_cascade_patch_policy", "required") or "required").strip().lower() == "required":
-                    try:
-                        pagehit_patch_res = ensure_pagehit_cascade_patch(inst)
-                        ph_status = str(pagehit_patch_res.get("status", "")).strip().lower()
-                        if ph_status == "patched":
-                            logging.info(
-                                "[%s] pagehit cascade patch applied: model=%s handler=%s",
-                                inst.root,
-                                pagehit_patch_res.get("page_model", "-"),
-                                pagehit_patch_res.get("handler", "-"),
-                            )
-                        elif ph_status == "error":
-                            logging.warning(
-                                "[%s] pagehit cascade patch error: %s",
-                                inst.root,
-                                pagehit_patch_res.get("reason", "unknown"),
-                            )
-                    except Exception as e:
-                        logging.warning("[%s] pagehit cascade patch check failed: %s", inst.root, e)
+                try:
+                    restore_res = restore_retired_mcd_core_patches(inst)
+                    if str(restore_res.get("status", "")).strip().lower() == "error":
+                        logging.warning("[%s] retired core patch restore error: %s", inst.root, restore_res.get("errors", []))
+                except Exception as e:
+                    logging.warning("[%s] retired core patch restore check failed: %s", inst.root, e)
 
                 if not inst.db:
                     continue
                 root = inst.root
                 db = MauticDB(inst.db)
-                inst_now = now_utc
-                if inst.mautic_timezone:
-                    try:
-                        inst_now = now_utc.astimezone(ZoneInfo(inst.mautic_timezone))
-                    except Exception:
-                        logging.warning("[%s] invalid mautic timezone in local.php: %s", root, inst.mautic_timezone)
-                sql_ctx = {
-                    "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "now_local": inst_now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
-                    "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
-                    "window_start_local_24h": (inst_now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
-                    "window_start_local_7d": (inst_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
-                }
+                sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
                 sql_ring_enabled_for_root = bool(
                     config.segment_sql_ring_enabled and config.segment_mode != "classic_loop"
                 )
@@ -4810,6 +5329,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             inst.mautic_major,
                         )
                         campaign_trigger_ids = db.fetch_ids(campaign_triggers_due_sql, limit=5000, context=sql_ctx)
+                        audit_interval = max(0, int(getattr(config, "campaign_trigger_audit_interval_sec", 0) or 0))
+                        if audit_interval > 0 and now - float(last_campaign_trigger_audit_ts.get(root, 0.0)) >= float(audit_interval):
+                            audit_ids = db.fetch_ids(_SQL_CAMPAIGNS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
+                            if audit_ids:
+                                before = set(campaign_trigger_ids)
+                                campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids + audit_ids))
+                                added = sorted(set(campaign_trigger_ids) - before)
+                                logging.info(
+                                    "[%s] campaign trigger audit planned ids=%s added=%s interval=%ss",
+                                    root,
+                                    len(audit_ids),
+                                    ",".join(str(x) for x in added[:50]) if added else "-",
+                                    audit_interval,
+                                )
+                            last_campaign_trigger_audit_ts[root] = now
                     except Exception as e:
                         campaign_query_error = e
                         logging.warning("[%s] campaign trigger query failed: %s", root, e)
@@ -4874,6 +5408,33 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         dependency_children = segment_dependencies_by_root.get(root, {})
                         dependency_parents = segment_parents_by_root.get(root, {})
                         logging.warning("[%s] segment dependency planning failed: %s", root, e)
+                    segment_definition_rows: list[dict[str, object]] = []
+                    invalid_filter_ids: set[int] = set()
+                    if standard_segment_ids:
+                        try:
+                            segment_definition_rows = db.fetch_segment_definitions(standard_segment_ids)
+                            invalid_issues = segment_invalid_filter_issues(segment_definition_rows)
+                            invalid_filter_ids = set(invalid_issues)
+                            if invalid_filter_ids:
+                                _log_invalid_segment_filters(
+                                    root,
+                                    format_segment_filter_issues(invalid_issues),
+                                )
+                                standard_segment_ids = [
+                                    sid for sid in standard_segment_ids if sid not in invalid_filter_ids
+                                ]
+                                segment_definition_rows = [
+                                    row
+                                    for row in segment_definition_rows
+                                    if int(row.get("id") or 0) not in invalid_filter_ids
+                                ]
+                        except Exception as e:
+                            logging.warning("[%s] segment filter validation failed: %s", root, e)
+                    segment_invalid_filter_sets[root] = invalid_filter_ids
+                    failure_blocked_ids = _segment_failure_blocked_ids(store, root)
+                    for sid in sorted(set(standard_segment_ids) & failure_blocked_ids)[:20]:
+                        _log_segment_failure_cooldown(root, sid)
+                    segment_failure_blocked_sets[root] = failure_blocked_ids
                     auto_sql_rules_for_root: dict[int, SQLSegmentRule] = {}
                     if sql_ring_enabled_for_root and config.segment_sql_auto_enabled and standard_segment_ids:
                         try:
@@ -4882,7 +5443,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 task_type="segment",
                                 since_sec=max(6 * 3600, int(config.tasks_history_keep_days or 1) * 86400),
                             )
-                            segment_rows = db.fetch_segment_definitions(standard_segment_ids)
+                            segment_rows = segment_definition_rows or db.fetch_segment_definitions(standard_segment_ids)
                             for row in segment_rows:
                                 try:
                                     sid = int(row.get("id") or 0)
@@ -5402,6 +5963,22 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("viber stats cron reconcile failed: %s", e)
             next_viber_cron_reconcile_at = now + 60
 
+        if now >= next_email_fetch_cron_reconcile_at:
+            try:
+                email_cron = reconcile_mautic_email_fetch_cron(
+                    profile_name=(config.profile_name or ""),
+                    install_dir="/opt/mcd",
+                    enabled=_any_monitored_email_fetch_replaces_mautic(config, installs),
+                )
+                changed = [line for line in email_cron.lines if "commented mautic email fetch" in line]
+                if changed:
+                    logging.info("mautic email fetch cron reconcile: %s", "; ".join(changed))
+                elif not email_cron.ok:
+                    logging.warning("mautic email fetch cron reconcile failed: %s", "; ".join(email_cron.lines))
+            except Exception as e:
+                logging.warning("mautic email fetch cron reconcile failed: %s", e)
+            next_email_fetch_cron_reconcile_at = now + 60
+
         if now >= next_empty_leads_cleanup_cron_reconcile_at:
             try:
                 ecron = reconcile_empty_leads_cleanup_cron(
@@ -5501,20 +6078,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             root = inst.root
             db = MauticDB(inst.db)
             now_utc = datetime.now(timezone.utc)
-            inst_now = now_utc
-            if inst.mautic_timezone:
-                try:
-                    inst_now = now_utc.astimezone(ZoneInfo(inst.mautic_timezone))
-                except Exception:
-                    inst_now = now_utc
-            sql_ctx = {
-                "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                "now_local": inst_now.strftime("%Y-%m-%d %H:%M:%S"),
-                "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
-                "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
-                "window_start_local_24h": (inst_now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
-                "window_start_local_7d": (inst_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
+            inst_now = mautic_local_datetime(now_utc, inst.mautic_timezone)
             seg_sql_ring = segment_sql_rings.setdefault(root, deque())
             seg_sql_rules = segment_sql_rules_by_root.setdefault(root, {})
             seg_sql_active = segment_sql_active_sets.setdefault(root, set())
@@ -5538,6 +6103,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 running=running,
                 recently_finished=_recent_finished_segment_ids(root, now),
             )
+            segment_blocked_ids |= set(segment_invalid_filter_sets.get(root, set()))
+            segment_blocked_ids |= set(segment_failure_blocked_sets.get(root, set()))
             if _import_in_settle(root, now):
                 import_pending_cache[root] = 0
             _mark_external_entities_executed(
@@ -5585,7 +6152,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             if not (cluster_cron_allowed or cluster_import_allowed or cluster_cache_allowed):
                 continue
 
-            if cluster_cron_allowed and config.segment_mode != "classic_loop":
+            segment_slot_limit = _effective_segment_slot_limit(config, throttled.get(root, False))
+            import_segment_slot_limit = max(1, segment_slot_limit) if cluster_import_allowed else segment_slot_limit
+            _submit_import_if_segment_slot(
+                config=config,
+                store=store,
+                running=running,
+                popens=popens,
+                root=root,
+                cluster_import_allowed=cluster_import_allowed,
+                import_pending_count=max(0, int(import_pending_cache.get(root, 0) or 0)),
+                segment_slot_limit=import_segment_slot_limit,
+                now_ts=now,
+            )
+
+            if (
+                cluster_cron_allowed
+                and config.segment_mode != "classic_loop"
+                and _segment_shared_slots_available(running, root, segment_slot_limit) > 0
+            ):
                 _run_sql_segment_ring(
                     config=config,
                     store=store,
@@ -5609,18 +6194,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     template=config.cmd_segment_full_update_template,
                     batch_limit=config.segment_batch_limit,
                 )
-                _submit_if_slot(
-                    config=config,
-                    store=store,
-                    running=running,
-                    root=root,
-                    task_type="segment",
-                    entity_id=None,
-                    args=args,
-                    timeout_sec=config.command_timeout_sec,
-                    max_parallel_for_type=1,
-                    popens=popens,
-                )
+                classic_segment_limit = _segment_task_limit_after_import(running, root, 1)
+                if classic_segment_limit > 0:
+                    _submit_if_slot(
+                        config=config,
+                        store=store,
+                        running=running,
+                        root=root,
+                        task_type="segment",
+                        entity_id=None,
+                        args=args,
+                        timeout_sec=config.command_timeout_sec,
+                        max_parallel_for_type=classic_segment_limit,
+                        popens=popens,
+                    )
             elif cluster_cron_allowed:
                 if throttled.get(root, False):
                     if config.segment_throttle_whitelist_only:
@@ -5633,6 +6220,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     seg_prio_limit = max(0, config.segment_priority_parallel_idle)
                     seg_reg_limit = max(0, config.segment_regular_parallel_idle)
                 seg_total_limit = seg_prio_limit + seg_reg_limit
+                seg_total_limit = _segment_task_limit_after_import(running, root, seg_total_limit)
                 eff_seg_prio_limit = seg_prio_limit
                 eff_seg_reg_limit = seg_reg_limit
                 prefer_priority_spill = False
@@ -5869,7 +6457,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         trg_reg_ring.rotate(-1)
 
                     if next_trigger_id is not None:
-                        _submit_if_slot(
+                        launched = _submit_if_slot(
                             config=config,
                             store=store,
                             running=running,
@@ -5889,6 +6477,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             max_parallel_for_type=1,
                             popens=popens,
                         )
+                        if launched:
+                            _advance_ring_after_launch(trg_prio_ring, next_trigger_id, remove_on_launch=True)
+                            _advance_ring_after_launch(trg_reg_ring, next_trigger_id, remove_on_launch=True)
                     else:
                         next_campaign_id = None
                         if reb_prio_ring:
@@ -5898,7 +6489,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             next_campaign_id = reb_reg_ring[0]
                             reb_reg_ring.rotate(-1)
                         if next_campaign_id is not None:
-                            _submit_if_slot(
+                            launched = _submit_if_slot(
                                 config=config,
                                 store=store,
                                 running=running,
@@ -5916,36 +6507,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 max_parallel_for_type=1,
                                 popens=popens,
                             )
+                            if launched:
+                                _advance_ring_after_launch(reb_prio_ring, next_campaign_id, remove_on_launch=True)
+                                _advance_ring_after_launch(reb_reg_ring, next_campaign_id, remove_on_launch=True)
             # Tiny mode has a single campaign worker:
             # - trigger-due campaigns first
             # - then rebuild-due campaigns
-            # Import polling must stay independent from campaign slot occupancy.
+            # Import polling is dispatched above through the shared segment slot.
             if (config.profile_name or "").strip().lower() == "tiny":
-                if (
-                    not _import_in_settle(root, now)
-                    and cluster_import_allowed
-                    and config.enable_import_polling
-                    and import_pending_cache.get(root, 0) > 0
-                ):
-                    args = render_mautic_command(
-                        php_bin=config.php_bin,
-                        run_as_user=config.mautic_run_as_user,
-                        root=root,
-                        template=config.cmd_import_template,
-                        import_limit=config.import_limit,
-                    )
-                    _submit_if_slot(
-                        config=config,
-                        store=store,
-                        running=running,
-                        root=root,
-                        task_type="import",
-                        entity_id=None,
-                        args=args,
-                        timeout_sec=config.command_timeout_sec,
-                        max_parallel_for_type=1,
-                        popens=popens,
-                    )
                 # Skip generic multi-ring campaign scheduler.
                 continue
 
@@ -5990,6 +6559,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_limit=config.campaign_limit,
                     batch_limit=config.campaign_batch_limit,
                 ),
+                remove_on_launch=True,
             )
             _fill_from_ring(
                 ring=trg_reg_ring,
@@ -6011,6 +6581,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_limit=config.campaign_limit,
                     batch_limit=config.campaign_batch_limit,
                 ),
+                remove_on_launch=True,
             )
             trg_cur_total = _running_count(running, root, "campaign_trigger")
             if trg_cur_total < trg_total_limit:
@@ -6036,6 +6607,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             campaign_limit=config.campaign_limit,
                             batch_limit=config.campaign_batch_limit,
                         ),
+                        remove_on_launch=True,
                     )
                 elif trg_prio_ring:
                     _fill_from_ring(
@@ -6058,6 +6630,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             campaign_limit=config.campaign_limit,
                             batch_limit=config.campaign_batch_limit,
                         ),
+                        remove_on_launch=True,
                     )
             if cluster_cron_allowed and config.enable_campaign_rebuild:
                 rebuild_prio_limit = max(0, config.campaign_rebuild_priority_parallel)
@@ -6088,6 +6661,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         template=config.cmd_campaign_rebuild_template,
                         id=cid,
                     ),
+                    remove_on_launch=True,
                 )
                 _fill_from_ring(
                     ring=reb_reg_ring,
@@ -6107,6 +6681,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         template=config.cmd_campaign_rebuild_template,
                         id=cid,
                     ),
+                    remove_on_launch=True,
                 )
                 reb_cur_total = _running_count(running, root, "campaign_rebuild")
                 if reb_cur_total < rebuild_total_limit:
@@ -6130,6 +6705,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 template=config.cmd_campaign_rebuild_template,
                                 id=cid,
                             ),
+                            remove_on_launch=True,
                         )
 
                     elif reb_prio_ring:
@@ -6151,36 +6727,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 template=config.cmd_campaign_rebuild_template,
                                 id=cid,
                             ),
+                            remove_on_launch=True,
                         )
 
             if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
-
-            if (
-                not _import_in_settle(root, now)
-                and cluster_import_allowed
-                and config.enable_import_polling
-                and import_pending_cache.get(root, 0) > 0
-            ):
-                args = render_mautic_command(
-                    php_bin=config.php_bin,
-                    run_as_user=config.mautic_run_as_user,
-                    root=root,
-                    template=config.cmd_import_template,
-                    import_limit=config.import_limit,
-                )
-                _submit_if_slot(
-                    config=config,
-                    store=store,
-                    running=running,
-                    root=root,
-                    task_type="import",
-                    entity_id=None,
-                    args=args,
-                    timeout_sec=config.command_timeout_sec,
-                    max_parallel_for_type=1,
-                    popens=popens,
-                )
 
             last_cleanup = last_cleanup_ts.get(root, 0.0)
             interval = max(1, config.contacts_cleanup_interval_sec)
@@ -6291,13 +6842,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     mautic_lock_cleanup_backup_reason or "backup_guard",
                 )
 
+            (
+                page_hits_cleanup_enabled,
+                page_hits_cleanup_interval,
+                page_hits_cleanup_schedule_type,
+                page_hits_cleanup_cron_expr,
+                page_hits_cleanup_window_min,
+                page_hits_cleanup_window_start,
+                page_hits_cleanup_window_end,
+                page_hits_cleanup_batch_size,
+                page_hits_cleanup_batches,
+                page_hits_cleanup_sleep_sec,
+                page_hits_cleanup_grace_min,
+                page_hits_cleanup_max_run_sec,
+            ) = _page_hits_orphan_cleanup_effective_setting(config, inst)
             last_page_hits_cleanup = last_page_hits_orphan_cleanup_ts.get(root, 0.0)
-            page_hits_cleanup_interval = max(60, int(config.page_hits_orphan_cleanup_interval_sec or 3600))
-            page_hits_cleanup_in_quiet = _in_daily_quiet_window(
-                dt,
-                max(0, min(23, int(config.page_hits_orphan_cleanup_quiet_hour or 2))),
-                max(1, min(720, int(config.page_hits_orphan_cleanup_quiet_window_min or 180))),
-            )
             page_hits_cleanup_backup_running = bool(backup_thread is not None and backup_thread.is_alive()) or backup_lock_active(
                 config
             )
@@ -6306,61 +6865,47 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 backup_running=page_hits_cleanup_backup_running,
                 now_local=dt,
             )
-            if (
-                config.enable_page_hits_orphan_cleanup
+            page_hits_cleanup_in_window, page_hits_cleanup_window_key = _cleanup_session_key(
+                schedule_type=page_hits_cleanup_schedule_type,
+                now_local=datetime.now(),
+                now_epoch=now,
+                interval_sec=page_hits_cleanup_interval,
+                cron_expr=page_hits_cleanup_cron_expr,
+                window_min=page_hits_cleanup_window_min,
+                window_start=page_hits_cleanup_window_start,
+                window_end=page_hits_cleanup_window_end,
+            )
+            page_hits_cleanup_due = (
+                bool(page_hits_cleanup_window_key)
+                and page_hits_cleanup_in_window
+                and (last_page_hits_cleanup <= 0 or now - last_page_hits_cleanup >= max(1.0, float(config.dispatch_interval_sec)))
+            )
+            if page_hits_cleanup_window_key:
+                if page_hits_orphan_cleanup_window_keys.get(root) != page_hits_cleanup_window_key:
+                    page_hits_orphan_cleanup_window_keys[root] = page_hits_cleanup_window_key
+                    page_hits_orphan_cleanup_window_counts[root] = 0
+                if page_hits_orphan_cleanup_done_window_keys.get(root) == page_hits_cleanup_window_key:
+                    page_hits_cleanup_due = False
+                if (
+                    page_hits_cleanup_batches > 0
+                    and page_hits_orphan_cleanup_window_counts.get(root, 0) >= page_hits_cleanup_batches
+                ):
+                    page_hits_cleanup_due = False
+            page_hits_cleanup_due = (
+                page_hits_cleanup_enabled
                 and cluster_cron_allowed
-                and page_hits_cleanup_in_quiet
+                and page_hits_cleanup_due
                 and not page_hits_cleanup_backup_pause
-                and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
-            ):
-                cutoff_utc = (
-                    now_utc - timedelta(minutes=max(5, int(config.page_hits_orphan_cleanup_grace_min or 60)))
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    preview = db.preview_orphan_page_hits_batch(
-                        cutoff_utc=cutoff_utc,
-                        batch_size=config.page_hits_orphan_cleanup_batch_size,
-                    )
-                    preview_count = int(preview.get("preview_count", 0) or 0)
-                    if preview_count > 0:
-                        logging.info(
-                            "[%s] page_hits_orphan_cleanup preview count=%s min_id=%s max_id=%s min_date_hit=%s max_date_hit=%s cutoff_utc=%s",
-                            root,
-                            preview_count,
-                            preview.get("min_id"),
-                            preview.get("max_id"),
-                            preview.get("min_date_hit"),
-                            preview.get("max_date_hit"),
-                            cutoff_utc,
-                        )
-                        result = db.delete_orphan_page_hits(
-                            cutoff_utc=cutoff_utc,
-                            batch_size=config.page_hits_orphan_cleanup_batch_size,
-                            max_batches=config.page_hits_orphan_cleanup_batches_per_run,
-                            sleep_sec=config.page_hits_orphan_cleanup_sleep_sec,
-                            max_run_sec=config.page_hits_orphan_cleanup_max_run_sec,
-                        )
-                        logging.info(
-                            "[%s] page_hits_orphan_cleanup ok batches=%s deleted=%s last_deleted=%s elapsed=%.2fs stop=%s cutoff_utc=%s",
-                            root,
-                            int(result.get("batches_run", 0) or 0),
-                            int(result.get("total_deleted", 0) or 0),
-                            int(result.get("last_deleted", 0) or 0),
-                            float(result.get("elapsed_sec", 0.0) or 0.0),
-                            str(result.get("stop_reason") or "-"),
-                            cutoff_utc,
-                        )
-                    else:
-                        logging.debug("[%s] page_hits_orphan_cleanup idle cutoff_utc=%s", root, cutoff_utc)
-                except Exception as e:
-                    logging.warning("[%s] page_hits_orphan_cleanup failed: %s", root, e)
-                last_page_hits_orphan_cleanup_ts[root] = now
-            elif (
-                config.enable_page_hits_orphan_cleanup
+            )
+            page_hits_cleanup_cutoff_utc = (
+                now_utc - timedelta(minutes=page_hits_cleanup_grace_min)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            if (
+                page_hits_cleanup_enabled
                 and cluster_cron_allowed
-                and page_hits_cleanup_in_quiet
+                and page_hits_cleanup_in_window
                 and page_hits_cleanup_backup_pause
-                and (last_page_hits_cleanup == 0.0 or now - last_page_hits_cleanup >= page_hits_cleanup_interval)
+                and bool(page_hits_cleanup_window_key)
             ):
                 logging.info(
                     "[%s] page_hits_orphan_cleanup skipped: backup guard active (%s)",
@@ -6369,62 +6914,298 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 )
 
             (
+                housekeeping_enabled,
+                housekeeping_interval,
+                housekeeping_quiet_hour,
+                housekeeping_window_min,
+                housekeeping_days_old,
+                housekeeping_flags,
+                housekeeping_optimize,
+                housekeeping_dry_run,
+            ) = _housekeeping_plugin_effective_setting(config, inst)
+            last_housekeeping = last_housekeeping_plugin_ts.get(root, 0.0)
+            housekeeping_in_quiet = _in_daily_quiet_window(
+                dt,
+                housekeeping_quiet_hour,
+                housekeeping_window_min,
+            )
+            housekeeping_due = (
+                housekeeping_enabled
+                and cluster_cron_allowed
+                and housekeeping_in_quiet
+                and (last_housekeeping == 0.0 or now - last_housekeeping >= housekeeping_interval)
+                and int(getattr(inst, "mautic_major", 0) or 0) in {4, 5, 6, 7}
+                and _housekeeping_plugin_installed(root)
+            )
+            housekeeping_selected_flags = [
+                _HOUSEKEEPING_ALLOWED_FLAGS[x]
+                for x in housekeeping_flags
+                if x in _HOUSEKEEPING_ALLOWED_FLAGS
+            ]
+            housekeeping_due = bool(housekeeping_due and housekeeping_selected_flags)
+
+            (
                 empty_cleanup_enabled,
                 empty_cleanup_interval,
                 empty_cleanup_mode,
                 empty_cleanup_schedule_type,
                 empty_cleanup_cron_expr,
+                empty_cleanup_batch_size,
+                empty_cleanup_window_min,
+                empty_cleanup_window_start,
+                empty_cleanup_window_end,
+                empty_cleanup_max_runs_per_window,
             ) = _empty_leads_cleanup_effective_setting(
                 config,
                 inst,
             )
             last_empty_cleanup = last_empty_leads_cleanup_ts.get(root, 0.0)
             empty_cleanup_due = False
-            if empty_cleanup_schedule_type == "cron":
-                cron_now = datetime.now().replace(second=0, microsecond=0)
-                cron_minute_key = cron_now.isoformat(timespec="minutes")
-                cron_state_key = f"{root}:{empty_cleanup_cron_expr}"
-                empty_cleanup_due = (
-                    bool(empty_cleanup_cron_expr)
-                    and _cron_expr_due(empty_cleanup_cron_expr, cron_now)
-                    and last_empty_leads_cleanup_cron_minute.get(cron_state_key) != cron_minute_key
-                )
-            else:
-                empty_cleanup_due = (
-                    last_empty_cleanup == 0.0 or now - last_empty_cleanup >= max(60, empty_cleanup_interval)
-                )
+            empty_cleanup_in_window = False
+            empty_cleanup_window_key = ""
+            empty_cleanup_in_window, empty_cleanup_window_key = _cleanup_session_key(
+                schedule_type=empty_cleanup_schedule_type,
+                now_local=datetime.now(),
+                now_epoch=now,
+                interval_sec=empty_cleanup_interval,
+                cron_expr=empty_cleanup_cron_expr,
+                window_min=empty_cleanup_window_min,
+                window_start=empty_cleanup_window_start,
+                window_end=empty_cleanup_window_end,
+            )
+
+            # All cleanup schedule modes share the same drain-loop semantics:
+            # a schedule occurrence opens a cleanup session, MCD runs one SQL
+            # batch per dispatch tick, and the session stops only when a pass
+            # deletes zero rows or the configured repeat limit is reached.
+            empty_cleanup_due = (
+                bool(empty_cleanup_window_key)
+                and empty_cleanup_in_window
+                and (last_empty_cleanup <= 0 or now - last_empty_cleanup >= max(1.0, float(config.dispatch_interval_sec)))
+            )
+            if empty_cleanup_window_key:
+                if empty_leads_cleanup_window_keys.get(root) != empty_cleanup_window_key:
+                    empty_leads_cleanup_window_keys[root] = empty_cleanup_window_key
+                    empty_leads_cleanup_window_counts[root] = 0
+                if empty_leads_cleanup_done_window_keys.get(root) == empty_cleanup_window_key:
+                    empty_cleanup_due = False
+                if (
+                    empty_cleanup_max_runs_per_window > 0
+                    and empty_leads_cleanup_window_counts.get(root, 0) >= empty_cleanup_max_runs_per_window
+                ):
+                    empty_cleanup_due = False
+            service_cleanup_candidates: list[str] = []
+            if page_hits_cleanup_due:
+                service_cleanup_candidates.append("page_hits_orphan_cleanup")
             if (
                 empty_cleanup_enabled
                 and cluster_cron_allowed
                 and empty_cleanup_due
+                and not backup_dispatch_pause
             ):
+                service_cleanup_candidates.append("empty_leads_cleanup")
+            if housekeeping_due:
+                service_cleanup_candidates.append("housekeeping")
+            selected_service_cleanup, selected_service_cleanup_idx = _select_fair_cleanup_task(
+                service_cleanup_candidates,
+                maintenance_cleanup_rr_index.get(root, -1),
+            )
+            if selected_service_cleanup:
+                maintenance_cleanup_rr_index[root] = selected_service_cleanup_idx
+
+            if selected_service_cleanup == "housekeeping":
+                template = "leuchtfeuer:housekeeping --days-old {days_old} " + " ".join(housekeeping_selected_flags)
+                if housekeeping_optimize:
+                    template += " --optimize-tables"
+                if housekeeping_dry_run:
+                    template += " --dry-run"
+                try:
+                    args = render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=template,
+                        days_old=housekeeping_days_old,
+                    )
+                    launched = _submit_if_slot(
+                        config=config,
+                        store=store,
+                        running=running,
+                        root=root,
+                        task_type="housekeeping",
+                        entity_id=None,
+                        args=args,
+                        timeout_sec=config.command_timeout_sec,
+                        max_parallel_for_type=1,
+                        popens=popens,
+                    )
+                    if launched:
+                        last_housekeeping_plugin_ts[root] = now
+                        logging.info(
+                            "[%s] housekeeping plugin queued fair_queue=%s flags=%s",
+                            root,
+                            "shared" if len(service_cleanup_candidates) > 1 else "solo",
+                            ",".join(housekeeping_selected_flags),
+                        )
+                except Exception as e:
+                    logging.warning("[%s] housekeeping plugin schedule failed: %s", root, e)
+
+            if selected_service_cleanup == "page_hits_orphan_cleanup":
+                try:
+                    preview = db.preview_orphan_page_hits_batch(
+                        cutoff_utc=page_hits_cleanup_cutoff_utc,
+                        batch_size=page_hits_cleanup_batch_size,
+                    )
+                    preview_count = int(preview.get("preview_count", 0) or 0)
+                    if preview_count > 0:
+                        logging.info(
+                            "[%s] page_hits_orphan_cleanup preview count=%s min_id=%s max_id=%s min_date_hit=%s max_date_hit=%s cutoff_utc=%s fair_queue=%s",
+                            root,
+                            preview_count,
+                            preview.get("min_id"),
+                            preview.get("max_id"),
+                            preview.get("min_date_hit"),
+                            preview.get("max_date_hit"),
+                            page_hits_cleanup_cutoff_utc,
+                            "shared" if len(service_cleanup_candidates) > 1 else "solo",
+                        )
+                        result = db.delete_orphan_page_hits(
+                            cutoff_utc=page_hits_cleanup_cutoff_utc,
+                            batch_size=page_hits_cleanup_batch_size,
+                            max_batches=1,
+                            sleep_sec=page_hits_cleanup_sleep_sec,
+                            max_run_sec=page_hits_cleanup_max_run_sec,
+                        )
+                        last_deleted = int(result.get("last_deleted", 0) or 0)
+                        total_deleted = int(result.get("total_deleted", 0) or 0)
+                        stop_reason = str(result.get("stop_reason") or "-")
+                        page_hits_orphan_cleanup_active[root] = bool(total_deleted > 0 and last_deleted > 0 and stop_reason != "empty")
+                        logging.info(
+                            "[%s] page_hits_orphan_cleanup ok batches=%s deleted=%s last_deleted=%s elapsed=%.2fs stop=%s cutoff_utc=%s fair_queue=%s",
+                            root,
+                            int(result.get("batches_run", 0) or 0),
+                            total_deleted,
+                            last_deleted,
+                            float(result.get("elapsed_sec", 0.0) or 0.0),
+                            stop_reason,
+                            page_hits_cleanup_cutoff_utc,
+                            "shared" if len(service_cleanup_candidates) > 1 else "solo",
+                        )
+                    else:
+                        page_hits_orphan_cleanup_active[root] = False
+                        logging.debug("[%s] page_hits_orphan_cleanup idle cutoff_utc=%s", root, page_hits_cleanup_cutoff_utc)
+
+                    message_result = db.delete_orphan_page_hit_notifications(
+                        cutoff_utc=page_hits_cleanup_cutoff_utc,
+                        batch_size=page_hits_cleanup_batch_size,
+                    )
+                    message_deleted = int(message_result.get("deleted", 0) or 0)
+                    if message_deleted > 0:
+                        page_hits_orphan_cleanup_active[root] = True
+                        logging.info(
+                            "[%s] page_hit_notification_cleanup ok table=%s scanned=%s deleted=%s orphan_hits=%s invalid_hits=%s cutoff_utc=%s",
+                            root,
+                            message_result.get("table", "-"),
+                            int(message_result.get("scanned", 0) or 0),
+                            message_deleted,
+                            int(message_result.get("orphan_hits", 0) or 0),
+                            int(message_result.get("invalid_hits", 0) or 0),
+                            page_hits_cleanup_cutoff_utc,
+                        )
+                    elif preview_count <= 0 and page_hits_cleanup_window_key:
+                        page_hits_orphan_cleanup_done_window_keys[root] = page_hits_cleanup_window_key
+                except Exception as e:
+                    page_hits_orphan_cleanup_active[root] = False
+                    logging.warning("[%s] page_hits_orphan_cleanup failed: %s", root, e)
+                last_page_hits_orphan_cleanup_ts[root] = now
+                if page_hits_cleanup_window_key:
+                    page_hits_orphan_cleanup_window_counts[root] = page_hits_orphan_cleanup_window_counts.get(root, 0) + 1
+
+            if selected_service_cleanup == "empty_leads_cleanup":
                 try:
                     result = db.delete_empty_leads(
                         mode=empty_cleanup_mode,
-                        batch_size=int(getattr(config, "empty_leads_cleanup_batch_size", 5000) or 5000),
-                        max_batches=int(getattr(config, "empty_leads_cleanup_max_batches_per_run", 10) or 10),
+                        batch_size=empty_cleanup_batch_size,
+                        max_batches=1,
                     )
                     deleted = int(result.get("total_deleted", 0) or 0)
                     if deleted > 0:
+                        last_empty_leads_cleanup_idle_ts[root] = 0.0
                         logging.info(
-                            "[%s] empty_leads_cleanup ok mode=%s batches=%s deleted=%s elapsed=%.2fs stop=%s",
+                            "[%s] empty_leads_cleanup ok mode=%s batches=%s batch_size=%s deleted=%s elapsed=%.2fs stop=%s",
                             root,
                             str(result.get("mode") or empty_cleanup_mode),
                             int(result.get("batches_run", 0) or 0),
+                            int(result.get("batch_size", 0) or empty_cleanup_batch_size),
                             deleted,
                             float(result.get("elapsed_sec", 0.0) or 0.0),
                             str(result.get("stop_reason") or "-"),
                         )
                     else:
+                        last_empty_leads_cleanup_idle_ts[root] = now
+                        if empty_cleanup_window_key:
+                            empty_leads_cleanup_done_window_keys[root] = empty_cleanup_window_key
                         logging.debug("[%s] empty_leads_cleanup idle mode=%s", root, empty_cleanup_mode)
                 except Exception as e:
                     logging.warning("[%s] empty_leads_cleanup failed: %s", root, e)
                 last_empty_leads_cleanup_ts[root] = now
-                if empty_cleanup_schedule_type == "cron":
-                    last_empty_leads_cleanup_cron_minute[f"{root}:{empty_cleanup_cron_expr}"] = datetime.now().replace(
-                        second=0,
-                        microsecond=0,
-                    ).isoformat(timespec="minutes")
+                if empty_cleanup_window_key:
+                    empty_leads_cleanup_window_counts[root] = empty_leads_cleanup_window_counts.get(root, 0) + 1
+            elif (
+                empty_cleanup_enabled
+                and cluster_cron_allowed
+                and empty_cleanup_due
+                and backup_dispatch_pause
+                and now - last_empty_leads_cleanup_skip_ts.get(root, 0.0) >= 300
+            ):
+                logging.info(
+                    "[%s] empty_leads_cleanup skipped: backup guard active (%s)",
+                    root,
+                    backup_pause_reason or "backup_guard",
+                )
+                last_empty_leads_cleanup_skip_ts[root] = now
+
+            monitored_email_setting = _monitored_email_parser_effective_setting(config, inst)
+            last_monitored_email = last_monitored_email_parser_ts.get(root, 0.0)
+            if (
+                monitored_email_setting.enabled
+                and cluster_cron_allowed
+                and (last_monitored_email <= 0 or now - last_monitored_email >= monitored_email_setting.interval_sec)
+            ):
+                if not getattr(inst, "db", None):
+                    logging.warning("[%s] monitored_email parser skipped: db config missing", root)
+                    last_monitored_email_parser_ts[root] = now
+                else:
+                    try:
+                        state_key = monitored_email_state_key(root, monitored_email_setting)
+                        state = store.get_runtime_sync(state_key) or {}
+                        result = process_monitored_email(
+                            db=db,
+                            local_php_path=getattr(inst, "local_php_path", None),
+                            php_bin=config.php_bin,
+                            settings=monitored_email_setting,
+                            state=state,
+                        )
+                        store.put_runtime_sync(state_key, result.state)
+                        if result.scanned or result.dnc_added or result.deleted or result.whitelist_dnc_removed or result.errors:
+                            logging.info(
+                                "[%s] monitored_email parser scanned=%s matched=%s contacts=%s dnc_added=%s dnc_existing=%s whitelist_dnc_removed=%s deleted=%s marked_seen=%s no_contact=%s types=%s errors=%s",
+                                root,
+                                result.scanned,
+                                result.matched,
+                                result.contacts_matched,
+                                result.dnc_added,
+                                result.dnc_existing,
+                                result.whitelist_dnc_removed,
+                                result.deleted,
+                                result.marked_seen,
+                                result.no_contact,
+                                ",".join(f"{k}:{v}" for k, v in sorted(result.by_type.items())) or "-",
+                                " | ".join(result.errors[:5]) if result.errors else "-",
+                            )
+                    except Exception as e:
+                        logging.warning("[%s] monitored_email parser failed: %s", root, e)
+                    last_monitored_email_parser_ts[root] = now
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
@@ -6511,6 +7292,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if not cluster_cron_allowed:
                     break
                 if not job.enabled:
+                    continue
+                if _is_mautic_email_fetch_template(job.command_template) and _monitored_email_fetch_replaces_mautic(config, inst):
                     continue
                 prev = jobs_last_run.get((root, job.name), 0.0)
                 if prev > 0 and time.time() - prev < max(1, job.interval_sec):

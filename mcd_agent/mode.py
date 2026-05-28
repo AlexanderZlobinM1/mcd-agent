@@ -27,6 +27,8 @@ MANAGED_KEYWORDS = (
     "cache:warm",
     "cache:warmup",
     "mautic:emails:send",
+    "mautic:email:fetch",
+    "mautic:emails:fetch",
     "viber:stats:update",
 )
 
@@ -72,6 +74,13 @@ def _is_viber_stats_job(line: str) -> bool:
     if not s or s.startswith("#"):
         return False
     return "bin/console" in s and "viber:stats:update" in s
+
+
+def _is_mautic_email_fetch_job(line: str) -> bool:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return False
+    return "bin/console" in s and ("mautic:email:fetch" in s or "mautic:emails:fetch" in s)
 
 
 def _is_empty_leads_cleanup_job(line: str) -> bool:
@@ -151,6 +160,44 @@ def _comment_viber_stats(content: str, stamp: str) -> tuple[str, int]:
             out.append("# " + line)
             changed += 1
             continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _comment_mautic_email_fetch(content: str, stamp: str) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if _is_mautic_email_fetch_job(line):
+            out.append(f"# MCD_MANAGED {stamp}: disabled mautic email fetch by mcd monitored-email parser")
+            out.append("# " + line)
+            changed += 1
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _restore_mautic_email_fetch_comments(content: str) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    skip_next_managed = False
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        s = line.strip()
+        if s.startswith("# MCD_MANAGED") and "mautic email fetch" in s and "monitored-email parser" in s:
+            skip_next_managed = True
+            changed += 1
+            continue
+        if skip_next_managed:
+            if line.startswith("# "):
+                legacy = line[2:]
+                if _is_mautic_email_fetch_job(legacy):
+                    out.append(legacy)
+                    changed += 1
+                    skip_next_managed = False
+                    continue
+            skip_next_managed = False
         out.append(line)
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
 
@@ -268,6 +315,47 @@ def reconcile_viber_stats_cron(*, profile_name: str, install_dir: str) -> ModeRe
             lines.append(f"{user}: failed to write crontab: {out2}")
             return ModeResult(ok=False, lines=lines)
         lines.append(f"{user}: {action}={changed}")
+    return ModeResult(ok=True, lines=lines)
+
+
+def reconcile_mautic_email_fetch_cron(*, profile_name: str, install_dir: str, enabled: bool) -> ModeResult:
+    """
+    Keep legacy mautic:email:fetch cron from racing the MCD monitored-email parser.
+    """
+    if os.geteuid() != 0:
+        return ModeResult(ok=False, lines=["mautic email fetch cron reconcile requires root"])
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    profile = (profile_name or "").strip().lower()
+    for user in ("root", "www-data"):
+        rc, cur = _read_crontab(None if user == "root" else user)
+        if rc != 0:
+            lines.append(f"{user}: crontab not readable, skip")
+            continue
+        _ensure_backup(install_dir, user, cur)
+        if not enabled:
+            updated, changed = _restore_mautic_email_fetch_comments(cur)
+            if changed <= 0:
+                lines.append(f"{user}: no mautic email fetch cron restore")
+                continue
+            rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+            if rc2 != 0:
+                lines.append(f"{user}: failed to write crontab: {out2}")
+                return ModeResult(ok=False, lines=lines)
+            lines.append(f"{user}: restored mautic email fetch cron lines={changed}")
+            continue
+        if profile == "passive":
+            lines.append(f"{user}: passive profile, mautic email fetch cron left unchanged")
+            continue
+        updated, changed = _comment_mautic_email_fetch(cur, stamp)
+        if changed <= 0:
+            lines.append(f"{user}: no mautic email fetch cron change")
+            continue
+        rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+        if rc2 != 0:
+            lines.append(f"{user}: failed to write crontab: {out2}")
+        else:
+            lines.append(f"{user}: commented mautic email fetch cron lines={changed}")
     return ModeResult(ok=True, lines=lines)
 
 

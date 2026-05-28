@@ -16,7 +16,7 @@ CACHE_TASK_TYPES = {"cache_clear", "cache_warm", "cache_warmup", "cache_hard"}
 def _local_ip_identity_values() -> set[str]:
     vals: set[str] = set()
     try:
-        out = subprocess.check_output(["hostname", "-I"], text=True, timeout=2)
+        out = subprocess.check_output(["hostname", "-I"], text=True, timeout=2, stderr=subprocess.DEVNULL)
     except Exception:
         out = ""
     for token in re.split(r"\s+", out.strip()):

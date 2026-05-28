@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -219,6 +220,66 @@ def _swap_signal() -> dict[str, Any]:
     }
 
 
+def _filesystem_signal() -> dict[str, Any]:
+    roots = ["/", "/var", "/var/www", "/var/lib/mysql"]
+    out: dict[str, dict[str, Any]] = {}
+    seen_mounts: set[str] = set()
+    for raw in roots:
+        p = Path(raw)
+        if not p.exists():
+            continue
+        try:
+            usage = shutil.disk_usage(str(p))
+        except Exception:
+            continue
+        mount = raw
+        device = ""
+        try:
+            proc = subprocess.run(["df", "-P", str(p)], capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0:
+                lines = [x for x in (proc.stdout or "").splitlines() if x.strip()]
+                if len(lines) >= 2:
+                    cols = lines[-1].split()
+                    if len(cols) >= 6:
+                        device = cols[0]
+                        mount = cols[5]
+        except Exception:
+            pass
+        key = str(mount or raw)
+        if key in seen_mounts:
+            continue
+        seen_mounts.add(key)
+        total = int(usage.total)
+        used = int(usage.used)
+        free = int(usage.free)
+        used_pct = (float(used) / float(total)) * 100.0 if total > 0 else 0.0
+        out[key] = {
+            "path": raw,
+            "mount": mount,
+            "device": device,
+            "total_bytes": total,
+            "used_bytes": used,
+            "free_bytes": free,
+            "used_pct": round(used_pct, 2),
+        }
+    worst = 0.0
+    for item in out.values():
+        try:
+            worst = max(worst, float(item.get("used_pct", 0.0) or 0.0))
+        except Exception:
+            continue
+    level = 0
+    if worst >= 97.0:
+        level = 4
+    elif worst >= 92.0:
+        level = 3
+    elif worst >= 85.0:
+        level = 2
+    elif worst >= 75.0:
+        level = 1
+    return {"level": level, "worst_used_pct": round(worst, 2), "filesystems": out}
+
+
 def _parse_nginx_access_ts(line: str) -> datetime | None:
     # Example: [23/Feb/2026:11:00:02 +0000]
     m = re.search(r"\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+\-]\d{4})\]", line)
@@ -290,6 +351,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
     live_console_total = len(console_rows)
     scheduler_drift = max(0, tracked_total - live_console_total)
     swap_state = _swap_signal()
+    fs_state = _filesystem_signal()
 
     kernel = _run_journal(["-k", "--since", since, "-n", "2000"])
     mysql = "\n".join(
@@ -327,6 +389,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
         "scheduler_duplicate_task_keys": duplicate_task_keys,
         "php_console_stuck": len(console_stuck),
         "swap_pressure_level": int(swap_state.get("level", 0) or 0),
+        "disk_pressure_level": int(fs_state.get("level", 0) or 0),
     }
 
     comp = {
@@ -343,6 +406,10 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
         "runtime": {
             "php_console_stuck": len(console_stuck),
             "swap_pressure_level": int(swap_state.get("level", 0) or 0),
+        },
+        "disk": {
+            "pressure_level": int(fs_state.get("level", 0) or 0),
+            "worst_used_pct": fs_state.get("worst_used_pct", 0.0),
         },
     }
     scheduler_level = 0
@@ -365,6 +432,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
         "web": min(5, (totals["http_5xx"] // 10 + (1 if totals["http_5xx"] > 0 else 0)) + (1 if totals["web_critical"] > 0 else 0)),
         "scheduler": scheduler_level,
         "runtime": runtime_level,
+        "disk": int(fs_state.get("level", 0) or 0),
     }
     overall = max(levels.values()) if levels else 0
     status = "ok" if overall == 0 else ("warn" if overall <= 2 else "critical")
@@ -380,6 +448,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
             "web": {"level": levels["web"], "signals": comp["web"]},
             "scheduler": {"level": levels["scheduler"], "signals": comp["scheduler"]},
             "runtime": {"level": levels["runtime"], "signals": comp["runtime"]},
+            "disk": {"level": levels["disk"], "signals": comp["disk"]},
         },
         "totals": totals,
     }
@@ -394,6 +463,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
         },
         "php_console_recent": console_rows[:20],
         "swap": swap_state,
+        "filesystems": fs_state.get("filesystems", {}),
     }
     return payload
 
@@ -418,6 +488,7 @@ def format_signals_text(payload: dict[str, object]) -> str:
             "scheduler_duplicate_task_keys",
             "php_console_stuck",
             "swap_pressure_level",
+            "disk_pressure_level",
         ):
             lines.append(f"{k}={int(totals.get(k, 0) or 0)}")
     return "\n".join(lines)

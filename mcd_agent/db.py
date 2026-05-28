@@ -11,6 +11,12 @@ import pymysql
 from mcd_agent.models import DBConfig
 
 
+_PAGE_HIT_NOTIFICATION_CLASS = "Mautic\\MessengerBundle\\Message\\PageHitNotification"
+_PAGE_HIT_NOTIFICATION_CLASS_ESCAPED = _PAGE_HIT_NOTIFICATION_CLASS.replace("\\", "\\\\")
+_PAGE_HIT_ID_RE = re.compile(r's:\d+:"(?:\x00[^"]+\x00)?hitId";i:(\d+);')
+_PAGE_HIT_ID_JSON_RE = re.compile(r'"hit_?id"\s*:\s*(\d+)', re.IGNORECASE)
+
+
 class MauticDB:
     def __init__(self, cfg: DBConfig) -> None:
         self.cfg = cfg
@@ -533,6 +539,159 @@ class MauticDB:
             return "FORCE INDEX (`idx_mcd_ph_lead_date`)"
         return ""
 
+    def _existing_table_columns(self, table: str) -> set[str] | None:
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    return self._table_columns(cur, table)
+        except Exception:
+            return None
+
+    def _messenger_messages_table(self) -> tuple[str | None, set[str]]:
+        prefix = str(self.cfg.table_prefix or "")
+        candidates = []
+        if prefix:
+            candidates.append(f"{prefix}messenger_messages")
+        candidates.append("messenger_messages")
+        seen: set[str] = set()
+        for raw in candidates:
+            table = self._safe_table(raw)
+            if table in seen:
+                continue
+            seen.add(table)
+            columns = self._existing_table_columns(table)
+            if columns and {"id", "body"}.issubset(columns):
+                return table, columns
+        return None, set()
+
+    @staticmethod
+    def extract_page_hit_notification_hit_id(body: Any) -> int | None:
+        raw = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body or "")
+        if _PAGE_HIT_NOTIFICATION_CLASS not in raw and _PAGE_HIT_NOTIFICATION_CLASS_ESCAPED not in raw:
+            return None
+        for pattern in (_PAGE_HIT_ID_RE, _PAGE_HIT_ID_JSON_RE):
+            m = pattern.search(raw)
+            if not m:
+                continue
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def delete_orphan_page_hit_notifications(
+        self,
+        *,
+        cutoff_utc: str,
+        batch_size: int,
+    ) -> dict[str, Any]:
+        """Drop stale Doctrine messenger PageHitNotification rows with missing hits.
+
+        This replaces the retired MCD PageHitNotificationHandler core patch with
+        daemon-side cleanup. It only deletes old queue rows that explicitly carry
+        a PageHitNotification payload and whose referenced page hit is absent.
+        """
+
+        message_table, message_columns = self._messenger_messages_table()
+        if not message_table:
+            return {"status": "skip", "reason": "messenger_messages_table_missing", "deleted": 0}
+
+        page_hits_table = self._safe_table(f"{self.cfg.table_prefix}page_hits")
+        if self._existing_table_columns(page_hits_table) is None:
+            return {"status": "skip", "reason": "page_hits_table_missing", "deleted": 0}
+
+        limit = max(1, int(batch_size))
+        where = "WHERE `body` LIKE %s"
+        params: list[Any] = ["%PageHitNotification%"]
+        if "created_at" in message_columns:
+            where += " AND `created_at` < %s"
+            params.append(str(cutoff_utc))
+        if "delivered_at" in message_columns:
+            where += " AND `delivered_at` IS NULL"
+
+        query = (
+            f"SELECT `id`, `body` FROM `{message_table}` "
+            f"{where} "
+            "ORDER BY `id` ASC "
+            "LIMIT %s"
+        )
+        params.append(limit)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                rows = cur.fetchall() or []
+
+        candidate_ids_by_hit: dict[int, list[int]] = {}
+        invalid_message_ids: list[int] = []
+        scanned = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            scanned += 1
+            try:
+                message_id = int(row.get("id"))
+            except (TypeError, ValueError):
+                continue
+            hit_id = self.extract_page_hit_notification_hit_id(row.get("body"))
+            if hit_id is None:
+                continue
+            if hit_id <= 0:
+                invalid_message_ids.append(message_id)
+                continue
+            candidate_ids_by_hit.setdefault(hit_id, []).append(message_id)
+
+        existing_hit_ids: set[int] = set()
+        hit_ids = sorted(candidate_ids_by_hit)
+        if hit_ids:
+            placeholders = ",".join(["%s"] * len(hit_ids))
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT `id` FROM `{page_hits_table}` WHERE `id` IN ({placeholders})", tuple(hit_ids))
+                    for row in cur.fetchall() or []:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            existing_hit_ids.add(int(row.get("id")))
+                        except (TypeError, ValueError):
+                            pass
+
+        orphan_message_ids = list(invalid_message_ids)
+        for hit_id, message_ids in candidate_ids_by_hit.items():
+            if hit_id not in existing_hit_ids:
+                orphan_message_ids.extend(message_ids)
+
+        if not orphan_message_ids:
+            return {
+                "status": "ok",
+                "table": message_table,
+                "scanned": scanned,
+                "deleted": 0,
+                "orphan_hits": 0,
+                "invalid_hits": len(invalid_message_ids),
+            }
+
+        unique_message_ids = sorted(set(orphan_message_ids))
+        placeholders = ",".join(["%s"] * len(unique_message_ids))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                deleted = int(
+                    cur.execute(
+                        f"DELETE FROM `{message_table}` WHERE `id` IN ({placeholders})",
+                        tuple(unique_message_ids),
+                    )
+                    or 0
+                )
+
+        return {
+            "status": "ok",
+            "table": message_table,
+            "scanned": scanned,
+            "deleted": deleted,
+            "orphan_hits": len([hit_id for hit_id in hit_ids if hit_id not in existing_hit_ids]),
+            "invalid_hits": len(invalid_message_ids),
+        }
+
     def preview_orphan_page_hits_batch(
         self,
         *,
@@ -648,21 +807,22 @@ class MauticDB:
         """
         Delete contacts that are unusable for import/matching.
 
-        Supported modes are intentionally narrow and mirror MCC UI choices:
-        - both_null: email IS NULL AND mobile IS NULL
-        - email_null: email IS NULL
-        - mobile_null: mobile IS NULL
+        Supported modes are intentionally narrow and mirror MCC UI choices.
+        Empty means NULL or an empty string; Mautic installations commonly use
+        both representations for unusable contact values.
         """
         table = self._safe_table(f"{self.cfg.table_prefix}leads")
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode == "email_or_mobile_null":
             normalized_mode = "both_null"
+        email_empty = "(`email` IS NULL OR `email` = '')"
+        mobile_empty = "(`mobile` IS NULL OR `mobile` = '')"
         if normalized_mode == "both_null":
-            predicate = "`email` IS NULL AND `mobile` IS NULL"
+            predicate = f"{email_empty} AND {mobile_empty}"
         elif normalized_mode == "email_null":
-            predicate = "`email` IS NULL"
+            predicate = email_empty
         elif normalized_mode == "mobile_null":
-            predicate = "`mobile` IS NULL"
+            predicate = mobile_empty
         else:
             raise ValueError(f"unsupported_empty_leads_cleanup_mode:{normalized_mode}")
         limit = max(1, int(batch_size))
@@ -705,6 +865,124 @@ class MauticDB:
             "stop_reason": stop_reason,
             "batch_size": limit,
         }
+
+    def add_dnc_for_emails(self, emails: list[str], *, reason: int, comments: str) -> dict[str, Any]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in emails:
+            email = str(raw or "").strip().lower()
+            if not email or "@" not in email or email in seen:
+                continue
+            seen.add(email)
+            cleaned.append(email)
+        if not cleaned:
+            return {"emails": 0, "contacts": 0, "added": 0, "existing": 0}
+
+        leads_table = self._safe_table(f"{self.cfg.table_prefix}leads")
+        dnc_table = self._safe_table(f"{self.cfg.table_prefix}lead_donotcontact")
+        placeholders = ",".join(["%s"] * len(cleaned))
+        select_leads = (
+            f"SELECT `id`, LOWER(`email`) AS email "
+            f"FROM `{leads_table}` "
+            f"WHERE LOWER(`email`) IN ({placeholders})"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(select_leads, tuple(cleaned))
+                rows = cur.fetchall() or []
+                lead_ids: list[int] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        lead_id = int(row.get("id") or 0)
+                    except Exception:
+                        continue
+                    if lead_id > 0:
+                        lead_ids.append(lead_id)
+                lead_ids = list(dict.fromkeys(lead_ids))
+                if not lead_ids:
+                    return {"emails": len(cleaned), "contacts": 0, "added": 0, "existing": 0}
+
+                lead_placeholders = ",".join(["%s"] * len(lead_ids))
+                cur.execute(
+                    f"SELECT `lead_id` FROM `{dnc_table}` "
+                    f"WHERE `channel`='email' AND `lead_id` IN ({lead_placeholders})",
+                    tuple(lead_ids),
+                )
+                existing_rows = cur.fetchall() or []
+                existing_ids: set[int] = set()
+                for row in existing_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        existing_ids.add(int(row.get("lead_id") or 0))
+                    except Exception:
+                        continue
+                to_add = [lead_id for lead_id in lead_ids if lead_id not in existing_ids]
+                if to_add:
+                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    cur.executemany(
+                        f"INSERT INTO `{dnc_table}` "
+                        "(`lead_id`, `date_added`, `reason`, `channel`, `channel_id`, `comments`) "
+                        "VALUES (%s, %s, %s, 'email', NULL, %s)",
+                        [(lead_id, now, int(reason), str(comments or "")) for lead_id in to_add],
+                    )
+                return {
+                    "emails": len(cleaned),
+                    "contacts": len(lead_ids),
+                    "added": len(to_add),
+                    "existing": len(existing_ids),
+                }
+
+    def remove_email_dnc_for_emails(self, emails: list[str]) -> dict[str, Any]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in emails:
+            email = str(raw or "").strip().lower()
+            if not email or "@" not in email or email in seen:
+                continue
+            seen.add(email)
+            cleaned.append(email)
+        if not cleaned:
+            return {"emails": 0, "contacts": 0, "removed": 0}
+
+        leads_table = self._safe_table(f"{self.cfg.table_prefix}leads")
+        dnc_table = self._safe_table(f"{self.cfg.table_prefix}lead_donotcontact")
+        placeholders = ",".join(["%s"] * len(cleaned))
+        select_leads = (
+            f"SELECT `id` "
+            f"FROM `{leads_table}` "
+            f"WHERE LOWER(`email`) IN ({placeholders})"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(select_leads, tuple(cleaned))
+                rows = cur.fetchall() or []
+                lead_ids: list[int] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        lead_id = int(row.get("id") or 0)
+                    except Exception:
+                        continue
+                    if lead_id > 0:
+                        lead_ids.append(lead_id)
+                lead_ids = list(dict.fromkeys(lead_ids))
+                if not lead_ids:
+                    return {"emails": len(cleaned), "contacts": 0, "removed": 0}
+                lead_placeholders = ",".join(["%s"] * len(lead_ids))
+                cur.execute(
+                    f"DELETE FROM `{dnc_table}` "
+                    f"WHERE `channel`='email' AND `lead_id` IN ({lead_placeholders})",
+                    tuple(lead_ids),
+                )
+                return {
+                    "emails": len(cleaned),
+                    "contacts": len(lead_ids),
+                    "removed": int(cur.rowcount or 0),
+                }
 
     def fetch_processlist(self, *, limit: int = 500) -> list[dict[str, Any]]:
         query = "SHOW FULL PROCESSLIST"

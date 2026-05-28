@@ -64,8 +64,56 @@ def _mysql_bin() -> str:
     raise RuntimeError("mysql/mariadb client is missing")
 
 
+_MYSQL_ADMIN_BASE: list[str] | None = None
+
+
+def _mysql_default_files() -> list[Path]:
+    return [
+        Path("/root/.my.cnf"),
+        Path("/etc/mysql/debian.cnf"),
+        Path("/etc/mysql/my.cnf"),
+        Path("/etc/my.cnf"),
+    ]
+
+
+def _mysql_probe_ok(out: str) -> bool:
+    lines = [line.strip() for line in str(out or "").splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "1"
+
+
+def _describe_mysql_base(base: list[str]) -> str:
+    for arg in base[1:]:
+        if arg.startswith("--defaults-extra-file="):
+            return f"{Path(base[0]).name} defaults={arg.split('=', 1)[1]}"
+    return Path(base[0]).name
+
+
+def _mysql_admin_base() -> list[str]:
+    global _MYSQL_ADMIN_BASE
+    if _MYSQL_ADMIN_BASE is not None:
+        return list(_MYSQL_ADMIN_BASE)
+
+    mysql = _mysql_bin()
+    candidates: list[list[str]] = [[mysql]]
+    for path in _mysql_default_files():
+        if path.exists():
+            candidates.append([mysql, f"--defaults-extra-file={path}"])
+
+    failures: list[str] = []
+    for base in candidates:
+        rc, out = _run([*base, "-N", "-B", "-e", "SELECT 1"], timeout_sec=15)
+        if rc == 0 and _mysql_probe_ok(out):
+            _MYSQL_ADMIN_BASE = list(base)
+            return list(base)
+        summary = " ".join(str(out or "").split())[:180]
+        failures.append(f"{_describe_mysql_base(base)}: {summary or 'failed'}")
+
+    detail = "; ".join(failures[-4:])
+    raise RuntimeError("mysql admin connection failed" + (f": {detail}" if detail else ""))
+
+
 def _mysql_exec(sql: str, *, timeout_sec: int = 120) -> str:
-    rc, out = _run([_mysql_bin(), "-N", "-B", "-e", sql], timeout_sec=timeout_sec)
+    rc, out = _run([*_mysql_admin_base(), "-N", "-B", "-e", sql], timeout_sec=timeout_sec)
     if rc != 0:
         raise RuntimeError(out or "mysql command failed")
     return out
@@ -135,26 +183,314 @@ def _download(url: str, token: str, dst: Path) -> None:
         shutil.copyfileobj(resp, f)
 
 
+_CREATE_TABLE_RE = re.compile(r"^CREATE TABLE `([^`]+)`")
+_CREATE_COLUMN_RE = re.compile(r"^\s*`([^`]+)`\s+")
+_INSERT_VALUES_RE = re.compile(r"^INSERT INTO `([^`]+)` VALUES\s*", re.DOTALL)
+
+
+def _sql_statement_complete(sql: str) -> bool:
+    in_quote = False
+    escaped = False
+    complete = False
+    for ch in sql:
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_quote = False
+            continue
+        if ch == "'":
+            in_quote = True
+            continue
+        if ch == ";":
+            complete = True
+        elif not ch.isspace():
+            complete = False
+    return complete and not in_quote
+
+
+def _split_sql_rows(values_sql: str) -> list[str]:
+    rows: list[str] = []
+    i = 0
+    n = len(values_sql)
+    while i < n:
+        while i < n and (values_sql[i].isspace() or values_sql[i] in ",;"):
+            i += 1
+        if i >= n:
+            break
+        if values_sql[i] != "(":
+            return []
+        start = i + 1
+        i += 1
+        depth = 1
+        in_quote = False
+        escaped = False
+        while i < n:
+            ch = values_sql[i]
+            if in_quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == "'":
+                    in_quote = False
+            else:
+                if ch == "'":
+                    in_quote = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        rows.append(values_sql[start:i])
+                        i += 1
+                        break
+            i += 1
+        else:
+            return []
+    return rows
+
+
+def _split_sql_values(row_sql: str) -> list[str]:
+    values: list[str] = []
+    start = 0
+    depth = 0
+    in_quote = False
+    escaped = False
+    for i, ch in enumerate(row_sql):
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_quote = False
+            continue
+        if ch == "'":
+            in_quote = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            values.append(row_sql[start:i])
+            start = i + 1
+    values.append(row_sql[start:])
+    return values
+
+
+def _rewrite_generated_insert(stmt: str, generated_columns: dict[str, tuple[list[str], set[int]]]) -> str:
+    match = _INSERT_VALUES_RE.match(stmt)
+    if not match:
+        return stmt
+    table = match.group(1)
+    meta = generated_columns.get(table)
+    if not meta:
+        return stmt
+    columns, generated_indexes = meta
+    non_generated_columns = [name for idx, name in enumerate(columns) if idx not in generated_indexes]
+    rows = _split_sql_rows(stmt[match.end() :])
+    if not rows:
+        return stmt
+    rewritten_rows: list[str] = []
+    for row in rows:
+        values = _split_sql_values(row)
+        if len(values) != len(columns):
+            return stmt
+        kept = [value for idx, value in enumerate(values) if idx not in generated_indexes]
+        rewritten_rows.append("(" + ",".join(kept) + ")")
+    column_sql = ",".join(_quote_ident(col) for col in non_generated_columns)
+    return f"INSERT INTO {_quote_ident(table)} ({column_sql}) VALUES\n" + ",\n".join(rewritten_rows) + ";\n"
+
+
+def _iter_mysql_import_sql(lines: Any) -> Any:
+    generated_columns: dict[str, tuple[list[str], set[int]]] = {}
+    create_table = ""
+    create_columns: list[tuple[str, bool]] = []
+    insert_buffer: list[str] = []
+
+    for line in lines:
+        if insert_buffer:
+            insert_buffer.append(line)
+            stmt = "".join(insert_buffer)
+            if _sql_statement_complete(stmt):
+                yield _rewrite_generated_insert(stmt, generated_columns)
+                insert_buffer = []
+            continue
+
+        create_match = _CREATE_TABLE_RE.match(line)
+        if create_match:
+            create_table = create_match.group(1)
+            create_columns = []
+            yield line
+            continue
+
+        if create_table:
+            column_match = _CREATE_COLUMN_RE.match(line)
+            if column_match:
+                create_columns.append((column_match.group(1), "GENERATED" in line.upper()))
+            if line.startswith(")"):
+                indexes = {idx for idx, (_, generated) in enumerate(create_columns) if generated}
+                if indexes:
+                    generated_columns[create_table] = ([name for name, _ in create_columns], indexes)
+                create_table = ""
+                create_columns = []
+            yield line
+            continue
+
+        insert_match = _INSERT_VALUES_RE.match(line)
+        if insert_match and insert_match.group(1) in generated_columns:
+            insert_buffer = [line]
+            stmt = "".join(insert_buffer)
+            if _sql_statement_complete(stmt):
+                yield _rewrite_generated_insert(stmt, generated_columns)
+                insert_buffer = []
+            continue
+
+        yield line
+
+    if insert_buffer:
+        yield _rewrite_generated_insert("".join(insert_buffer), generated_columns)
+
+
 def _mysql_import_gz(path: Path, db_name: str) -> None:
     proc = subprocess.Popen(
-        [_mysql_bin(), db_name],
+        [*_mysql_admin_base(), db_name],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     assert proc.stdin is not None
+    out_b = b""
+    err_b = b""
     try:
-        with gzip.open(path, "rb") as f:
-            shutil.copyfileobj(f, proc.stdin)
+        with gzip.open(path, "rt", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            for chunk in _iter_mysql_import_sql(f):
+                proc.stdin.write(chunk.encode("utf-8", errors="surrogateescape"))
         proc.stdin.close()
         proc.stdin = None
         out_b, err_b = proc.communicate(timeout=1800)
-    except Exception:
+    except Exception as exc:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            proc.stdin = None
+        try:
+            out_b, err_b = proc.communicate(timeout=30)
+        except Exception:
+            proc.kill()
+            out_b, err_b = proc.communicate()
+        out = ((out_b or b"") + (err_b or b"")).decode("utf-8", errors="replace").strip()
+        if out:
+            raise RuntimeError("database import failed: " + out) from exc
         proc.kill()
         raise
     if proc.returncode != 0:
         out = ((out_b or b"") + (err_b or b"")).decode("utf-8", errors="replace").strip()
         raise RuntimeError("database import failed: " + out)
+
+
+def _apt_install_packages(packages: list[str]) -> None:
+    wanted = [str(x or "").strip() for x in packages if str(x or "").strip()]
+    if not wanted:
+        return
+    if not shutil.which("apt-get"):
+        raise RuntimeError("missing required packages and apt-get is unavailable: " + ", ".join(wanted))
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    for cmd, timeout in (
+        (["apt-get", "update"], 900),
+        (["apt-get", "install", "-y", "--no-install-recommends", *wanted], 1800),
+    ):
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(((proc.stdout or "") + (proc.stderr or "")).strip() or f"{cmd[0]} failed")
+
+
+def _myloader_bin(cfg: AgentConfig) -> str:
+    configured = str(getattr(cfg, "backup_myloader_bin", "") or "").strip()
+    candidates = [configured] if configured else []
+    candidates += ["myloader", "/usr/bin/myloader"]
+    for name in candidates:
+        if not name:
+            continue
+        found = shutil.which(name) or (name if Path(name).exists() else "")
+        if found:
+            return found
+    package = str(getattr(cfg, "backup_mydumper_package", "") or "mydumper").strip() or "mydumper"
+    _apt_install_packages([package])
+    for name in candidates:
+        if not name:
+            continue
+        found = shutil.which(name) or (name if Path(name).exists() else "")
+        if found:
+            return found
+    raise RuntimeError("myloader is missing after package install")
+
+
+def _mysql_admin_defaults_file() -> Path | None:
+    for arg in _mysql_admin_base()[1:]:
+        if arg.startswith("--defaults-extra-file="):
+            return Path(arg.split("=", 1)[1])
+    return None
+
+
+def _myloader_base_args(cfg: AgentConfig) -> list[str]:
+    args = [_myloader_bin(cfg)]
+    defaults = _mysql_admin_defaults_file()
+    if defaults is not None:
+        args.append(f"--defaults-file={defaults}")
+    return args
+
+
+def _find_mydumper_dump_dir(root: Path) -> Path:
+    candidates: list[Path] = []
+    for item in [root, *root.rglob("*")]:
+        if not item.is_dir():
+            continue
+        try:
+            if any(child.name.startswith("metadata") for child in item.iterdir()):
+                candidates.append(item)
+        except Exception:
+            pass
+    if not candidates:
+        raise RuntimeError("mydumper metadata not found in database artifact")
+    candidates.sort(key=lambda p: (len(p.parts), str(p)))
+    return candidates[0]
+
+
+def _mysql_import_mydumper_tar(cfg: AgentConfig, path: Path, db_name: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="mcd-image-db-mydumper-") as td:
+        extract_root = Path(td)
+        with tarfile.open(path, "r:gz") as tf:
+            _safe_extract(tf, extract_root)
+        dump_dir = _find_mydumper_dump_dir(extract_root)
+        rc, out = _run(
+            [
+                *_myloader_base_args(cfg),
+                "-B",
+                db_name,
+                "-d",
+                str(dump_dir),
+                "--threads",
+                str(max(1, int(getattr(cfg, "backup_myloader_threads", 4) or 4))),
+                "--overwrite-tables",
+            ],
+            timeout_sec=max(1800, int(getattr(cfg, "backup_dump_timeout_sec", 1800) or 1800)),
+        )
+        if rc != 0:
+            raise RuntimeError("myloader import failed: " + out)
+
+
+def _mysql_import_artifact(cfg: AgentConfig, path: Path, db_name: str) -> None:
+    if tarfile.is_tarfile(path):
+        _mysql_import_mydumper_tar(cfg, path, db_name)
+        return
+    _mysql_import_gz(path, db_name)
 
 
 def _artifact_url(cfg: AgentConfig, image_ref: str, kind: str) -> str:
@@ -286,11 +622,11 @@ def install_from_image(
     with tempfile.TemporaryDirectory(prefix="mcd-image-install-") as td:
         tmp = Path(td)
         files_tgz = tmp / "files.tar.gz"
-        db_gz = tmp / "db.sql.gz"
+        db_artifact = tmp / "db.artifact"
         print("Downloading image files")
         _download(_artifact_url(cfg, plan.image_ref, "files"), str(cfg.mcc_token), files_tgz)
         print("Downloading image database")
-        _download(_artifact_url(cfg, plan.image_ref, "db"), str(cfg.mcc_token), db_gz)
+        _download(_artifact_url(cfg, plan.image_ref, "db"), str(cfg.mcc_token), db_artifact)
 
         print("Creating database and user")
         _mysql_exec(f"CREATE DATABASE {_quote_ident(plan.db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
@@ -318,7 +654,7 @@ def install_from_image(
         _patch_local_php(local_php, plan)
 
         print("Importing database")
-        _mysql_import_gz(db_gz, plan.db_name)
+        _mysql_import_artifact(cfg, db_artifact, plan.db_name)
 
         print("Fixing permissions")
         _run(["chown", "-R", "www-data:www-data", str(plan.webroot.parent)], timeout_sec=300)
