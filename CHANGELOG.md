@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.9.90 - 2026-05-28
+
+- Fixed: monitored email parser now runs on `tiny` profile instances before
+  the tiny campaign scheduler skips the generic multi-ring path.
+
 ## 0.9.89 - 2026-05-28
 
 - Added: MCD-managed monitored mailbox parser with per-instance UI settings

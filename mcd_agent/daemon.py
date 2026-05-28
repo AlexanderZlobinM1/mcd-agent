@@ -6514,6 +6514,48 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             # - trigger-due campaigns first
             # - then rebuild-due campaigns
             # Import polling is dispatched above through the shared segment slot.
+            monitored_email_setting = _monitored_email_parser_effective_setting(config, inst)
+            last_monitored_email = last_monitored_email_parser_ts.get(root, 0.0)
+            if (
+                monitored_email_setting.enabled
+                and cluster_cron_allowed
+                and (last_monitored_email <= 0 or now - last_monitored_email >= monitored_email_setting.interval_sec)
+            ):
+                if not getattr(inst, "db", None):
+                    logging.warning("[%s] monitored_email parser skipped: db config missing", root)
+                    last_monitored_email_parser_ts[root] = now
+                else:
+                    try:
+                        state_key = monitored_email_state_key(root, monitored_email_setting)
+                        state = store.get_runtime_sync(state_key) or {}
+                        result = process_monitored_email(
+                            db=db,
+                            local_php_path=getattr(inst, "local_php_path", None),
+                            php_bin=config.php_bin,
+                            settings=monitored_email_setting,
+                            state=state,
+                        )
+                        store.put_runtime_sync(state_key, result.state)
+                        if result.scanned or result.dnc_added or result.deleted or result.whitelist_dnc_removed or result.errors:
+                            logging.info(
+                                "[%s] monitored_email parser scanned=%s matched=%s contacts=%s dnc_added=%s dnc_existing=%s whitelist_dnc_removed=%s deleted=%s marked_seen=%s no_contact=%s types=%s errors=%s",
+                                root,
+                                result.scanned,
+                                result.matched,
+                                result.contacts_matched,
+                                result.dnc_added,
+                                result.dnc_existing,
+                                result.whitelist_dnc_removed,
+                                result.deleted,
+                                result.marked_seen,
+                                result.no_contact,
+                                ",".join(f"{k}:{v}" for k, v in sorted(result.by_type.items())) or "-",
+                                " | ".join(result.errors[:5]) if result.errors else "-",
+                            )
+                    except Exception as e:
+                        logging.warning("[%s] monitored_email parser failed: %s", root, e)
+                    last_monitored_email_parser_ts[root] = now
+
             if (config.profile_name or "").strip().lower() == "tiny":
                 # Skip generic multi-ring campaign scheduler.
                 continue
@@ -7164,48 +7206,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     backup_pause_reason or "backup_guard",
                 )
                 last_empty_leads_cleanup_skip_ts[root] = now
-
-            monitored_email_setting = _monitored_email_parser_effective_setting(config, inst)
-            last_monitored_email = last_monitored_email_parser_ts.get(root, 0.0)
-            if (
-                monitored_email_setting.enabled
-                and cluster_cron_allowed
-                and (last_monitored_email <= 0 or now - last_monitored_email >= monitored_email_setting.interval_sec)
-            ):
-                if not getattr(inst, "db", None):
-                    logging.warning("[%s] monitored_email parser skipped: db config missing", root)
-                    last_monitored_email_parser_ts[root] = now
-                else:
-                    try:
-                        state_key = monitored_email_state_key(root, monitored_email_setting)
-                        state = store.get_runtime_sync(state_key) or {}
-                        result = process_monitored_email(
-                            db=db,
-                            local_php_path=getattr(inst, "local_php_path", None),
-                            php_bin=config.php_bin,
-                            settings=monitored_email_setting,
-                            state=state,
-                        )
-                        store.put_runtime_sync(state_key, result.state)
-                        if result.scanned or result.dnc_added or result.deleted or result.whitelist_dnc_removed or result.errors:
-                            logging.info(
-                                "[%s] monitored_email parser scanned=%s matched=%s contacts=%s dnc_added=%s dnc_existing=%s whitelist_dnc_removed=%s deleted=%s marked_seen=%s no_contact=%s types=%s errors=%s",
-                                root,
-                                result.scanned,
-                                result.matched,
-                                result.contacts_matched,
-                                result.dnc_added,
-                                result.dnc_existing,
-                                result.whitelist_dnc_removed,
-                                result.deleted,
-                                result.marked_seen,
-                                result.no_contact,
-                                ",".join(f"{k}:{v}" for k, v in sorted(result.by_type.items())) or "-",
-                                " | ".join(result.errors[:5]) if result.errors else "-",
-                            )
-                    except Exception as e:
-                        logging.warning("[%s] monitored_email parser failed: %s", root, e)
-                    last_monitored_email_parser_ts[root] = now
 
             last_cache_clear = last_cache_clear_ts.get(root, 0.0)
             if (
