@@ -498,12 +498,14 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
     if bool(getattr(config, "disable_whitelist", False)):
         return set()
 
-    segment_ids = set(getattr(config, "segment_whitelist", []) or []) | _load_id_file(
-        getattr(config, "segment_whitelist_file", None)
-    )
+    def global_segment_ids() -> set[int]:
+        return set(getattr(config, "segment_whitelist", []) or []) | _load_id_file(
+            getattr(config, "segment_whitelist_file", None)
+        )
+
     settings = getattr(config, "segment_whitelist_instance_settings", {})
     if not isinstance(settings, dict):
-        return segment_ids
+        return global_segment_ids()
 
     for key in _viber_stats_setting_keys(inst) + ["default"]:
         if key not in settings:
@@ -521,10 +523,10 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
                 ids |= _load_id_file(file_raw)
             return ids
         if isinstance(raw, bool):
-            return segment_ids if raw else set()
+            return global_segment_ids() if raw else set()
         return set(_to_int_list(raw))
 
-    return segment_ids
+    return global_segment_ids()
 
 
 def _monitored_email_parser_effective_setting(config: AgentConfig, inst: object) -> MonitoredEmailParserSettings:

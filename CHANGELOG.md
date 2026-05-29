@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.9.92 - 2026-05-29
+
+- Fixed: instance-scoped segment whitelist lookup no longer reads the legacy
+  host-level whitelist file when a matching instance override exists.
+
 ## 0.9.91 - 2026-05-29
 
 - Changed: segment whitelist settings from MCC are now scoped per Mautic
