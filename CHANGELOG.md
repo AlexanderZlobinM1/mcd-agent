@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.91 - 2026-05-29
+
+- Changed: segment whitelist settings from MCC are now scoped per Mautic
+  instance, so multi-instance hosts no longer share one host-wide segment
+  whitelist from the instance operations tile.
+- Fixed: segment planning and throttle-only dispatch now resolve whitelist IDs
+  from the active instance key/root/domain before weighting, priority splitting,
+  and throttled whitelist-only launches.
+
 ## 0.9.90 - 2026-05-28
 
 - Fixed: monitored email parser now runs on `tiny` profile instances before

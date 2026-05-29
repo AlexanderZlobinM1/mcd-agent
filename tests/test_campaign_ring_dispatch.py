@@ -13,6 +13,7 @@ from mcd_agent.daemon import (
     _effective_segment_slot_limit,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
+    _segment_whitelist_effective_setting,
     _submit_import_if_segment_slot,
     _task_key,
     _task_repeat_interval_sec,
@@ -223,6 +224,43 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         cfg.segment_throttle_whitelist_only = True
         self.assertEqual(_effective_segment_slot_limit(cfg, True), 1)
+
+    def test_segment_whitelist_uses_instance_specific_setting(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[10],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={
+                "site-a.example.com": {"segment_whitelist": [187, "191"]},
+                "default": {"segment_whitelist": [5]},
+            },
+        )
+        inst = SimpleNamespace(
+            instance_uid="site-a.example.com",
+            root="/var/www/site-a",
+            name="site-a",
+            primary_domain="site-a.example.com",
+            domains=["site-a.example.com"],
+        )
+
+        self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
+
+    def test_segment_whitelist_falls_back_to_default_per_instance(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[10],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={"default": {"segment_whitelist": [5]}},
+        )
+        inst = SimpleNamespace(
+            instance_uid="site-b.example.com",
+            root="/var/www/site-b",
+            name="site-b",
+            primary_domain="site-b.example.com",
+            domains=["site-b.example.com"],
+        )
+
+        self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {5})
 
 
 if __name__ == "__main__":

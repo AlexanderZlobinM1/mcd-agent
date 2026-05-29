@@ -212,6 +212,9 @@ _VIBER_STATS_STABLE_RUNTIME_KEYS = {
     "viber_stats_interval_sec",
     "viber_stats_instance_settings",
 }
+_SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS = {
+    "segment_whitelist_instance_settings",
+}
 _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
     "empty_leads_cleanup_enabled",
     "empty_leads_cleanup_interval_sec",
@@ -269,6 +272,7 @@ _CLUSTER_STABLE_RUNTIME_KEYS = {
 _STABLE_RUNTIME_KEYS = (
     _BACKUP_STABLE_RUNTIME_KEYS
     | _VIBER_STATS_STABLE_RUNTIME_KEYS
+    | _SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS
     | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
     | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
     | _HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS
@@ -488,6 +492,39 @@ def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[b
         except Exception:
             return enabled, interval
     return enabled, interval
+
+
+def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> set[int]:
+    if bool(getattr(config, "disable_whitelist", False)):
+        return set()
+
+    segment_ids = set(getattr(config, "segment_whitelist", []) or []) | _load_id_file(
+        getattr(config, "segment_whitelist_file", None)
+    )
+    settings = getattr(config, "segment_whitelist_instance_settings", {})
+    if not isinstance(settings, dict):
+        return segment_ids
+
+    for key in _viber_stats_setting_keys(inst) + ["default"]:
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
+                return set()
+            if _to_boolish(raw.get("disable_whitelist"), False):
+                return set()
+            ids_raw = raw.get("segment_whitelist", raw.get("segments", raw.get("ids", raw.get("whitelist", []))))
+            ids = set(_to_int_list(ids_raw))
+            file_raw = str(raw.get("segment_whitelist_file", "") or "").strip()
+            if file_raw:
+                ids |= _load_id_file(file_raw)
+            return ids
+        if isinstance(raw, bool):
+            return segment_ids if raw else set()
+        return set(_to_int_list(raw))
+
+    return segment_ids
 
 
 def _monitored_email_parser_effective_setting(config: AgentConfig, inst: object) -> MonitoredEmailParserSettings:
@@ -4435,10 +4472,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     logging.info("MCD loop started")
     base_config = config
 
-    segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
     campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
     if config.disable_whitelist:
-        segment_whitelist = set()
         campaign_whitelist = set()
 
     store = TaskStore(config.state_db_path, config)
@@ -4692,10 +4727,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         next_plan_refresh_at = 0.0
                         next_update_check_at = 0.0
                         next_service_profile_apply_at = 0.0
-                        segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
                         campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
                         if config.disable_whitelist:
-                            segment_whitelist = set()
                             campaign_whitelist = set()
                         new_profile = (config.profile_name or "").strip().lower()
                         logging.info(
@@ -5250,6 +5283,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if not inst.db:
                     continue
                 root = inst.root
+                segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
                 db = MauticDB(inst.db)
                 sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
                 sql_ring_enabled_for_root = bool(
@@ -5537,7 +5571,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                         seg_w = store.get_weights("segment", root, config.weights_recalc_interval_sec)
                         if _needs_weight_recalc(standard_segment_ids, seg_w):
-                            seg_w = _segment_weights(standard_segment_ids, segment_weight_rows, segment_whitelist, now_ts)
+                            seg_w = _segment_weights(
+                                standard_segment_ids,
+                                segment_weight_rows,
+                                segment_whitelist_for_inst,
+                                now_ts,
+                            )
                             store.put_weights("segment", root, seg_w)
                         stale_seg_ids = _stale_segment_priority_ids(
                             standard_segment_ids,
@@ -5551,7 +5590,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     seg_prio, seg_reg = _split_segment_circles(
                         standard_segment_ids,
                         seg_w,
-                        segment_whitelist,
+                        segment_whitelist_for_inst,
                         config.segment_priority_weight_threshold,
                         config.segment_priority_size,
                         stale_priority_ids=stale_seg_ids,
@@ -5913,10 +5952,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         next_update_check_at = 0.0
                         next_service_profile_apply_at = 0.0
                         next_runtime_overrides_poll_at = 0.0
-                        segment_whitelist = set(config.segment_whitelist) | _load_id_file(config.segment_whitelist_file)
                         campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
                         if config.disable_whitelist:
-                            segment_whitelist = set()
                             campaign_whitelist = set()
                         try:
                             queue_profile_event(
@@ -6076,6 +6113,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 continue
 
             root = inst.root
+            segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
             db = MauticDB(inst.db)
             now_utc = datetime.now(timezone.utc)
             sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
@@ -6266,7 +6304,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     for key, task in list(running.items()):
                         if task.root != root or task.task_type != "segment":
                             continue
-                        if task.entity_id is None or task.entity_id in segment_whitelist:
+                        if task.entity_id is None or task.entity_id in segment_whitelist_for_inst:
                             continue
                         _kill_pid(task.pid, config.segment_kill_grace_sec)
                         store.finish(task.row_id, state="timeout", rc=None, note="throttle_kill")
@@ -6299,7 +6337,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     )
 
                 if throttled.get(root, False) and config.segment_throttle_whitelist_only:
-                    wl_ids = list(dict.fromkeys([x for x in list(seg_prio_ring) + list(seg_reg_ring) if x in segment_whitelist]))
+                    wl_ids = list(
+                        dict.fromkeys(
+                            [x for x in list(seg_prio_ring) + list(seg_reg_ring) if x in segment_whitelist_for_inst]
+                        )
+                    )
                     seg_wl_ring = deque(wl_ids)
                     _fill_from_ring(
                         ring=seg_wl_ring,
@@ -6308,7 +6350,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         root=root,
                         task_type="segment",
                         running=running,
-                        ring_entities=segment_whitelist,
+                        ring_entities=segment_whitelist_for_inst,
                         config=config,
                         store=store,
                         popens=popens,

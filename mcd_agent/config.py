@@ -449,6 +449,7 @@ class AgentConfig:
     jobs_max_workers: int
     segment_whitelist: list[int]
     segment_whitelist_file: str | None
+    segment_whitelist_instance_settings: dict[str, Any]
     campaign_whitelist: list[int]
     campaign_whitelist_file: str | None
     segment_priority_weight_threshold: float
@@ -1729,6 +1730,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "jobs_max_workers": "jobs_max_workers",
     "segment_whitelist": "segment_whitelist",
     "segment_whitelist_file": "segment_whitelist_file",
+    "segment_whitelist_instance_settings": "segment_whitelist_instance_settings",
     "campaign_whitelist": "campaign_whitelist",
     "campaign_whitelist_file": "campaign_whitelist_file",
     "segment_priority_weight_threshold": "segment_priority_weight_threshold",
@@ -2454,6 +2456,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         jobs_max_workers=int(runtime.get("jobs_max_workers", 2)),
         segment_whitelist=_normalize_int_list(runtime.get("segment_whitelist", [])),
         segment_whitelist_file=str(runtime.get("segment_whitelist_file")).strip() if runtime.get("segment_whitelist_file") else None,
+        segment_whitelist_instance_settings=(
+            dict(runtime.get("segment_whitelist_instance_settings", {}))
+            if isinstance(runtime.get("segment_whitelist_instance_settings", {}), dict)
+            else {}
+        ),
         campaign_whitelist=_normalize_int_list(runtime.get("campaign_whitelist", [])),
         campaign_whitelist_file=str(runtime.get("campaign_whitelist_file")).strip() if runtime.get("campaign_whitelist_file") else None,
         segment_priority_weight_threshold=float(runtime.get("segment_priority_weight_threshold", 60)),

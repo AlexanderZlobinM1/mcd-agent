@@ -34,6 +34,14 @@ def test_housekeeping_plugin_runtime_keys_are_stable() -> None:
     assert expected <= daemon._STABLE_RUNTIME_KEYS
 
 
+def test_segment_whitelist_instance_runtime_keys_are_stable() -> None:
+    expected = {
+        "segment_whitelist_instance_settings",
+    }
+
+    assert expected <= daemon._STABLE_RUNTIME_KEYS
+
+
 def test_monitored_email_parser_runtime_keys_are_stable() -> None:
     expected = {
         "monitored_email_parser_enabled",
