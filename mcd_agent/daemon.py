@@ -600,6 +600,24 @@ def _load_segment_whitelist_file(path: str | None, inst: object) -> set[int]:
     return legacy
 
 
+def _published_segment_whitelist_ids(
+    db: MauticDB,
+    whitelist: set[int],
+    sql_ctx: dict[str, str],
+) -> list[int]:
+    ids = sorted({int(x) for x in whitelist if int(x) > 0})
+    if not ids:
+        return []
+    id_sql = ",".join(str(x) for x in ids)
+    query = (
+        "SELECT ll.id "
+        "FROM {prefix}lead_lists ll "
+        f"WHERE ll.is_published = 1 AND ll.id IN ({id_sql}) "
+        "ORDER BY ll.id ASC"
+    )
+    return db.fetch_ids(query, limit=len(ids), context=sql_ctx)
+
+
 def _ids_from_segment_whitelist_setting(raw: object) -> set[int]:
     if isinstance(raw, dict):
         if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
@@ -5578,6 +5596,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                 if segment_ids is not None:
                     standard_segment_ids = list(dict.fromkeys(segment_ids))
+                    if segment_whitelist_for_inst:
+                        try:
+                            published_whitelist_ids = _published_segment_whitelist_ids(
+                                db,
+                                segment_whitelist_for_inst,
+                                sql_ctx,
+                            )
+                            if published_whitelist_ids:
+                                before = set(standard_segment_ids)
+                                standard_segment_ids = list(dict.fromkeys(standard_segment_ids + published_whitelist_ids))
+                                added = sorted(set(standard_segment_ids) - before)
+                                if added:
+                                    logging.info(
+                                        "[%s] segment whitelist planned ids=%s",
+                                        root,
+                                        ",".join(str(x) for x in added[:50]),
+                                    )
+                        except Exception as e:
+                            logging.warning("[%s] segment whitelist publish check failed: %s", root, e)
                     dependency_children: dict[int, set[int]] = {}
                     dependency_parents: dict[int, set[int]] = {}
                     try:

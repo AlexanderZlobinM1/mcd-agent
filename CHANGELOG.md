@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.94 - 2026-05-29
+
+- Fixed: segment whitelist IDs are now force-added to the current segment
+  planning set when the segments are published, so instance whitelists work
+  even when the normal `segments_due` SQL does not return those IDs.
+
 ## 0.9.93 - 2026-05-29
 
 - Changed: segment whitelist common files now support scoped lines in the

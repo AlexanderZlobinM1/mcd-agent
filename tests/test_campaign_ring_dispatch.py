@@ -11,6 +11,7 @@ from mcd_agent.daemon import (
     RunningTask,
     TaskStore,
     _effective_segment_slot_limit,
+    _published_segment_whitelist_ids,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
@@ -311,6 +312,29 @@ class CampaignRingDispatchTests(unittest.TestCase):
             self.assertIn("ananasmk.sales-snap.com: 187 191", contents)
             self.assertNotIn("\n187\n", contents)
             self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
+
+    def test_published_segment_whitelist_ids_uses_only_integer_ids(self) -> None:
+        class FakeDB:
+            def __init__(self) -> None:
+                self.query = ""
+                self.limit = 0
+                self.context = {}
+
+            def fetch_ids(self, query_template, limit, context=None):
+                self.query = query_template
+                self.limit = limit
+                self.context = context or {}
+                return [187, 191]
+
+        db = FakeDB()
+
+        ids = _published_segment_whitelist_ids(db, {191, 187, -3, 0}, {"root": "/var/www/site"})
+
+        self.assertEqual(ids, [187, 191])
+        self.assertEqual(db.limit, 2)
+        self.assertIn("ll.is_published = 1", db.query)
+        self.assertIn("ll.id IN (187,191)", db.query)
+        self.assertEqual(db.context, {"root": "/var/www/site"})
 
 
 if __name__ == "__main__":
