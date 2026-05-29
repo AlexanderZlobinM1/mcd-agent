@@ -111,7 +111,8 @@ jobs_max_workers = 2
 
 # Segment ids forced to priority ring.
 segment_whitelist = []
-# Path to segment whitelist file (one id per line).
+# Path to segment whitelist file. MCD writes scoped lines like
+# "instance.example.com: 187 191"; old one-id-per-line files are converted once.
 segment_whitelist_file = "/etc/mcd/segment-whitelist.txt"
 # Per-instance segment whitelist overrides keyed by instance_uid/root/domain.
 segment_whitelist_instance_settings = {}

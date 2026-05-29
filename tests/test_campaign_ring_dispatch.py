@@ -14,6 +14,7 @@ from mcd_agent.daemon import (
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
+    _sync_segment_whitelist_file,
     _submit_import_if_segment_slot,
     _task_key,
     _task_repeat_interval_sec,
@@ -261,6 +262,55 @@ class CampaignRingDispatchTests(unittest.TestCase):
         )
 
         self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {5})
+
+    def test_segment_whitelist_reads_scoped_common_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/segment-whitelist.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("site-a.example.com: 187 191\n")
+                f.write("site-b.example.com: 5\n")
+                f.write("9\n")
+            cfg = SimpleNamespace(
+                disable_whitelist=False,
+                segment_whitelist=[],
+                segment_whitelist_file=path,
+                segment_whitelist_instance_settings={},
+            )
+            inst = SimpleNamespace(
+                instance_uid="site-a.example.com",
+                root="/var/www/site-a",
+                name="site-a",
+                primary_domain="site-a.example.com",
+                domains=["site-a.example.com"],
+            )
+
+            self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
+
+    def test_segment_whitelist_sync_converts_legacy_file_to_instance_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/segment-whitelist.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("187\n191\n")
+            cfg = SimpleNamespace(
+                disable_whitelist=False,
+                segment_whitelist=[],
+                segment_whitelist_file=path,
+                segment_whitelist_instance_settings={},
+            )
+            inst = SimpleNamespace(
+                instance_uid="ananasmk.sales-snap.com",
+                root="/var/www/ananasmk",
+                name="ananasmk",
+                primary_domain="ananasmk.sales-snap.com",
+                domains=["ananasmk.sales-snap.com"],
+            )
+
+            self.assertTrue(_sync_segment_whitelist_file(cfg, [inst]))
+            with open(path, "r", encoding="utf-8") as f:
+                contents = f.read()
+            self.assertIn("ananasmk.sales-snap.com: 187 191", contents)
+            self.assertNotIn("\n187\n", contents)
+            self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
 
 
 if __name__ == "__main__":

@@ -499,8 +499,9 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
         return set()
 
     def global_segment_ids() -> set[int]:
-        return set(getattr(config, "segment_whitelist", []) or []) | _load_id_file(
-            getattr(config, "segment_whitelist_file", None)
+        return set(getattr(config, "segment_whitelist", []) or []) | _load_segment_whitelist_file(
+            getattr(config, "segment_whitelist_file", None),
+            inst,
         )
 
     settings = getattr(config, "segment_whitelist_instance_settings", {})
@@ -520,13 +521,159 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
             ids = set(_to_int_list(ids_raw))
             file_raw = str(raw.get("segment_whitelist_file", "") or "").strip()
             if file_raw:
-                ids |= _load_id_file(file_raw)
+                ids |= _load_segment_whitelist_file(file_raw, inst)
             return ids
         if isinstance(raw, bool):
             return global_segment_ids() if raw else set()
         return set(_to_int_list(raw))
 
     return global_segment_ids()
+
+
+def _segment_whitelist_file_key_for_instance(inst: object) -> str:
+    for attr in ("instance_uid", "primary_domain", "name", "root"):
+        value = str(getattr(inst, attr, "") or "").strip()
+        if value:
+            return value
+    keys = _viber_stats_setting_keys(inst)
+    return keys[0] if keys else "default"
+
+
+def _parse_segment_whitelist_tokens(value: object) -> set[int]:
+    ids: set[int] = set()
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            ids.update(_parse_segment_whitelist_tokens(item))
+        return ids
+    if value is None:
+        return ids
+    for token in re.split(r"[\s,;]+", str(value).strip()):
+        if not token:
+            continue
+        try:
+            ids.add(int(token))
+        except ValueError:
+            continue
+    return ids
+
+
+def _parse_segment_whitelist_file(path: str | None) -> tuple[dict[str, set[int]], set[int]]:
+    scoped: dict[str, set[int]] = {}
+    legacy: set[int] = set()
+    if not path:
+        return scoped, legacy
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if ":" in line:
+                    key, raw_ids = line.split(":", 1)
+                    key = key.strip()
+                    if not key:
+                        legacy.update(_parse_segment_whitelist_tokens(raw_ids))
+                        continue
+                    scoped.setdefault(key, set()).update(_parse_segment_whitelist_tokens(raw_ids))
+                    continue
+                legacy.update(_parse_segment_whitelist_tokens(line))
+    except FileNotFoundError:
+        logging.debug("segment whitelist file not found: %s", path)
+    return scoped, legacy
+
+
+def _load_segment_whitelist_file(path: str | None, inst: object) -> set[int]:
+    scoped, legacy = _parse_segment_whitelist_file(path)
+    if not scoped:
+        return legacy
+    keys = set(_viber_stats_setting_keys(inst))
+    exact_ids: set[int] = set()
+    exact_seen = False
+    for key, ids in scoped.items():
+        if key in keys:
+            exact_seen = True
+            exact_ids.update(ids)
+    if exact_seen:
+        return exact_ids
+    if "default" in scoped:
+        return set(scoped["default"])
+    return legacy
+
+
+def _ids_from_segment_whitelist_setting(raw: object) -> set[int]:
+    if isinstance(raw, dict):
+        if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
+            return set()
+        if _to_boolish(raw.get("disable_whitelist"), False):
+            return set()
+        return set(
+            _to_int_list(raw.get("segment_whitelist", raw.get("segments", raw.get("ids", raw.get("whitelist", [])))))
+        )
+    if isinstance(raw, bool):
+        return set()
+    return set(_to_int_list(raw))
+
+
+def _format_segment_whitelist_file(entries: dict[str, set[int]]) -> str:
+    lines = [
+        "# Managed by MCD.",
+        "# Format: <instance-key>: <segment ids>",
+        "# Instance key can be instance_uid, root, name, or domain.",
+    ]
+    for key in sorted(entries):
+        ids = sorted(entries[key])
+        if not ids:
+            lines.append(f"{key}:")
+            continue
+        lines.append(f"{key}: {' '.join(str(x) for x in ids)}")
+    return "\n".join(lines) + "\n"
+
+
+def _sync_segment_whitelist_file(config: AgentConfig, installs: list[object] | None = None) -> bool:
+    path_raw = str(getattr(config, "segment_whitelist_file", "") or "").strip()
+    if not path_raw:
+        return False
+    path = Path(path_raw)
+    settings = getattr(config, "segment_whitelist_instance_settings", {})
+    entries: dict[str, set[int]] = {}
+
+    if isinstance(settings, dict):
+        for raw_key, raw_value in settings.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            entries[key] = _ids_from_segment_whitelist_setting(raw_value)
+
+    scoped_from_file, legacy_from_file = _parse_segment_whitelist_file(path_raw)
+    if not entries:
+        entries.update(scoped_from_file)
+
+    legacy_ids = set(legacy_from_file) | set(getattr(config, "segment_whitelist", []) or [])
+    if legacy_ids:
+        target_key = "default"
+        if installs and len(installs) == 1:
+            target_key = _segment_whitelist_file_key_for_instance(installs[0])
+        entries.setdefault(target_key, set()).update(legacy_ids)
+
+    if not entries:
+        return False
+
+    text = _format_segment_whitelist_file(entries)
+    try:
+        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        if current == text:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        try:
+            os.chmod(path, 0o644)
+        except OSError:
+            pass
+        logging.info("segment whitelist file synced: %s", path)
+        return True
+    except Exception as e:
+        logging.warning("segment whitelist file sync failed for %s: %s", path, e)
+        return False
 
 
 def _monitored_email_parser_effective_setting(config: AgentConfig, inst: object) -> MonitoredEmailParserSettings:
@@ -944,7 +1091,11 @@ def _migrate_empty_leads_cleanup_runtime(config: AgentConfig, lines: list[str]) 
     return bool(changed)
 
 
-def _persist_stable_backup_runtime_to_config(config: AgentConfig, applied_keys: list[str]) -> None:
+def _persist_stable_backup_runtime_to_config(
+    config: AgentConfig,
+    applied_keys: list[str],
+    installs: list[object] | None = None,
+) -> None:
     stable_keys = sorted(set(applied_keys) & _STABLE_RUNTIME_KEYS)
     if not stable_keys:
         return
@@ -965,6 +1116,12 @@ def _persist_stable_backup_runtime_to_config(config: AgentConfig, applied_keys: 
             )
     except Exception as e:
         logging.warning("runtime-overrides persist to config failed: %s", e)
+    if (
+        "segment_whitelist_instance_settings" in stable_keys
+        or "segment_whitelist" in stable_keys
+        or "segment_whitelist_file" in stable_keys
+    ):
+        _sync_segment_whitelist_file(config, installs)
 
 
 def _to_int_list(value: object) -> list[int]:
@@ -4508,6 +4665,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             installs = inventory.list_instances()
     else:
         installs = inventory.list_instances()
+    _sync_segment_whitelist_file(config, installs)
     segment_sql_rings: dict[str, deque[int]] = {}
     segment_sql_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
     segment_sql_active_sets: dict[str, set[int]] = {}
@@ -4763,7 +4921,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         last_monitored_email_parser_ts.clear()
                         maintenance_cleanup_rr_index.clear()
                         logging.info("runtime-overrides cleanup schedules refreshed for immediate scheduler apply")
-                    _persist_stable_backup_runtime_to_config(next_cfg if isinstance(next_cfg, AgentConfig) else config, applied_keys)
+                    _persist_stable_backup_runtime_to_config(
+                        next_cfg if isinstance(next_cfg, AgentConfig) else config,
+                        applied_keys,
+                        installs,
+                    )
                     base_config = config
                     last_runtime_overrides_fp = fp
                     store.put_runtime_sync(

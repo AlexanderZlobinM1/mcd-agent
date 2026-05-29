@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.93 - 2026-05-29
+
+- Changed: segment whitelist common files now support scoped lines in the
+  format `<instance-key>: <segment ids>`, so the file remains readable while
+  preserving instance-level whitelist behavior.
+- Added: legacy one-id-per-line segment whitelist files are converted once
+  into scoped format; single-instance hosts use the instance key and
+  multi-instance hosts use `default` to preserve the previous host-wide
+  behavior.
+- Added: MCD synchronizes the common segment whitelist file from
+  per-instance runtime settings after startup and runtime override updates.
+
 ## 0.9.92 - 2026-05-29
 
 - Fixed: instance-scoped segment whitelist lookup no longer reads the legacy
