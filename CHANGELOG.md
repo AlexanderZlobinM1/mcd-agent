@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.99 - 2026-05-30
+
+- Fixed: successful `mautic-upgrade apply` now verifies the final Mautic
+  runtime version and refreshes the local `.mcd/mautic.version` cache
+  immediately. Agent state pushes no longer report the previous Mautic patch
+  version after an upgrade completed successfully.
+
 ## 0.9.98 - 2026-05-30
 
 - Fixed: `self-update status` normalizes stale

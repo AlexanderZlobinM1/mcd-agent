@@ -51,6 +51,8 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "7.0": "7.0.0",
 }
 
+_VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
+
 
 @dataclass(slots=True)
 class UpgradeProbeResult:
@@ -88,6 +90,35 @@ def _branch_key(version: str) -> str:
     if sv == (0, 0, 0):
         return ""
     return f"{sv[0]}.{sv[1]}"
+
+
+def _write_upgrade_version_cache(root: str, version: str) -> int:
+    safe = str(version or "").strip()
+    if not safe or safe == "0.0.0":
+        return 0
+    root_path = Path(root)
+    candidates = [root_path]
+    if root_path.name.lower() in {"public", "docroot", "public_html"}:
+        candidates.append(root_path.parent)
+    candidates.append(root_path.parent.parent)
+    written = 0
+    seen: set[str] = set()
+    for base in candidates:
+        key = str(base)
+        if key in seen or key == "/" or not base.exists() or not base.is_dir():
+            continue
+        seen.add(key)
+        target = base / _VERSION_CACHE_REL
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+            tmp.write_text(safe + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, target)
+            written += 1
+        except OSError:
+            continue
+    return written
 
 
 def _default_zip_url(version: str) -> str:
@@ -945,7 +976,12 @@ def run_upgrade_apply(
 
     _post_upgrade_verify(config, inst)
 
-    print(f"Upgrade completed: {current} -> {target}")
+    final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
+    if _parse_semver(final_version) != _parse_semver(target):
+        raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
+    cache_count = _write_upgrade_version_cache(install_root, final_version)
+    print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
+    print(f"Upgrade completed: {current} -> {final_version}")
     return 0
 
 
