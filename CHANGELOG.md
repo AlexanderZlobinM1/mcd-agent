@@ -6,6 +6,8 @@
   `last_cluster_update_result`, so `mcd-cli self-update status` does not keep a
   stale `waiting for peer install` message after the shared coordinator is
   already done.
+- Fixed: cluster backup local-date checks now honor an explicit timezone-aware
+  reference time, making the safety test stable on UTC and non-UTC MCC runners.
 
 ## 0.9.95 - 2026-05-30
 

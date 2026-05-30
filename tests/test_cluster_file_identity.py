@@ -63,7 +63,12 @@ class ClusterFileIdentityTests(unittest.TestCase):
             with patch("mcd_agent.daemon.datetime") as dt:
                 dt.fromisoformat.side_effect = datetime.fromisoformat
                 dt.now.return_value = datetime(2026, 5, 11, 9, 34, 0, tzinfo=timezone.utc)
-                self.assertTrue(_cluster_local_full_done_for_date(cfg, datetime(2026, 5, 11, 9, 34, 0)))
+                self.assertTrue(
+                    _cluster_local_full_done_for_date(
+                        cfg,
+                        datetime(2026, 5, 11, 9, 34, 0, tzinfo=timezone(timedelta(hours=2))),
+                    )
+                )
 
     def test_cluster_full_done_rejects_old_full_from_previous_cycle(self) -> None:
         cfg = _cfg()

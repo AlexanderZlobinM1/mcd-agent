@@ -1681,6 +1681,8 @@ def _cluster_state_ts_local_date(value: str, local_dt: datetime) -> bool:
         ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
+        if local_dt.tzinfo is not None:
+            return ts.astimezone(local_dt.tzinfo).date() == local_dt.date()
         return ts.astimezone().date() == local_dt.date()
     except Exception:
         return False
