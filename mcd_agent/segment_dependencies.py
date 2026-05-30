@@ -84,6 +84,41 @@ def dependent_segment_closure(seed_ids: set[int], children_by_parent: dict[int, 
     return out
 
 
+def dependency_segment_closure(seed_ids: set[int], parents_by_child: dict[int, set[int]]) -> set[int]:
+    out: set[int] = set()
+    queue = deque(int(x) for x in seed_ids if int(x) > 0)
+    while queue:
+        child_id = int(queue.popleft())
+        for parent_id in sorted(parents_by_child.get(child_id, set())):
+            if parent_id in out:
+                continue
+            out.add(parent_id)
+            queue.append(parent_id)
+    return out
+
+
+def suppress_mautic_cascade_dependencies(
+    candidate_ids: list[int],
+    parents_by_child: dict[int, set[int]],
+) -> tuple[list[int], set[int]]:
+    """
+    Remove explicit parent launches already covered by Mautic 7 segment rebuilds.
+
+    Mautic 7 rebuilds leadlist-filter dependencies recursively before the
+    requested segment. If MCD also schedules those parents as separate segment
+    tasks in the same planning cycle, a child can rebuild its parent again and
+    create repeated parent/child follow-up work.
+    """
+    ordered = list(dict.fromkeys(int(x) for x in candidate_ids if int(x) > 0))
+    if not ordered or not parents_by_child:
+        return ordered, set()
+    candidate_set = set(ordered)
+    covered = dependency_segment_closure(candidate_set, parents_by_child) & candidate_set
+    if not covered:
+        return ordered, set()
+    return [sid for sid in ordered if sid not in covered], covered
+
+
 def _timestamp_key(value: object) -> tuple[int, str]:
     raw = str(value or "").strip()
     if not raw:

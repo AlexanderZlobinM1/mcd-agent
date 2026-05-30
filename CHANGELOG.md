@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.95 - 2026-05-30
+
+- Fixed: agent state and update checks now report the actually running MCD
+  version as the canonical `agent_version`; the source-tree version remains a
+  diagnostic field only. This prevents MCC from treating stale `/opt/mcd/src`
+  metadata as the live agent version.
+- Fixed: Mautic 7 segment planning now suppresses explicit parent segment
+  launches already covered by Mautic's built-in leadlist dependency cascade,
+  avoiding repeated parent/child rebuild loops.
+- Changed: self-update cleanup defaults now remove old update archives and
+  pre-update source backups after successful updates instead of keeping a trail
+  of old agent packages.
+
 ## 0.9.94 - 2026-05-29
 
 - Fixed: segment whitelist IDs are now force-added to the current segment

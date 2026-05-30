@@ -28,8 +28,9 @@ class VersionIdentityTests(unittest.TestCase):
 
             payload = agent_version_payload(root)
 
-        self.assertEqual(payload["agent_version"], "0.9.37")
+        self.assertEqual(payload["agent_version"], "0.9.75")
         self.assertEqual(payload["agent_running_version"], "0.9.75")
+        self.assertEqual(payload["agent_installed_version"], "0.9.37")
         self.assertEqual(payload["agent_source_version"], "0.9.37")
         self.assertTrue(payload["agent_version_mismatch"])
 

@@ -30,9 +30,13 @@ def installed_agent_version(source_dir: Path | str | None = None) -> str:
 def agent_version_payload(source_dir: Path | str | None = None) -> dict[str, Any]:
     installed = installed_agent_version(source_dir)
     source = source_version(source_dir) or ""
+    running = __version__
     return {
-        "agent_version": installed,
-        "agent_running_version": __version__,
+        # Legacy field consumed by MCC and older tooling. Keep it tied to the
+        # actually running package; the source tree can be stale or staged.
+        "agent_version": running,
+        "agent_running_version": running,
+        "agent_installed_version": installed,
         "agent_source_version": source,
-        "agent_version_mismatch": bool(source and source != __version__),
+        "agent_version_mismatch": bool(source and source != running),
     }

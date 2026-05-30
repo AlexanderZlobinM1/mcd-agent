@@ -453,9 +453,14 @@ def _prune_entries(paths: list[Path], *, keep_count: int, max_age_sec: int, now_
     return removed
 
 
-def _cleanup_update_artifacts(cfg: AgentConfig, *, now_s: int | None = None) -> dict[str, int]:
+def _cleanup_update_artifacts(
+    cfg: AgentConfig,
+    *,
+    now_s: int | None = None,
+    install_dir: Path | None = None,
+) -> dict[str, int]:
     now = int(time.time()) if now_s is None else int(now_s)
-    install_dir = Path("/opt/mcd")
+    install_dir = install_dir or Path("/opt/mcd")
     updates_dir = install_dir / "var" / "updates"
     backup_dir = install_dir / "var" / "backup"
 
@@ -1454,6 +1459,7 @@ def update_status(cfg: AgentConfig) -> dict[str, Any]:
     versions = agent_version_payload()
     out["current_version"] = versions.get("agent_version") or __version__
     out["running_version"] = versions.get("agent_running_version") or __version__
+    out["installed_version"] = versions.get("agent_installed_version") or ""
     out["source_version"] = versions.get("agent_source_version") or ""
     out["version_mismatch"] = bool(versions.get("agent_version_mismatch"))
     out.setdefault("policy", _update_policy(cfg))

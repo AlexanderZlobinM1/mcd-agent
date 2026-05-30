@@ -37,8 +37,9 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
             old_payload = self_update.agent_version_payload
             try:
                 self_update.agent_version_payload = lambda: {
-                    "agent_version": "0.9.37",
+                    "agent_version": "0.9.75",
                     "agent_running_version": "0.9.75",
+                    "agent_installed_version": "0.9.37",
                     "agent_source_version": "0.9.37",
                     "agent_version_mismatch": True,
                 }
@@ -46,8 +47,9 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
             finally:
                 self_update.agent_version_payload = old_payload
 
-        self.assertEqual(out["current_version"], "0.9.37")
+        self.assertEqual(out["current_version"], "0.9.75")
         self.assertEqual(out["running_version"], "0.9.75")
+        self.assertEqual(out["installed_version"], "0.9.37")
         self.assertEqual(out["source_version"], "0.9.37")
         self.assertTrue(out["version_mismatch"])
 
@@ -88,6 +90,29 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         self.assertEqual(releases[0]["result_status"], "success")
         self.assertEqual(releases[0]["new_version"], "9.9.9")
         self.assertEqual(state["last_status"], "version_mismatch_restart")
+
+    def test_update_cleanup_defaults_remove_old_agent_artifacts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            install_dir = Path(tmp) / "mcd"
+            updates = install_dir / "var" / "updates"
+            backups = install_dir / "var" / "backup"
+            updates.mkdir(parents=True)
+            backups.mkdir(parents=True)
+            (updates / "mcd-agent-0.9.90.tar.gz").write_text("old", encoding="utf-8")
+            (updates / "mcd-agent-0.9.94.tar.gz").write_text("current", encoding="utf-8")
+            (updates / "src.prev-123").mkdir()
+            (backups / "mcd-src-preupdate-123.tgz").write_text("backup", encoding="utf-8")
+            cfg = SimpleNamespace(
+                mcd_update_keep_archives=0,
+                mcd_update_keep_preupdate_backups=0,
+                mcd_update_artifacts_max_age_days=1,
+            )
+
+            removed = self_update._cleanup_update_artifacts(cfg, now_s=4_000_000_000, install_dir=install_dir)
+
+        self.assertEqual(removed["archives"], 2)
+        self.assertEqual(removed["preupdate_backups"], 1)
+        self.assertEqual(removed["stale_dirs"], 1)
 
 
 if __name__ == "__main__":

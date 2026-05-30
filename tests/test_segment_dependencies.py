@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 from mcd_agent.segment_dependencies import (
     dependent_segment_closure,
+    dependency_segment_closure,
     extract_leadlist_filter_segment_ids,
     segment_dependency_blocked_ids,
     segment_dependency_maps,
     stale_dependent_segment_closure,
+    suppress_mautic_cascade_dependencies,
 )
 
 
@@ -47,6 +49,13 @@ class SegmentDependencyTests(unittest.TestCase):
         self.assertEqual(children, {6: {8}, 8: {9}})
         self.assertEqual(parents, {8: {6}, 9: {8}})
         self.assertEqual(dependent_segment_closure({6}, children), {8, 9})
+        self.assertEqual(dependency_segment_closure({9}, parents), {6, 8})
+
+    def test_suppresses_mautic7_dependencies_already_rebuilt_by_child_command(self) -> None:
+        planned, suppressed = suppress_mautic_cascade_dependencies([6, 8, 9, 10], {8: {6}, 9: {8}})
+
+        self.assertEqual(planned, [9, 10])
+        self.assertEqual(suppressed, {6, 8})
 
     def test_blocks_child_until_parent_finished_or_not_running(self) -> None:
         running = {

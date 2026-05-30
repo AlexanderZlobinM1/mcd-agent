@@ -93,6 +93,7 @@ from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_s
 from mcd_agent.segment_dependencies import (
     segment_dependency_blocked_ids,
     segment_dependency_maps,
+    suppress_mautic_cascade_dependencies,
     stale_dependent_segment_closure,
 )
 from mcd_agent.signals import collect_signals
@@ -5622,23 +5623,35 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         dependency_children, dependency_parents = segment_dependency_maps(dep_rows)
                         segment_dependencies_by_root[root] = dependency_children
                         segment_parents_by_root[root] = dependency_parents
-                        recently_finished = _recent_finished_segment_ids(root, now)
-                        dependent_ids = stale_dependent_segment_closure(
-                            recently_finished,
-                            dep_rows,
-                            dependency_children,
-                        )
-                        if dependent_ids:
-                            before = set(standard_segment_ids)
-                            standard_segment_ids = list(dict.fromkeys(standard_segment_ids + sorted(dependent_ids)))
-                            added = sorted(set(standard_segment_ids) - before)
-                            if added:
+                        if int(getattr(inst, "mautic_major", 0) or 0) >= 7:
+                            standard_segment_ids, suppressed_ids = suppress_mautic_cascade_dependencies(
+                                standard_segment_ids,
+                                dependency_parents,
+                            )
+                            if suppressed_ids:
                                 logging.info(
-                                    "[%s] segment dependency follow-up planned parents=%s children=%s",
+                                    "[%s] mautic7 segment dependency cascade covered ids=%s",
                                     root,
-                                    ",".join(str(x) for x in sorted(recently_finished)[:30]),
-                                    ",".join(str(x) for x in added[:50]),
+                                    ",".join(str(x) for x in sorted(suppressed_ids)[:50]),
                                 )
+                        else:
+                            recently_finished = _recent_finished_segment_ids(root, now)
+                            dependent_ids = stale_dependent_segment_closure(
+                                recently_finished,
+                                dep_rows,
+                                dependency_children,
+                            )
+                            if dependent_ids:
+                                before = set(standard_segment_ids)
+                                standard_segment_ids = list(dict.fromkeys(standard_segment_ids + sorted(dependent_ids)))
+                                added = sorted(set(standard_segment_ids) - before)
+                                if added:
+                                    logging.info(
+                                        "[%s] segment dependency follow-up planned parents=%s children=%s",
+                                        root,
+                                        ",".join(str(x) for x in sorted(recently_finished)[:30]),
+                                        ",".join(str(x) for x in added[:50]),
+                                    )
                     except Exception as e:
                         dependency_children = segment_dependencies_by_root.get(root, {})
                         dependency_parents = segment_parents_by_root.get(root, {})
