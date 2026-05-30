@@ -49,6 +49,7 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "5.2": "5.2.9",
     "6.0": "6.0.7",
     "7.0": "7.0.0",
+    "7.1": "7.1.2",
 }
 
 _VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
@@ -198,6 +199,16 @@ def _parse_semver(raw: str) -> tuple[int, int, int]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
+def _clean_target_version(raw: str | None) -> str | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    m = re.match(r"^(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9_.-]+)?)$", value)
+    if not m:
+        raise RuntimeError(f"Invalid Mautic target version: {value}")
+    return m.group(1)
+
+
 def _mautic_console_cmd(cmd: list[str], run_as_user: str | None = "www-data") -> list[str]:
     user = str(run_as_user or "").strip()
     if user and user != "root" and hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -252,6 +263,41 @@ def _latest_same_branch(config: AgentConfig, version: str) -> str | None:
         return None
     latest = max(candidates, key=lambda x: _parse_semver(x))
     return latest if _parse_semver(latest) > v else None
+
+
+def _upgrade_target_relation(current: str, target: str, *, allow_minor: bool = False) -> str:
+    current_sv = _parse_semver(current)
+    target_sv = _parse_semver(target)
+    if current_sv == (0, 0, 0) or target_sv == (0, 0, 0):
+        return "invalid"
+    if target_sv <= current_sv:
+        return "none"
+    if target_sv[0] != current_sv[0]:
+        return "blocked_major"
+    if target_sv[1] == current_sv[1]:
+        return "allowed"
+    if allow_minor and target_sv[1] == current_sv[1] + 1:
+        return "allowed"
+    return "blocked_minor"
+
+
+def _ensure_upgrade_target_allowed(current: str, target: str, *, allow_minor: bool = False) -> bool:
+    relation = _upgrade_target_relation(current, target, allow_minor=allow_minor)
+    if relation == "allowed":
+        return True
+    if relation == "none":
+        return False
+    if relation == "blocked_major":
+        raise RuntimeError(
+            f"Major upgrade is disabled in current flow: {current} -> {target}. "
+            "Only patch updates are allowed by default; one-step minor updates require --allow-minor."
+        )
+    if relation == "blocked_minor":
+        raise RuntimeError(
+            f"Minor upgrade is disabled in current flow: {current} -> {target}. "
+            "Pass --allow-minor for a one-step minor upgrade within the same major."
+        )
+    raise RuntimeError(f"Invalid Mautic upgrade target: {current} -> {target}")
 
 
 def _resolve_update_package(config: AgentConfig, target: str) -> Path:
@@ -915,19 +961,18 @@ def run_upgrade_apply(
     do_backup: bool,
     with_system_upgrade: bool,
     target_override: str | None = None,
+    allow_minor: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
-    target = target_override or _latest_same_branch(config, current)
+    target = _clean_target_version(target_override) or _latest_same_branch(config, current)
     if not target:
         print(f"No upgrade target for current version {current}")
         return 0
-    if _parse_semver(target)[:2] != _parse_semver(current)[:2]:
-        raise RuntimeError(
-            f"Major/minor upgrade is disabled in current flow: {current} -> {target}. "
-            "Only patch updates in current branch are allowed."
-        )
+    if not _ensure_upgrade_target_allowed(current, target, allow_minor=allow_minor):
+        print(f"No upgrade target for current version {current}")
+        return 0
 
     print(f"Upgrade plan: {current} -> {target} (mode={mode})")
     if not yes:

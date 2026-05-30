@@ -1672,6 +1672,8 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--yes", action="store_true")
     up.add_argument("--backup", action="store_true")
     up.add_argument("--with-system-upgrade", action="store_true")
+    up.add_argument("--target", help="Explicit target Mautic version")
+    up.add_argument("--allow-minor", action="store_true", help="Allow one-step minor upgrade within the current major")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
     img.add_argument("--config", default=default_cfg)
@@ -2490,6 +2492,8 @@ def main() -> int:
             yes=bool(args.yes),
             do_backup=bool(args.backup),
             with_system_upgrade=bool(args.with_system_upgrade),
+            target_override=str(args.target or "").strip() or None,
+            allow_minor=bool(args.allow_minor),
         )
         if rc == 0:
             _push_state_after_change(cfg, "mautic-upgrade-apply")

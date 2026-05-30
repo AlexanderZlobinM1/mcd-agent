@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.100 - 2026-05-30
+
+- Added: `mcd-cli mautic-upgrade apply --target <version>` can now run an
+  explicit same-major target selected by MCC.
+- Changed: patch upgrades remain the default. One-step minor upgrades such as
+  `5.1.x -> 5.2.x` or `7.0.x -> 7.1.x` require the explicit `--allow-minor`
+  flag; major upgrades and multi-minor jumps remain blocked.
+
 ## 0.9.99 - 2026-05-30
 
 - Fixed: successful `mautic-upgrade apply` now verifies the final Mautic
