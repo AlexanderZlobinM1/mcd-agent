@@ -77,6 +77,38 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
 
         self.assertNotIn("active_campaign_processes", out)
 
+    def test_update_status_normalizes_stale_cluster_wait_after_success(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            state_path = Path(tmp) / "mcd-self-update.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "last_status": "success",
+                        "last_target": "0.9.98",
+                        "last_cluster_update_result": "cluster update: waiting for host-b install",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_payload = self_update.agent_version_payload
+            try:
+                self_update.agent_version_payload = lambda: {
+                    "agent_version": "0.9.98",
+                    "agent_running_version": "0.9.98",
+                    "agent_installed_version": "0.9.98",
+                    "agent_source_version": "0.9.98",
+                    "agent_version_mismatch": False,
+                }
+                out = self_update.update_status(cfg)
+            finally:
+                self_update.agent_version_payload = old_payload
+
+        self.assertEqual(
+            out["last_cluster_update_result"],
+            "update applied -> 0.9.98; source switched, service restart scheduled",
+        )
+
     def test_apply_update_releases_session_when_only_restart_is_needed(self) -> None:
         releases: list[dict[str, str]] = []
         restarts: list[bool] = []

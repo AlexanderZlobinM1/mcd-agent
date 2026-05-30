@@ -1482,6 +1482,16 @@ def update_status(cfg: AgentConfig) -> dict[str, Any]:
     out["installed_version"] = versions.get("agent_installed_version") or ""
     out["source_version"] = versions.get("agent_source_version") or ""
     out["version_mismatch"] = bool(versions.get("agent_version_mismatch"))
+    current = str(out.get("current_version") or "")
+    if (
+        current
+        and not bool(out.get("version_mismatch"))
+        and str(out.get("last_status") or "") == "success"
+        and str(out.get("last_target") or "") == current
+    ):
+        cluster_result = str(out.get("last_cluster_update_result") or "")
+        if cluster_result.startswith("cluster update: waiting"):
+            out["last_cluster_update_result"] = f"update applied -> {current}; source switched, service restart scheduled"
     out.setdefault("policy", _update_policy(cfg))
     out.setdefault("auto_update_enabled", bool(cfg.mcd_auto_update_enabled))
     return out

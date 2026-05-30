@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.98 - 2026-05-30
+
+- Fixed: `self-update status` normalizes stale
+  `last_cluster_update_result=cluster update: waiting ...` once the local host
+  has already applied the target version successfully.
+
 ## 0.9.97 - 2026-05-30
 
 - Fixed: `self-update status` no longer reports stale
