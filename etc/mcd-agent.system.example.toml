@@ -164,9 +164,11 @@ mcd_update_cleanup_enabled = true
 # How often to run cleanup policy, sec.
 mcd_update_cleanup_interval_sec = 86400
 # Keep this number of latest downloaded agent archives (`mcd-agent-*.tar.gz`).
-mcd_update_keep_archives = 3
+# Default is 0: after a successful update only the running installation remains.
+mcd_update_keep_archives = 0
 # Keep this number of latest preupdate source backups (`mcd-src-preupdate-*.tgz`).
-mcd_update_keep_preupdate_backups = 3
+# Default is 0: stale agent copies are removed during update cleanup.
+mcd_update_keep_preupdate_backups = 0
 # Remove older self-update artifacts even if keep-count not exceeded.
 mcd_update_artifacts_max_age_days = 30
 # Number of local config history snapshots stored by MCD.
