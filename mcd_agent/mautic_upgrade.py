@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any
 from dataclasses import dataclass
 from urllib import error as urlerror
@@ -408,11 +409,39 @@ def _run(cmd: list[str], *, cwd: str, as_www_data: bool = False) -> None:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(full)}\n{proc.stdout}\n{proc.stderr}")
 
 
+def _remove_tree_with_retry(path: Path, *, strict: bool) -> None:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.2 * (attempt + 1))
+
+    proc = subprocess.run(["rm", "-rf", "--", str(path)], text=True, capture_output=True, check=False)
+    if not path.exists():
+        return
+    msg = str(last_error or "").strip()
+    fallback = (proc.stderr or proc.stdout or "").strip()
+    detail = "; ".join(x for x in (msg, fallback) if x)
+    if strict:
+        raise RuntimeError(f"Unable to remove {path}: {detail or 'directory still exists'}")
+    print(f"WARN unable to remove old cache tree {path}: {detail or 'directory still exists'}")
+
+
 def _hard_clear_prod_cache(root: str) -> None:
     cache_root = Path(root) / "var" / "cache"
     prod_cache = cache_root / "prod"
     if prod_cache.exists():
-        shutil.rmtree(prod_cache)
+        old_cache = cache_root / f".prod.mcd-delete-{int(time.time())}-{os.getpid()}"
+        try:
+            prod_cache.rename(old_cache)
+            _remove_tree_with_retry(old_cache, strict=False)
+        except OSError:
+            _remove_tree_with_retry(prod_cache, strict=True)
     prod_cache.mkdir(parents=True, exist_ok=True)
     try:
         shutil.chown(cache_root, user="www-data", group="www-data")

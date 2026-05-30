@@ -10,6 +10,7 @@ from mcd_agent.mautic_upgrade import (
     _clean_target_version,
     _enter_upgrade_maintenance,
     _exit_upgrade_maintenance,
+    _hard_clear_prod_cache,
     _upgrade_target_relation,
 )
 
@@ -75,6 +76,37 @@ class MauticUpgradeTargetTests(unittest.TestCase):
                 _exit_upgrade_maintenance(cfg, guard)
                 self.assertTrue(pause_flag.exists())
                 restore_cron.assert_not_called()
+
+    def test_hard_clear_prod_cache_recreates_prod(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prod = root / "var" / "cache" / "prod"
+            prod.mkdir(parents=True)
+            (prod / "stale.php").write_text("old\n", encoding="utf-8")
+
+            _hard_clear_prod_cache(str(root))
+
+            self.assertTrue(prod.is_dir())
+            self.assertFalse((prod / "stale.php").exists())
+
+    def test_hard_clear_prod_cache_continues_when_old_tree_delete_races(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prod = root / "var" / "cache" / "prod"
+            prod.mkdir(parents=True)
+            (prod / "stale.php").write_text("old\n", encoding="utf-8")
+
+            with (
+                patch("mcd_agent.mautic_upgrade.shutil.rmtree", side_effect=OSError("Directory not empty")),
+                patch("mcd_agent.mautic_upgrade.subprocess.run") as run,
+            ):
+                run.return_value.returncode = 1
+                run.return_value.stdout = ""
+                run.return_value.stderr = "Directory not empty"
+                _hard_clear_prod_cache(str(root))
+
+            self.assertTrue(prod.is_dir())
+            self.assertFalse((prod / "stale.php").exists())
 
 
 if __name__ == "__main__":

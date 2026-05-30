@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.102 - 2026-05-30
+
+- Fixed: `mautic-upgrade apply` now clears `var/cache/prod` using an atomic
+  rename/recreate flow. Live web traffic can no longer fail the upgrade with
+  `Directory not empty` while PHP-FPM is regenerating cache files.
+- Added: regression tests for live cache-clear races during Mautic upgrades.
+
 ## 0.9.101 - 2026-05-30
 
 - Fixed: `mautic-upgrade apply` now wraps the upgrade in an MCD maintenance
