@@ -451,6 +451,20 @@ def _hard_clear_prod_cache(root: str) -> None:
     print("Composer preflight: cleared var/cache/prod")
 
 
+def _clear_prod_cache_with_fallback(project_root: str, console_path: str, php_bin: str) -> None:
+    proc = _run_capture([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
+    if proc.returncode == 0:
+        print("Composer post-update cache clear ok")
+        return
+    print("WARN standard cache:clear failed; falling back to hard var/cache/prod clear")
+    if proc.stdout.strip():
+        print(proc.stdout.strip())
+    if proc.stderr.strip():
+        print(proc.stderr.strip())
+    _hard_clear_prod_cache(project_root)
+    _run([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
+
+
 def _backup_install(root: str) -> Path:
     backups = Path("/opt/mcd/backups")
     backups.mkdir(parents=True, exist_ok=True)
@@ -884,9 +898,8 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     updated, changes = _replace_version_tokens(text, current, target)
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
-    _hard_clear_prod_cache(project_root)
     _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
-    _run([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
+    _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=project_root, as_www_data=True)
     migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
     _run_doctrine_migrate_with_reconcile(project_root, console_path, php_bin, migration_cmd)

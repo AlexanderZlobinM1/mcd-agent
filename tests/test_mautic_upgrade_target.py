@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from mcd_agent.mautic_upgrade import (
     _clean_target_version,
+    _clear_prod_cache_with_fallback,
     _enter_upgrade_maintenance,
     _exit_upgrade_maintenance,
     _hard_clear_prod_cache,
@@ -107,6 +108,34 @@ class MauticUpgradeTargetTests(unittest.TestCase):
 
             self.assertTrue(prod.is_dir())
             self.assertFalse((prod / "stale.php").exists())
+
+    def test_standard_cache_clear_does_not_hard_clear_when_successful(self) -> None:
+        with (
+            patch("mcd_agent.mautic_upgrade._run_capture") as run_capture,
+            patch("mcd_agent.mautic_upgrade._hard_clear_prod_cache") as hard_clear,
+        ):
+            run_capture.return_value.returncode = 0
+            run_capture.return_value.stdout = ""
+            run_capture.return_value.stderr = ""
+
+            _clear_prod_cache_with_fallback("/tmp/app", "bin/console", "php")
+
+            hard_clear.assert_not_called()
+
+    def test_standard_cache_clear_falls_back_to_hard_clear_on_failure(self) -> None:
+        with (
+            patch("mcd_agent.mautic_upgrade._run_capture") as run_capture,
+            patch("mcd_agent.mautic_upgrade._hard_clear_prod_cache") as hard_clear,
+            patch("mcd_agent.mautic_upgrade._run") as run,
+        ):
+            run_capture.return_value.returncode = 1
+            run_capture.return_value.stdout = "cache error"
+            run_capture.return_value.stderr = ""
+
+            _clear_prod_cache_with_fallback("/tmp/app", "bin/console", "php")
+
+            hard_clear.assert_called_once_with("/tmp/app")
+            run.assert_called_once_with(["php", "bin/console", "cache:clear"], cwd="/tmp/app", as_www_data=True)
 
 
 if __name__ == "__main__":

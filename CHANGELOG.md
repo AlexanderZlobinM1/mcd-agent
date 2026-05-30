@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.103 - 2026-05-30
+
+- Changed: composer-based Mautic upgrades now use normal `bin/console
+  cache:clear` first. Hard deletion of `var/cache/prod` is reserved for
+  fallback recovery when the standard cache clear fails.
+- Added: regression tests proving successful standard cache clear does not run
+  the hard-clear path.
+
 ## 0.9.102 - 2026-05-30
 
 - Fixed: `mautic-upgrade apply` now clears `var/cache/prod` using an atomic
