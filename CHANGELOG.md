@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.105 - 2026-05-30
+
+- Fixed: IPv6 status now reports a persistent disable intent separately and
+  treats hosts with unreadable/missing runtime IPv6 sysctl keys as disabled when
+  the MCD persistent disable file is present and requests all/default/lo=1.
+  This covers systems where IPv6 sysctl paths disappear after disablement.
+
 ## 0.9.104 - 2026-05-30
 
 - Fixed: IPv6 disabled detection now tolerates vanished transient interface

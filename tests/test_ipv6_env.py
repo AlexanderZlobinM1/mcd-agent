@@ -41,6 +41,17 @@ class IPv6EnvTests(unittest.TestCase):
 
         self.assertIsNone(ipv6_runtime_disabled(status))
 
+    def test_runtime_disabled_accepts_persistent_intent_when_runtime_keys_are_unreadable(self) -> None:
+        status = {
+            "net.ipv6.conf.all.disable_ipv6": "?",
+            "net.ipv6.conf.default.disable_ipv6": "?",
+            "net.ipv6.conf.lo.disable_ipv6": "?",
+            "persistent_exists": "1",
+            "persistent_intent": "1",
+        }
+
+        self.assertTrue(ipv6_runtime_disabled(status))
+
     def test_disable_intent_uses_persistent_mcd_file_and_base_keys(self) -> None:
         status = {
             "net.ipv6.conf.all.disable_ipv6": "1",

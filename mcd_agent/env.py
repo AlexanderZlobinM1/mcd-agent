@@ -37,6 +37,7 @@ def ipv6_status() -> dict[str, str]:
             out[key] = "?"
     out["persistent_file"] = str(SYSCTL_FILE)
     out["persistent_exists"] = "1" if SYSCTL_FILE.exists() else "0"
+    out["persistent_intent"] = "1" if _persistent_file_disables_ipv6() else "0"
     return out
 
 
@@ -53,11 +54,11 @@ def ipv6_runtime_disabled(st: dict[str, str] | None = None) -> bool | None:
     data = st if st is not None else ipv6_status()
     keys = _status_ipv6_keys(data)
     if not keys:
-        return None
+        return True if ipv6_disable_intent_enabled(data) else None
     vals = [str(data.get(k, "?")).strip() for k in keys]
     known = [v for v in vals if v in {"0", "1"}]
     if not known:
-        return None
+        return True if ipv6_disable_intent_enabled(data) else None
     if any(v == "0" for v in known):
         return False
     if any(v not in {"0", "1"} for v in vals):
@@ -67,9 +68,28 @@ def ipv6_runtime_disabled(st: dict[str, str] | None = None) -> bool | None:
 
 def ipv6_disable_intent_enabled(st: dict[str, str] | None = None) -> bool:
     data = st if st is not None else ipv6_status()
+    if str(data.get("persistent_intent", "")).strip() == "1":
+        return True
     if str(data.get("persistent_exists", "")).strip() != "1":
         return False
-    return all(str(data.get(k, "")).strip() == "1" for k in PERSISTENT_KEYS)
+    if all(str(data.get(k, "")).strip() == "1" for k in PERSISTENT_KEYS):
+        return True
+    return _persistent_file_disables_ipv6()
+
+
+def _persistent_file_disables_ipv6() -> bool:
+    try:
+        text = SYSCTL_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    found: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        found[key.strip()] = value.strip()
+    return all(found.get(k) == "1" for k in PERSISTENT_KEYS)
 
 
 def reconcile_ipv6_runtime_from_intent() -> list[str]:
