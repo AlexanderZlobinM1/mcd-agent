@@ -1156,7 +1156,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 )
             return False, msg
 
-    install_dir = Path("/opt/mcd")
+    install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
     src_dir = install_dir / "src"
     backup_dir = install_dir / "var" / "backup"
     updates_dir = install_dir / "var" / "updates"
@@ -1221,6 +1221,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
         )
         if _cluster_update_enabled(cfg):
             local_host = _cluster_local_host_name(cfg)
+            state["last_cluster_update_result"] = f"update applied -> {target}; source switched, service restart scheduled"
             try:
                 _cluster_update_finalize_download(
                     cfg,

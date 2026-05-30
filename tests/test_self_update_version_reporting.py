@@ -91,6 +91,84 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         self.assertEqual(releases[0]["new_version"], "9.9.9")
         self.assertEqual(state["last_status"], "version_mismatch_restart")
 
+    def test_apply_update_refreshes_cluster_result_message(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg.cluster_id = "cluster-test"
+            cfg.state_mysql_host = "localhost"
+            cfg.mcd_install_dir = str(Path(tmp) / "mcd")
+            cfg.mcd_update_cleanup_enabled = True
+            cfg.mcd_update_cleanup_interval_sec = 86400
+            install_dir = Path(cfg.mcd_install_dir)
+            (install_dir / "src").mkdir(parents=True)
+            state_path = Path(tmp) / "mcd-self-update.json"
+            state_path.write_text(
+                json.dumps({"last_cluster_update_result": "cluster update: waiting for host-b install"}),
+                encoding="utf-8",
+            )
+            old_installed = self_update.installed_agent_version
+            old_cluster_enabled = self_update._cluster_update_enabled
+            old_cluster_host = self_update._cluster_local_host_name
+            old_finalize_download = self_update._cluster_update_finalize_download
+            old_finalize_install = self_update._cluster_update_finalize_install
+            old_release = self_update.release_session
+            old_archive_path = self_update._update_archive_path
+            old_ensure_archive = self_update._ensure_update_archive
+            old_extract = self_update._extract_archive_to_dir
+            old_install_reqs = self_update._install_requirements_for_staged_source
+            old_smoke = self_update._pre_switch_smoke_check
+            old_restart = self_update._restart_service_async
+            old_cleanup = self_update._cleanup_update_artifacts
+            try:
+                self_update.installed_agent_version = lambda: "0.9.95"
+                self_update._cluster_update_enabled = lambda _cfg: True
+                self_update._cluster_local_host_name = lambda _cfg: "host-a"
+                self_update._cluster_update_finalize_download = lambda *args, **kw: None
+                self_update._cluster_update_finalize_install = lambda *args, **kw: None
+                self_update.release_session = lambda *args, **kw: None
+                self_update._update_archive_path = lambda _target: Path(tmp) / "archive.tar.gz"
+                self_update._ensure_update_archive = lambda _cfg, _plan: Path(tmp) / "archive.tar.gz"
+                self_update._extract_archive_to_dir = lambda _archive, dst: dst.mkdir(parents=True, exist_ok=True)
+                self_update._install_requirements_for_staged_source = lambda *_args, **_kw: None
+                self_update._pre_switch_smoke_check = lambda *_args, **_kw: None
+                self_update._restart_service_async = lambda: None
+                self_update._cleanup_update_artifacts = lambda *_args, **_kw: {
+                    "archives": 0,
+                    "preupdate_backups": 0,
+                    "stale_dirs": 0,
+                }
+                ok, msg = self_update.apply_update(
+                    cfg,
+                    {
+                        "status": "update",
+                        "target": "0.9.96",
+                        "package_url": "https://mcc.invalid/mcd-agent-0.9.96.tar.gz",
+                    },
+                )
+            finally:
+                self_update.installed_agent_version = old_installed
+                self_update._cluster_update_enabled = old_cluster_enabled
+                self_update._cluster_local_host_name = old_cluster_host
+                self_update._cluster_update_finalize_download = old_finalize_download
+                self_update._cluster_update_finalize_install = old_finalize_install
+                self_update.release_session = old_release
+                self_update._update_archive_path = old_archive_path
+                self_update._ensure_update_archive = old_ensure_archive
+                self_update._extract_archive_to_dir = old_extract
+                self_update._install_requirements_for_staged_source = old_install_reqs
+                self_update._pre_switch_smoke_check = old_smoke
+                self_update._restart_service_async = old_restart
+                self_update._cleanup_update_artifacts = old_cleanup
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(ok)
+        self.assertIn("update applied -> 0.9.96", msg)
+        self.assertEqual(
+            state["last_cluster_update_result"],
+            "update applied -> 0.9.96; source switched, service restart scheduled",
+        )
+
     def test_update_cleanup_defaults_remove_old_agent_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:
             install_dir = Path(tmp) / "mcd"

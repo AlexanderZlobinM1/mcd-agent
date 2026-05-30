@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.96 - 2026-05-30
+
+- Fixed: successful cluster self-update now refreshes the local
+  `last_cluster_update_result`, so `mcd-cli self-update status` does not keep a
+  stale `waiting for peer install` message after the shared coordinator is
+  already done.
+
 ## 0.9.95 - 2026-05-30
 
 - Fixed: agent state and update checks now report the actually running MCD
