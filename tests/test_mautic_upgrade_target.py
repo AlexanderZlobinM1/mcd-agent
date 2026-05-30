@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from mcd_agent.mautic_upgrade import _clean_target_version, _upgrade_target_relation
+from mcd_agent.mautic_upgrade import (
+    _clean_target_version,
+    _enter_upgrade_maintenance,
+    _exit_upgrade_maintenance,
+    _upgrade_target_relation,
+)
 
 
 class MauticUpgradeTargetTests(unittest.TestCase):
@@ -22,6 +31,50 @@ class MauticUpgradeTargetTests(unittest.TestCase):
         self.assertEqual(_clean_target_version("7.1.2"), "7.1.2")
         with self.assertRaises(RuntimeError):
             _clean_target_version("bad 7.1.2")
+
+    def test_upgrade_maintenance_guard_owns_pause_and_cron_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            pause_flag = Path(td) / "scheduler.pause"
+            cfg = SimpleNamespace(scheduler_pause_flag_path=str(pause_flag))
+            with (
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_cron_service",
+                    return_value={"ok": True, "unit": "cron", "was_active": True},
+                ) as stop_cron,
+                patch(
+                    "mcd_agent.mautic_upgrade.restore_cron_service_if_needed",
+                    return_value={"ok": True, "unit": "cron", "started": True},
+                ) as restore_cron,
+            ):
+                guard = _enter_upgrade_maintenance(cfg)
+                self.assertTrue(pause_flag.exists())
+                self.assertTrue(guard.owned_pause_flag)
+                self.assertTrue(guard.owned_cron_stop)
+                stop_cron.assert_called_once_with(cfg)
+
+                _exit_upgrade_maintenance(cfg, guard)
+                self.assertFalse(pause_flag.exists())
+                restore_cron.assert_called_once_with(cfg)
+
+    def test_upgrade_maintenance_guard_preserves_existing_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            pause_flag = Path(td) / "scheduler.pause"
+            marker = Path(td) / "maintenance.cron.stopped.json"
+            pause_flag.write_text("paused\n", encoding="utf-8")
+            marker.write_text('{"unit":"cron","was_active":true}', encoding="utf-8")
+            cfg = SimpleNamespace(scheduler_pause_flag_path=str(pause_flag))
+            with (
+                patch("mcd_agent.mautic_upgrade.stop_cron_service") as stop_cron,
+                patch("mcd_agent.mautic_upgrade.restore_cron_service_if_needed") as restore_cron,
+            ):
+                guard = _enter_upgrade_maintenance(cfg)
+                self.assertFalse(guard.owned_pause_flag)
+                self.assertFalse(guard.owned_cron_stop)
+                stop_cron.assert_not_called()
+
+                _exit_upgrade_maintenance(cfg, guard)
+                self.assertTrue(pause_flag.exists())
+                restore_cron.assert_not_called()
 
 
 if __name__ == "__main__":

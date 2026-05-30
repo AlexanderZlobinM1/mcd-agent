@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.101 - 2026-05-30
+
+- Fixed: `mautic-upgrade apply` now wraps the upgrade in an MCD maintenance
+  guard: scheduler dispatch is paused, cron is stopped before the upgrade, and
+  both are restored to their original ownership state after success or failure.
+- Added: maintenance guard tests covering owned and pre-existing maintenance
+  states, so passive/maintenance hosts do not get cron restarted incorrectly.
+
 ## 0.9.100 - 2026-05-30
 
 - Added: `mcd-cli mautic-upgrade apply --target <version>` can now run an

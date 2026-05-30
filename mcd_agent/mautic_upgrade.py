@@ -16,6 +16,7 @@ import urllib.request
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.maintenance_mode import cron_marker_path, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.models import MauticInstall
 from mcd_agent.amazon_mailer_dep import (
     ensure_amazon_mailer_for_bundles,
@@ -60,6 +61,13 @@ class UpgradeProbeResult:
     ok: bool
     summary: str
     detail: str = ""
+
+
+@dataclass(slots=True)
+class UpgradeMaintenanceGuard:
+    pause_flag: Path
+    owned_pause_flag: bool
+    owned_cron_stop: bool
 
 
 def _pick_install_record(config: AgentConfig, root: str | None) -> MauticInstall:
@@ -120,6 +128,67 @@ def _write_upgrade_version_cache(root: str, version: str) -> int:
         except OSError:
             continue
     return written
+
+
+def _scheduler_pause_flag(config: AgentConfig) -> Path:
+    raw = str(getattr(config, "scheduler_pause_flag_path", "/opt/mcd/var/scheduler.pause") or "").strip()
+    path = Path(raw or "/opt/mcd/var/scheduler.pause")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
+    pause_flag = _scheduler_pause_flag(config)
+    owned_pause_flag = not pause_flag.exists()
+    if owned_pause_flag:
+        pause_flag.write_text("paused\n", encoding="utf-8")
+        print(f"Maintenance guard: scheduler paused ({pause_flag})")
+    else:
+        print(f"Maintenance guard: scheduler already paused ({pause_flag})")
+
+    owned_cron_stop = False
+    marker = cron_marker_path(config)
+    if marker.exists():
+        print(f"Maintenance guard: cron stop marker already present ({marker}); leaving ownership unchanged")
+    else:
+        cron_stop = stop_cron_service(config)
+        if not bool(cron_stop.get("ok", False)):
+            if owned_pause_flag and pause_flag.exists():
+                pause_flag.unlink()
+            message = str(cron_stop.get("message", "") or "").strip() or "cron service stop failed"
+            unit = str(cron_stop.get("unit", "") or "").strip() or "-"
+            raise RuntimeError(f"Maintenance guard failed: unable to stop cron unit {unit}: {message}")
+        owned_cron_stop = True
+        unit = str(cron_stop.get("unit", "") or "").strip() or "-"
+        was_active = str(bool(cron_stop.get("was_active", False))).lower()
+        print(f"Maintenance guard: cron stopped unit={unit} was_active={was_active}")
+
+    return UpgradeMaintenanceGuard(
+        pause_flag=pause_flag,
+        owned_pause_flag=owned_pause_flag,
+        owned_cron_stop=owned_cron_stop,
+    )
+
+
+def _exit_upgrade_maintenance(config: AgentConfig, guard: UpgradeMaintenanceGuard) -> None:
+    if guard.owned_cron_stop:
+        cron_restore = restore_cron_service_if_needed(config)
+        if not bool(cron_restore.get("ok", False)):
+            message = str(cron_restore.get("message", "") or "").strip() or "cron service restore failed"
+            unit = str(cron_restore.get("unit", "") or "").strip() or "-"
+            raise RuntimeError(f"Maintenance guard failed: unable to restore cron unit {unit}: {message}")
+        unit = str(cron_restore.get("unit", "") or "").strip() or "-"
+        started = str(bool(cron_restore.get("started", False))).lower()
+        print(f"Maintenance guard: cron restored unit={unit} started={started}")
+    else:
+        print("Maintenance guard: cron ownership unchanged")
+
+    if guard.owned_pause_flag:
+        if guard.pause_flag.exists():
+            guard.pause_flag.unlink()
+        print(f"Maintenance guard: scheduler resumed ({guard.pause_flag})")
+    else:
+        print("Maintenance guard: scheduler pause left unchanged")
 
 
 def _default_zip_url(version: str) -> str:
@@ -981,52 +1050,62 @@ def run_upgrade_apply(
             print("Cancelled")
             return 0
 
-    # Mandatory preflight: align permissions before any upgrade action.
-    _pre_upgrade_permissions_check(config, install_root)
+    guard = _enter_upgrade_maintenance(config)
+    try:
+        # Mandatory preflight: align permissions before any upgrade action.
+        _pre_upgrade_permissions_check(config, install_root)
 
-    if do_backup:
-        b = _backup_install(install_root)
-        print(f"Backup created: {b}")
+        if do_backup:
+            b = _backup_install(install_root)
+            print(f"Backup created: {b}")
 
-    chosen_mode = mode
-    if chosen_mode == "auto":
-        chosen_mode = detect_install_type(install_root)
+        chosen_mode = mode
+        if chosen_mode == "auto":
+            chosen_mode = detect_install_type(install_root)
 
-    if chosen_mode == "zip":
-        _apply_zip(config, install_root, console, config.php_bin, target)
-    elif chosen_mode == "composer":
-        _apply_composer(install_root, console, config.php_bin, current, target)
-    else:
-        raise RuntimeError(f"Unsupported mode: {mode}")
+        if chosen_mode == "zip":
+            _apply_zip(config, install_root, console, config.php_bin, target)
+        elif chosen_mode == "composer":
+            _apply_composer(install_root, console, config.php_bin, current, target)
+        else:
+            raise RuntimeError(f"Unsupported mode: {mode}")
 
-    if with_system_upgrade:
-        _apply_system_upgrade(current, target)
+        if with_system_upgrade:
+            _apply_system_upgrade(current, target)
 
-    # Restore transport dependencies for API senders after upgrade
-    # (especially relevant for zip installs where update flow may drop composer deps).
-    ensure_mailer_packages_for_sender_config(
-        config=config,
-        root=install_root,
-        console_path=console,
-        reason="mautic-upgrade-sender-restore",
-    )
+        # Restore transport dependencies for API senders after upgrade
+        # (especially relevant for zip installs where update flow may drop composer deps).
+        ensure_mailer_packages_for_sender_config(
+            config=config,
+            root=install_root,
+            console_path=console,
+            reason="mautic-upgrade-sender-restore",
+        )
 
-    ensure_amazon_mailer_for_bundles(
-        config=config,
-        root=install_root,
-        console_path=console,
-        bundles=installed_required_bundles(install_root),
-        reason="mautic-upgrade",
-    )
+        ensure_amazon_mailer_for_bundles(
+            config=config,
+            root=install_root,
+            console_path=console,
+            bundles=installed_required_bundles(install_root),
+            reason="mautic-upgrade",
+        )
 
-    _post_upgrade_verify(config, inst)
+        _post_upgrade_verify(config, inst)
 
-    final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
-    if _parse_semver(final_version) != _parse_semver(target):
-        raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
-    cache_count = _write_upgrade_version_cache(install_root, final_version)
-    print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
-    print(f"Upgrade completed: {current} -> {final_version}")
+        final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
+        if _parse_semver(final_version) != _parse_semver(target):
+            raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
+        cache_count = _write_upgrade_version_cache(install_root, final_version)
+        print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
+        print(f"Upgrade completed: {current} -> {final_version}")
+    except Exception:
+        try:
+            _exit_upgrade_maintenance(config, guard)
+        except Exception as cleanup_error:
+            print(f"WARN maintenance cleanup failed after upgrade error: {cleanup_error}")
+        raise
+
+    _exit_upgrade_maintenance(config, guard)
     return 0
 
 
