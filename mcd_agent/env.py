@@ -55,9 +55,14 @@ def ipv6_runtime_disabled(st: dict[str, str] | None = None) -> bool | None:
     if not keys:
         return None
     vals = [str(data.get(k, "?")).strip() for k in keys]
-    if any(v == "?" or v == "" for v in vals):
+    known = [v for v in vals if v in {"0", "1"}]
+    if not known:
         return None
-    return all(v == "1" for v in vals)
+    if any(v == "0" for v in known):
+        return False
+    if any(v not in {"0", "1"} for v in vals):
+        return True if ipv6_disable_intent_enabled(data) else None
+    return True
 
 
 def ipv6_disable_intent_enabled(st: dict[str, str] | None = None) -> bool:

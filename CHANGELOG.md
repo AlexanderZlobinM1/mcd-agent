@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.104 - 2026-05-30
+
+- Fixed: IPv6 disabled detection now tolerates vanished transient interface
+  entries reported as `?` when the persistent disable intent exists and all
+  readable runtime IPv6 keys are disabled. This prevents MCC remediation rules
+  from repeatedly targeting already-remediated hosts.
+- Added: regression tests for the transient-interface IPv6 status case.
+
 ## 0.9.103 - 2026-05-30
 
 - Changed: composer-based Mautic upgrades now use normal `bin/console
