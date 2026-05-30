@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.97 - 2026-05-30
+
+- Fixed: `self-update status` no longer reports stale
+  `active_campaign_processes` after a deferred update has already succeeded or
+  a later status check sees no live campaign process.
+
 ## 0.9.96 - 2026-05-30
 
 - Fixed: successful cluster self-update now refreshes the local

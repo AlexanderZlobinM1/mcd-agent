@@ -74,6 +74,10 @@ def _write_state(cfg: AgentConfig, payload: dict[str, Any]) -> None:
     p.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+def _clear_active_campaign_process_state(state: dict[str, Any]) -> None:
+    state.pop("active_campaign_processes", None)
+
+
 def _post_json(url: str, payload: dict[str, Any], token: str | None, timeout_sec: int = 10) -> dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
     req = request.Request(url=url, data=data, method="POST", headers={"Content-Type": "application/json"})
@@ -1110,6 +1114,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                     "last_session_id": session_id,
                 }
             )
+            _clear_active_campaign_process_state(state)
             _write_state(cfg, state)
             if session_id:
                 release_session(
@@ -1219,6 +1224,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 "last_session_id": session_id,
             }
         )
+        _clear_active_campaign_process_state(state)
         if _cluster_update_enabled(cfg):
             local_host = _cluster_local_host_name(cfg)
             state["last_cluster_update_result"] = f"update applied -> {target}; source switched, service restart scheduled"
@@ -1351,17 +1357,20 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
         except Exception as e:
             logging.warning("MCD update backup lock check failed: %s", e)
 
-    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)) and not cluster_update_mode:
+    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
         active_campaigns = _active_campaign_processes()
         if active_campaigns:
-            retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
-            state["last_check_ts"] = now_s
-            state["last_check_status"] = "deferred_active_campaign"
-            state["last_result"] = _active_campaign_update_defer_message(active_campaigns)
             state["active_campaign_processes"] = active_campaigns[:10]
-            state["next_check_ts"] = now_s + retry_sec
-            _write_state(cfg, state)
-            return str(state["last_result"]), retry_sec
+            if not cluster_update_mode:
+                retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
+                state["last_check_ts"] = now_s
+                state["last_check_status"] = "deferred_active_campaign"
+                state["last_result"] = _active_campaign_update_defer_message(active_campaigns)
+                state["next_check_ts"] = now_s + retry_sec
+                _write_state(cfg, state)
+                return str(state["last_result"]), retry_sec
+        else:
+            _clear_active_campaign_process_state(state)
 
     # Cluster mode has its own Galera-backed rollout coordinator, so MCC is
     # queried as a release catalog and must not reserve a per-host update slot.
@@ -1403,10 +1412,12 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
                 f"source/running version mismatch repaired: source={current_installed} "
                 f"running={__version__}; service restart scheduled"
             )
+            _clear_active_campaign_process_state(state)
             state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))
             _write_state(cfg, state)
             return str(state["last_result"]), int(state["next_check_ts"]) - now_s
         state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
+        _clear_active_campaign_process_state(state)
         _write_state(cfg, state)
         return None, int(state["next_check_ts"]) - now_s
 
@@ -1426,10 +1437,12 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
                     f"source/running version mismatch repaired: source={current_installed} "
                     f"running={__version__}; service restart scheduled"
                 )
+                _clear_active_campaign_process_state(state)
                 state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))
                 _write_state(cfg, state)
                 return str(state["last_result"]), int(state["next_check_ts"]) - now_s
             state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_check_interval_sec))
+            _clear_active_campaign_process_state(state)
             _write_state(cfg, state)
             return None, int(state["next_check_ts"]) - now_s
         if status == "update_available" and not auto:
@@ -1457,6 +1470,12 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
 
 def update_status(cfg: AgentConfig) -> dict[str, Any]:
     out = _read_state(cfg)
+    if "active_campaign_processes" in out:
+        active_campaigns = _active_campaign_processes()
+        if active_campaigns:
+            out["active_campaign_processes"] = active_campaigns[:10]
+        else:
+            out.pop("active_campaign_processes", None)
     versions = agent_version_payload()
     out["current_version"] = versions.get("agent_version") or __version__
     out["running_version"] = versions.get("agent_running_version") or __version__

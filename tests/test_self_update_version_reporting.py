@@ -53,6 +53,30 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         self.assertEqual(out["source_version"], "0.9.37")
         self.assertTrue(out["version_mismatch"])
 
+    def test_update_status_hides_stale_active_campaign_processes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            state_path = Path(tmp) / "mcd-self-update.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "last_status": "success",
+                        "active_campaign_processes": [
+                            {"pid": 123, "elapsed_sec": 999, "cmd": "php bin/console mautic:campaigns:trigger"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_active = self_update._active_campaign_processes
+            try:
+                self_update._active_campaign_processes = lambda: []
+                out = self_update.update_status(cfg)
+            finally:
+                self_update._active_campaign_processes = old_active
+
+        self.assertNotIn("active_campaign_processes", out)
+
     def test_apply_update_releases_session_when_only_restart_is_needed(self) -> None:
         releases: list[dict[str, str]] = []
         restarts: list[bool] = []
@@ -103,7 +127,14 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
             (install_dir / "src").mkdir(parents=True)
             state_path = Path(tmp) / "mcd-self-update.json"
             state_path.write_text(
-                json.dumps({"last_cluster_update_result": "cluster update: waiting for host-b install"}),
+                json.dumps(
+                    {
+                        "last_cluster_update_result": "cluster update: waiting for host-b install",
+                        "active_campaign_processes": [
+                            {"pid": 123, "elapsed_sec": 999, "cmd": "php bin/console mautic:campaigns:trigger"}
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             old_installed = self_update.installed_agent_version
@@ -141,8 +172,8 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
                     cfg,
                     {
                         "status": "update",
-                        "target": "0.9.96",
-                        "package_url": "https://mcc.invalid/mcd-agent-0.9.96.tar.gz",
+                        "target": "0.9.97",
+                        "package_url": "https://mcc.invalid/mcd-agent-0.9.97.tar.gz",
                     },
                 )
             finally:
@@ -163,11 +194,12 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
         self.assertTrue(ok)
-        self.assertIn("update applied -> 0.9.96", msg)
+        self.assertIn("update applied -> 0.9.97", msg)
         self.assertEqual(
             state["last_cluster_update_result"],
-            "update applied -> 0.9.96; source switched, service restart scheduled",
+            "update applied -> 0.9.97; source switched, service restart scheduled",
         )
+        self.assertNotIn("active_campaign_processes", state)
 
     def test_update_cleanup_defaults_remove_old_agent_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:
