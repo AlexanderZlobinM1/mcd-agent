@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.9.108 - 2026-05-31
+
+- Fixed: Mautic 6 plugin updates now pre-align selected metadata-less plugin
+  DB rows to the installed file version before plugin reload. This avoids the
+  Mautic 6 `PluginUpdateEvent` null Doctrine metadata crash without modifying
+  Mautic core.
+- Added: regression tests for metadata-less Mautic 6 plugin version prealign
+  and recovery reload after a previous failed plugin update.
+
+## 0.9.107 - 2026-05-31
+
+- Fixed: plugin install/update metadata workaround now normalizes every
+  installed plugin `Config/config.php` before Mautic plugin reload. Mautic 6 can
+  fail reload if any installed plugin config has missing metadata, even when
+  only one selected plugin is being updated.
+
 ## 0.9.106 - 2026-05-31
 
 - Changed: plugin install/update no longer patches Mautic

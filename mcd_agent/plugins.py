@@ -1463,11 +1463,38 @@ def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]
     return changed_any
 
 
+def _plugin_config_metadata_paths(plugins_dir: Path, selected_rows: list[dict[str, Any]]) -> list[tuple[str, Path]]:
+    paths: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+
+    def add_bundle(bundle: str) -> None:
+        name = str(bundle or "").strip()
+        if not _is_valid_bundle_name(name):
+            return
+        p = plugins_dir / name / "Config" / "config.php"
+        try:
+            key = p.resolve()
+        except Exception:
+            key = p
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append((name, p))
+
+    for bundle in _selected_install_bundles(selected_rows):
+        add_bundle(bundle)
+
+    if plugins_dir.exists():
+        for child in sorted(plugins_dir.iterdir(), key=lambda x: x.name):
+            if child.is_dir():
+                add_bundle(child.name)
+    return paths
+
+
 def _apply_plugin_config_metadata_patch(install, selected_rows: list[dict[str, Any]]) -> bool:
     plugins_dir = _resolve_plugins_dir(install.root, create=False)
     changed_any = False
-    for bundle in _selected_install_bundles(selected_rows):
-        config_path = plugins_dir / bundle / "Config" / "config.php"
+    for bundle, config_path in _plugin_config_metadata_paths(plugins_dir, selected_rows):
         if not config_path.exists():
             continue
         text = config_path.read_text(encoding="utf-8", errors="ignore")
@@ -1495,6 +1522,58 @@ def _apply_plugin_config_metadata_patch(install, selected_rows: list[dict[str, A
         config_path.write_text(new_text, encoding="utf-8")
         changed_any = True
         logging.info("[%s] plugin metadata config patch applied: %s", install.root, bundle)
+    return changed_any
+
+
+def _plugin_has_doctrine_entity_metadata(plugin_dir: Path) -> bool:
+    entity_dir = plugin_dir / "Entity"
+    if not entity_dir.exists() or not entity_dir.is_dir():
+        return False
+    try:
+        return any(p.is_file() and p.suffix == ".php" for p in entity_dir.rglob("*.php"))
+    except Exception:
+        return True
+
+
+def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str, Any]]) -> bool:
+    if int(getattr(install, "mautic_major", 0) or 0) != 6:
+        return False
+    if not getattr(install, "db", None):
+        return False
+
+    plugins_dir = _resolve_plugins_dir(install.root, create=False)
+    if not plugins_dir.exists():
+        return False
+
+    changed_any = False
+    db: MauticDB | None = None
+    for bundle in _selected_install_bundles(selected_rows):
+        if not _is_valid_bundle_name(bundle):
+            continue
+        plugin_dir = plugins_dir / bundle
+        if not plugin_dir.exists() or not plugin_dir.is_dir():
+            continue
+        if _plugin_has_doctrine_entity_metadata(plugin_dir):
+            continue
+        version = _read_installed_version(plugin_dir)
+        if not version or version == "-":
+            continue
+        try:
+            if db is None:
+                db = MauticDB(install.db)
+            affected = db.align_plugin_version(bundle, version)
+        except Exception as e:
+            logging.warning("[%s] plugin version prealign failed for %s: %s", install.root, bundle, e)
+            continue
+        if int(affected or 0) > 0:
+            changed_any = True
+            logging.info(
+                "[%s] plugin version prealigned for metadata-less Mautic 6 reload: %s=%s affected=%s",
+                install.root,
+                bundle,
+                version,
+                affected,
+            )
     return changed_any
 
 
@@ -1673,6 +1752,7 @@ def _apply_plugin_file_changes(
         # the plugin version at OK while core reload still needs patching.
         compatibility_changed = _apply_hostnet_mautic4_tx_patch(install, selected) or compatibility_changed
         compatibility_changed = _apply_plugin_config_metadata_patch(install, selected) or compatibility_changed
+        compatibility_changed = _prealign_metadataless_plugin_versions(install, selected) or compatibility_changed
 
     if changed or compatibility_changed:
         _run_manifest_sql_fixes(config, install, selected)

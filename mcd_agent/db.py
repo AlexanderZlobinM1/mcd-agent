@@ -271,6 +271,42 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def align_plugin_version(self, bundle: str, version: str) -> int:
+        """
+        Align one Mautic plugin DB row to the installed bundle version.
+
+        This is used as a narrow installer-side workaround for Mautic 6 reloads
+        where plugins without Doctrine entity metadata can crash core update
+        handling before reload completes.
+        """
+        bundle_clean = str(bundle or "").strip()
+        version_clean = str(version or "").strip()
+        if not bundle_clean or not version_clean:
+            return 0
+        table = self._safe_table(f"{self.cfg.table_prefix}plugins")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                columns = self._table_columns(cur, table)
+                if "version" not in columns:
+                    return 0
+                if "bundle" in columns:
+                    match_column = "bundle"
+                elif "name" in columns:
+                    match_column = "name"
+                else:
+                    return 0
+                affected = cur.execute(
+                    f"UPDATE `{table}` "
+                    f"SET `version`=%s "
+                    f"WHERE `{match_column}`=%s "
+                    "AND (`version` IS NULL OR `version`<>%s)",
+                    (version_clean, bundle_clean, version_clean),
+                )
+        try:
+            return int(affected)
+        except (TypeError, ValueError):
+            return 0
+
     @staticmethod
     def _apply_statement_timeout(cur: Any, timeout_sec: int | None) -> None:
         """Best-effort per-session cap for SQL segment rebuild statements."""
