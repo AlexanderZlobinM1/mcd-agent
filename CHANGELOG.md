@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.106 - 2026-05-31
+
+- Changed: plugin install/update no longer patches Mautic
+  `PluginBundle/Helper/ReloadHelper.php` for missing plugin metadata. MCD now
+  adds an empty `metadata` array to the selected plugin's installed
+  `Config/config.php` before running Mautic plugin reload, keeping the
+  workaround in the installer/plugin layer instead of Mautic core.
+- Fixed: plugin metadata DB repair now checks whether `{prefix}plugins.metadata`
+  exists before running repair SQL, avoiding noisy warnings on Mautic schemas
+  without that column.
+
 ## 0.9.105 - 2026-05-30
 
 - Fixed: IPv6 status now reports a persistent disable intent separately and

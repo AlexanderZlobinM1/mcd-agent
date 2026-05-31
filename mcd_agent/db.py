@@ -242,6 +242,25 @@ class MauticDB:
                     out.add(raw)
         return out
 
+    def table_has_column(self, table_template: str, column: str) -> bool:
+        table = str(table_template or "").format(prefix=str(self.cfg.table_prefix or ""))
+        column = self._safe_column(column)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND COLUMN_NAME = %s
+                    LIMIT 1
+                    """,
+                    (table, column),
+                )
+                row = cur.fetchone()
+        return bool(row)
+
     def execute_sql_template(self, query_template: str, context: dict[str, str] | None = None) -> int:
         query = self._render_query(query_template, context=context)
         with self._connect() as conn:

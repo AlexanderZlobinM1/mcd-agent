@@ -18,9 +18,11 @@ from mcd_agent.plugins import (
     _cluster_plugin_row_signature,
     _cluster_plugin_wait_file_sync,
     _run_cluster_plugin_operation,
+    _run_plugin_install_reload,
     _plugin_selection_digest,
     _protected_plugin_path_names,
     _remove_plugin_path,
+    _apply_plugin_config_metadata_patch,
     _run_manifest_sql_fixes,
     _exclusive_counterparts,
 )
@@ -210,6 +212,45 @@ class PluginConflictPathTests(unittest.TestCase):
             _run_manifest_sql_fixes(cfg, install, rows)
 
         db.execute_sql_template.assert_called_once_with("UPDATE ss_plugins SET is_published = 1")
+
+    def test_plugin_metadata_repair_skips_when_column_is_absent(self) -> None:
+        cfg = SimpleNamespace()
+        install = SimpleNamespace(root="/var/www/ss/public_html", db={"driver": "pdo_mysql"})
+        db = SimpleNamespace(
+            table_has_column=Mock(return_value=False),
+            execute_sql_template=Mock(return_value=1),
+        )
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db), \
+             patch("mcd_agent.plugins._run_plugin_template", return_value=(0, "ok")) as run_template:
+            _run_plugin_install_reload(cfg, install)
+
+        db.table_has_column.assert_called_once_with("{prefix}plugins", "metadata")
+        db.execute_sql_template.assert_not_called()
+        run_template.assert_called_once()
+
+    def test_plugin_config_metadata_patch_adds_metadata_without_core_patch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "plugins" / "DemoBundle" / "Config" / "config.php"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "<?php\nreturn [\n"
+                "    \"name\"        => \"Demo\",\n"
+                "    \"version\"     => \"1.0.0\",\n"
+                "    \"author\"      => \"Test\",\n"
+                "];\n",
+                encoding="utf-8",
+            )
+            install = SimpleNamespace(root=str(root))
+            selected = [{"bundle": "DemoBundle", "install_bundle": "DemoBundle", "item": {}}]
+
+            changed = _apply_plugin_config_metadata_patch(install, selected)
+
+            self.assertTrue(changed)
+            text = config.read_text(encoding="utf-8")
+            self.assertIn('"metadata"    => []', text)
+            self.assertFalse((root / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php").exists())
 
     def test_cluster_node_status_is_written_to_node_scoped_runtime_row(self) -> None:
         calls = []

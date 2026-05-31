@@ -1248,6 +1248,13 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
         if not install.db:
             return False
         db = MauticDB(install.db)
+        try:
+            if not db.table_has_column("{prefix}plugins", "metadata"):
+                logging.info("[%s] plugin metadata repair skipped: plugins.metadata column not present", root)
+                return False
+        except Exception as e:
+            logging.warning("[%s] plugin metadata column check failed: %s", root, e)
+            return False
         repaired_any = False
         # Mautic bug workaround: malformed/null plugin metadata may break
         # mautic:plugin:install|reload with PluginUpdateEvent metadata=null.
@@ -1456,28 +1463,39 @@ def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]
     return changed_any
 
 
-def _apply_plugin_reload_metadata_patch(install) -> bool:
-    helper_path = Path(install.root) / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php"
-    if not helper_path.exists():
-        return False
-    text = helper_path.read_text(encoding="utf-8", errors="ignore")
-    replacements = {
-        "$metadata        = $pluginMetadata[$pluginConfig['namespace']] ?? null;":
-            "$metadata        = $pluginMetadata[$pluginConfig['namespace']] ?? [];",
-        "$metadata = $pluginMetadata[$pluginConfig['namespace']] ?? null;":
-            "$metadata = $pluginMetadata[$pluginConfig['namespace']] ?? [];",
-    }
-    new_text = text
-    changed = 0
-    for old, new in replacements.items():
-        if old in new_text:
-            new_text = new_text.replace(old, new)
-            changed += 1
-    if new_text != text:
-        helper_path.write_text(new_text, encoding="utf-8")
-        logging.info("[%s] plugin reload metadata patch applied: replacements=%s", install.root, changed)
-        return True
-    return False
+def _apply_plugin_config_metadata_patch(install, selected_rows: list[dict[str, Any]]) -> bool:
+    plugins_dir = _resolve_plugins_dir(install.root, create=False)
+    changed_any = False
+    for bundle in _selected_install_bundles(selected_rows):
+        config_path = plugins_dir / bundle / "Config" / "config.php"
+        if not config_path.exists():
+            continue
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"['\"]metadata['\"]\s*=>", text):
+            continue
+
+        quote = '"' if re.search(r'^\s*"name"\s*=>', text, flags=re.MULTILINE) else "'"
+        metadata_line = f"    {quote}metadata{quote}    => [],"
+        new_text, count = re.subn(
+            r"(?m)^(?P<indent>\s*)(?P<key>['\"]author['\"]\s*=>\s*[^,\n]+,\s*)$",
+            lambda m: m.group(0) + "\n" + metadata_line,
+            text,
+            count=1,
+        )
+        if count == 0:
+            new_text, count = re.subn(
+                r"(?m)^(?P<indent>\s*)(?P<key>['\"]version['\"]\s*=>\s*[^,\n]+,\s*)$",
+                lambda m: m.group(0) + "\n" + metadata_line,
+                text,
+                count=1,
+            )
+        if count == 0:
+            logging.debug("[%s] plugin metadata config patch skipped for %s: insertion point not found", install.root, bundle)
+            continue
+        config_path.write_text(new_text, encoding="utf-8")
+        changed_any = True
+        logging.info("[%s] plugin metadata config patch applied: %s", install.root, bundle)
+    return changed_any
 
 
 def _selected_install_bundles(selected: list[dict[str, Any]]) -> list[str]:
@@ -1654,7 +1672,7 @@ def _apply_plugin_file_changes(
         # plugin files successfully and then fail during Mautic reload, leaving
         # the plugin version at OK while core reload still needs patching.
         compatibility_changed = _apply_hostnet_mautic4_tx_patch(install, selected) or compatibility_changed
-        compatibility_changed = _apply_plugin_reload_metadata_patch(install) or compatibility_changed
+        compatibility_changed = _apply_plugin_config_metadata_patch(install, selected) or compatibility_changed
 
     if changed or compatibility_changed:
         _run_manifest_sql_fixes(config, install, selected)
