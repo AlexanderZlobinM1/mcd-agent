@@ -10,6 +10,7 @@ import mcd_agent.state_backend as state_backend
 from mcd_agent.plugins import (
     _auto_remove_conflicting_installed_bundles,
     _apply_plugin_file_changes,
+    _cleanup_conflicting_plugin_rows,
     _cluster_plugin_cache_clear_all,
     _cluster_pre_sql_is_dangerous,
     _cluster_plugin_note_node,
@@ -214,6 +215,35 @@ class PluginConflictPathTests(unittest.TestCase):
             _run_manifest_sql_fixes(cfg, install, rows)
 
         db.execute_sql_template.assert_called_once_with("UPDATE ss_plugins SET is_published = 1")
+
+    def test_conflict_db_cleanup_protects_selected_install_bundle_alias(self) -> None:
+        install = SimpleNamespace(root="/var/www/ss/public_html", db={"driver": "pdo_mysql"})
+        rows = [
+            {
+                "bundle": "AmazonSesManagedBundle",
+                "install_bundle": "AmazonSesBundle",
+                "item": {
+                    "bundle": "AmazonSesManagedBundle",
+                    "install_bundle": "AmazonSesBundle",
+                    "replaces": [
+                        "AmazonSesBundle",
+                        "AmazonSesBundleDev",
+                        "AmazonSesUpstreamBundle",
+                        "AmazonSnsCallbackBundle",
+                        "MauticAmazonSesBundle",
+                    ],
+                },
+            }
+        ]
+        db = SimpleNamespace(execute_sql_template=Mock(return_value=1))
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db):
+            _cleanup_conflicting_plugin_rows(install, rows)
+
+        sql = db.execute_sql_template.call_args.args[0]
+        self.assertNotIn("'AmazonSesBundle'", sql)
+        self.assertIn("'AmazonSnsCallbackBundle'", sql)
+        self.assertIn("'MauticAmazonSesBundle'", sql)
 
     def test_plugin_metadata_repair_skips_when_column_is_absent(self) -> None:
         cfg = SimpleNamespace()

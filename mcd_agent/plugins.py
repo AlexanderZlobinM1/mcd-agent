@@ -1331,11 +1331,7 @@ def _run_manifest_sql_fixes(config: AgentConfig, install, selected_rows: list[di
 def _cleanup_conflicting_plugin_rows(install, selected_rows: list[dict[str, Any]]) -> None:
     if not install.db:
         return
-    selected_set = {
-        str(row.get("bundle", "")).strip()
-        for row in selected_rows
-        if str(row.get("bundle", "")).strip()
-    }
+    selected_set = set(_selected_install_bundles(selected_rows))
     conflicts: set[str] = set()
     for row in selected_rows:
         bundle = str(row.get("bundle", "")).strip()

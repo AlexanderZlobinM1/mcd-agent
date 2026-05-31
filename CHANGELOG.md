@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.109 - 2026-05-31
+
+- Fixed: plugin conflict DB cleanup now protects selected runtime install
+  bundle aliases, not only manifest bundle keys. Managed variants such as
+  `AmazonSesManagedBundle` install as `AmazonSesBundle`; their active DB row
+  must not be deleted as a conflicting bundle before Mautic reload.
+- Added: regression coverage for managed plugin alias DB cleanup.
+
 ## 0.9.108 - 2026-05-31
 
 - Fixed: Mautic 6 plugin updates now pre-align selected metadata-less plugin
