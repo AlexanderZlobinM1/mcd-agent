@@ -284,6 +284,65 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         self.assertLess(events.index("maintenance_on"), events.index("db_import:single"))
         self.assertLess(events.index("db_import:single"), events.index("patch_db"))
 
+    def test_source_db_stream_prefers_mariadb_dump_without_events(self) -> None:
+        class FakeInventory:
+            def __init__(self, _path: str) -> None:
+                pass
+
+            def list_instances(self):
+                return [
+                    MauticInstall(
+                        instance_uid="uid-1",
+                        name="example",
+                        root="/var/www/example",
+                        console_path="/var/www/example/bin/console",
+                    )
+                ]
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO(b"-- sql\n")
+                self.stderr = io.BytesIO(b"")
+
+            def wait(self):
+                return 0
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_popen(argv, **_kwargs):
+            captured["argv"] = list(argv)
+            return FakeProc()
+
+        cfg = type("Cfg", (), {"state_db_path": "/tmp/mcd-state.sqlite"})()
+        db = DBConfig(
+            host="localhost",
+            port=3306,
+            name="baza_source",
+            user="source_user",
+            password="source_password",
+            table_prefix="ss_",
+        )
+
+        with (
+            patch.object(instance_migrate, "InstanceInventory", FakeInventory),
+            patch.object(instance_migrate, "ensure_seeded", return_value=None),
+            patch.object(instance_migrate, "_db_from_local_php", return_value=db),
+            patch.object(
+                instance_migrate.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/mariadb-dump" if name == "mariadb-dump" else "/usr/bin/mysqldump",
+            ),
+            patch.object(instance_migrate.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            output = io.BytesIO()
+            instance_migrate.stream_source_db(cfg, selector="/var/www/example", output=output)
+
+        argv = captured["argv"]
+        self.assertEqual(argv[0], "/usr/bin/mariadb-dump")
+        self.assertIn("--routines", argv)
+        self.assertIn("--triggers", argv)
+        self.assertNotIn("--events", argv)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -511,15 +511,17 @@ def stream_source_db(config: AgentConfig, *, selector: str | None, output: Any) 
             encoding="utf-8",
         )
         defaults.chmod(0o600)
+        dump_bin = shutil.which("mariadb-dump") or shutil.which("mysqldump")
+        if not dump_bin:
+            raise RuntimeError("mariadb-dump or mysqldump is required for source database stream")
         proc = subprocess.Popen(
             [
-                "mysqldump",
+                dump_bin,
                 f"--defaults-extra-file={defaults}",
                 "--single-transaction",
                 "--quick",
                 "--routines",
                 "--triggers",
-                "--events",
                 source_db.name,
             ],
             stdout=subprocess.PIPE,

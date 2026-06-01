@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.111 - 2026-06-01
+
+- Fixed: relay-mode instance migration database streams now prefer
+  `mariadb-dump` and no longer request database events. This avoids MariaDB
+  failures when `event_scheduler` is disabled on the source.
+- Added: regression coverage for the source DB stream dump command.
+
 ## 0.9.110 - 2026-06-01
 
 - Changed: instance migration target-pull now imports the database only once,
