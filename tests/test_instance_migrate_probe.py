@@ -185,6 +185,105 @@ class InstanceMigrateProbeTests(unittest.TestCase):
 
             self.assertEqual(instance_migrate._nginx_web_root(root), root / "docroot")
 
+    def test_target_pull_migration_imports_database_once_after_final_sync(self) -> None:
+        class FakeInventory:
+            def __init__(self, _path: str) -> None:
+                pass
+
+            def rescan(self, _config):
+                return []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        events: list[str] = []
+        source_db = DBConfig(
+            host="localhost",
+            port=3306,
+            name="baza_source",
+            user="source_user",
+            password="source_password",
+            table_prefix="ss_",
+        )
+        target_db = DBConfig(
+            host="localhost",
+            port=3306,
+            name="baza_target",
+            user="target_user",
+            password="target_password",
+            table_prefix="ss_",
+        )
+
+        def fake_rsync(**kwargs):
+            events.append("rsync")
+            Path(kwargs["target_path"]).mkdir(parents=True, exist_ok=True)
+
+        def fake_remote_mcd(**_kwargs):
+            events.append("maintenance_on")
+            return "{}"
+
+        def fake_tunnel(**_kwargs):
+            events.append("tunnel")
+            return FakeProc(), 3307
+
+        def fake_dump(_config, *, local_source_db, target_db, label: str):
+            events.append(f"db_import:{label}")
+            return {"label": label}
+
+        with tempfile.TemporaryDirectory() as td:
+            key = Path(td) / "source.key"
+            key.write_text("key", encoding="utf-8")
+            target_root = Path(td) / "target" / "public_html"
+            cfg = type("Cfg", (), {"state_db_path": str(Path(td) / "state.sqlite")})()
+
+            with (
+                patch.object(instance_migrate.os, "geteuid", return_value=0),
+                patch.object(instance_migrate.shutil, "which", return_value="/usr/bin/rsync"),
+                patch.object(instance_migrate, "_mysql_admin_base", return_value=["mysql"]),
+                patch.object(instance_migrate, "_run_checked", return_value=""),
+                patch.object(instance_migrate, "_rsync_from_source", side_effect=fake_rsync),
+                patch.object(instance_migrate, "_db_from_local_php", return_value=source_db),
+                patch.object(instance_migrate, "_target_db_from_values", return_value=target_db),
+                patch.object(instance_migrate, "_target_db_exists", return_value=False),
+                patch.object(instance_migrate, "_remote_mcd", side_effect=fake_remote_mcd),
+                patch.object(instance_migrate, "_open_source_db_tunnel", side_effect=fake_tunnel),
+                patch.object(instance_migrate, "_dump_source_into_target", side_effect=fake_dump),
+                patch.object(instance_migrate, "_patch_local_php_db", side_effect=lambda *_args: events.append("patch_db")),
+                patch.object(instance_migrate, "_copy_letsencrypt", return_value=False),
+                patch.object(instance_migrate, "_write_nginx_vhost", return_value="/etc/nginx/sites-available/example.conf"),
+                patch.object(instance_migrate, "_target_healthcheck", return_value=[]),
+                patch.object(instance_migrate, "InstanceInventory", FakeInventory),
+            ):
+                result = instance_migrate.run_target_pull_migration(
+                    cfg,
+                    source_address="192.0.2.10",
+                    source_ssh_user="root",
+                    source_ssh_port=22,
+                    source_ssh_key_file=str(key),
+                    source_root="/var/www/source/public_html",
+                    target_root=str(target_root),
+                    domains_json='["example.com"]',
+                    target_db_name="baza_target",
+                    target_db_user="target_user",
+                    target_db_password="target_password",
+                    php_version="8.4",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([x for x in events if x.startswith("db_import:")], ["db_import:single"])
+        self.assertLess(events.index("maintenance_on"), events.index("db_import:single"))
+        self.assertLess(events.index("db_import:single"), events.index("patch_db"))
+
 
 if __name__ == "__main__":
     unittest.main()

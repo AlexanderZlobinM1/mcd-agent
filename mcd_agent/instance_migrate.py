@@ -841,27 +841,6 @@ def run_target_pull_migration(
             raise RuntimeError(f"target database already exists: {target_db.name}")
         result["target_db_name"] = target_db.name
         result["target_db_user"] = target_db.user
-        source_db_port = int(copied_source_db.port or 3306)
-
-        print("progress: 20 source DB tunnel")
-        tunnel, local_port = _open_source_db_tunnel(
-            source_ssh_user=source_ssh_user,
-            source_address=source_address,
-            source_ssh_port=source_ssh_port,
-            source_ssh_key_file=source_ssh_key_file,
-            source_db_port=source_db_port,
-        )
-        source_db = DBConfig(
-            host="127.0.0.1",
-            port=local_port,
-            name=copied_source_db.name,
-            user=copied_source_db.user,
-            password=copied_source_db.password,
-            table_prefix=copied_source_db.table_prefix,
-        )
-
-        print("progress: 30 initial database import")
-        result["steps"].append(_dump_source_into_target(config, local_source_db=source_db, target_db=target_db, label="initial"))
 
         print("progress: 60 source maintenance on")
         _remote_mcd(
@@ -885,10 +864,28 @@ def run_target_pull_migration(
             delete=True,
             excludes=exclusions,
         )
-        _patch_local_php_db(target, target_db)
+        source_db_port = int(copied_source_db.port or 3306)
 
-        print("progress: 76 final database catch-up")
-        result["steps"].append(_dump_source_into_target(config, local_source_db=source_db, target_db=target_db, label="final"))
+        print("progress: 72 source DB tunnel")
+        tunnel, local_port = _open_source_db_tunnel(
+            source_ssh_user=source_ssh_user,
+            source_address=source_address,
+            source_ssh_port=source_ssh_port,
+            source_ssh_key_file=source_ssh_key_file,
+            source_db_port=source_db_port,
+        )
+        source_db = DBConfig(
+            host="127.0.0.1",
+            port=local_port,
+            name=copied_source_db.name,
+            user=copied_source_db.user,
+            password=copied_source_db.password,
+            table_prefix=copied_source_db.table_prefix,
+        )
+
+        print("progress: 76 database import")
+        result["steps"].append(_dump_source_into_target(config, local_source_db=source_db, target_db=target_db, label="single"))
+        _patch_local_php_db(target, target_db)
 
         print("progress: 88 target web config")
         copied_certs = _copy_letsencrypt(

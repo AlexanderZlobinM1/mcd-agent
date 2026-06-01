@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.110 - 2026-06-01
+
+- Changed: instance migration target-pull now imports the database only once,
+  after source maintenance is enabled and the final file sync is complete.
+  This avoids the previous double full database transfer during migrations.
+- Added: regression coverage proving target-pull migration performs one
+  post-maintenance database import.
+
 ## 0.9.109 - 2026-05-31
 
 - Fixed: plugin conflict DB cleanup now protects selected runtime install
