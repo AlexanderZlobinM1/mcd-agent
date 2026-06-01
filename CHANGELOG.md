@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.112 - 2026-06-01
+
+- Fixed: instance migration now rehomes Mautic instance-local paths after file
+  sync. Target `cache_path`, `log_path`, `tmp_path`, import directories, and
+  media/temp upload directories are rewritten to the target instance root so a
+  migrated instance cannot share another local instance cache or writable paths.
+- Added: regression coverage for target-local path rewriting during instance
+  migration.
+
 ## 0.9.111 - 2026-06-01
 
 - Fixed: relay-mode instance migration database streams now prefer

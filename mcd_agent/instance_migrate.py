@@ -176,6 +176,37 @@ def _patch_local_php_db(root: Path, db: DBConfig) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _patch_local_php_instance_paths(root: Path) -> list[str]:
+    path = _local_php_path(root)
+    root = root.resolve()
+    media_root = _nginx_web_root(root) / "media" / "files"
+    replacements = {
+        "cache_path": root / "var" / "cache",
+        "log_path": root / "var" / "logs",
+        "tmp_path": root / "var" / "tmp",
+        "import_campaigns_dir": root / "var" / "import",
+        "import_leads_dir": root / "var" / "import",
+        "upload_dir": media_root,
+        "contact_export_dir": media_root / "temp",
+        "report_temp_dir": media_root / "temp",
+        "form_upload_dir": media_root / "form",
+    }
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    changed: list[str] = []
+    for key, value_path in replacements.items():
+        value = str(value_path)
+        pattern = rf"(['\"]{re.escape(key)}['\"]\s*=>\s*)['\"][^'\"]*['\"]"
+        new_text, count = re.subn(pattern, lambda m, v=value: m.group(1) + _quote_sql(v), text, count=1)
+        if count > 0 and new_text != text:
+            changed.append(key)
+            text = new_text
+    if changed:
+        path.write_text(text, encoding="utf-8")
+        for value_path in replacements.values():
+            value_path.mkdir(parents=True, exist_ok=True)
+    return changed
+
+
 def _quote_for_ssh(value: str) -> str:
     import shlex
 
@@ -583,6 +614,7 @@ def finalize_target_relay(
     target_db = _target_db_from_direct_values(name=target_db_name, user=target_db_user, password=target_db_password)
     print("progress: 88 target web config")
     _patch_local_php_db(target, target_db)
+    _patch_local_php_instance_paths(target)
     site = _write_nginx_vhost(root=target, domains=domains, php_version=php_version or "")
     _run_checked(["chown", "-R", "www-data:www-data", str(target)], timeout_sec=1800)
     print("progress: 94 target healthcheck")
@@ -888,6 +920,9 @@ def run_target_pull_migration(
         print("progress: 76 database import")
         result["steps"].append(_dump_source_into_target(config, local_source_db=source_db, target_db=target_db, label="single"))
         _patch_local_php_db(target, target_db)
+        patched_paths = _patch_local_php_instance_paths(target)
+        if patched_paths:
+            result["steps"].append({"label": "local_paths", "keys": patched_paths})
 
         print("progress: 88 target web config")
         copied_certs = _copy_letsencrypt(

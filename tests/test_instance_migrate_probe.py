@@ -132,6 +132,40 @@ class InstanceMigrateProbeTests(unittest.TestCase):
             self.assertIn("'db_user' => 'korisnik_3gstore'", text)
             self.assertIn("'db_password' => 'newsecret'", text)
 
+    def test_patch_local_php_instance_paths_are_target_local(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "target" / "public_html"
+            cfg_dir = root / "config"
+            cfg_dir.mkdir(parents=True)
+            (root / "index.php").write_text("<?php\n", encoding="utf-8")
+            (cfg_dir / "local.php").write_text(
+                "<?php return array("
+                "'cache_path' => '/var/www/mautic/var/cache', "
+                "'log_path' => '/var/www/mautic/var/logs', "
+                "'tmp_path' => '/var/www/mautic/var/tmp', "
+                "'import_campaigns_dir' => '/var/www/mautic/var/import', "
+                "'import_leads_dir' => '/var/www/mautic/var/import', "
+                "'upload_dir' => '/var/www/mautic/media/files', "
+                "'contact_export_dir' => '/var/www/mautic/media/files/temp', "
+                "'report_temp_dir' => '/var/www/mautic/media/files/temp', "
+                "'form_upload_dir' => '/var/www/mautic/media/files/form');",
+                encoding="utf-8",
+            )
+
+            changed = instance_migrate._patch_local_php_instance_paths(root)
+
+            resolved = root.resolve()
+            text = (cfg_dir / "local.php").read_text(encoding="utf-8")
+            self.assertIn("cache_path' => '" + str(resolved / "var" / "cache") + "'", text)
+            self.assertIn("log_path' => '" + str(resolved / "var" / "logs") + "'", text)
+            self.assertIn("tmp_path' => '" + str(resolved / "var" / "tmp") + "'", text)
+            self.assertIn("upload_dir' => '" + str(resolved / "media" / "files") + "'", text)
+            self.assertIn("form_upload_dir' => '" + str(resolved / "media" / "files" / "form") + "'", text)
+            self.assertNotIn("/var/www/mautic", text)
+            self.assertIn("cache_path", changed)
+            self.assertTrue((resolved / "var" / "cache").is_dir())
+            self.assertTrue((resolved / "media" / "files" / "temp").is_dir())
+
     def test_target_relay_preflight_reports_existing_target_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "public_html"
@@ -259,6 +293,7 @@ class InstanceMigrateProbeTests(unittest.TestCase):
                 patch.object(instance_migrate, "_open_source_db_tunnel", side_effect=fake_tunnel),
                 patch.object(instance_migrate, "_dump_source_into_target", side_effect=fake_dump),
                 patch.object(instance_migrate, "_patch_local_php_db", side_effect=lambda *_args: events.append("patch_db")),
+                patch.object(instance_migrate, "_patch_local_php_instance_paths", side_effect=lambda *_args: events.append("patch_paths") or []),
                 patch.object(instance_migrate, "_copy_letsencrypt", return_value=False),
                 patch.object(instance_migrate, "_write_nginx_vhost", return_value="/etc/nginx/sites-available/example.conf"),
                 patch.object(instance_migrate, "_target_healthcheck", return_value=[]),
