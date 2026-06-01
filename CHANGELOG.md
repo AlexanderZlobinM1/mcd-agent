@@ -1,5 +1,23 @@
 # MCD Changelog
 
+## 0.9.115 - 2026-06-01
+
+- Fixed: Mautic lock cleanup now also clears stale Symfony command lock files
+  from `var/cache/run/sf.mautic-*.lock` when their recorded PID is no longer
+  alive. This prevents dead segment, campaign, or message locks from blocking
+  future scheduler/manual runs.
+- Fixed: segment dependency planning now follows Mautic major behavior. Mautic
+  7 schedules terminal dependent segments only because core rebuilds
+  leadlist-filter dependencies recursively; Mautic <=6 plans dependency
+  chains explicitly in parent-before-child order.
+- Changed: MCD segment dispatch now treats a connected dependency chain as one
+  active slot, so dependent segments are not launched in parallel while
+  unrelated chains can still use other slots.
+- Added: regression coverage for stale file-lock cleanup, including live-PID
+  protection and age-based cleanup for locks without a readable PID.
+- Added: regression coverage for Mautic 7 terminal planning and legacy
+  dependency expansion.
+
 ## 0.9.112 - 2026-06-01
 
 - Fixed: instance migration now rehomes Mautic instance-local paths after file

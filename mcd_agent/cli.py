@@ -99,6 +99,7 @@ from mcd_agent.mautic6_core_patch import (
     patch_status as mautic6_patch_status,
     revert_m6_plugin_update_metadata_patch,
 )
+from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_version_cache import (
     discover_and_refresh_mautic_version_cache,
     install_zabbix_mautic_version_userparameter,
@@ -2301,6 +2302,7 @@ def main() -> int:
         cutoff_utc = (
             datetime.now(timezone.utc) - timedelta(seconds=max(1800, int(getattr(args, "min_age_sec", 21600) or 21600)))
         ).strftime("%Y-%m-%d %H:%M:%S")
+        file_lock_min_age_sec = max(0, int(getattr(args, "min_age_sec", 21600) or 21600))
         results: list[dict[str, object]] = []
         changed = 0
         for inst in installs:
@@ -2310,9 +2312,24 @@ def main() -> int:
                 "instance_uid": inst.instance_uid,
                 "cutoff_utc": cutoff_utc,
             }
+            try:
+                file_payload = cleanup_stale_mautic_file_locks(
+                    inst.root,
+                    min_age_sec=file_lock_min_age_sec,
+                )
+                row["file_locks"] = file_payload.get("file_locks", [])
+                row["cleared_file_locks"] = int(file_payload.get("cleared_file_locks", 0) or 0)
+                row["skipped_live_file_locks"] = int(file_payload.get("skipped_live_file_locks", 0) or 0)
+                changed += int(row["cleared_file_locks"])
+            except Exception as e:
+                row["file_lock_status"] = "error"
+                row["file_lock_reason"] = str(e)
+                row["cleared_file_locks"] = 0
             if not inst.db:
-                row["status"] = "skipped"
+                row["status"] = "ok"
                 row["reason"] = "missing_db_config"
+                row["cleared_segments"] = 0
+                row["cleared_campaigns"] = 0
                 results.append(row)
                 continue
             try:
@@ -2344,15 +2361,21 @@ def main() -> int:
         else:
             for row in results:
                 print(
-                    "root={root} status={status} cleared_segments={segments} cleared_campaigns={campaigns}".format(
+                    (
+                        "root={root} status={status} cleared_segments={segments} "
+                        "cleared_campaigns={campaigns} cleared_file_locks={file_locks}"
+                    ).format(
                         root=str(row.get("root") or ""),
                         status=str(row.get("status") or "unknown"),
                         segments=int(row.get("cleared_segments", 0) or 0),
                         campaigns=int(row.get("cleared_campaigns", 0) or 0),
+                        file_locks=int(row.get("cleared_file_locks", 0) or 0),
                     )
                 )
                 if str(row.get("status") or "") == "error":
                     print(f"  reason={str(row.get('reason') or '')}")
+                if str(row.get("file_lock_status") or "") == "error":
+                    print(f"  file_lock_reason={str(row.get('file_lock_reason') or '')}")
             print(f"cutoff_utc={cutoff_utc}")
         return 0
 

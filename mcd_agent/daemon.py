@@ -59,6 +59,7 @@ from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
 from mcd_agent.mautic_version_cache import (
     install_zabbix_mautic_version_userparameter,
@@ -91,9 +92,11 @@ from mcd_agent.self_update import maybe_auto_update
 from mcd_agent.segment_filter_safety import format_segment_filter_issues, segment_invalid_filter_issues
 from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
 from mcd_agent.segment_dependencies import (
+    dependency_expanded_segment_plan,
     segment_dependency_blocked_ids,
     segment_dependency_maps,
-    suppress_mautic_cascade_dependencies,
+    mautic7_terminal_segment_plan,
+    segment_related_ids,
     stale_dependent_segment_closure,
 )
 from mcd_agent.signals import collect_signals
@@ -2155,6 +2158,7 @@ def _fill_from_ring(
     popens: dict[str, subprocess.Popen[bytes]],
     build_args,
     blocked_entities: set[int] | None = None,
+    dynamic_blocked=None,
     remove_on_launch: bool = False,
 ) -> None:
     if not ring or ring_limit <= 0 or total_limit <= 0:
@@ -2164,6 +2168,9 @@ def _fill_from_ring(
         eid = ring[0]
         scans -= 1
         if blocked_entities and eid in blocked_entities:
+            ring.rotate(-1)
+            continue
+        if dynamic_blocked is not None and dynamic_blocked(eid):
             ring.rotate(-1)
             continue
         if _is_running(running, root, task_type, eid):
@@ -5626,17 +5633,31 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         segment_dependencies_by_root[root] = dependency_children
                         segment_parents_by_root[root] = dependency_parents
                         if int(getattr(inst, "mautic_major", 0) or 0) >= 7:
-                            standard_segment_ids, suppressed_ids = suppress_mautic_cascade_dependencies(
+                            planned_before = list(standard_segment_ids)
+                            standard_segment_ids, suppressed_ids = mautic7_terminal_segment_plan(
                                 standard_segment_ids,
-                                dependency_parents,
+                                dependency_children,
                             )
-                            if suppressed_ids:
+                            if suppressed_ids or standard_segment_ids != planned_before:
                                 logging.info(
-                                    "[%s] mautic7 segment dependency cascade covered ids=%s",
+                                    "[%s] mautic7 segment terminal plan ids=%s covered_internal_ids=%s",
                                     root,
+                                    ",".join(str(x) for x in standard_segment_ids[:50]) or "-",
                                     ",".join(str(x) for x in sorted(suppressed_ids)[:50]),
                                 )
                         else:
+                            planned_before = list(standard_segment_ids)
+                            standard_segment_ids = dependency_expanded_segment_plan(
+                                standard_segment_ids,
+                                dependency_parents,
+                            )
+                            added_dependencies = sorted(set(standard_segment_ids) - set(planned_before))
+                            if added_dependencies:
+                                logging.info(
+                                    "[%s] legacy segment dependency plan added ids=%s",
+                                    root,
+                                    ",".join(str(x) for x in added_dependencies[:50]),
+                                )
                             recently_finished = _recent_finished_segment_ids(root, now)
                             dependent_ids = stale_dependent_segment_closure(
                                 recently_finished,
@@ -6359,6 +6380,39 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             )
             segment_blocked_ids |= set(segment_invalid_filter_sets.get(root, set()))
             segment_blocked_ids |= set(segment_failure_blocked_sets.get(root, set()))
+            dependency_parents_for_root = segment_parents_by_root.get(root, {})
+            dependency_children_for_root = segment_dependencies_by_root.get(root, {})
+
+            def _segment_chain_running_conflict(eid: int) -> bool:
+                if not dependency_parents_for_root and not dependency_children_for_root:
+                    return False
+                try:
+                    candidate_related = segment_related_ids(
+                        int(eid),
+                        dependency_parents_for_root,
+                        dependency_children_for_root,
+                    )
+                except Exception:
+                    return False
+                if not candidate_related:
+                    return False
+                for task in running.values():
+                    if task.root != root or task.entity_id is None:
+                        continue
+                    if task.task_type not in {"segment", "segment_sql"}:
+                        continue
+                    try:
+                        running_related = segment_related_ids(
+                            int(task.entity_id),
+                            dependency_parents_for_root,
+                            dependency_children_for_root,
+                        )
+                    except Exception:
+                        running_related = {int(task.entity_id)}
+                    if candidate_related & running_related:
+                        return True
+                return False
+
             if _import_in_settle(root, now):
                 import_pending_cache[root] = 0
             _mark_external_entities_executed(
@@ -6550,6 +6604,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             batch_limit=config.segment_batch_limit,
                         ),
                         blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
                     )
 
                 if throttled.get(root, False) and config.segment_throttle_whitelist_only:
@@ -6579,6 +6634,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             batch_limit=config.segment_batch_limit,
                         ),
                         blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
@@ -6607,6 +6663,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             batch_limit=config.segment_batch_limit,
                         ),
                         blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
                     )
                     _fill_from_ring(
                         ring=seg_reg_ring,
@@ -6628,6 +6685,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             batch_limit=config.segment_batch_limit,
                         ),
                         blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total < seg_total_limit:
@@ -6653,6 +6711,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     batch_limit=config.segment_batch_limit,
                                 ),
                                 blocked_entities=segment_blocked_ids,
+                                dynamic_blocked=_segment_chain_running_conflict,
                             )
                         elif seg_reg_ring:
                             _fill_from_ring(
@@ -6675,6 +6734,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     batch_limit=config.segment_batch_limit,
                                 ),
                                 blocked_entities=segment_blocked_ids,
+                                dynamic_blocked=_segment_chain_running_conflict,
                             )
                         elif seg_prio_ring and spill > 0:
                             # If regular ring is empty, keep total segment concurrency at target
@@ -6699,6 +6759,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     batch_limit=config.segment_batch_limit,
                                 ),
                                 blocked_entities=segment_blocked_ids,
+                                dynamic_blocked=_segment_chain_running_conflict,
                             )
 
             # `mautic:campaigns:update` is treated as synonym of
@@ -7102,6 +7163,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     and task.task_type in {"campaign_update", "campaign_rebuild", "campaign_trigger"}
                 }
                 try:
+                    file_lock_res = cleanup_stale_mautic_file_locks(
+                        root,
+                        min_age_sec=max(0, int(config.mautic_lock_cleanup_min_age_sec or 21600)),
+                    )
                     lock_res = db.cleanup_stale_checked_out_locks(
                         cutoff_utc=cutoff_utc,
                         max_rows=config.mautic_lock_cleanup_max_rows_per_run,
@@ -7114,15 +7179,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     camp_rows = camp_rows if isinstance(camp_rows, list) else []
                     cleared_segments = int((lock_res or {}).get("cleared_segments", 0) or 0)
                     cleared_campaigns = int((lock_res or {}).get("cleared_campaigns", 0) or 0)
-                    if cleared_segments > 0 or cleared_campaigns > 0:
+                    file_rows = file_lock_res.get("file_locks") if isinstance(file_lock_res, dict) else []
+                    file_rows = file_rows if isinstance(file_rows, list) else []
+                    cleared_file_locks = int((file_lock_res or {}).get("cleared_file_locks", 0) or 0)
+                    if cleared_segments > 0 or cleared_campaigns > 0 or cleared_file_locks > 0:
                         logging.warning(
-                            "[%s] mautic_lock_cleanup cleared segments=%s campaigns=%s cutoff_utc=%s segment_ids=%s campaign_ids=%s",
+                            (
+                                "[%s] mautic_lock_cleanup cleared segments=%s campaigns=%s file_locks=%s "
+                                "cutoff_utc=%s segment_ids=%s campaign_ids=%s file_lock_paths=%s"
+                            ),
                             root,
                             cleared_segments,
                             cleared_campaigns,
+                            cleared_file_locks,
                             cutoff_utc,
                             ",".join(str(int(row.get("id") or 0)) for row in seg_rows if int(row.get("id") or 0) > 0) or "-",
                             ",".join(str(int(row.get("id") or 0)) for row in camp_rows if int(row.get("id") or 0) > 0) or "-",
+                            ",".join(
+                                str(row.get("path") or "")
+                                for row in file_rows
+                                if str(row.get("status") or "") == "cleared" and str(row.get("path") or "")
+                            )
+                            or "-",
                         )
                     else:
                         logging.debug("[%s] mautic_lock_cleanup idle cutoff_utc=%s", root, cutoff_utc)
