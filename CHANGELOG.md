@@ -5,6 +5,9 @@
 - Fixed: campaign trigger audit ids now persist between scheduler ticks until
   the next audit refresh. This prevents all-published audit candidates from
   being dropped by the narrower due SQL before they receive a trigger slot.
+- Fixed: campaign triggers now wait for a same-campaign `campaigns:update`
+  rebuild pass after planning; after a successful trigger, the next trigger
+  cycle requires a new rebuild first.
 - Added: regression coverage for audit-discovered campaign ids surviving
   repeated due-SQL planning cycles.
 

@@ -10,7 +10,11 @@ from mcd_agent import daemon as daemon_mod
 from mcd_agent.daemon import (
     RunningTask,
     TaskStore,
+    _CAMPAIGN_REBUILD_FINISHED_AT,
+    _campaign_trigger_waits_for_rebuild,
     _effective_segment_slot_limit,
+    _mark_campaign_rebuild_finished,
+    _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
     _published_segment_whitelist_ids,
     _segment_shared_slots_available,
@@ -64,6 +68,41 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn(656, first_plan)
         self.assertIn(656, next_plan)
         self.assertEqual(first_plan.index(656), next_plan.index(656))
+
+    def test_campaign_trigger_waits_for_rebuild_after_plan(self) -> None:
+        _CAMPAIGN_REBUILD_FINISHED_AT.clear()
+        root = "/var/www/site"
+
+        self.assertTrue(
+            _campaign_trigger_waits_for_rebuild(
+                root=root,
+                campaign_id=656,
+                planned_after_ts=100.0,
+                running={},
+            )
+        )
+
+        _mark_campaign_rebuild_finished(root, 656, now_ts=101.0)
+
+        self.assertFalse(
+            _campaign_trigger_waits_for_rebuild(
+                root=root,
+                campaign_id=656,
+                planned_after_ts=100.0,
+                running={},
+            )
+        )
+
+        _mark_campaign_trigger_finished(root, 656)
+
+        self.assertTrue(
+            _campaign_trigger_waits_for_rebuild(
+                root=root,
+                campaign_id=656,
+                planned_after_ts=100.0,
+                running={},
+            )
+        )
 
     def test_task_store_persists_last_launch_for_restart_guard(self) -> None:
         with tempfile.NamedTemporaryFile() as tmp:

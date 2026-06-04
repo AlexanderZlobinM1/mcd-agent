@@ -131,6 +131,7 @@ _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
 _SEGMENT_DEPENDENCY_FINISH_WINDOW_SEC = 2 * 3600
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
+_CAMPAIGN_REBUILD_FINISHED_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FILTER_WARN_TS: dict[tuple[str, str], float] = {}
 _SEGMENT_FAILURE_WARN_TS: dict[tuple[str, int], float] = {}
 _IMPORT_SETTLE_UNTIL: dict[str, float] = {}
@@ -336,6 +337,49 @@ def _mark_segment_finished(root: str, segment_id: int | None, now_ts: float | No
     if sid <= 0:
         return
     _SEGMENT_FINISHED_AT[(str(root), sid)] = float(now_ts or time.time())
+
+
+def _mark_campaign_rebuild_finished(root: str, campaign_id: int | None, now_ts: float | None = None) -> None:
+    if campaign_id is None:
+        return
+    try:
+        cid = int(campaign_id)
+    except Exception:
+        return
+    if cid <= 0:
+        return
+    _CAMPAIGN_REBUILD_FINISHED_AT[(str(root), cid)] = float(now_ts or time.time())
+
+
+def _mark_campaign_trigger_finished(root: str, campaign_id: int | None) -> None:
+    if campaign_id is None:
+        return
+    try:
+        cid = int(campaign_id)
+    except Exception:
+        return
+    if cid <= 0:
+        return
+    _CAMPAIGN_REBUILD_FINISHED_AT.pop((str(root), cid), None)
+
+
+def _campaign_trigger_waits_for_rebuild(
+    *,
+    root: str,
+    campaign_id: int,
+    planned_after_ts: float,
+    running: dict[str, "RunningTask"],
+) -> bool:
+    try:
+        cid = int(campaign_id)
+    except Exception:
+        return False
+    if cid <= 0:
+        return False
+    if _is_running(running, root, "campaign_rebuild", cid):
+        return True
+    rebuilt_at = float(_CAMPAIGN_REBUILD_FINISHED_AT.get((str(root), cid), 0.0) or 0.0)
+    return rebuilt_at < float(planned_after_ts or 0.0)
 
 
 def _segment_failure_blocked_ids(store: "TaskStore", root: str) -> set[int]:
@@ -4335,6 +4379,10 @@ def _monitor_running(
                 store.finish(task.row_id, state=state, rc=rc, note=note)
                 if rc == 0 and task.task_type == "segment":
                     _mark_segment_finished(task.root, task.entity_id, now_ts=now)
+                if rc == 0 and task.task_type == "campaign_rebuild":
+                    _mark_campaign_rebuild_finished(task.root, task.entity_id, now_ts=now)
+                if rc == 0 and task.task_type == "campaign_trigger":
+                    _mark_campaign_trigger_finished(task.root, task.entity_id)
                 if rc == 0 and task.task_type == "import":
                     _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
                 running.pop(key, None)
@@ -4747,6 +4795,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_empty_leads_cleanup_skip_ts: dict[str, float] = {}
     last_campaign_trigger_audit_ts: dict[str, float] = {}
     campaign_trigger_audit_ids_by_root: dict[str, list[int]] = {}
+    campaign_trigger_plan_started_at_by_root: dict[str, dict[int, float]] = {}
     last_empty_leads_cleanup_cron_minute: dict[str, str] = {}
     empty_leads_cleanup_window_counts: dict[str, int] = {}
     empty_leads_cleanup_window_keys: dict[str, str] = {}
@@ -5607,6 +5656,32 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_trigger_ids = []
                     campaign_rebuild_ids = []
 
+                if campaign_trigger_ids is not None:
+                    trigger_plan_started_at = campaign_trigger_plan_started_at_by_root.setdefault(root, {})
+                    planned_trigger_ids = {int(x) for x in campaign_trigger_ids if int(x) > 0}
+                    for stale_id in list(trigger_plan_started_at):
+                        if stale_id not in planned_trigger_ids:
+                            trigger_plan_started_at.pop(stale_id, None)
+                            _CAMPAIGN_REBUILD_FINISHED_AT.pop((str(root), stale_id), None)
+                    for cid in planned_trigger_ids:
+                        trigger_plan_started_at.setdefault(cid, now)
+                    if config.enable_campaign_rebuild and campaign_rebuild_ids is not None:
+                        rebuild_before_trigger_ids = [
+                            int(cid)
+                            for cid in campaign_trigger_ids
+                            if _campaign_trigger_waits_for_rebuild(
+                                root=root,
+                                campaign_id=int(cid),
+                                planned_after_ts=trigger_plan_started_at.get(int(cid), now),
+                                running=running,
+                            )
+                        ]
+                        if rebuild_before_trigger_ids:
+                            campaign_rebuild_ids = _merge_campaign_trigger_audit_ids(
+                                campaign_rebuild_ids,
+                                rebuild_before_trigger_ids,
+                            )
+
                 if campaign_query_error is not None and _is_db_dispatch_pause_error(campaign_query_error):
                     _mark_db_dispatch_pause(
                         root=root,
@@ -6389,6 +6464,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set())
             reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set())
             reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set())
+            trigger_plan_started_at = campaign_trigger_plan_started_at_by_root.setdefault(root, {})
             segment_blocked_ids = segment_dependency_blocked_ids(
                 root=root,
                 candidate_ids=set(seg_prio_set) | set(seg_reg_set) | set(seg_sql_active),
@@ -6430,6 +6506,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if candidate_related & running_related:
                         return True
                 return False
+
+            def _trigger_waits_for_rebuild(cid: int) -> bool:
+                if not config.enable_campaign_rebuild:
+                    return False
+                return _campaign_trigger_waits_for_rebuild(
+                    root=root,
+                    campaign_id=int(cid),
+                    planned_after_ts=trigger_plan_started_at.get(int(cid), now),
+                    running=running,
+                )
 
             if _import_in_settle(root, now):
                 import_pending_cache[root] = 0
@@ -6792,6 +6878,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     elif trg_reg_ring:
                         next_trigger_id = trg_reg_ring[0]
                         trg_reg_ring.rotate(-1)
+                    if next_trigger_id is not None and _trigger_waits_for_rebuild(int(next_trigger_id)):
+                        next_trigger_id = None
 
                     if next_trigger_id is not None:
                         launched = _submit_if_slot(
@@ -6938,6 +7026,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_limit=config.campaign_limit,
                     batch_limit=config.campaign_batch_limit,
                 ),
+                dynamic_blocked=_trigger_waits_for_rebuild,
                 remove_on_launch=True,
             )
             _fill_from_ring(
@@ -6960,6 +7049,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_limit=config.campaign_limit,
                     batch_limit=config.campaign_batch_limit,
                 ),
+                dynamic_blocked=_trigger_waits_for_rebuild,
                 remove_on_launch=True,
             )
             trg_cur_total = _running_count(running, root, "campaign_trigger")
@@ -6986,6 +7076,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             campaign_limit=config.campaign_limit,
                             batch_limit=config.campaign_batch_limit,
                         ),
+                        dynamic_blocked=_trigger_waits_for_rebuild,
                         remove_on_launch=True,
                     )
                 elif trg_prio_ring:
@@ -7009,6 +7100,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             campaign_limit=config.campaign_limit,
                             batch_limit=config.campaign_batch_limit,
                         ),
+                        dynamic_blocked=_trigger_waits_for_rebuild,
                         remove_on_launch=True,
                     )
             if cluster_cron_allowed and config.enable_campaign_rebuild:
