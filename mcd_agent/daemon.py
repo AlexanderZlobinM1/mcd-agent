@@ -2074,6 +2074,17 @@ def _split_campaign_circles(
     return priority, regular
 
 
+def _merge_campaign_trigger_audit_ids(due_ids: list[int], audit_ids: list[int]) -> list[int]:
+    """Keep audit-discovered published campaigns in the trigger plan.
+
+    The narrow due SQL can miss campaigns that still need a regular trigger
+    pass for newly-added contacts. The periodic all-published audit is the
+    safety net for those campaigns, so its ids must survive more than one
+    scheduler tick.
+    """
+    return list(dict.fromkeys(list(due_ids or []) + list(audit_ids or [])))
+
+
 def _needs_weight_recalc(ids: list[int], cached: dict[int, float]) -> bool:
     if not cached:
         return True
@@ -4735,6 +4746,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_empty_leads_cleanup_idle_ts: dict[str, float] = {}
     last_empty_leads_cleanup_skip_ts: dict[str, float] = {}
     last_campaign_trigger_audit_ts: dict[str, float] = {}
+    campaign_trigger_audit_ids_by_root: dict[str, list[int]] = {}
     last_empty_leads_cleanup_cron_minute: dict[str, str] = {}
     empty_leads_cleanup_window_counts: dict[str, int] = {}
     empty_leads_cleanup_window_keys: dict[str, str] = {}
@@ -5558,9 +5570,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         audit_interval = max(0, int(getattr(config, "campaign_trigger_audit_interval_sec", 0) or 0))
                         if audit_interval > 0 and now - float(last_campaign_trigger_audit_ts.get(root, 0.0)) >= float(audit_interval):
                             audit_ids = db.fetch_ids(_SQL_CAMPAIGNS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
+                            campaign_trigger_audit_ids_by_root[root] = list(dict.fromkeys(audit_ids or []))
                             if audit_ids:
                                 before = set(campaign_trigger_ids)
-                                campaign_trigger_ids = list(dict.fromkeys(campaign_trigger_ids + audit_ids))
+                                campaign_trigger_ids = _merge_campaign_trigger_audit_ids(campaign_trigger_ids, audit_ids)
                                 added = sorted(set(campaign_trigger_ids) - before)
                                 logging.info(
                                     "[%s] campaign trigger audit planned ids=%s added=%s interval=%ss",
@@ -5570,6 +5583,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     audit_interval,
                                 )
                             last_campaign_trigger_audit_ts[root] = now
+                        elif campaign_trigger_audit_ids_by_root.get(root):
+                            campaign_trigger_ids = _merge_campaign_trigger_audit_ids(
+                                campaign_trigger_ids,
+                                campaign_trigger_audit_ids_by_root[root],
+                            )
                     except Exception as e:
                         campaign_query_error = e
                         logging.warning("[%s] campaign trigger query failed: %s", root, e)

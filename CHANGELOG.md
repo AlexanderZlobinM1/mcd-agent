@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.116 - 2026-06-04
+
+- Fixed: campaign trigger audit ids now persist between scheduler ticks until
+  the next audit refresh. This prevents all-published audit candidates from
+  being dropped by the narrower due SQL before they receive a trigger slot.
+- Added: regression coverage for audit-discovered campaign ids surviving
+  repeated due-SQL planning cycles.
+
 ## 0.9.115 - 2026-06-01
 
 - Fixed: Mautic lock cleanup now also clears stale Symfony command lock files

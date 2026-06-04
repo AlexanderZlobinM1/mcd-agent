@@ -11,6 +11,7 @@ from mcd_agent.daemon import (
     RunningTask,
     TaskStore,
     _effective_segment_slot_limit,
+    _merge_campaign_trigger_audit_ids,
     _published_segment_whitelist_ids,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
@@ -53,6 +54,16 @@ class CampaignRingDispatchTests(unittest.TestCase):
         )
 
         self.assertEqual(_task_repeat_interval_sec(cfg, "campaign_trigger"), 300)
+
+    def test_campaign_trigger_audit_ids_persist_between_due_sql_cycles(self) -> None:
+        audit_ids = [684, 683, 681, 678, 668, 667, 657, 656]
+
+        first_plan = _merge_campaign_trigger_audit_ids([684, 683], audit_ids)
+        next_plan = _merge_campaign_trigger_audit_ids([684, 683], audit_ids)
+
+        self.assertIn(656, first_plan)
+        self.assertIn(656, next_plan)
+        self.assertEqual(first_plan.index(656), next_plan.index(656))
 
     def test_task_store_persists_last_launch_for_restart_guard(self) -> None:
         with tempfile.NamedTemporaryFile() as tmp:
