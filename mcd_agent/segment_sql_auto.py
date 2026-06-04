@@ -9,6 +9,15 @@ import phpserialize
 
 _SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _URL_LAST_DAYS_RE = re.compile(r"^(url|url_title)_in_last_(\d+)_days$", re.IGNORECASE)
+_ABS_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RELATIVE_INTERVAL_RE = re.compile(
+    r"^(?:today\s+)?(?P<sign>[+-])\s*(?P<count>\d+)\s*(?P<unit>day|days|week|weeks|month|months|year|years)$",
+    re.IGNORECASE,
+)
+_RELATIVE_AGO_RE = re.compile(
+    r"^(?P<count>\d+)\s*(?P<unit>day|days|week|weeks|month|months|year|years)\s+ago$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +122,59 @@ def _compile_not_like_any(expr: str, null_expr: str, values: list[str]) -> str |
     return f"({null_expr} IS NULL OR (" + " AND ".join(parts) + "))"
 
 
+def _date_sql_expr(value: str) -> str | None:
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"\s+", " ", raw)
+    if not raw:
+        return None
+    if _ABS_DATE_RE.match(raw):
+        return f"DATE({_sql_quote(raw)})"
+    if raw == "today":
+        return "DATE('{now_local}')"
+    if raw == "yesterday":
+        return "DATE(DATE_SUB('{now_local}', INTERVAL 1 DAY))"
+    if raw == "tomorrow":
+        return "DATE(DATE_ADD('{now_local}', INTERVAL 1 DAY))"
+
+    match = _RELATIVE_AGO_RE.match(raw)
+    if match:
+        count = int(match.group("count"))
+        unit = match.group("unit").rstrip("s").upper()
+        return f"DATE(DATE_SUB('{{now_local}}', INTERVAL {count} {unit}))"
+
+    match = _RELATIVE_INTERVAL_RE.match(raw)
+    if not match:
+        return None
+    count = int(match.group("count"))
+    unit = match.group("unit").rstrip("s").upper()
+    direction = "DATE_ADD" if match.group("sign") == "+" else "DATE_SUB"
+    return f"DATE({direction}('{{now_local}}', INTERVAL {count} {unit}))"
+
+
+def _compile_date_clause(col_expr: str, operator: str, value: str) -> str | None:
+    date_expr = _date_sql_expr(value)
+    if date_expr is None:
+        return None
+    op_map = {
+        "eq": "=",
+        "=": "=",
+        "neq": "<>",
+        "!=": "<>",
+        "gt": ">",
+        ">": ">",
+        "gte": ">=",
+        ">=": ">=",
+        "lt": "<",
+        "<": "<",
+        "lte": "<=",
+        "<=": "<=",
+    }
+    sql_op = op_map.get(operator)
+    if not sql_op:
+        return None
+    return f"(DATE({col_expr}) {sql_op} {date_expr})"
+
+
 def _normalize_lead_columns(raw: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None) -> set[str] | None:
     if raw is None:
         return None
@@ -155,6 +217,7 @@ def _compile_lead_clause(
 
     col_expr = f"l.`{field}`"
     cast_expr = f"CAST({col_expr} AS CHAR CHARACTER SET utf8mb4)"
+    field_type = str(clause.get("type") or "").strip().lower()
     if operator == "!empty":
         return _CompiledClause(
             sql=f"({col_expr} IS NOT NULL AND {cast_expr} <> '')",
@@ -165,6 +228,14 @@ def _compile_lead_clause(
             sql=f"({col_expr} IS NULL OR {cast_expr} = '')",
             has_page_hits=False,
         )
+    if field_type in {"date", "datetime"}:
+        values = _normalize_filter_values(_clause_filter_value(clause))
+        if len(values) != 1:
+            return None
+        date_sql = _compile_date_clause(col_expr, operator, values[0])
+        if date_sql is None:
+            return None
+        return _CompiledClause(sql=date_sql, has_page_hits=False)
     if operator in {"contains", "like"}:
         values = _normalize_filter_values(_clause_filter_value(clause))
         like_sql = _compile_like_any(cast_expr, values)

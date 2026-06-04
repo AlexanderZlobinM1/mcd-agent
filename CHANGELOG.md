@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.117 - 2026-06-04
+
+- Fixed: SQL-auto segment rebuilds now compile Mautic relative date filters
+  (`today`, `yesterday`, `tomorrow`, `+/-N days`, `N days ago`) as date
+  expressions based on the instance-local `{now_local}` clock instead of
+  comparing date fields with literal strings such as `'-1 day'`. This prevents
+  optimized SQL rebuilds from emptying valid segments like AnanasMK segment 191.
+- Added: regression coverage for Mautic serialized relative date filters in
+  SQL-auto segment rule detection.
+
 ## 0.9.116 - 2026-06-04
 
 - Fixed: campaign trigger audit ids now persist between scheduler ticks until
