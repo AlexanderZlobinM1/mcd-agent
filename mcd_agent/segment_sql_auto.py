@@ -273,7 +273,7 @@ def _compile_behavior_clause(clause: dict[str, object]) -> _CompiledClause | Non
     match = _URL_LAST_DAYS_RE.match(field)
     if match:
         target_col = match.group(1).lower()
-        days_expr = f"ph.date_hit >= DATE_SUB('{{now_local}}', INTERVAL {int(match.group(2))} DAY)"
+        days_expr = f"ph.date_hit >= DATE(DATE_SUB('{{now_local}}', INTERVAL {int(match.group(2))} DAY))"
     elif field == "hit_url":
         target_col = "url"
     elif field == "url_title":

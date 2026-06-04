@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.118 - 2026-06-04
+
+- Fixed: SQL-auto `url_in_last_N_days` / `url_title_in_last_N_days`
+  page-hit filters now use Mautic's local calendar-day window
+  (`DATE(DATE_SUB({now_local}, INTERVAL N DAY))`) instead of a sliding
+  `N * 24h` window. This brings SQL preview/rebuild results in line with
+  native `mautic:segments:update` for behavior segments.
+- Added: regression coverage for page-hit last-days SQL generation.
+
 ## 0.9.117 - 2026-06-04
 
 - Fixed: SQL-auto segment rebuilds now compile Mautic relative date filters
