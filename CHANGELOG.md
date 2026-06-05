@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.121 - 2026-06-05
+
+- Added: segment scheduler monitoring now publishes a per-root cycle snapshot
+  with queued, running and already-launched segment ids. MCC can show the
+  current ring pass in the Queued lane instead of relying only on recent task
+  history.
+- Fixed: segment monitor cycles reset after all planned ids complete, so the
+  next ring pass returns ids to Queued and Finished does not accumulate repeat
+  ovals for the same segment.
+- Added: regression coverage for segment monitor cycle snapshots.
+
 ## 0.9.120 - 2026-06-05
 
 - Added: scheduler signals now include recently finished MCD tasks, so MCC live

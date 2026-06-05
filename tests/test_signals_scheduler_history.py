@@ -33,6 +33,15 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE runtime_sync (
+                  key TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  updated_at REAL NOT NULL
+                )
+                """
+            )
             now = time.time()
             conn.execute(
                 """
@@ -60,6 +69,17 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                     0,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO runtime_sync(key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "scheduler_monitor_plan:abc",
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[51,63],"done":[110],"running":[61],"total":4}]}',
+                    now,
+                ),
+            )
             conn.commit()
             conn.close()
 
@@ -70,6 +90,9 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(payload["sample"][0]["entity_id"], 61)
         self.assertEqual(payload["recent"][0]["entity_id"], 110)
         self.assertEqual(payload["recent"][0]["rc"], 0)
+        self.assertEqual(payload["planned"][0]["root"], "/var/www/mautic")
+        self.assertEqual(payload["planned"][0]["queued"], [51, 63])
+        self.assertEqual(payload["planned"][0]["done"], [110])
 
 
 if __name__ == "__main__":

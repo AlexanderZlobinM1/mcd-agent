@@ -13,8 +13,11 @@ from typing import Any
 from mcd_agent.config import AgentConfig
 
 
+_SCHEDULER_MONITOR_PLAN_PREFIX = "scheduler_monitor_plan:"
+
+
 def _empty_scheduler_shadow() -> dict[str, Any]:
-    return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": [], "recent": []}
+    return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": [], "recent": [], "planned": []}
 
 
 def _run_journal(args: list[str], timeout_sec: int = 4) -> str:
@@ -161,6 +164,20 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
         ).fetchall()
     except Exception:
         return _empty_scheduler_shadow()
+    planned_rows: list[sqlite3.Row] = []
+    try:
+        planned_rows = conn.execute(
+            """
+            SELECT payload_json, updated_at
+            FROM runtime_sync
+            WHERE key LIKE ?
+            ORDER BY updated_at DESC
+            LIMIT 200
+            """,
+            (_SCHEDULER_MONITOR_PLAN_PREFIX + "%",),
+        ).fetchall()
+    except Exception:
+        planned_rows = []
     finally:
         try:
             conn.close()
@@ -202,6 +219,36 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
                 "rc": int(row["rc"]) if row["rc"] is not None else None,
             }
         )
+    planned: list[dict[str, Any]] = []
+    for row in planned_rows:
+        raw = str(row["payload_json"] or "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        root = str(payload.get("root", "") or "").strip()
+        cycles = payload.get("cycles") if isinstance(payload.get("cycles"), list) else []
+        for cycle in cycles:
+            if not isinstance(cycle, dict):
+                continue
+            task_type = str(cycle.get("task_type", "") or "").strip()
+            if not task_type:
+                continue
+            planned.append(
+                {
+                    "root": root,
+                    "task_type": task_type,
+                    "queued": [int(x) for x in list(cycle.get("queued") or []) if str(x).strip().isdigit()],
+                    "done": [int(x) for x in list(cycle.get("done") or []) if str(x).strip().isdigit()],
+                    "running": [int(x) for x in list(cycle.get("running") or []) if str(x).strip().isdigit()],
+                    "total": int(cycle.get("total", 0) or 0),
+                    "updated_at": float(payload.get("updated_at", row["updated_at"] or 0.0) or 0.0),
+                }
+            )
     duplicate_task_keys = sum(1 for count in key_counts.values() if int(count or 0) > 1)
     return {
         "tracked_total": len(rows),
@@ -209,6 +256,7 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
         "by_type": by_type,
         "sample": sample,
         "recent": recent,
+        "planned": planned,
     }
 
 

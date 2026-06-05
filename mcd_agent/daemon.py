@@ -1525,6 +1525,7 @@ def _run_sql_segment_ring(
     sql_ctx: dict[str, str],
     now_ts: float,
     now_local: datetime,
+    on_launch=None,
 ) -> int:
     if not config.segment_sql_ring_enabled:
         return 0
@@ -1593,6 +1594,11 @@ def _run_sql_segment_ring(
             )
             _mark_segment_finished(root, sid, now_ts=now_ts)
             done_set.add(sid)
+            if on_launch is not None:
+                try:
+                    on_launch(sid)
+                except Exception:
+                    pass
             _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment_sql", sid)] = float(now_ts)
             # Keep shared cooldown in sync with regular `segment` task type.
             _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment", sid)] = float(now_ts)
@@ -2199,6 +2205,111 @@ def _clear_campaign_rings(
     rebuild_reg_sets[root] = set()
 
 
+_SCHEDULER_MONITOR_PLAN_PREFIX = "scheduler_monitor_plan:"
+
+
+def _scheduler_monitor_plan_key(root: str) -> str:
+    digest = hashlib.sha1(str(root or "").encode("utf-8")).hexdigest()
+    return f"{_SCHEDULER_MONITOR_PLAN_PREFIX}{digest}"
+
+
+def _unique_positive_ids(ids: list[int] | deque[int] | tuple[int, ...]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in ids:
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value <= 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _monitor_cycle_mark_launched(
+    cycle_done: dict[tuple[str, str], set[int]],
+    *,
+    root: str,
+    task_type: str,
+    entity_id: int | None,
+) -> None:
+    if entity_id is None:
+        return
+    try:
+        eid = int(entity_id)
+    except Exception:
+        return
+    if eid <= 0:
+        return
+    cycle_done.setdefault((str(root), str(task_type)), set()).add(eid)
+
+
+def _monitor_running_entity_ids(
+    running: dict[str, "RunningTask"],
+    *,
+    root: str,
+    task_types: set[str],
+) -> set[int]:
+    out: set[int] = set()
+    for task in running.values():
+        if task.root != root or task.task_type not in task_types or task.entity_id is None:
+            continue
+        try:
+            eid = int(task.entity_id)
+        except Exception:
+            continue
+        if eid > 0:
+            out.add(eid)
+    return out
+
+
+def _publish_segment_monitor_cycle(
+    *,
+    store: "TaskStore",
+    root: str,
+    cycle_done: dict[tuple[str, str], set[int]],
+    running: dict[str, "RunningTask"],
+    now_ts: float,
+    seg_sql_ring: deque[int],
+    seg_resume_ring: deque[int],
+    seg_prio_ring: deque[int],
+    seg_reg_ring: deque[int],
+) -> None:
+    planned = _unique_positive_ids(
+        list(seg_sql_ring) + list(seg_resume_ring) + list(seg_prio_ring) + list(seg_reg_ring)
+    )
+    planned_set = set(planned)
+    done_set = cycle_done.setdefault((str(root), "segment"), set())
+    if not planned_set:
+        done_set.clear()
+    else:
+        done_set.intersection_update(planned_set)
+
+    running_ids = _monitor_running_entity_ids(running, root=root, task_types={"segment", "segment_sql"})
+    if planned_set and planned_set.issubset(done_set) and not (running_ids & planned_set):
+        done_set.clear()
+
+    done_ordered = [sid for sid in planned if sid in done_set]
+    queued = [sid for sid in planned if sid not in done_set and sid not in running_ids]
+    payload = {
+        "version": 1,
+        "root": str(root),
+        "updated_at": float(now_ts),
+        "cycles": [
+            {
+                "task_type": "segment",
+                "queued": queued[:200],
+                "done": done_ordered[:200],
+                "running": sorted(running_ids & planned_set)[:200],
+                "total": len(planned),
+            }
+        ],
+    }
+    store.put_runtime_sync(_scheduler_monitor_plan_key(root), payload)
+
+
 def _fill_from_ring(
     *,
     ring: deque[int],
@@ -2215,6 +2326,7 @@ def _fill_from_ring(
     blocked_entities: set[int] | None = None,
     dynamic_blocked=None,
     remove_on_launch: bool = False,
+    on_launch=None,
 ) -> None:
     if not ring or ring_limit <= 0 or total_limit <= 0:
         return
@@ -2248,6 +2360,11 @@ def _fill_from_ring(
             popens=popens,
         )
         if launched:
+            if on_launch is not None:
+                try:
+                    on_launch(eid)
+                except Exception:
+                    pass
             _advance_ring_after_launch(ring, eid, remove_on_launch=remove_on_launch)
         else:
             break
@@ -4567,6 +4684,7 @@ def _mark_external_entities_executed(
     trg_reg_ring: deque[int],
     reb_prio_ring: deque[int],
     reb_reg_ring: deque[int],
+    monitor_cycle_done: dict[tuple[str, str], set[int]] | None = None,
 ) -> None:
     for task in running.values():
         if not bool(getattr(task, "external", False)):
@@ -4579,6 +4697,13 @@ def _mark_external_entities_executed(
             _mark_ring_entity_executed(seg_sql_ring, entity_id)
             _mark_ring_entity_executed(seg_prio_ring, entity_id)
             _mark_ring_entity_executed(seg_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="segment",
+                    entity_id=entity_id,
+                )
         elif task.task_type == "campaign_trigger":
             _mark_ring_entity_executed(trg_prio_ring, entity_id)
             _mark_ring_entity_executed(trg_reg_ring, entity_id)
@@ -4609,6 +4734,7 @@ def _dispatch_manual_requests_for_root(
     trg_reg_ring: deque[int],
     reb_prio_ring: deque[int],
     reb_reg_ring: deque[int],
+    monitor_cycle_done: dict[tuple[str, str], set[int]] | None = None,
 ) -> None:
     pending = store.pending_manual_requests(root, limit=64)
     if not pending:
@@ -4657,6 +4783,13 @@ def _dispatch_manual_requests_for_root(
             _mark_ring_entity_executed(seg_sql_ring, entity_id)
             _mark_ring_entity_executed(seg_prio_ring, entity_id)
             _mark_ring_entity_executed(seg_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="segment",
+                    entity_id=entity_id,
+                )
         elif task_type == "campaign_trigger":
             _mark_ring_entity_executed(trg_prio_ring, entity_id)
             _mark_ring_entity_executed(trg_reg_ring, entity_id)
@@ -4776,6 +4909,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     campaign_rebuild_reg_sets: dict[str, set[int]] = {}
     campaign_round_robin: dict[str, int] = {}
     segment_resume_rings: dict[str, deque[int]] = {}
+    monitor_cycle_done: dict[tuple[str, str], set[int]] = {}
     queue_samples: dict[str, deque[tuple[float, int]]] = {}
     throttled: dict[str, bool] = {}
     last_import_poll_ts: dict[str, float] = {}
@@ -5477,6 +5611,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         trg_reg_ring=campaign_trigger_reg_rings.setdefault(root, deque()),
                         reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
                         reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
+                        monitor_cycle_done=monitor_cycle_done,
                     )
                 if now >= next_passive_notice_at:
                     logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
@@ -6387,6 +6522,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     trg_reg_ring=campaign_trigger_reg_rings.setdefault(root, deque()),
                     reb_prio_ring=campaign_rebuild_prio_rings.setdefault(root, deque()),
                     reb_reg_ring=campaign_rebuild_reg_rings.setdefault(root, deque()),
+                    monitor_cycle_done=monitor_cycle_done,
                 )
             if now >= next_passive_notice_at:
                 logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
@@ -6517,6 +6653,41 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     running=running,
                 )
 
+            def _mark_segment_cycle(sid: int) -> None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="segment",
+                    entity_id=sid,
+                )
+
+            def _publish_monitor_cycle() -> None:
+                if config.segment_mode == "classic_loop":
+                    empty_ring: deque[int] = deque()
+                    _publish_segment_monitor_cycle(
+                        store=store,
+                        root=root,
+                        cycle_done=monitor_cycle_done,
+                        running=running,
+                        now_ts=now,
+                        seg_sql_ring=empty_ring,
+                        seg_resume_ring=empty_ring,
+                        seg_prio_ring=empty_ring,
+                        seg_reg_ring=empty_ring,
+                    )
+                    return
+                _publish_segment_monitor_cycle(
+                    store=store,
+                    root=root,
+                    cycle_done=monitor_cycle_done,
+                    running=running,
+                    now_ts=now,
+                    seg_sql_ring=seg_sql_ring,
+                    seg_resume_ring=segment_resume_rings.setdefault(root, deque()),
+                    seg_prio_ring=seg_prio_ring,
+                    seg_reg_ring=seg_reg_ring,
+                )
+
             if _import_in_settle(root, now):
                 import_pending_cache[root] = 0
             _mark_external_entities_executed(
@@ -6530,12 +6701,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 trg_reg_ring=trg_reg_ring,
                 reb_prio_ring=reb_prio_ring,
                 reb_reg_ring=reb_reg_ring,
+                monitor_cycle_done=monitor_cycle_done,
             )
 
             if dispatch_pause:
+                _publish_monitor_cycle()
                 continue
             db_pause_until = float(db_dispatch_pause_until.get(root, 0.0))
             if db_pause_until > now:
+                _publish_monitor_cycle()
                 continue
             if db_pause_until > 0:
                 logging.info(
@@ -6559,9 +6733,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 trg_reg_ring=trg_reg_ring,
                 reb_prio_ring=reb_prio_ring,
                 reb_reg_ring=reb_reg_ring,
+                monitor_cycle_done=monitor_cycle_done,
             )
 
             if not (cluster_cron_allowed or cluster_import_allowed or cluster_cache_allowed):
+                _publish_monitor_cycle()
                 continue
 
             segment_slot_limit = _effective_segment_slot_limit(config, throttled.get(root, False))
@@ -6596,6 +6772,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     sql_ctx=sql_ctx,
                     now_ts=now,
                     now_local=inst_now,
+                    on_launch=_mark_segment_cycle,
                 )
 
             if cluster_cron_allowed and config.segment_mode == "classic_loop":
@@ -6709,6 +6886,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         blocked_entities=segment_blocked_ids,
                         dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
                     )
 
                 if throttled.get(root, False) and config.segment_throttle_whitelist_only:
@@ -6739,6 +6917,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         blocked_entities=segment_blocked_ids,
                         dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
@@ -6768,6 +6947,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         blocked_entities=segment_blocked_ids,
                         dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
                     )
                     _fill_from_ring(
                         ring=seg_reg_ring,
@@ -6790,6 +6970,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         blocked_entities=segment_blocked_ids,
                         dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
                     )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total < seg_total_limit:
@@ -6816,6 +6997,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 ),
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
+                                on_launch=_mark_segment_cycle,
                             )
                         elif seg_reg_ring:
                             _fill_from_ring(
@@ -6839,6 +7021,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 ),
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
+                                on_launch=_mark_segment_cycle,
                             )
                         elif seg_prio_ring and spill > 0:
                             # If regular ring is empty, keep total segment concurrency at target
@@ -6864,7 +7047,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 ),
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
+                                on_launch=_mark_segment_cycle,
                             )
+
+            _publish_monitor_cycle()
 
             # `mautic:campaigns:update` is treated as synonym of
             # `mautic:campaigns:rebuild` and is not scheduled separately.
