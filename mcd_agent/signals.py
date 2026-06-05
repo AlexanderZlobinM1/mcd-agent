@@ -6,10 +6,15 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from mcd_agent.config import AgentConfig
+
+
+def _empty_scheduler_shadow() -> dict[str, Any]:
+    return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": [], "recent": []}
 
 
 def _run_journal(args: list[str], timeout_sec: int = 4) -> str:
@@ -123,13 +128,13 @@ def _ps_console_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
 
 def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
     if cfg is None:
-        return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": []}
+        return _empty_scheduler_shadow()
     db_path = str(getattr(cfg, "state_db_path", "") or "").strip()
     if not db_path:
-        return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": []}
+        return _empty_scheduler_shadow()
     path = Path(db_path)
     if not path.exists():
-        return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": []}
+        return _empty_scheduler_shadow()
     try:
         conn = sqlite3.connect(str(path), timeout=2)
         conn.row_factory = sqlite3.Row
@@ -141,8 +146,21 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
             ORDER BY id ASC
             """
         ).fetchall()
+        recent_cutoff = time.time() - 600
+        recent_rows = conn.execute(
+            """
+            SELECT id, root, task_key, task_type, entity_id, pid, command_str, started_at, finished_at, state, rc
+            FROM tasks
+            WHERE state IN ('done', 'failed', 'timeout')
+              AND finished_at IS NOT NULL
+              AND finished_at >= ?
+            ORDER BY finished_at DESC, id DESC
+            LIMIT 40
+            """,
+            (recent_cutoff,),
+        ).fetchall()
     except Exception:
-        return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": []}
+        return _empty_scheduler_shadow()
     finally:
         try:
             conn.close()
@@ -168,12 +186,29 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
                     "started_at": float(row["started_at"] or 0.0),
                 }
             )
+    recent: list[dict[str, Any]] = []
+    for row in recent_rows:
+        state = str(row["state"] or "").strip() or "done"
+        recent.append(
+            {
+                "id": int(row["id"] or 0),
+                "root": str(row["root"] or "").strip(),
+                "task_type": str(row["task_type"] or "").strip() or "unknown",
+                "entity_id": int(row["entity_id"]) if row["entity_id"] is not None else None,
+                "pid": int(row["pid"] or 0),
+                "started_at": float(row["started_at"] or 0.0),
+                "finished_at": float(row["finished_at"] or 0.0),
+                "state": state,
+                "rc": int(row["rc"]) if row["rc"] is not None else None,
+            }
+        )
     duplicate_task_keys = sum(1 for count in key_counts.values() if int(count or 0) > 1)
     return {
         "tracked_total": len(rows),
         "duplicate_task_keys": duplicate_task_keys,
         "by_type": by_type,
         "sample": sample,
+        "recent": recent,
     }
 
 
@@ -460,6 +495,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
             "duplicate_task_keys": duplicate_task_keys,
             "by_type": scheduler_shadow.get("by_type", {}),
             "sample": scheduler_shadow.get("sample", []),
+            "recent": scheduler_shadow.get("recent", []),
         },
         "php_console_recent": console_rows[:20],
         "swap": swap_state,

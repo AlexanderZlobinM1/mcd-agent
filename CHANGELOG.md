@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.120 - 2026-06-05
+
+- Added: scheduler signals now include recently finished MCD tasks, so MCC live
+  monitoring can show fast segment/rebuild/trigger jobs after they complete
+  instead of losing them between polling intervals.
+- Added: regression coverage for recent scheduler history in MCD signals.
+
 ## 0.9.119 - 2026-06-05
 
 - Fixed: active campaign profiles now self-heal legacy runtime configs that
