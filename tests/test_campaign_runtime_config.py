@@ -60,6 +60,47 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.campaign_limit, 0)
 
+    def test_active_campaign_trigger_reenables_legacy_disabled_rebuild(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "tiny"',
+                    "[runtime]",
+                    "enable_campaign_rebuild = false",
+                    "campaign_trigger_regular_parallel = 1",
+                    "campaign_rebuild_regular_parallel = 0",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertTrue(cfg.enable_campaign_rebuild)
+        self.assertEqual(cfg.campaign_rebuild_regular_parallel, 1)
+
+    def test_passive_profile_keeps_campaign_rebuild_disabled(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "passive"',
+                    "[runtime]",
+                    "enable_campaign_rebuild = false",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertFalse(cfg.enable_campaign_rebuild)
+
 
 if __name__ == "__main__":
     unittest.main()

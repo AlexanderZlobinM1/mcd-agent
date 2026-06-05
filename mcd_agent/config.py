@@ -788,6 +788,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             ring_mode="single",
             disable_throttle=True,
             disable_whitelist=True,
+            enable_campaign_rebuild=True,
             segment_priority_weight_threshold=999999,
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
@@ -811,6 +812,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             ring_mode="single",
             disable_throttle=True,
             disable_whitelist=True,
+            enable_campaign_rebuild=True,
             segment_priority_weight_threshold=999999,
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
@@ -859,6 +861,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             ring_mode="dual",
             disable_throttle=True,
             disable_whitelist=False,
+            enable_campaign_rebuild=True,
             segment_priority_size=10,
             campaign_priority_size=10,
             segment_priority_parallel_idle=3,
@@ -880,6 +883,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             ring_mode="dual",
             disable_throttle=False,
             disable_whitelist=False,
+            enable_campaign_rebuild=True,
             queue_throttle_threshold=200,
             queue_throttle_window_min=5,
             segment_priority_size=10,
@@ -906,6 +910,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             ring_mode="dual",
             disable_throttle=False,
             disable_whitelist=False,
+            enable_campaign_rebuild=True,
             queue_throttle_threshold=200,
             queue_throttle_window_min=5,
             segment_priority_size=10,
@@ -998,6 +1003,34 @@ def _normalize_campaign_trigger_template(value: object) -> str:
         text = text.replace(f" {legacy_limit}", "{campaign_limit_arg}")
         text = text.replace(legacy_limit, "{campaign_limit_arg}")
     return " ".join(text.split())
+
+
+def _campaign_trigger_slots_enabled(cfg: AgentConfig) -> bool:
+    return (
+        max(0, int(cfg.campaign_trigger_priority_parallel))
+        + max(0, int(cfg.campaign_trigger_regular_parallel))
+    ) > 0
+
+
+def _campaign_rebuild_slots_enabled(cfg: AgentConfig) -> bool:
+    return (
+        max(0, int(cfg.campaign_rebuild_priority_parallel))
+        + max(0, int(cfg.campaign_rebuild_regular_parallel))
+    ) > 0
+
+
+def _enforce_campaign_rebuild_guard(cfg: AgentConfig) -> AgentConfig:
+    profile = (cfg.profile_name or "").strip().lower()
+    if profile == "passive" or not _campaign_trigger_slots_enabled(cfg):
+        return cfg
+    updates: dict[str, Any] = {}
+    if not cfg.enable_campaign_rebuild:
+        updates["enable_campaign_rebuild"] = True
+    if not _campaign_rebuild_slots_enabled(cfg):
+        updates["campaign_rebuild_regular_parallel"] = 1
+    if not updates:
+        return cfg
+    return replace(cfg, **updates)
 
 
 def _normalize_json_dict(value: object) -> dict[str, Any]:
@@ -3075,6 +3108,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         cfg = replace(cfg, segment_whitelist=[], segment_whitelist_file=None, campaign_whitelist=[], campaign_whitelist_file=None)
     profiled = _apply_profile(cfg)
     merged = _reapply_manual_runtime_overrides(profiled, runtime)
+    merged = _enforce_campaign_rebuild_guard(merged)
     if merged.disable_whitelist:
         merged = replace(merged, segment_whitelist=[], segment_whitelist_file=None, campaign_whitelist=[], campaign_whitelist_file=None)
     # Runtime customization flag is not "runtime section exists"; it is

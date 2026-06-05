@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.119 - 2026-06-05
+
+- Fixed: active campaign profiles now self-heal legacy runtime configs that
+  disabled `campaigns:rebuild` while leaving `campaigns:trigger` slots active.
+  Campaign triggers again require a same-campaign rebuild pass before launch.
+- Changed: the generated system config now enables the campaign rebuild worker
+  by default.
+- Added: regression coverage for legacy trigger-only campaign scheduler
+  configs.
+
 ## 0.9.118 - 2026-06-04
 
 - Fixed: SQL-auto `url_in_last_N_days` / `url_title_in_last_N_days`

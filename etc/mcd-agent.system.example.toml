@@ -218,7 +218,7 @@ mautic6_core_patch_apply_if_version_unknown = true
 pagehit_cascade_patch_policy = "off"
 
 # Enable campaign rebuild worker.
-enable_campaign_rebuild = false
+enable_campaign_rebuild = true
 # Rebuild planner interval, sec.
 campaign_rebuild_poll_interval_sec = 300
 # Max cycles per rebuild tick.
