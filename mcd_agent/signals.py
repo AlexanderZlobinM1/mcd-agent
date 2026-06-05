@@ -544,6 +544,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
             "by_type": scheduler_shadow.get("by_type", {}),
             "sample": scheduler_shadow.get("sample", []),
             "recent": scheduler_shadow.get("recent", []),
+            "planned": scheduler_shadow.get("planned", []),
         },
         "php_console_recent": console_rows[:20],
         "swap": swap_state,

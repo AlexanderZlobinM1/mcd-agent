@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.122 - 2026-06-05
+
+- Fixed: scheduler signal payload now exposes planned monitor cycles to MCC,
+  so Queued/Finished segment ovals reflect the current ring pass instead of
+  only showing recent history.
+- Added: regression coverage for full signal collection carrying planned
+  scheduler cycles.
+
 ## 0.9.121 - 2026-06-05
 
 - Added: segment scheduler monitoring now publishes a per-root cycle snapshot
