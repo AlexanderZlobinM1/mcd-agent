@@ -99,7 +99,7 @@ from mcd_agent.segment_dependencies import (
     segment_related_ids,
     stale_dependent_segment_closure,
 )
-from mcd_agent.signals import collect_signals
+from mcd_agent.signals import collect_monitor_signals, collect_signals
 from mcd_agent.state_push import (
     MCCStatePusher,
     clear_pending_profile_event,
@@ -4985,6 +4985,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_profile_guard_at = 0.0
     last_runtime_overrides_fp = ""
     last_runtime_overrides_error = ""
+    last_monitor_signals_push_error = ""
     last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
     pusher = MCCStatePusher(config)
 
@@ -7966,6 +7967,24 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     popens=popens,
                 ):
                     jobs_last_run[(root, job.name)] = time.time()
+
+        if pusher.enabled():
+            try:
+                monitor_signals = collect_monitor_signals(config)
+                if pusher.should_push_monitor_signals(time.time(), monitor_signals):
+                    ok, msg = pusher.send_signals(monitor_signals)
+                    if ok:
+                        last_monitor_signals_push_error = ""
+                    else:
+                        reason = str(msg or "unknown")
+                        if reason != last_monitor_signals_push_error:
+                            logging.warning("monitor signals push failed: %s", reason)
+                            last_monitor_signals_push_error = reason
+            except Exception as e:
+                reason = str(e)
+                if reason != last_monitor_signals_push_error:
+                    logging.warning("monitor signals push failed: %s", reason)
+                    last_monitor_signals_push_error = reason
 
         if single_cycle:
             return

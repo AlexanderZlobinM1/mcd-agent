@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcd_agent.signals import _shadow_running_tasks, collect_signals
+from mcd_agent.signals import _shadow_running_tasks, collect_monitor_signals, collect_signals
 
 
 class SignalsSchedulerHistoryTests(unittest.TestCase):
@@ -166,6 +166,66 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(scheduler["planned"][0]["root"], "/var/www/mautic")
         self.assertEqual(scheduler["planned"][0]["queued"], [14])
         self.assertEqual(scheduler["planned"][0]["done"], [20, 51])
+
+    def test_collect_monitor_signals_uses_lightweight_scheduler_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE tasks (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  root TEXT NOT NULL,
+                  task_key TEXT NOT NULL,
+                  task_type TEXT NOT NULL,
+                  entity_id INTEGER,
+                  command_str TEXT NOT NULL,
+                  pid INTEGER NOT NULL,
+                  timeout_sec INTEGER NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 1,
+                  state TEXT NOT NULL,
+                  note TEXT,
+                  started_at REAL NOT NULL,
+                  finished_at REAL,
+                  rc INTEGER,
+                  manual_request_id INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE runtime_sync (
+                  key TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  updated_at REAL NOT NULL
+                )
+                """
+            )
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO runtime_sync(key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "scheduler_monitor_plan:ghi",
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[73],"done":[20],"running":[51],"total":3}]}',
+                    now,
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            cfg = type("Cfg", (), {"state_db_path": str(db_path)})()
+            with patch("mcd_agent.signals._ps_console_processes", return_value=[]):
+                payload = collect_monitor_signals(cfg)
+
+        self.assertTrue(payload["monitor_only"])
+        scheduler = payload["details"]["scheduler"]
+        self.assertEqual(scheduler["planned"][0]["queued"], [73])
+        self.assertEqual(scheduler["planned"][0]["done"], [20])
+        self.assertEqual(scheduler["planned"][0]["running"], [51])
+        self.assertEqual(payload["details"]["php_console_recent"], [])
 
 
 if __name__ == "__main__":

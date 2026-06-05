@@ -127,6 +127,15 @@ def stable_change_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def monitor_signals_change_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    scheduler = details.get("scheduler") if isinstance(details.get("scheduler"), dict) else {}
+    return {
+        "scheduler": scheduler,
+        "php_console_recent": details.get("php_console_recent") if isinstance(details.get("php_console_recent"), list) else [],
+    }
+
+
 def _read_config_text(path: str) -> str | None:
     try:
         p = Path(path)
@@ -1197,6 +1206,8 @@ class MCCStatePusher:
         self.latest_cluster_assets_state_ts = 0.0
         self._last_snapshot_hash = ""
         self._last_snapshot_ts = 0.0
+        self._last_monitor_signals_hash = ""
+        self._last_monitor_signals_push_ts = 0.0
         # Filesystem-permissions repair deltas.
         # We push deltas (not cumulative totals) so MCC 3-day aggregation
         # remains correct and stable across daemon restarts.
@@ -1457,6 +1468,59 @@ class MCCStatePusher:
             "rule_hits": 0,
         }
         self._db_watchdog_events_pending = []
+
+    def should_push_monitor_signals(self, now_ts: float, payload: dict[str, Any]) -> bool:
+        new_hash = _hash_payload(monitor_signals_change_payload(payload))
+        if not new_hash or new_hash == self._last_monitor_signals_hash:
+            return False
+        if now_ts - self._last_monitor_signals_push_ts < 0.5:
+            return False
+        return True
+
+    def send_signals(self, payload: dict[str, Any], timeout_sec: int = 3) -> tuple[bool, str]:
+        if not self.enabled():
+            return False, "push disabled"
+        ident = resolve_agent_identity(self.cfg)
+        body = {
+            "hostname": str(ident.get("effective_hostname") or ""),
+            "mcc_host_name": str(ident.get("effective_mcc_host_name") or ""),
+            "agent_hostname": str(ident.get("local_hostname") or ""),
+            "configured_host_name": str(ident.get("configured_host_name") or ""),
+            "agent_version": __version__,
+            "signals": payload if isinstance(payload, dict) else {},
+        }
+        base = str(self.cfg.mcc_url).rstrip("/")
+        url = base + "/api/v1/agent/signals"
+        data = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        req = request.Request(
+            url=url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.cfg.mcc_token}",
+                "X-MCD-Agent-Version": __version__,
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=timeout_sec) as resp:
+                code = int(getattr(resp, "status", 200))
+                text = (resp.read() or b"").decode("utf-8", errors="replace").strip()
+                if 200 <= code < 300:
+                    self._last_monitor_signals_hash = _hash_payload(monitor_signals_change_payload(payload))
+                    self._last_monitor_signals_push_ts = time.time()
+                    return True, text or "ok"
+                return False, f"http {code}: {text}"
+        except HTTPError as e:
+            try:
+                msg = (e.read() or b"").decode("utf-8", errors="replace").strip()
+            except Exception:
+                msg = ""
+            return False, f"http {e.code}: {msg or e.reason}"
+        except URLError as e:
+            return False, f"urlerror: {e.reason}"
+        except Exception as e:
+            return False, str(e)
 
     def _store_state_snapshot(self, payload: dict[str, Any], now_ts: float) -> None:
         payload_hash = _hash_payload(payload)

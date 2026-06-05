@@ -8,7 +8,7 @@ from unittest.mock import patch
 from mcd_agent.backup import _cluster_node_slug
 from mcd_agent.cluster_routing import cluster_local_identity_values
 from mcd_agent.daemon import _cluster_local_full_done_for_date
-from mcd_agent.state_push import stable_change_payload, _hash_payload
+from mcd_agent.state_push import MCCStatePusher, monitor_signals_change_payload, stable_change_payload, _hash_payload
 
 
 def _cfg(**overrides: object) -> SimpleNamespace:
@@ -52,6 +52,57 @@ class ClusterFileIdentityTests(unittest.TestCase):
         }
 
         self.assertEqual(_hash_payload(stable_change_payload(a)), _hash_payload(stable_change_payload(b)))
+
+    def test_monitor_signal_hash_ignores_collection_timestamp(self) -> None:
+        a = {
+            "monitor_only": True,
+            "collected_at_utc": "2026-06-05T20:00:00Z",
+            "details": {
+                "scheduler": {"planned": [{"root": "/var/www/mautic", "queued": [14]}]},
+                "php_console_recent": [],
+            },
+        }
+        b = {
+            "monitor_only": True,
+            "collected_at_utc": "2026-06-05T20:00:30Z",
+            "details": {
+                "scheduler": {"planned": [{"root": "/var/www/mautic", "queued": [14]}]},
+                "php_console_recent": [],
+            },
+        }
+
+        self.assertEqual(
+            _hash_payload(monitor_signals_change_payload(a)),
+            _hash_payload(monitor_signals_change_payload(b)),
+        )
+
+    def test_monitor_signal_push_gate_tracks_changes_with_short_throttle(self) -> None:
+        pusher = MCCStatePusher(
+            SimpleNamespace(
+                mcc_push_enabled=True,
+                mcc_url="https://mcc.example.test",
+                mcc_token="token",
+            )
+        )
+        payload = {
+            "details": {
+                "scheduler": {"planned": [{"root": "/var/www/mautic", "queued": [14]}]},
+                "php_console_recent": [],
+            }
+        }
+        changed_payload = {
+            "details": {
+                "scheduler": {"planned": [{"root": "/var/www/mautic", "running": [14]}]},
+                "php_console_recent": [],
+            }
+        }
+
+        self.assertTrue(pusher.should_push_monitor_signals(10.0, payload))
+        pusher._last_monitor_signals_hash = _hash_payload(monitor_signals_change_payload(payload))
+        pusher._last_monitor_signals_push_ts = 10.0
+        self.assertFalse(pusher.should_push_monitor_signals(10.1, payload))
+        self.assertFalse(pusher.should_push_monitor_signals(10.1, changed_payload))
+        self.assertTrue(pusher.should_push_monitor_signals(10.6, changed_payload))
 
     def test_cluster_full_done_accepts_recent_full_across_utc_date_boundary(self) -> None:
         cfg = _cfg()

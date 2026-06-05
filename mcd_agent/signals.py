@@ -553,6 +553,25 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
     return payload
 
 
+def collect_monitor_signals(cfg: AgentConfig | None = None) -> dict[str, object]:
+    scheduler_shadow = _shadow_running_tasks(cfg)
+    return {
+        "monitor_only": True,
+        "collected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "details": {
+            "scheduler": {
+                "tracked_total": int(scheduler_shadow.get("tracked_total", 0) or 0),
+                "duplicate_task_keys": int(scheduler_shadow.get("duplicate_task_keys", 0) or 0),
+                "by_type": scheduler_shadow.get("by_type", {}),
+                "sample": scheduler_shadow.get("sample", []),
+                "recent": scheduler_shadow.get("recent", []),
+                "planned": scheduler_shadow.get("planned", []),
+            },
+            "php_console_recent": _ps_console_processes()[:20],
+        },
+    }
+
+
 def format_signals_text(payload: dict[str, object]) -> str:
     overall = payload.get("overall", {}) if isinstance(payload, dict) else {}
     totals = payload.get("totals", {}) if isinstance(payload, dict) else {}

@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.123 - 2026-06-05
+
+- Added: MCD now pushes lightweight monitor-only scheduler/PHP-console signal
+  changes directly to MCC via `/api/v1/agent/signals`. Instance monitoring no
+  longer waits for the full periodic state payload to refresh Queued,
+  Processing and Finished lanes after scheduler transitions.
+- Added: regression coverage for monitor-only signal collection and push change
+  detection.
+
 ## 0.9.122 - 2026-06-05
 
 - Fixed: scheduler signal payload now exposes planned monitor cycles to MCC,
