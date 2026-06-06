@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.125 - 2026-06-06
+
+- Fixed: scheduler monitor Queued lanes now show only launchable items. Items
+  held by per-entity cooldowns or dependency guards stay out of Queued, so MCC
+  no longer shows campaign triggers or segments as stuck with free Processing
+  slots.
+- Added: regression coverage for campaign trigger cooldown visibility in the
+  monitor cycle.
+
 ## 0.9.124 - 2026-06-06
 
 - Fixed: scheduler monitor cycle snapshots now include campaign rebuild and

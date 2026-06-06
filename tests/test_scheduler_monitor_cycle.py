@@ -147,6 +147,57 @@ class SchedulerMonitorCycleTests(unittest.TestCase):
             self.assertEqual(cycles["campaign_rebuild"]["done"], [109])
             self.assertEqual(cycles["campaign_rebuild"]["running"], [122])
 
+    def test_campaign_cycle_keeps_cooldown_items_out_of_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            store = TaskStore(str(db_path))
+            root = "/var/www/mautic"
+            cycle_done: dict[tuple[str, str], set[int]] = {(root, "campaign_trigger"): {118, 119}}
+
+            _publish_scheduler_monitor_cycles(
+                store=store,
+                root=root,
+                cycle_done=cycle_done,
+                running={},
+                now_ts=1000.0,
+                seg_sql_ring=deque(),
+                seg_resume_ring=deque(),
+                seg_prio_ring=deque(),
+                seg_reg_ring=deque(),
+                campaign_trigger_prio_ring=deque([119, 118]),
+                campaign_trigger_reg_ring=deque(),
+                campaign_rebuild_prio_ring=deque(),
+                campaign_rebuild_reg_ring=deque(),
+                campaign_trigger_queued_ids=[],
+            )
+
+            payload = self._read_payload(db_path, root)
+            trigger_cycle = {cycle["task_type"]: cycle for cycle in payload["cycles"]}["campaign_trigger"]
+            self.assertEqual(trigger_cycle["queued"], [])
+            self.assertEqual(trigger_cycle["done"], [119, 118])
+
+            _publish_scheduler_monitor_cycles(
+                store=store,
+                root=root,
+                cycle_done=cycle_done,
+                running={},
+                now_ts=1301.0,
+                seg_sql_ring=deque(),
+                seg_resume_ring=deque(),
+                seg_prio_ring=deque(),
+                seg_reg_ring=deque(),
+                campaign_trigger_prio_ring=deque([119, 118]),
+                campaign_trigger_reg_ring=deque(),
+                campaign_rebuild_prio_ring=deque(),
+                campaign_rebuild_reg_ring=deque(),
+                campaign_trigger_queued_ids=[119, 118],
+            )
+
+            payload = self._read_payload(db_path, root)
+            trigger_cycle = {cycle["task_type"]: cycle for cycle in payload["cycles"]}["campaign_trigger"]
+            self.assertEqual(trigger_cycle["queued"], [119, 118])
+            self.assertEqual(trigger_cycle["done"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

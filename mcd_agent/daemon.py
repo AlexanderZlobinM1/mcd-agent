@@ -2270,6 +2270,7 @@ def _monitor_cycle_snapshot(
     root: str,
     task_type: str,
     planned_ids: list[int] | deque[int] | tuple[int, ...],
+    queued_ids: list[int] | deque[int] | tuple[int, ...] | None = None,
     cycle_done: dict[tuple[str, str], set[int]],
     running: dict[str, "RunningTask"],
     running_task_types: set[str],
@@ -2277,18 +2278,30 @@ def _monitor_cycle_snapshot(
     task_type = str(task_type)
     running_ids = _monitor_running_entity_ids(running, root=root, task_types=running_task_types)
     done_set = cycle_done.setdefault((str(root), task_type), set())
-    planned = _unique_positive_ids(list(planned_ids) + list(done_set) + sorted(running_ids))
+    base_planned = _unique_positive_ids(list(planned_ids))
+    if not base_planned and not running_ids:
+        done_set.clear()
+        return {
+            "task_type": task_type,
+            "queued": [],
+            "done": [],
+            "running": [],
+            "total": 0,
+        }
+
+    planned = _unique_positive_ids(base_planned + list(done_set) + sorted(running_ids))
     planned_set = set(planned)
     if not planned_set:
         done_set.clear()
     else:
         done_set.intersection_update(planned_set)
 
-    if planned_set and planned_set.issubset(done_set) and not (running_ids & planned_set):
+    queue_source = planned if queued_ids is None else _unique_positive_ids(list(queued_ids))
+    if planned_set and planned_set.issubset(done_set) and not (running_ids & planned_set) and queue_source:
         done_set.clear()
 
     done_ordered = [sid for sid in planned if sid in done_set]
-    queued = [sid for sid in planned if sid not in done_set and sid not in running_ids]
+    queued = [sid for sid in queue_source if sid in planned_set and sid not in done_set and sid not in running_ids]
     return {
         "task_type": task_type,
         "queued": queued[:200],
@@ -2296,6 +2309,45 @@ def _monitor_cycle_snapshot(
         "running": sorted(running_ids & planned_set)[:200],
         "total": len(planned),
     }
+
+
+def _monitor_visible_queued_ids(
+    *,
+    ring: list[int] | deque[int] | tuple[int, ...],
+    root: str,
+    task_type: str,
+    running: dict[str, "RunningTask"],
+    config: AgentConfig,
+    now_ts: float,
+    blocked_entities: set[int] | None = None,
+    dynamic_blocked=None,
+    running_task_types: set[str] | None = None,
+) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    running_types = running_task_types or {task_type}
+    for raw in list(ring):
+        try:
+            eid = int(raw)
+        except Exception:
+            continue
+        if eid <= 0 or eid in seen:
+            continue
+        seen.add(eid)
+        if blocked_entities and eid in blocked_entities:
+            continue
+        if dynamic_blocked is not None:
+            try:
+                if dynamic_blocked(eid):
+                    continue
+            except Exception:
+                continue
+        if any(_is_running(running, root, running_task_type, eid) for running_task_type in running_types):
+            continue
+        if not _launch_allowed(config, root, task_type, eid, now_ts=now_ts):
+            continue
+        out.append(eid)
+    return out
 
 
 def _publish_scheduler_monitor_cycles(
@@ -2313,12 +2365,16 @@ def _publish_scheduler_monitor_cycles(
     campaign_trigger_reg_ring: deque[int],
     campaign_rebuild_prio_ring: deque[int],
     campaign_rebuild_reg_ring: deque[int],
+    segment_queued_ids: list[int] | None = None,
+    campaign_trigger_queued_ids: list[int] | None = None,
+    campaign_rebuild_queued_ids: list[int] | None = None,
 ) -> None:
     cycles = [
         _monitor_cycle_snapshot(
             root=root,
             task_type="segment",
             planned_ids=list(seg_sql_ring) + list(seg_resume_ring) + list(seg_prio_ring) + list(seg_reg_ring),
+            queued_ids=segment_queued_ids,
             cycle_done=cycle_done,
             running=running,
             running_task_types={"segment", "segment_sql"},
@@ -2327,6 +2383,7 @@ def _publish_scheduler_monitor_cycles(
             root=root,
             task_type="campaign_rebuild",
             planned_ids=list(campaign_rebuild_prio_ring) + list(campaign_rebuild_reg_ring),
+            queued_ids=campaign_rebuild_queued_ids,
             cycle_done=cycle_done,
             running=running,
             running_task_types={"campaign_rebuild", "campaign_update"},
@@ -2335,6 +2392,7 @@ def _publish_scheduler_monitor_cycles(
             root=root,
             task_type="campaign_trigger",
             planned_ids=list(campaign_trigger_prio_ring) + list(campaign_trigger_reg_ring),
+            queued_ids=campaign_trigger_queued_ids,
             cycle_done=cycle_done,
             running=running,
             running_task_types={"campaign_trigger"},
@@ -6777,6 +6835,98 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
             def _publish_monitor_cycle() -> None:
                 segment_resume_ring = segment_resume_rings.setdefault(root, deque())
+                segment_queued_ids: list[int] = []
+                campaign_trigger_queued_ids: list[int] = []
+                campaign_rebuild_queued_ids: list[int] = []
+                if cluster_cron_allowed and config.segment_mode != "classic_loop":
+                    segment_queued_ids = _unique_positive_ids(
+                        _monitor_visible_queued_ids(
+                            ring=seg_sql_ring,
+                            root=root,
+                            task_type="segment_sql",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            running_task_types={"segment", "segment_sql"},
+                        )
+                        + _monitor_visible_queued_ids(
+                            ring=segment_resume_ring,
+                            root=root,
+                            task_type="segment",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            running_task_types={"segment", "segment_sql"},
+                        )
+                        + _monitor_visible_queued_ids(
+                            ring=seg_prio_ring,
+                            root=root,
+                            task_type="segment",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            running_task_types={"segment", "segment_sql"},
+                        )
+                        + _monitor_visible_queued_ids(
+                            ring=seg_reg_ring,
+                            root=root,
+                            task_type="segment",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            running_task_types={"segment", "segment_sql"},
+                        )
+                    )
+                if cluster_cron_allowed:
+                    campaign_trigger_queued_ids = _unique_positive_ids(
+                        _monitor_visible_queued_ids(
+                            ring=trg_prio_ring,
+                            root=root,
+                            task_type="campaign_trigger",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            dynamic_blocked=_trigger_waits_for_rebuild,
+                        )
+                        + _monitor_visible_queued_ids(
+                            ring=trg_reg_ring,
+                            root=root,
+                            task_type="campaign_trigger",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            dynamic_blocked=_trigger_waits_for_rebuild,
+                        )
+                    )
+                    if config.enable_campaign_rebuild:
+                        campaign_rebuild_queued_ids = _unique_positive_ids(
+                            _monitor_visible_queued_ids(
+                                ring=reb_prio_ring,
+                                root=root,
+                                task_type="campaign_rebuild",
+                                running=running,
+                                config=config,
+                                now_ts=now,
+                                running_task_types={"campaign_rebuild", "campaign_update"},
+                            )
+                            + _monitor_visible_queued_ids(
+                                ring=reb_reg_ring,
+                                root=root,
+                                task_type="campaign_rebuild",
+                                running=running,
+                                config=config,
+                                now_ts=now,
+                                running_task_types={"campaign_rebuild", "campaign_update"},
+                            )
+                        )
                 if config.segment_mode == "classic_loop":
                     empty_ring: deque[int] = deque()
                     _publish_scheduler_monitor_cycles(
@@ -6793,6 +6943,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         campaign_trigger_reg_ring=trg_reg_ring,
                         campaign_rebuild_prio_ring=reb_prio_ring,
                         campaign_rebuild_reg_ring=reb_reg_ring,
+                        segment_queued_ids=[],
+                        campaign_trigger_queued_ids=campaign_trigger_queued_ids,
+                        campaign_rebuild_queued_ids=campaign_rebuild_queued_ids,
                     )
                     return
                 _publish_scheduler_monitor_cycles(
@@ -6809,6 +6962,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     campaign_trigger_reg_ring=trg_reg_ring,
                     campaign_rebuild_prio_ring=reb_prio_ring,
                     campaign_rebuild_reg_ring=reb_reg_ring,
+                    segment_queued_ids=segment_queued_ids,
+                    campaign_trigger_queued_ids=campaign_trigger_queued_ids,
+                    campaign_rebuild_queued_ids=campaign_rebuild_queued_ids,
                 )
 
             if _import_in_settle(root, now):
