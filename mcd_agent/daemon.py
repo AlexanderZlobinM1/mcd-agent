@@ -2265,6 +2265,90 @@ def _monitor_running_entity_ids(
     return out
 
 
+def _monitor_cycle_snapshot(
+    *,
+    root: str,
+    task_type: str,
+    planned_ids: list[int] | deque[int] | tuple[int, ...],
+    cycle_done: dict[tuple[str, str], set[int]],
+    running: dict[str, "RunningTask"],
+    running_task_types: set[str],
+) -> dict[str, object]:
+    task_type = str(task_type)
+    running_ids = _monitor_running_entity_ids(running, root=root, task_types=running_task_types)
+    done_set = cycle_done.setdefault((str(root), task_type), set())
+    planned = _unique_positive_ids(list(planned_ids) + list(done_set) + sorted(running_ids))
+    planned_set = set(planned)
+    if not planned_set:
+        done_set.clear()
+    else:
+        done_set.intersection_update(planned_set)
+
+    if planned_set and planned_set.issubset(done_set) and not (running_ids & planned_set):
+        done_set.clear()
+
+    done_ordered = [sid for sid in planned if sid in done_set]
+    queued = [sid for sid in planned if sid not in done_set and sid not in running_ids]
+    return {
+        "task_type": task_type,
+        "queued": queued[:200],
+        "done": done_ordered[:200],
+        "running": sorted(running_ids & planned_set)[:200],
+        "total": len(planned),
+    }
+
+
+def _publish_scheduler_monitor_cycles(
+    *,
+    store: "TaskStore",
+    root: str,
+    cycle_done: dict[tuple[str, str], set[int]],
+    running: dict[str, "RunningTask"],
+    now_ts: float,
+    seg_sql_ring: deque[int],
+    seg_resume_ring: deque[int],
+    seg_prio_ring: deque[int],
+    seg_reg_ring: deque[int],
+    campaign_trigger_prio_ring: deque[int],
+    campaign_trigger_reg_ring: deque[int],
+    campaign_rebuild_prio_ring: deque[int],
+    campaign_rebuild_reg_ring: deque[int],
+) -> None:
+    cycles = [
+        _monitor_cycle_snapshot(
+            root=root,
+            task_type="segment",
+            planned_ids=list(seg_sql_ring) + list(seg_resume_ring) + list(seg_prio_ring) + list(seg_reg_ring),
+            cycle_done=cycle_done,
+            running=running,
+            running_task_types={"segment", "segment_sql"},
+        ),
+        _monitor_cycle_snapshot(
+            root=root,
+            task_type="campaign_rebuild",
+            planned_ids=list(campaign_rebuild_prio_ring) + list(campaign_rebuild_reg_ring),
+            cycle_done=cycle_done,
+            running=running,
+            running_task_types={"campaign_rebuild", "campaign_update"},
+        ),
+        _monitor_cycle_snapshot(
+            root=root,
+            task_type="campaign_trigger",
+            planned_ids=list(campaign_trigger_prio_ring) + list(campaign_trigger_reg_ring),
+            cycle_done=cycle_done,
+            running=running,
+            running_task_types={"campaign_trigger"},
+        ),
+    ]
+    payload = {
+        "version": 1,
+        "root": str(root),
+        "updated_at": float(now_ts),
+        "cycles": cycles,
+    }
+    store.put_runtime_sync(_scheduler_monitor_plan_key(root), payload)
+
+
 def _publish_segment_monitor_cycle(
     *,
     store: "TaskStore",
@@ -2277,37 +2361,22 @@ def _publish_segment_monitor_cycle(
     seg_prio_ring: deque[int],
     seg_reg_ring: deque[int],
 ) -> None:
-    planned = _unique_positive_ids(
-        list(seg_sql_ring) + list(seg_resume_ring) + list(seg_prio_ring) + list(seg_reg_ring)
+    empty_ring: deque[int] = deque()
+    _publish_scheduler_monitor_cycles(
+        store=store,
+        root=root,
+        cycle_done=cycle_done,
+        running=running,
+        now_ts=now_ts,
+        seg_sql_ring=seg_sql_ring,
+        seg_resume_ring=seg_resume_ring,
+        seg_prio_ring=seg_prio_ring,
+        seg_reg_ring=seg_reg_ring,
+        campaign_trigger_prio_ring=empty_ring,
+        campaign_trigger_reg_ring=empty_ring,
+        campaign_rebuild_prio_ring=empty_ring,
+        campaign_rebuild_reg_ring=empty_ring,
     )
-    planned_set = set(planned)
-    done_set = cycle_done.setdefault((str(root), "segment"), set())
-    if not planned_set:
-        done_set.clear()
-    else:
-        done_set.intersection_update(planned_set)
-
-    running_ids = _monitor_running_entity_ids(running, root=root, task_types={"segment", "segment_sql"})
-    if planned_set and planned_set.issubset(done_set) and not (running_ids & planned_set):
-        done_set.clear()
-
-    done_ordered = [sid for sid in planned if sid in done_set]
-    queued = [sid for sid in planned if sid not in done_set and sid not in running_ids]
-    payload = {
-        "version": 1,
-        "root": str(root),
-        "updated_at": float(now_ts),
-        "cycles": [
-            {
-                "task_type": "segment",
-                "queued": queued[:200],
-                "done": done_ordered[:200],
-                "running": sorted(running_ids & planned_set)[:200],
-                "total": len(planned),
-            }
-        ],
-    }
-    store.put_runtime_sync(_scheduler_monitor_plan_key(root), payload)
 
 
 def _fill_from_ring(
@@ -4707,9 +4776,23 @@ def _mark_external_entities_executed(
         elif task.task_type == "campaign_trigger":
             _mark_ring_entity_executed(trg_prio_ring, entity_id)
             _mark_ring_entity_executed(trg_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_trigger",
+                    entity_id=entity_id,
+                )
         elif task.task_type == "campaign_rebuild":
             _mark_ring_entity_executed(reb_prio_ring, entity_id)
             _mark_ring_entity_executed(reb_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_rebuild",
+                    entity_id=entity_id,
+                )
 
 
 def _load_orphans_from_store(store: TaskStore) -> dict[str, RunningTask]:
@@ -4793,9 +4876,23 @@ def _dispatch_manual_requests_for_root(
         elif task_type == "campaign_trigger":
             _mark_ring_entity_executed(trg_prio_ring, entity_id)
             _mark_ring_entity_executed(trg_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_trigger",
+                    entity_id=entity_id,
+                )
         elif task_type == "campaign_rebuild":
             _mark_ring_entity_executed(reb_prio_ring, entity_id)
             _mark_ring_entity_executed(reb_reg_ring, entity_id)
+            if monitor_cycle_done is not None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_rebuild",
+                    entity_id=entity_id,
+                )
 
         logging.info(
             "[%s] manual request launched id=%s task=%s entity=%s",
@@ -6662,10 +6759,27 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     entity_id=sid,
                 )
 
+            def _mark_campaign_trigger_cycle(cid: int) -> None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_trigger",
+                    entity_id=cid,
+                )
+
+            def _mark_campaign_rebuild_cycle(cid: int) -> None:
+                _monitor_cycle_mark_launched(
+                    monitor_cycle_done,
+                    root=root,
+                    task_type="campaign_rebuild",
+                    entity_id=cid,
+                )
+
             def _publish_monitor_cycle() -> None:
+                segment_resume_ring = segment_resume_rings.setdefault(root, deque())
                 if config.segment_mode == "classic_loop":
                     empty_ring: deque[int] = deque()
-                    _publish_segment_monitor_cycle(
+                    _publish_scheduler_monitor_cycles(
                         store=store,
                         root=root,
                         cycle_done=monitor_cycle_done,
@@ -6675,18 +6789,26 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         seg_resume_ring=empty_ring,
                         seg_prio_ring=empty_ring,
                         seg_reg_ring=empty_ring,
+                        campaign_trigger_prio_ring=trg_prio_ring,
+                        campaign_trigger_reg_ring=trg_reg_ring,
+                        campaign_rebuild_prio_ring=reb_prio_ring,
+                        campaign_rebuild_reg_ring=reb_reg_ring,
                     )
                     return
-                _publish_segment_monitor_cycle(
+                _publish_scheduler_monitor_cycles(
                     store=store,
                     root=root,
                     cycle_done=monitor_cycle_done,
                     running=running,
                     now_ts=now,
                     seg_sql_ring=seg_sql_ring,
-                    seg_resume_ring=segment_resume_rings.setdefault(root, deque()),
+                    seg_resume_ring=segment_resume_ring,
                     seg_prio_ring=seg_prio_ring,
                     seg_reg_ring=seg_reg_ring,
+                    campaign_trigger_prio_ring=trg_prio_ring,
+                    campaign_trigger_reg_ring=trg_reg_ring,
+                    campaign_rebuild_prio_ring=reb_prio_ring,
+                    campaign_rebuild_reg_ring=reb_reg_ring,
                 )
 
             if _import_in_settle(root, now):
@@ -7090,6 +7212,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             popens=popens,
                         )
                         if launched:
+                            _mark_campaign_trigger_cycle(next_trigger_id)
                             _advance_ring_after_launch(trg_prio_ring, next_trigger_id, remove_on_launch=True)
                             _advance_ring_after_launch(trg_reg_ring, next_trigger_id, remove_on_launch=True)
                     else:
@@ -7120,6 +7243,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 popens=popens,
                             )
                             if launched:
+                                _mark_campaign_rebuild_cycle(next_campaign_id)
                                 _advance_ring_after_launch(reb_prio_ring, next_campaign_id, remove_on_launch=True)
                                 _advance_ring_after_launch(reb_reg_ring, next_campaign_id, remove_on_launch=True)
             # Tiny mode has a single campaign worker:
@@ -7169,6 +7293,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     last_monitored_email_parser_ts[root] = now
 
             if (config.profile_name or "").strip().lower() == "tiny":
+                _publish_monitor_cycle()
                 # Skip generic multi-ring campaign scheduler.
                 continue
 
@@ -7215,6 +7340,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 ),
                 dynamic_blocked=_trigger_waits_for_rebuild,
                 remove_on_launch=True,
+                on_launch=_mark_campaign_trigger_cycle,
             )
             _fill_from_ring(
                 ring=trg_reg_ring,
@@ -7238,6 +7364,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 ),
                 dynamic_blocked=_trigger_waits_for_rebuild,
                 remove_on_launch=True,
+                on_launch=_mark_campaign_trigger_cycle,
             )
             trg_cur_total = _running_count(running, root, "campaign_trigger")
             if trg_cur_total < trg_total_limit:
@@ -7265,6 +7392,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         dynamic_blocked=_trigger_waits_for_rebuild,
                         remove_on_launch=True,
+                        on_launch=_mark_campaign_trigger_cycle,
                     )
                 elif trg_prio_ring:
                     _fill_from_ring(
@@ -7289,6 +7417,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         dynamic_blocked=_trigger_waits_for_rebuild,
                         remove_on_launch=True,
+                        on_launch=_mark_campaign_trigger_cycle,
                     )
             if cluster_cron_allowed and config.enable_campaign_rebuild:
                 rebuild_prio_limit = max(0, config.campaign_rebuild_priority_parallel)
@@ -7320,6 +7449,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         id=cid,
                     ),
                     remove_on_launch=True,
+                    on_launch=_mark_campaign_rebuild_cycle,
                 )
                 _fill_from_ring(
                     ring=reb_reg_ring,
@@ -7340,6 +7470,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         id=cid,
                     ),
                     remove_on_launch=True,
+                    on_launch=_mark_campaign_rebuild_cycle,
                 )
                 reb_cur_total = _running_count(running, root, "campaign_rebuild")
                 if reb_cur_total < rebuild_total_limit:
@@ -7364,6 +7495,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 id=cid,
                             ),
                             remove_on_launch=True,
+                            on_launch=_mark_campaign_rebuild_cycle,
                         )
 
                     elif reb_prio_ring:
@@ -7386,10 +7518,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 id=cid,
                             ),
                             remove_on_launch=True,
+                            on_launch=_mark_campaign_rebuild_cycle,
                         )
 
             if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
+
+            _publish_monitor_cycle()
 
             last_cleanup = last_cleanup_ts.get(root, 0.0)
             interval = max(1, config.contacts_cleanup_interval_sec)

@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.124 - 2026-06-06
+
+- Fixed: scheduler monitor cycle snapshots now include campaign rebuild and
+  campaign trigger rings, not only segment rings. MCC instance monitoring can
+  show upcoming campaign rebuild/trigger ovals in the Queued lane before they
+  start.
+- Fixed: campaign rebuild/trigger launches are marked inside the current
+  monitor cycle, so campaign ovals move through Queued, Processing and
+  Finished consistently.
+- Added: regression coverage for campaign monitor cycle snapshots.
+
 ## 0.9.123 - 2026-06-05
 
 - Added: MCD now pushes lightweight monitor-only scheduler/PHP-console signal
