@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from mcd_agent.backup import (
     _apply_cluster_backup_integrity_status,
@@ -10,6 +13,7 @@ from mcd_agent.backup import (
     _cluster_file_source_path_forbidden,
     _cluster_file_source_paths,
     _cluster_prepared_mysql_datadir_from_cmdline,
+    cluster_backup_status,
 )
 
 
@@ -101,6 +105,65 @@ class ClusterBackupIntegrityStatusTest(unittest.TestCase):
         self.assertEqual(state["cluster_integrity_status"], "ok")
         self.assertEqual(state["last_status"], "ok")
         self.assertEqual(_cluster_backup_integrity_problem(state), "")
+
+    def test_unmounted_offsite_mount_keeps_persisted_archive_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            state_dir = base / "state"
+            state_dir.mkdir()
+            local_root = base / "local"
+            local_root.mkdir()
+            mount_base = base / "mounts"
+            host_name = "ananas-cluster-replica-xtrabackup"
+            offsite_archive = (
+                mount_base
+                / host_name
+                / "backup"
+                / "ananasrs.sales-snap.com"
+                / "daily"
+                / "2026-06-08"
+                / "files-snapshot-20260608-011740.tar.gz"
+            )
+            (state_dir / f"host-{host_name}.json").write_text(
+                json.dumps(
+                    {
+                        "last_status": "ok",
+                        "last_error": "",
+                        "last_backup_kind": "cluster_offsite",
+                        "last_offsite_backup_path": str(offsite_archive.parent),
+                        "last_offsite_files_archive_path": str(offsite_archive),
+                        "last_offsite_files_archive_ok": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(
+                backup_host_name=host_name,
+                backup_state_dir=str(state_dir),
+                backup_mount_base_dir=str(mount_base),
+                backup_cluster_enabled=True,
+                backup_cluster_local_root_dir=str(local_root),
+                backup_lock_dir=str(base / "locks"),
+                cluster_id="cluster-ananasrs-prod",
+                cluster_name="ananasrs.sales-snap.com",
+                cluster_node_role="replica",
+                cluster_node_index=6,
+                backup_cluster_authority_role="replica",
+                backup_cluster_authority_host="",
+                cluster_route_backup_host="",
+            )
+
+            with (
+                patch("mcd_agent.backup._effective_cfg", side_effect=lambda x: x),
+                patch("mcd_agent.backup._mounted", return_value=False),
+                patch("mcd_agent.backup._cluster_offsite_processes", return_value=[]),
+            ):
+                state = cluster_backup_status(cfg)
+
+        self.assertEqual(state["last_status"], "ok")
+        self.assertEqual(state["last_error"], "")
+        self.assertEqual(state["cluster_integrity_status"], "ok")
+        self.assertTrue(state["last_offsite_files_archive_ok"])
 
 
 if __name__ == "__main__":

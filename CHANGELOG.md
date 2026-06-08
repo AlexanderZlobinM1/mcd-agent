@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.126 - 2026-06-08
+
+- Fixed: cluster offsite backup status no longer turns a successful backup into
+  `failed` after the remote backup mount is unmounted. MCD now keeps the
+  persisted archive verification result unless the offsite path is actually
+  visible for revalidation.
+- Added: regression coverage for unmounted cluster offsite backup status.
+
 ## 0.9.125 - 2026-06-06
 
 - Fixed: scheduler monitor Queued lanes now show only launchable items. Items

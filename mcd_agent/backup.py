@@ -4047,6 +4047,8 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
     state_path = _cluster_state_path(cfg)
     state = _json_read(state_path)
     root = _cluster_local_root(cfg)
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    offsite_mount_active = _mounted(mount_path)
     current_full = _cluster_current_full_dir(cfg)
     latest_incr = None
     chain_id = ""
@@ -4080,14 +4082,18 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
         offsite_path_raw = str(state.get("last_backup_path") or "").strip()
     if offsite_path_raw:
         offsite_path = Path(offsite_path_raw)
-        marker = _read_backup_marker(offsite_path)
-        if marker:
-            offsite_state = _cluster_offsite_state_from_marker(marker, offsite_path)
-            archive_path = str(offsite_state.get("last_offsite_files_archive_path") or "").strip()
-            state.update(offsite_state)
-            state["last_files_archive_path"] = archive_path
-            state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
-        else:
+        offsite_under_mount = _path_is_under(offsite_path, mount_path)
+        if offsite_mount_active or not offsite_under_mount:
+            marker = _read_backup_marker(offsite_path)
+            if marker:
+                offsite_state = _cluster_offsite_state_from_marker(marker, offsite_path)
+                archive_path = str(offsite_state.get("last_offsite_files_archive_path") or "").strip()
+                state.update(offsite_state)
+                state["last_files_archive_path"] = archive_path
+                state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
+            else:
+                state["last_offsite_files_archive_ok"] = False
+        elif state.get("last_offsite_files_archive_ok") is None:
             state["last_offsite_files_archive_ok"] = False
     _apply_cluster_backup_integrity_status(state)
     return state
