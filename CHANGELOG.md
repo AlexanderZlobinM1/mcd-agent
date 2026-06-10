@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.127 - 2026-06-10
+
+- Added: Wazuh service profile apply support. MCD can install or reconcile
+  `wazuh-agent`, keep the Wazuh apt repository/key present, write manager and
+  enrollment settings, and start the agent service from MCC-managed profile
+  data.
+- Fixed: existing Wazuh agents still get the Wazuh apt repository/key
+  reconciled without forcing a package reinstall, so normal apt maintenance can
+  keep them updated.
+- Added: regression coverage for Wazuh service profile apply behavior.
+
 ## 0.9.126 - 2026-06-08
 
 - Fixed: cluster offsite backup status no longer turns a successful backup into

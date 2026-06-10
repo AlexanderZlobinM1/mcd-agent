@@ -93,6 +93,66 @@ class WazuhServiceProfileTests(unittest.TestCase):
         self.assertEqual(res.get("status"), "planned")
         self.assertIn("wazuh_agent_install", res.get("actions", []))
 
+    def test_existing_wazuh_agent_still_reconciles_repo_without_reinstall(self) -> None:
+        old_collect = wazuh_profile.collect_wazuh_agent_state
+        old_geteuid = wazuh_profile.os.geteuid
+        old_prereq = wazuh_profile._ensure_prerequisites
+        old_repo = wazuh_profile._ensure_wazuh_repo
+        old_keyring = wazuh_profile._ensure_wazuh_keyring
+        old_apt_update = wazuh_profile._apt_update
+        old_pkg_state = wazuh_profile._pkg_state
+        old_install = wazuh_profile._install_wazuh_agent
+        old_config = wazuh_profile._ensure_agent_config
+        old_hold = wazuh_profile._set_package_hold
+        old_run = wazuh_profile._run
+        calls: list[str] = []
+        try:
+            wazuh_profile.collect_wazuh_agent_state = lambda _profile=None: {"installed": True}
+            wazuh_profile.os.geteuid = lambda: 0
+            wazuh_profile._ensure_prerequisites = lambda _timeout_sec: calls.append("prerequisites")
+            wazuh_profile._ensure_wazuh_repo = lambda _profile: calls.append("repo") or True
+            wazuh_profile._ensure_wazuh_keyring = lambda _profile, *, timeout_sec: (
+                calls.append("keyring") or (True, "/usr/share/keyrings/wazuh.gpg")
+            )
+            wazuh_profile._apt_update = lambda _timeout_sec: calls.append("apt_update")
+            wazuh_profile._pkg_state = lambda _package: (True, "4.12.0")
+            wazuh_profile._install_wazuh_agent = lambda _profile, _cfg, *, timeout_sec: calls.append("install")
+            wazuh_profile._ensure_agent_config = lambda _profile, _cfg: (
+                calls.append("config") or (False, [])
+            )
+            wazuh_profile._set_package_hold = lambda _hold: calls.append("hold") or True
+            wazuh_profile._run = lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            res = wazuh_profile.apply_wazuh_profile(
+                {
+                    "enabled": True,
+                    "manager_address": "10.0.0.10",
+                    "repo_enabled": True,
+                    "ensure_prerequisites": True,
+                    "install_package": True,
+                    "start_service": False,
+                },
+                SimpleNamespace(),
+            )
+        finally:
+            wazuh_profile.collect_wazuh_agent_state = old_collect
+            wazuh_profile.os.geteuid = old_geteuid
+            wazuh_profile._ensure_prerequisites = old_prereq
+            wazuh_profile._ensure_wazuh_repo = old_repo
+            wazuh_profile._ensure_wazuh_keyring = old_keyring
+            wazuh_profile._apt_update = old_apt_update
+            wazuh_profile._pkg_state = old_pkg_state
+            wazuh_profile._install_wazuh_agent = old_install
+            wazuh_profile._ensure_agent_config = old_config
+            wazuh_profile._set_package_hold = old_hold
+            wazuh_profile._run = old_run
+
+        self.assertEqual(res.get("status"), "applied")
+        self.assertIn("repo", calls)
+        self.assertIn("keyring", calls)
+        self.assertIn("apt_update", calls)
+        self.assertNotIn("install", calls)
+
 
 if __name__ == "__main__":
     unittest.main()
