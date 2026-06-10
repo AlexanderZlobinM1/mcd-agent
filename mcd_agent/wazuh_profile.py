@@ -239,7 +239,7 @@ def _apt_update(timeout_sec: int) -> None:
         raise RuntimeError((proc.stderr or proc.stdout or "apt-get update failed").strip())
 
 
-def _install_wazuh_agent(profile: dict[str, Any], cfg: AgentConfig, *, timeout_sec: int) -> None:
+def _wazuh_package_env(profile: dict[str, Any], cfg: AgentConfig) -> dict[str, str]:
     manager = str(profile.get("manager_address", "") or "").strip()
     registration_server = str(profile.get("registration_server", "") or "").strip() or manager
     env = {
@@ -257,9 +257,36 @@ def _install_wazuh_agent(profile: dict[str, Any], cfg: AgentConfig, *, timeout_s
     password = str(profile.get("registration_password", "") or "")
     if password:
         env["WAZUH_REGISTRATION_PASSWORD"] = password
+    return env
+
+
+def _install_wazuh_agent(profile: dict[str, Any], cfg: AgentConfig, *, timeout_sec: int) -> None:
+    env = _wazuh_package_env(profile, cfg)
     proc = _run(["apt-get", "install", "-y", "wazuh-agent"], timeout_sec=timeout_sec, env_extra=env)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "failed to install wazuh-agent").strip())
+
+
+def _wazuh_upgrade_available(timeout_sec: int) -> bool:
+    proc = _run(["apt-get", "-s", "install", "--only-upgrade", "wazuh-agent"], timeout_sec=timeout_sec)
+    if proc.returncode != 0:
+        return False
+    merged = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    for line in merged.splitlines():
+        if line.strip().startswith("Inst wazuh-agent "):
+            return True
+    return False
+
+
+def _upgrade_wazuh_agent(profile: dict[str, Any], cfg: AgentConfig, *, timeout_sec: int) -> None:
+    env = _wazuh_package_env(profile, cfg)
+    proc = _run(
+        ["apt-get", "install", "-y", "--only-upgrade", "wazuh-agent"],
+        timeout_sec=timeout_sec,
+        env_extra=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "failed to upgrade wazuh-agent").strip())
 
 
 def _desired_client_settings(profile: dict[str, Any], cfg: AgentConfig) -> dict[str, str]:
@@ -410,12 +437,20 @@ def apply_wazuh_profile(
             _apt_update(timeout_sec)
             actions.append("apt_update:ok")
 
+        hold_package = _bool(profile.get("hold_package"), False)
+        if not hold_package:
+            _set_package_hold(False)
+            actions.append("package_hold:disabled")
+
         installed, _version = _pkg_state("wazuh-agent")
         if not installed:
             if not _bool(profile.get("install_package"), True):
                 raise RuntimeError("wazuh-agent is not installed and install_package=false")
             _install_wazuh_agent(profile, cfg, timeout_sec=timeout_sec)
             actions.append("wazuh_agent:installed")
+        elif _bool(profile.get("install_package"), True) and not hold_package and _wazuh_upgrade_available(timeout_sec):
+            _upgrade_wazuh_agent(profile, cfg, timeout_sec=timeout_sec)
+            actions.append("wazuh_agent:upgraded")
         else:
             actions.append("wazuh_agent:present")
 
@@ -426,12 +461,9 @@ def apply_wazuh_profile(
         else:
             actions.append("ossec_conf:ok")
 
-        if _bool(profile.get("hold_package"), False):
+        if hold_package:
             _set_package_hold(True)
             actions.append("package_hold:enabled")
-        else:
-            _set_package_hold(False)
-            actions.append("package_hold:disabled")
 
         if _bool(profile.get("force_reenroll"), False) and _WAZUH_CLIENT_KEYS.exists():
             _WAZUH_CLIENT_KEYS.unlink()

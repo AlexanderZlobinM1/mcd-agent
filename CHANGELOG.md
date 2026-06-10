@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.129 - 2026-06-10
+
+- Fixed: Wazuh service-profile apply now upgrades an already installed
+  `wazuh-agent` package when apt reports a newer candidate, instead of only
+  reconciling repository/config/service state and returning a misleading
+  success.
+
 ## 0.9.128 - 2026-06-10
 
 - Added: host `apt_state` now includes cached `wazuh-agent` installation
