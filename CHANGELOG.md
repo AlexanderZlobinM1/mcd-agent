@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.128 - 2026-06-10
+
+- Added: host `apt_state` now includes cached `wazuh-agent` installation
+  state, package version, repository presence, service status and parsed
+  manager config so MCC Wazuh Operations can show what is actually installed
+  on each host.
+- Added: regression coverage for Wazuh state in the apt state payload.
+
 ## 0.9.127 - 2026-06-10
 
 - Added: Wazuh service profile apply support. MCD can install or reconcile

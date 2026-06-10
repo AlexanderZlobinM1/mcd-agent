@@ -1672,6 +1672,26 @@ def ensure_zabbix_mysql_monitor_user(
     }
 
 
+def _collect_wazuh_agent_state_for_push() -> dict[str, Any]:
+    try:
+        from mcd_agent.wazuh_profile import collect_wazuh_agent_state
+
+        state = collect_wazuh_agent_state()
+    except Exception as exc:
+        return {
+            "installed": False,
+            "version": "",
+            "error": str(exc)[:500],
+        }
+    if isinstance(state, dict):
+        return state
+    return {
+        "installed": False,
+        "version": "",
+        "error": "invalid_wazuh_agent_state",
+    }
+
+
 def collect_apt_state(
     *,
     timeout_sec: int = 45,
@@ -1724,6 +1744,7 @@ def collect_apt_state(
         "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "zabbix_mysql_monitor": zbx_payload,
+        "wazuh_agent": _collect_wazuh_agent_state_for_push(),
         "repo_profiles": collect_apt_repo_profiles_state(cfg=cfg),
         "unattended_upgrade": collect_unattended_upgrade_state(),
     }
