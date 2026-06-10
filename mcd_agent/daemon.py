@@ -5510,9 +5510,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             try:
                 components = [c.strip().lower() for c in (config.service_profiles_components or []) if str(c).strip()]
                 if not components:
-                    components = ["php_fpm", "mysql", "apt"]
+                    components = ["php_fpm", "mysql", "apt", "wazuh", "mautic_db_indexes"]
                 for comp in components:
-                    if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
+                    if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
                         continue
                     res = service_profiles_apply_once(config, component=comp, dry_run=False)
                     status = str(res.get("status", "")).strip().lower()

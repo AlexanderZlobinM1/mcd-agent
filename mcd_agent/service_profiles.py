@@ -15,6 +15,7 @@ from mcd_agent import __version__
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.mautic_db_indexes import apply_mautic_db_indexes
+from mcd_agent.wazuh_profile import apply_wazuh_profile
 
 
 _SYSCTL_PATH = Path("/etc/sysctl.d/99-mcd-hw.conf")
@@ -65,7 +66,7 @@ def fetch_service_profile(cfg: AgentConfig, component: str) -> dict[str, Any]:
     if not base:
         return {"status": "disabled", "reason": "mcc_url_not_set"}
     comp = (component or "").strip().lower().replace("-", "_")
-    if comp not in {"php_fpm", "mysql", "apt", "mautic_db_indexes", "db_indexes"}:
+    if comp not in {"php_fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "db_indexes"}:
         return {"status": "error", "reason": f"unsupported component: {component}"}
     ident = resolve_agent_identity(cfg)
     payload = {
@@ -98,6 +99,19 @@ def fetch_mysql_profile(cfg: AgentConfig) -> dict[str, Any]:
 
 def fetch_apt_profile(cfg: AgentConfig) -> dict[str, Any]:
     return fetch_service_profile(cfg, "apt")
+
+
+def fetch_wazuh_profile(cfg: AgentConfig) -> dict[str, Any]:
+    return fetch_service_profile(cfg, "wazuh")
+
+
+def _service_profile_apply_outcome(applied: dict[str, Any]) -> tuple[str, str | None]:
+    status = str(applied.get("status") or "").strip().lower()
+    if status in {"applied", "planned", "noop", "disabled", "ok", "already_present"}:
+        return "ok", None
+    if status in {"skipped", "deferred"}:
+        return "skipped", str(applied.get("reason") or status or "skipped")
+    return "error", str(applied.get("reason") or status or "apply_failed")
 
 
 def _detect_php_version() -> str:
@@ -898,7 +912,7 @@ def service_profiles_apply_once(
     allow_cluster_db_maintenance: bool = False,
 ) -> dict[str, Any]:
     comp = (component or "php_fpm").strip().lower().replace("-", "_")
-    if comp not in {"php_fpm", "mysql", "apt", "mautic_db_indexes", "db_indexes"}:
+    if comp not in {"php_fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "db_indexes"}:
         return {"status": "skipped", "reason": f"unsupported component: {component}"}
     guard = _cluster_db_maintenance_guard(
         cfg,
@@ -926,6 +940,8 @@ def service_profiles_apply_once(
         applied = apply_php_fpm_profile(cfg, profile, dry_run=dry_run)
     elif comp == "mysql":
         applied = apply_mysql_profile(cfg, profile, dry_run=dry_run)
+    elif comp == "wazuh":
+        applied = apply_wazuh_profile(profile, cfg, dry_run=dry_run)
     else:
         if os.geteuid() != 0:
             raise RuntimeError("service-profile apply requires root")
@@ -935,4 +951,8 @@ def service_profiles_apply_once(
             cfg=cfg,
             force_repo_rescan=bool(force_apt_repo_rescan),
         )
-    return {"status": "ok", "fetch": fetched, "apply": applied}
+    result_status, reason = _service_profile_apply_outcome(applied)
+    out = {"status": result_status, "fetch": fetched, "apply": applied}
+    if reason:
+        out["reason"] = reason
+    return out

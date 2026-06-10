@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+import types
 import unittest
 from unittest.mock import Mock
+
+if "pymysql" not in sys.modules:
+    pymysql = types.ModuleType("pymysql")
+    pymysql.connect = lambda **_kwargs: None
+    pymysql.connections = types.SimpleNamespace(Connection=object)
+    cursors = types.ModuleType("pymysql.cursors")
+    cursors.DictCursor = object
+    pymysql.cursors = cursors
+    sys.modules["pymysql"] = pymysql
+    sys.modules["pymysql.cursors"] = cursors
 
 import mcd_agent.service_profiles as service_profiles
 

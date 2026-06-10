@@ -1729,6 +1729,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "php-fpm",
             "mysql",
             "apt",
+            "wazuh",
             "mautic_db_indexes",
             "mautic-db-indexes",
             "db_indexes",
@@ -2679,7 +2680,7 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
         if args.op == "fetch":
-            if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
+            if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
                 print(json.dumps({"status": "error", "reason": f"unsupported component: {comp}"}, ensure_ascii=True))
                 return 2
             if comp.replace("-", "_") in {"mautic_db_indexes", "db_indexes"}:
