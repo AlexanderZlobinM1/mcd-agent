@@ -1526,10 +1526,11 @@ def _run_sql_segment_ring(
     now_ts: float,
     now_local: datetime,
     on_launch=None,
+    dynamic_blocked=None,
 ) -> int:
     if not config.segment_sql_ring_enabled:
         return 0
-    limit = max(0, int(getattr(config, "segment_sql_ring_max_per_tick", 1) or 0))
+    limit = min(1, max(0, int(getattr(config, "segment_sql_ring_max_per_tick", 1) or 0)))
     if limit <= 0 or not ring or not rules:
         return 0
     launched = 0
@@ -1556,6 +1557,9 @@ def _run_sql_segment_ring(
             ring.rotate(-1)
             continue
         if _is_running(running, root, "segment", sid):
+            ring.rotate(-1)
+            continue
+        if dynamic_blocked is not None and dynamic_blocked(sid):
             ring.rotate(-1)
             continue
         if not _launch_allowed(config, root, "segment_sql", sid, now_ts=now_ts):
@@ -2454,11 +2458,17 @@ def _fill_from_ring(
     dynamic_blocked=None,
     remove_on_launch: bool = False,
     on_launch=None,
-) -> None:
+    max_launches: int = 1,
+) -> int:
     if not ring or ring_limit <= 0 or total_limit <= 0:
-        return
+        return 0
+    launched_count = 0
     scans = len(ring)
-    while _running_count_for_entities(running, root, task_type, ring_entities) < ring_limit and scans > 0:
+    while (
+        launched_count < max(1, int(max_launches or 1))
+        and _running_count_for_entities(running, root, task_type, ring_entities) < ring_limit
+        and scans > 0
+    ):
         eid = ring[0]
         scans -= 1
         if blocked_entities and eid in blocked_entities:
@@ -2493,8 +2503,10 @@ def _fill_from_ring(
                 except Exception:
                     pass
             _advance_ring_after_launch(ring, eid, remove_on_launch=remove_on_launch)
+            launched_count += 1
         else:
             break
+    return launched_count
 
 
 def _compute_throttle_active(samples: deque[tuple[float, int]], threshold: int, window_min: int) -> bool:
@@ -4327,6 +4339,43 @@ def _running_campaign_total(running: dict[str, RunningTask], root: str) -> int:
         for t in running.values()
         if t.root == root and t.task_type in {"campaign_update", "campaign_trigger", "campaign_rebuild"}
     )
+
+
+def _campaign_pressure_active(
+    config: AgentConfig,
+    running: dict[str, RunningTask],
+    root: str,
+    *,
+    trigger_prio_ring: deque[int],
+    trigger_reg_ring: deque[int],
+    rebuild_prio_ring: deque[int],
+    rebuild_reg_ring: deque[int],
+    trigger_dynamic_blocked=None,
+) -> bool:
+    if not bool(getattr(config, "segment_throttle_during_campaigns", True)):
+        return False
+    if _running_campaign_total(running, root) > 0:
+        return True
+
+    def ring_has_launchable(ring: deque[int], task_type: str, dynamic_blocked=None) -> bool:
+        for eid in ring:
+            if _is_running(running, root, task_type, eid):
+                continue
+            if dynamic_blocked is not None and dynamic_blocked(int(eid)):
+                continue
+            return True
+        return False
+
+    if ring_has_launchable(trigger_prio_ring, "campaign_trigger", trigger_dynamic_blocked):
+        return True
+    if ring_has_launchable(trigger_reg_ring, "campaign_trigger", trigger_dynamic_blocked):
+        return True
+    if bool(getattr(config, "enable_campaign_rebuild", True)):
+        if ring_has_launchable(rebuild_prio_ring, "campaign_rebuild"):
+            return True
+        if ring_has_launchable(rebuild_reg_ring, "campaign_rebuild"):
+            return True
+    return False
 
 
 def _running_count_for_entities(
@@ -7019,9 +7068,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 _publish_monitor_cycle()
                 continue
 
-            segment_slot_limit = _effective_segment_slot_limit(config, throttled.get(root, False))
+            campaign_pressure = _campaign_pressure_active(
+                config,
+                running,
+                root,
+                trigger_prio_ring=trg_prio_ring,
+                trigger_reg_ring=trg_reg_ring,
+                rebuild_prio_ring=reb_prio_ring,
+                rebuild_reg_ring=reb_reg_ring,
+                trigger_dynamic_blocked=_trigger_waits_for_rebuild,
+            )
+            segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
+            segment_slot_limit = _effective_segment_slot_limit(config, segment_throttled_active)
             import_segment_slot_limit = max(1, segment_slot_limit) if cluster_import_allowed else segment_slot_limit
-            _submit_import_if_segment_slot(
+            segment_launched_this_tick = 0
+            if _submit_import_if_segment_slot(
                 config=config,
                 store=store,
                 running=running,
@@ -7031,14 +7092,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 import_pending_count=max(0, int(import_pending_cache.get(root, 0) or 0)),
                 segment_slot_limit=import_segment_slot_limit,
                 now_ts=now,
-            )
+            ):
+                segment_launched_this_tick += 1
 
             if (
-                cluster_cron_allowed
+                segment_launched_this_tick <= 0
+                and cluster_cron_allowed
                 and config.segment_mode != "classic_loop"
                 and _segment_shared_slots_available(running, root, segment_slot_limit) > 0
+                and not (segment_throttled_active and config.segment_throttle_whitelist_only)
             ):
-                _run_sql_segment_ring(
+                segment_launched_this_tick += _run_sql_segment_ring(
                     config=config,
                     store=store,
                     db=db,
@@ -7052,6 +7116,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     now_ts=now,
                     now_local=inst_now,
                     on_launch=_mark_segment_cycle,
+                    dynamic_blocked=_segment_chain_running_conflict,
                 )
 
             if cluster_cron_allowed and config.segment_mode == "classic_loop":
@@ -7063,8 +7128,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     batch_limit=config.segment_batch_limit,
                 )
                 classic_segment_limit = _segment_task_limit_after_import(running, root, 1)
-                if classic_segment_limit > 0:
-                    _submit_if_slot(
+                if classic_segment_limit > 0 and segment_launched_this_tick <= 0:
+                    if _submit_if_slot(
                         config=config,
                         store=store,
                         running=running,
@@ -7075,9 +7140,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         timeout_sec=config.command_timeout_sec,
                         max_parallel_for_type=classic_segment_limit,
                         popens=popens,
-                    )
+                    ):
+                        segment_launched_this_tick += 1
             elif cluster_cron_allowed:
-                if throttled.get(root, False):
+                if segment_throttled_active:
                     if config.segment_throttle_whitelist_only:
                         seg_prio_limit = max(0, config.segment_throttle_whitelist_parallel)
                         seg_reg_limit = 0
@@ -7093,7 +7159,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 eff_seg_reg_limit = seg_reg_limit
                 prefer_priority_spill = False
                 if (
-                    not throttled.get(root, False)
+                    not segment_throttled_active
                     and seg_prio_limit > 0
                     and seg_reg_limit > 0
                     and seg_prio_set
@@ -7130,7 +7196,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         )
                 seg_resume_ring = segment_resume_rings.setdefault(root, deque())
 
-                if throttled.get(root, False) and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
+                if segment_throttled_active and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
                     for key, task in list(running.items()):
                         if task.root != root or task.task_type != "segment":
                             continue
@@ -7143,8 +7209,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         if task.entity_id not in seg_resume_ring:
                             seg_resume_ring.appendleft(task.entity_id)
 
-                if not throttled.get(root, False) and seg_resume_ring:
-                    _fill_from_ring(
+                if not segment_throttled_active and seg_resume_ring and segment_launched_this_tick <= 0:
+                    segment_launched_this_tick += _fill_from_ring(
                         ring=seg_resume_ring,
                         ring_limit=seg_total_limit,
                         total_limit=seg_total_limit,
@@ -7168,36 +7234,37 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         on_launch=_mark_segment_cycle,
                     )
 
-                if throttled.get(root, False) and config.segment_throttle_whitelist_only:
+                if segment_throttled_active and config.segment_throttle_whitelist_only:
                     wl_ids = list(
                         dict.fromkeys(
                             [x for x in list(seg_prio_ring) + list(seg_reg_ring) if x in segment_whitelist_for_inst]
                         )
                     )
                     seg_wl_ring = deque(wl_ids)
-                    _fill_from_ring(
-                        ring=seg_wl_ring,
-                        ring_limit=seg_prio_limit,
-                        total_limit=seg_total_limit,
-                        root=root,
-                        task_type="segment",
-                        running=running,
-                        ring_entities=segment_whitelist_for_inst,
-                        config=config,
-                        store=store,
-                        popens=popens,
-                        build_args=lambda sid: render_mautic_command(
-                            php_bin=config.php_bin,
-                            run_as_user=config.mautic_run_as_user,
+                    if segment_launched_this_tick <= 0:
+                        segment_launched_this_tick += _fill_from_ring(
+                            ring=seg_wl_ring,
+                            ring_limit=seg_prio_limit,
+                            total_limit=seg_total_limit,
                             root=root,
-                            template=config.cmd_segment_update_template,
-                            id=sid,
-                            batch_limit=config.segment_batch_limit,
-                        ),
-                        blocked_entities=segment_blocked_ids,
-                        dynamic_blocked=_segment_chain_running_conflict,
-                        on_launch=_mark_segment_cycle,
-                    )
+                            task_type="segment",
+                            running=running,
+                            ring_entities=segment_whitelist_for_inst,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda sid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_segment_update_template,
+                                id=sid,
+                                batch_limit=config.segment_batch_limit,
+                            ),
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            on_launch=_mark_segment_cycle,
+                        )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
                         pass
@@ -7205,57 +7272,59 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         # No non-whitelist launches while throttle is active.
                         pass
                 else:
-                    _fill_from_ring(
-                        ring=seg_prio_ring,
-                        ring_limit=eff_seg_prio_limit,
-                        total_limit=seg_total_limit,
-                        root=root,
-                        task_type="segment",
-                        running=running,
-                        ring_entities=seg_prio_set,
-                        config=config,
-                        store=store,
-                        popens=popens,
-                        build_args=lambda sid: render_mautic_command(
-                            php_bin=config.php_bin,
-                            run_as_user=config.mautic_run_as_user,
+                    if segment_launched_this_tick <= 0:
+                        segment_launched_this_tick += _fill_from_ring(
+                            ring=seg_prio_ring,
+                            ring_limit=eff_seg_prio_limit,
+                            total_limit=seg_total_limit,
                             root=root,
-                            template=config.cmd_segment_update_template,
-                            id=sid,
-                            batch_limit=config.segment_batch_limit,
-                        ),
-                        blocked_entities=segment_blocked_ids,
-                        dynamic_blocked=_segment_chain_running_conflict,
-                        on_launch=_mark_segment_cycle,
-                    )
-                    _fill_from_ring(
-                        ring=seg_reg_ring,
-                        ring_limit=eff_seg_reg_limit,
-                        total_limit=seg_total_limit,
-                        root=root,
-                        task_type="segment",
-                        running=running,
-                        ring_entities=seg_reg_set,
-                        config=config,
-                        store=store,
-                        popens=popens,
-                        build_args=lambda sid: render_mautic_command(
-                            php_bin=config.php_bin,
-                            run_as_user=config.mautic_run_as_user,
+                            task_type="segment",
+                            running=running,
+                            ring_entities=seg_prio_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda sid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_segment_update_template,
+                                id=sid,
+                                batch_limit=config.segment_batch_limit,
+                            ),
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            on_launch=_mark_segment_cycle,
+                        )
+                    if segment_launched_this_tick <= 0:
+                        segment_launched_this_tick += _fill_from_ring(
+                            ring=seg_reg_ring,
+                            ring_limit=eff_seg_reg_limit,
+                            total_limit=seg_total_limit,
                             root=root,
-                            template=config.cmd_segment_update_template,
-                            id=sid,
-                            batch_limit=config.segment_batch_limit,
-                        ),
-                        blocked_entities=segment_blocked_ids,
-                        dynamic_blocked=_segment_chain_running_conflict,
-                        on_launch=_mark_segment_cycle,
-                    )
+                            task_type="segment",
+                            running=running,
+                            ring_entities=seg_reg_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda sid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_segment_update_template,
+                                id=sid,
+                                batch_limit=config.segment_batch_limit,
+                            ),
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            on_launch=_mark_segment_cycle,
+                        )
                     seg_cur_total = _running_count(running, root, "segment")
-                    if seg_cur_total < seg_total_limit:
+                    if segment_launched_this_tick <= 0 and seg_cur_total < seg_total_limit:
                         spill = seg_total_limit - seg_cur_total
                         if prefer_priority_spill and seg_prio_ring and spill > 0:
-                            _fill_from_ring(
+                            segment_launched_this_tick += _fill_from_ring(
                                 ring=seg_prio_ring,
                                 ring_limit=eff_seg_prio_limit,
                                 total_limit=seg_total_limit,
@@ -7279,7 +7348,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 on_launch=_mark_segment_cycle,
                             )
                         elif seg_reg_ring:
-                            _fill_from_ring(
+                            segment_launched_this_tick += _fill_from_ring(
                                 ring=seg_reg_ring,
                                 ring_limit=spill,
                                 total_limit=seg_total_limit,
@@ -7305,7 +7374,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         elif seg_prio_ring and spill > 0:
                             # If regular ring is empty, keep total segment concurrency at target
                             # by temporarily borrowing regular slot(s) for priority ring.
-                            _fill_from_ring(
+                            segment_launched_this_tick += _fill_from_ring(
                                 ring=seg_prio_ring,
                                 ring_limit=seg_prio_limit + spill,
                                 total_limit=seg_total_limit,
@@ -7459,76 +7528,57 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 max(0, int(config.campaign_trigger_priority_parallel))
                 + max(0, int(config.campaign_trigger_regular_parallel))
             ) > 0
-            prefer_rebuild = (
-                shared_campaign_cap > 0
-                and config.enable_campaign_rebuild
-                and (rr % 2 == 1)
-            )
-            trg_prio_limit = max(0, config.campaign_trigger_priority_parallel) if cluster_cron_allowed else 0
-            trg_reg_limit = max(0, config.campaign_trigger_regular_parallel) if cluster_cron_allowed else 0
-            trg_total_limit = trg_prio_limit + trg_reg_limit
-            if shared_campaign_cap > 0:
-                rem = max(0, shared_campaign_cap - _running_campaign_total(running, root))
-                if prefer_rebuild:
-                    rem = 0
-                trg_total_limit = min(trg_total_limit, rem)
-                trg_prio_limit = min(trg_prio_limit, trg_total_limit)
-                trg_reg_limit = min(trg_reg_limit, max(0, trg_total_limit - trg_prio_limit))
-            _fill_from_ring(
-                ring=trg_prio_ring,
-                ring_limit=trg_prio_limit,
-                total_limit=trg_total_limit,
-                root=root,
-                task_type="campaign_trigger",
-                running=running,
-                ring_entities=trg_prio_set,
-                config=config,
-                store=store,
-                popens=popens,
-                build_args=lambda cid: render_mautic_command(
-                    php_bin=config.php_bin,
-                    run_as_user=config.mautic_run_as_user,
+            prefer_rebuild = bool(config.enable_campaign_rebuild and trigger_lane_configured and (rr % 2 == 1))
+
+            def _campaign_shared_available() -> int | None:
+                if shared_campaign_cap <= 0:
+                    return None
+                return max(0, shared_campaign_cap - _running_campaign_total(running, root))
+
+            def _campaign_lane_limits(prio_limit: int, reg_limit: int) -> tuple[int, int, int]:
+                prio = max(0, int(prio_limit or 0)) if cluster_cron_allowed else 0
+                reg = max(0, int(reg_limit or 0)) if cluster_cron_allowed else 0
+                total = prio + reg
+                shared_avail = _campaign_shared_available()
+                if shared_avail is not None:
+                    total = min(total, shared_avail)
+                    prio = min(prio, total)
+                    reg = min(reg, max(0, total - prio))
+                return prio, reg, total
+
+            def _try_campaign_trigger_once() -> int:
+                trg_prio_limit, trg_reg_limit, trg_total_limit = _campaign_lane_limits(
+                    config.campaign_trigger_priority_parallel,
+                    config.campaign_trigger_regular_parallel,
+                )
+                launched = _fill_from_ring(
+                    ring=trg_prio_ring,
+                    ring_limit=trg_prio_limit,
+                    total_limit=trg_total_limit,
                     root=root,
-                    template=config.cmd_campaign_trigger_template,
-                    id=cid,
-                    campaign_limit=config.campaign_limit,
-                    batch_limit=config.campaign_batch_limit,
-                ),
-                dynamic_blocked=_trigger_waits_for_rebuild,
-                remove_on_launch=True,
-                on_launch=_mark_campaign_trigger_cycle,
-            )
-            _fill_from_ring(
-                ring=trg_reg_ring,
-                ring_limit=trg_reg_limit,
-                total_limit=trg_total_limit,
-                root=root,
-                task_type="campaign_trigger",
-                running=running,
-                ring_entities=trg_reg_set,
-                config=config,
-                store=store,
-                popens=popens,
-                build_args=lambda cid: render_mautic_command(
-                    php_bin=config.php_bin,
-                    run_as_user=config.mautic_run_as_user,
-                    root=root,
-                    template=config.cmd_campaign_trigger_template,
-                    id=cid,
-                    campaign_limit=config.campaign_limit,
-                    batch_limit=config.campaign_batch_limit,
-                ),
-                dynamic_blocked=_trigger_waits_for_rebuild,
-                remove_on_launch=True,
-                on_launch=_mark_campaign_trigger_cycle,
-            )
-            trg_cur_total = _running_count(running, root, "campaign_trigger")
-            if trg_cur_total < trg_total_limit:
-                spill = trg_total_limit - trg_cur_total
-                if trg_reg_ring:
-                    _fill_from_ring(
+                    task_type="campaign_trigger",
+                    running=running,
+                    ring_entities=trg_prio_set,
+                    config=config,
+                    store=store,
+                    popens=popens,
+                    build_args=lambda cid: render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=config.cmd_campaign_trigger_template,
+                        id=cid,
+                        campaign_limit=config.campaign_limit,
+                        batch_limit=config.campaign_batch_limit,
+                    ),
+                    dynamic_blocked=_trigger_waits_for_rebuild,
+                    remove_on_launch=True,
+                    on_launch=_mark_campaign_trigger_cycle,
+                )
+                if launched <= 0:
+                    launched += _fill_from_ring(
                         ring=trg_reg_ring,
-                        ring_limit=spill,
+                        ring_limit=trg_reg_limit,
                         total_limit=trg_total_limit,
                         root=root,
                         task_type="campaign_trigger",
@@ -7550,43 +7600,69 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         remove_on_launch=True,
                         on_launch=_mark_campaign_trigger_cycle,
                     )
-                elif trg_prio_ring:
-                    _fill_from_ring(
-                        ring=trg_prio_ring,
-                        ring_limit=spill,
-                        total_limit=trg_total_limit,
-                        root=root,
-                        task_type="campaign_trigger",
-                        running=running,
-                        ring_entities=trg_prio_set,
-                        config=config,
-                        store=store,
-                        popens=popens,
-                        build_args=lambda cid: render_mautic_command(
-                            php_bin=config.php_bin,
-                            run_as_user=config.mautic_run_as_user,
+                trg_cur_total = _running_count(running, root, "campaign_trigger")
+                if launched <= 0 and trg_cur_total < trg_total_limit:
+                    spill = trg_total_limit - trg_cur_total
+                    if trg_reg_ring:
+                        launched += _fill_from_ring(
+                            ring=trg_reg_ring,
+                            ring_limit=spill,
+                            total_limit=trg_total_limit,
                             root=root,
-                            template=config.cmd_campaign_trigger_template,
-                            id=cid,
-                            campaign_limit=config.campaign_limit,
-                            batch_limit=config.campaign_batch_limit,
-                        ),
-                        dynamic_blocked=_trigger_waits_for_rebuild,
-                        remove_on_launch=True,
-                        on_launch=_mark_campaign_trigger_cycle,
-                    )
-            if cluster_cron_allowed and config.enable_campaign_rebuild:
-                rebuild_prio_limit = max(0, config.campaign_rebuild_priority_parallel)
-                rebuild_reg_limit = max(0, config.campaign_rebuild_regular_parallel)
-                rebuild_total_limit = rebuild_prio_limit + rebuild_reg_limit
-                if shared_campaign_cap > 0:
-                    rem = max(0, shared_campaign_cap - _running_campaign_total(running, root))
-                    if (not prefer_rebuild) and (trg_prio_limit + trg_reg_limit) > 0:
-                        rem = 0
-                    rebuild_total_limit = min(rebuild_total_limit, rem)
-                    rebuild_prio_limit = min(rebuild_prio_limit, rebuild_total_limit)
-                    rebuild_reg_limit = min(rebuild_reg_limit, max(0, rebuild_total_limit - rebuild_prio_limit))
-                _fill_from_ring(
+                            task_type="campaign_trigger",
+                            running=running,
+                            ring_entities=trg_reg_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda cid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_campaign_trigger_template,
+                                id=cid,
+                                campaign_limit=config.campaign_limit,
+                                batch_limit=config.campaign_batch_limit,
+                            ),
+                            dynamic_blocked=_trigger_waits_for_rebuild,
+                            remove_on_launch=True,
+                            on_launch=_mark_campaign_trigger_cycle,
+                        )
+                    elif trg_prio_ring:
+                        launched += _fill_from_ring(
+                            ring=trg_prio_ring,
+                            ring_limit=spill,
+                            total_limit=trg_total_limit,
+                            root=root,
+                            task_type="campaign_trigger",
+                            running=running,
+                            ring_entities=trg_prio_set,
+                            config=config,
+                            store=store,
+                            popens=popens,
+                            build_args=lambda cid: render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=config.cmd_campaign_trigger_template,
+                                id=cid,
+                                campaign_limit=config.campaign_limit,
+                                batch_limit=config.campaign_batch_limit,
+                            ),
+                            dynamic_blocked=_trigger_waits_for_rebuild,
+                            remove_on_launch=True,
+                            on_launch=_mark_campaign_trigger_cycle,
+                        )
+                return launched
+
+            def _try_campaign_rebuild_once() -> int:
+                if not (cluster_cron_allowed and config.enable_campaign_rebuild):
+                    return 0
+                rebuild_prio_limit, rebuild_reg_limit, rebuild_total_limit = _campaign_lane_limits(
+                    config.campaign_rebuild_priority_parallel,
+                    config.campaign_rebuild_regular_parallel,
+                )
+                launched = _fill_from_ring(
                     ring=reb_prio_ring,
                     ring_limit=rebuild_prio_limit,
                     total_limit=rebuild_total_limit,
@@ -7607,32 +7683,33 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     remove_on_launch=True,
                     on_launch=_mark_campaign_rebuild_cycle,
                 )
-                _fill_from_ring(
-                    ring=reb_reg_ring,
-                    ring_limit=rebuild_reg_limit,
-                    total_limit=rebuild_total_limit,
-                    root=root,
-                    task_type="campaign_rebuild",
-                    running=running,
-                    ring_entities=reb_reg_set,
-                    config=config,
-                    store=store,
-                    popens=popens,
-                    build_args=lambda cid: render_mautic_command(
-                        php_bin=config.php_bin,
-                        run_as_user=config.mautic_run_as_user,
+                if launched <= 0:
+                    launched += _fill_from_ring(
+                        ring=reb_reg_ring,
+                        ring_limit=rebuild_reg_limit,
+                        total_limit=rebuild_total_limit,
                         root=root,
-                        template=config.cmd_campaign_rebuild_template,
-                        id=cid,
-                    ),
-                    remove_on_launch=True,
-                    on_launch=_mark_campaign_rebuild_cycle,
-                )
+                        task_type="campaign_rebuild",
+                        running=running,
+                        ring_entities=reb_reg_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda cid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
+                            root=root,
+                            template=config.cmd_campaign_rebuild_template,
+                            id=cid,
+                        ),
+                        remove_on_launch=True,
+                        on_launch=_mark_campaign_rebuild_cycle,
+                    )
                 reb_cur_total = _running_count(running, root, "campaign_rebuild")
-                if reb_cur_total < rebuild_total_limit:
+                if launched <= 0 and reb_cur_total < rebuild_total_limit:
                     spill = rebuild_total_limit - reb_cur_total
                     if reb_reg_ring:
-                        _fill_from_ring(
+                        launched += _fill_from_ring(
                             ring=reb_reg_ring,
                             ring_limit=spill,
                             total_limit=rebuild_total_limit,
@@ -7653,9 +7730,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             remove_on_launch=True,
                             on_launch=_mark_campaign_rebuild_cycle,
                         )
-
                     elif reb_prio_ring:
-                        _fill_from_ring(
+                        launched += _fill_from_ring(
                             ring=reb_prio_ring,
                             ring_limit=spill,
                             total_limit=rebuild_total_limit,
@@ -7676,8 +7752,19 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             remove_on_launch=True,
                             on_launch=_mark_campaign_rebuild_cycle,
                         )
+                return launched
 
-            if shared_campaign_cap > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
+            campaign_launched_this_tick = 0
+            if prefer_rebuild:
+                campaign_launched_this_tick += _try_campaign_rebuild_once()
+                if campaign_launched_this_tick <= 0:
+                    campaign_launched_this_tick += _try_campaign_trigger_once()
+            else:
+                campaign_launched_this_tick += _try_campaign_trigger_once()
+                if campaign_launched_this_tick <= 0:
+                    campaign_launched_this_tick += _try_campaign_rebuild_once()
+
+            if campaign_launched_this_tick > 0 and config.enable_campaign_rebuild and trigger_lane_configured:
                 campaign_round_robin[root] = rr + 1
 
             _publish_monitor_cycle()

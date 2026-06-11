@@ -37,7 +37,9 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   - import execution on pending import queue
   - optional periodic contacts cleanup (`{prefix}leads` rows with empty email+phone fields)
 - Segment whitelist policy during active campaigns
-- Runtime concurrency controls for campaigns and segments
+- Runtime concurrency controls for campaigns and segments; limits are worker
+  ceilings, while automatic scheduler dispatch claims at most one new queued
+  task per pass to avoid burst-starting all free workers at once
 - Round-robin segment scheduling so all eligible segments are processed over time
 - Priority/regular circles for both segments and campaigns with dynamic weights
 - Queue-based throttling using DB queue metrics (`message_queue` for Mautic 5+)
@@ -54,7 +56,10 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 - Scheduler model:
   - single daemon loop
   - DB/config refresh on `poll_interval_sec`
-  - dispatcher refill on `dispatch_interval_sec` (keeps target parallelism continuously)
+  - dispatcher refill on `dispatch_interval_sec` (keeps target parallelism over
+    time, but starts automatic ring work one task at a time)
+  - dependent segment chains share one worker lane; unrelated chains may still
+    occupy other segment workers
   - two circles for segments and campaigns (`priority` + `regular`) with separate parallel limits
   - `spawn-and-release`: daemon starts command and does not wait for completion
   - process status is tracked asynchronously by PID monitor

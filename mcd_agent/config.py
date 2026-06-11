@@ -757,6 +757,7 @@ class AgentConfig:
     ring_mode: str
     disable_throttle: bool
     disable_whitelist: bool
+    segment_throttle_during_campaigns: bool
     segment_throttle_whitelist_only: bool
     segment_throttle_whitelist_parallel: int
     segment_throttle_kill_non_whitelist: bool
@@ -1912,6 +1913,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_allow_test_build": "mcd_update_allow_test_build",
     "mcd_update_wait_retry_sec": "mcd_update_wait_retry_sec",
     "mcd_update_defer_during_campaigns": "mcd_update_defer_during_campaigns",
+    "segment_throttle_during_campaigns": "segment_throttle_during_campaigns",
     "mcd_update_cleanup_enabled": "mcd_update_cleanup_enabled",
     "mcd_update_cleanup_interval_sec": "mcd_update_cleanup_interval_sec",
     "mcd_update_keep_archives": "mcd_update_keep_archives",
@@ -2004,6 +2006,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "ring_mode": "ring_mode",
     "disable_throttle": "disable_throttle",
     "disable_whitelist": "disable_whitelist",
+    "segment_throttle_during_campaigns": "segment_throttle_during_campaigns",
     "segment_throttle_whitelist_only": "segment_throttle_whitelist_only",
     "segment_throttle_whitelist_parallel": "segment_throttle_whitelist_parallel",
     "segment_throttle_kill_non_whitelist": "segment_throttle_kill_non_whitelist",
@@ -2291,6 +2294,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     segment_throttle_whitelist_only = bool(runtime.get("segment_throttle_whitelist_only", False))
     segment_throttle_whitelist_parallel = int(runtime.get("segment_throttle_whitelist_parallel", 1))
     segment_throttle_kill_non_whitelist = bool(runtime.get("segment_throttle_kill_non_whitelist", False))
+    segment_throttle_during_campaigns = bool(runtime.get("segment_throttle_during_campaigns", True))
     campaign_priority_parallel = int(runtime.get("campaign_priority_parallel", 4))
     campaign_regular_parallel = int(runtime.get("campaign_regular_parallel", 1))
     campaign_total_parallel = int(runtime.get("campaign_total_parallel", 0))
@@ -3098,6 +3102,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         ring_mode=ring_mode,
         disable_throttle=disable_throttle,
         disable_whitelist=disable_whitelist,
+        segment_throttle_during_campaigns=segment_throttle_during_campaigns,
         segment_throttle_whitelist_only=segment_throttle_whitelist_only,
         segment_throttle_whitelist_parallel=segment_throttle_whitelist_parallel,
         segment_throttle_kill_non_whitelist=segment_throttle_kill_non_whitelist,

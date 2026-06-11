@@ -3,20 +3,25 @@ from __future__ import annotations
 import unittest
 import tempfile
 from collections import deque
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mcd_agent import daemon as daemon_mod
 from mcd_agent.daemon import (
     RunningTask,
+    SQLSegmentRule,
     TaskStore,
     _CAMPAIGN_REBUILD_FINISHED_AT,
+    _campaign_pressure_active,
     _campaign_trigger_waits_for_rebuild,
     _effective_segment_slot_limit,
+    _fill_from_ring,
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
     _published_segment_whitelist_ids,
+    _run_sql_segment_ring,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
@@ -276,6 +281,160 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         cfg.segment_throttle_whitelist_only = True
         self.assertEqual(_effective_segment_slot_limit(cfg, True), 1)
+
+    def test_fill_from_ring_launches_only_one_entity_per_scheduler_pass(self) -> None:
+        root = "/var/www/site"
+        ring = deque([11, 22, 33])
+        cfg = SimpleNamespace(command_timeout_sec=3600, segment_full_scan_interval_sec=0)
+
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True) as submit:
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=3,
+                total_limit=3,
+                root=root,
+                task_type="segment",
+                running={},
+                ring_entities={11, 22, 33},
+                config=cfg,
+                store=SimpleNamespace(),
+                popens={},
+                build_args=lambda sid: ["php", "bin/console", "mautic:segments:update", "-i", str(sid)],
+            )
+
+        self.assertEqual(launched, 1)
+        submit.assert_called_once()
+        self.assertEqual(submit.call_args.kwargs["entity_id"], 11)
+        self.assertEqual(list(ring), [22, 33, 11])
+
+    def test_fill_from_ring_skips_blocked_dependency_chain_and_launches_independent_segment(self) -> None:
+        root = "/var/www/site"
+        ring = deque([11, 22, 33])
+        cfg = SimpleNamespace(command_timeout_sec=3600, segment_full_scan_interval_sec=0)
+
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True) as submit:
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=3,
+                total_limit=3,
+                root=root,
+                task_type="segment",
+                running={},
+                ring_entities={11, 22, 33},
+                config=cfg,
+                store=SimpleNamespace(),
+                popens={},
+                build_args=lambda sid: ["php", "bin/console", "mautic:segments:update", "-i", str(sid)],
+                dynamic_blocked=lambda sid: sid == 11,
+            )
+
+        self.assertEqual(launched, 1)
+        submit.assert_called_once()
+        self.assertEqual(submit.call_args.kwargs["entity_id"], 22)
+        self.assertEqual(list(ring), [33, 11, 22])
+
+    def test_sql_segment_ring_respects_dependency_chain_worker_lock(self) -> None:
+        root = "/var/www/site"
+        db = SimpleNamespace(rebuild_segment_membership=Mock(return_value={}))
+        cfg = SimpleNamespace(segment_sql_ring_enabled=True)
+        store = SimpleNamespace()
+        ring = deque([22])
+
+        launched = _run_sql_segment_ring(
+            config=cfg,
+            store=store,
+            db=db,
+            root=root,
+            ring=ring,
+            rules={22: SQLSegmentRule(segment_id=22, select_sql="SELECT 1", depends_on=())},
+            active_set={22},
+            done_set=set(),
+            running={},
+            sql_ctx={},
+            now_ts=100.0,
+            now_local=datetime.now(timezone.utc),
+            dynamic_blocked=lambda sid: sid == 22,
+        )
+
+        self.assertEqual(launched, 0)
+        db.rebuild_segment_membership.assert_not_called()
+        self.assertEqual(list(ring), [22])
+
+    def test_campaign_pressure_throttles_segments_when_campaign_running(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(segment_throttle_during_campaigns=True, enable_campaign_rebuild=True)
+        running = {
+            _task_key(root, "campaign_trigger", 104): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 104),
+                task_type="campaign_trigger",
+                entity_id=104,
+                command_str="campaign trigger 104",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=100.0,
+                pid=1004,
+            )
+        }
+
+        self.assertTrue(
+            _campaign_pressure_active(
+                cfg,
+                running,
+                root,
+                trigger_prio_ring=deque(),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+            )
+        )
+
+    def test_campaign_pressure_throttles_segments_before_launchable_campaign_starts(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(segment_throttle_during_campaigns=True, enable_campaign_rebuild=True)
+
+        self.assertTrue(
+            _campaign_pressure_active(
+                cfg,
+                {},
+                root,
+                trigger_prio_ring=deque([104]),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+                trigger_dynamic_blocked=lambda cid: False,
+            )
+        )
+
+        self.assertFalse(
+            _campaign_pressure_active(
+                cfg,
+                {},
+                root,
+                trigger_prio_ring=deque([104]),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+                trigger_dynamic_blocked=lambda cid: True,
+            )
+        )
+
+    def test_campaign_pressure_can_be_disabled_for_segment_scheduler(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(segment_throttle_during_campaigns=False, enable_campaign_rebuild=True)
+
+        self.assertFalse(
+            _campaign_pressure_active(
+                cfg,
+                {},
+                root,
+                trigger_prio_ring=deque([104]),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque([105]),
+                rebuild_reg_ring=deque(),
+            )
+        )
 
     def test_segment_whitelist_uses_instance_specific_setting(self) -> None:
         cfg = SimpleNamespace(

@@ -1,5 +1,24 @@
 # MCD Changelog
 
+## 0.9.130 - 2026-06-11
+
+- Changed: scheduler ring dispatch now launches at most one new automatic task
+  per scheduler pass for segment/campaign pools instead of burst-filling all
+  free slots at once. Configured parallel limits still cap concurrent workers,
+  but new work enters gradually as workers become available.
+- Fixed: campaign trigger/rebuild dispatch now alternates the first lane even
+  without a shared campaign cap, preventing trigger backlogs from starving
+  rebuild work after one-at-a-time dispatch.
+- Fixed: active or immediately launchable campaign trigger/rebuild work now
+  puts segment dispatch into campaign-pressure throttle. During this pressure,
+  whitelist segments may still run through the configured whitelist slot, while
+  non-whitelist and SQL-ring segment rebuilds wait.
+- Fixed: SQL-ring segment rebuilds now respect the same dependency-chain worker
+  lock as standard Mautic segment jobs, so one dependent chain runs sequentially
+  while unrelated chains can still use other workers.
+- Added: regression coverage for campaign-pressure segment throttling and
+  one-at-a-time ring dispatch.
+
 ## 0.9.129 - 2026-06-10
 
 - Fixed: Wazuh service-profile apply now upgrades an already installed
