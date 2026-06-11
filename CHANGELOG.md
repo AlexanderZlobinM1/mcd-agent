@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.131 - 2026-06-11
+
+- Changed: campaign-pressure segment throttling now treats campaigns as heavy
+  only after configurable thresholds are reached. A queued or short-running
+  campaign no longer reduces segment workers by itself.
+- Added: runtime knobs `campaign_pressure_min_running_sec` and
+  `campaign_pressure_min_running_count` for controlling when campaign activity
+  should throttle segment dispatch.
+- Fixed: regression coverage now verifies that dependent segment chains still
+  serialize while unrelated chains can use other workers without campaign
+  pressure being triggered by light campaign activity.
+
 ## 0.9.130 - 2026-06-11
 
 - Changed: scheduler ring dispatch now launches at most one new automatic task
@@ -9,10 +21,9 @@
 - Fixed: campaign trigger/rebuild dispatch now alternates the first lane even
   without a shared campaign cap, preventing trigger backlogs from starving
   rebuild work after one-at-a-time dispatch.
-- Fixed: active or immediately launchable campaign trigger/rebuild work now
-  puts segment dispatch into campaign-pressure throttle. During this pressure,
-  whitelist segments may still run through the configured whitelist slot, while
-  non-whitelist and SQL-ring segment rebuilds wait.
+- Fixed: active campaign pressure can put segment dispatch into throttle.
+  During this pressure, whitelist segments may still run through the configured
+  whitelist slot, while non-whitelist and SQL-ring segment rebuilds wait.
 - Fixed: SQL-ring segment rebuilds now respect the same dependency-chain worker
   lock as standard Mautic segment jobs, so one dependent chain runs sequentially
   while unrelated chains can still use other workers.

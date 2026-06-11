@@ -758,6 +758,8 @@ class AgentConfig:
     disable_throttle: bool
     disable_whitelist: bool
     segment_throttle_during_campaigns: bool
+    campaign_pressure_min_running_sec: int
+    campaign_pressure_min_running_count: int
     segment_throttle_whitelist_only: bool
     segment_throttle_whitelist_parallel: int
     segment_throttle_kill_non_whitelist: bool
@@ -1914,6 +1916,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "mcd_update_wait_retry_sec": "mcd_update_wait_retry_sec",
     "mcd_update_defer_during_campaigns": "mcd_update_defer_during_campaigns",
     "segment_throttle_during_campaigns": "segment_throttle_during_campaigns",
+    "campaign_pressure_min_running_sec": "campaign_pressure_min_running_sec",
+    "campaign_pressure_min_running_count": "campaign_pressure_min_running_count",
     "mcd_update_cleanup_enabled": "mcd_update_cleanup_enabled",
     "mcd_update_cleanup_interval_sec": "mcd_update_cleanup_interval_sec",
     "mcd_update_keep_archives": "mcd_update_keep_archives",
@@ -2007,6 +2011,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "disable_throttle": "disable_throttle",
     "disable_whitelist": "disable_whitelist",
     "segment_throttle_during_campaigns": "segment_throttle_during_campaigns",
+    "campaign_pressure_min_running_sec": "campaign_pressure_min_running_sec",
+    "campaign_pressure_min_running_count": "campaign_pressure_min_running_count",
     "segment_throttle_whitelist_only": "segment_throttle_whitelist_only",
     "segment_throttle_whitelist_parallel": "segment_throttle_whitelist_parallel",
     "segment_throttle_kill_non_whitelist": "segment_throttle_kill_non_whitelist",
@@ -2295,6 +2301,8 @@ def _load_config_inner(path: str) -> AgentConfig:
     segment_throttle_whitelist_parallel = int(runtime.get("segment_throttle_whitelist_parallel", 1))
     segment_throttle_kill_non_whitelist = bool(runtime.get("segment_throttle_kill_non_whitelist", False))
     segment_throttle_during_campaigns = bool(runtime.get("segment_throttle_during_campaigns", True))
+    campaign_pressure_min_running_sec = max(0, int(runtime.get("campaign_pressure_min_running_sec", 120) or 0))
+    campaign_pressure_min_running_count = max(0, int(runtime.get("campaign_pressure_min_running_count", 2) or 0))
     campaign_priority_parallel = int(runtime.get("campaign_priority_parallel", 4))
     campaign_regular_parallel = int(runtime.get("campaign_regular_parallel", 1))
     campaign_total_parallel = int(runtime.get("campaign_total_parallel", 0))
@@ -3103,6 +3111,8 @@ def _load_config_inner(path: str) -> AgentConfig:
         disable_throttle=disable_throttle,
         disable_whitelist=disable_whitelist,
         segment_throttle_during_campaigns=segment_throttle_during_campaigns,
+        campaign_pressure_min_running_sec=campaign_pressure_min_running_sec,
+        campaign_pressure_min_running_count=campaign_pressure_min_running_count,
         segment_throttle_whitelist_only=segment_throttle_whitelist_only,
         segment_throttle_whitelist_parallel=segment_throttle_whitelist_parallel,
         segment_throttle_kill_non_whitelist=segment_throttle_kill_non_whitelist,

@@ -4351,30 +4351,26 @@ def _campaign_pressure_active(
     rebuild_prio_ring: deque[int],
     rebuild_reg_ring: deque[int],
     trigger_dynamic_blocked=None,
+    now_ts: float | None = None,
 ) -> bool:
     if not bool(getattr(config, "segment_throttle_during_campaigns", True)):
         return False
-    if _running_campaign_total(running, root) > 0:
-        return True
-
-    def ring_has_launchable(ring: deque[int], task_type: str, dynamic_blocked=None) -> bool:
-        for eid in ring:
-            if _is_running(running, root, task_type, eid):
-                continue
-            if dynamic_blocked is not None and dynamic_blocked(int(eid)):
-                continue
-            return True
+    running_campaigns = [
+        t
+        for t in running.values()
+        if t.root == root and t.task_type in {"campaign_update", "campaign_trigger", "campaign_rebuild"}
+    ]
+    if not running_campaigns:
         return False
-
-    if ring_has_launchable(trigger_prio_ring, "campaign_trigger", trigger_dynamic_blocked):
+    min_running_count = max(0, int(getattr(config, "campaign_pressure_min_running_count", 2) or 0))
+    if min_running_count > 0 and len(running_campaigns) >= min_running_count:
         return True
-    if ring_has_launchable(trigger_reg_ring, "campaign_trigger", trigger_dynamic_blocked):
+    min_running_sec = max(0, int(getattr(config, "campaign_pressure_min_running_sec", 120) or 0))
+    if min_running_sec <= 0:
         return True
-    if bool(getattr(config, "enable_campaign_rebuild", True)):
-        if ring_has_launchable(rebuild_prio_ring, "campaign_rebuild"):
-            return True
-        if ring_has_launchable(rebuild_reg_ring, "campaign_rebuild"):
-            return True
+    now = time.time() if now_ts is None else float(now_ts)
+    if any(now - float(t.started_at or 0) >= min_running_sec for t in running_campaigns):
+        return True
     return False
 
 
@@ -7077,6 +7073,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 rebuild_prio_ring=reb_prio_ring,
                 rebuild_reg_ring=reb_reg_ring,
                 trigger_dynamic_blocked=_trigger_waits_for_rebuild,
+                now_ts=now,
             )
             segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
             segment_slot_limit = _effective_segment_slot_limit(config, segment_throttled_active)

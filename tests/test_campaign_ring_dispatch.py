@@ -360,9 +360,50 @@ class CampaignRingDispatchTests(unittest.TestCase):
         db.rebuild_segment_membership.assert_not_called()
         self.assertEqual(list(ring), [22])
 
-    def test_campaign_pressure_throttles_segments_when_campaign_running(self) -> None:
+    def test_campaign_pressure_ignores_short_single_campaign(self) -> None:
         root = "/var/www/site"
-        cfg = SimpleNamespace(segment_throttle_during_campaigns=True, enable_campaign_rebuild=True)
+        cfg = SimpleNamespace(
+            segment_throttle_during_campaigns=True,
+            enable_campaign_rebuild=True,
+            campaign_pressure_min_running_sec=120,
+            campaign_pressure_min_running_count=2,
+        )
+        running = {
+            _task_key(root, "campaign_trigger", 104): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 104),
+                task_type="campaign_trigger",
+                entity_id=104,
+                command_str="campaign trigger 104",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=100.0,
+                pid=1004,
+            )
+        }
+
+        self.assertFalse(
+            _campaign_pressure_active(
+                cfg,
+                running,
+                root,
+                trigger_prio_ring=deque(),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+                now_ts=150.0,
+            )
+        )
+
+    def test_campaign_pressure_throttles_segments_when_campaign_runs_long(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(
+            segment_throttle_during_campaigns=True,
+            enable_campaign_rebuild=True,
+            campaign_pressure_min_running_sec=120,
+            campaign_pressure_min_running_count=2,
+        )
         running = {
             _task_key(root, "campaign_trigger", 104): RunningTask(
                 row_id=1,
@@ -387,24 +428,65 @@ class CampaignRingDispatchTests(unittest.TestCase):
                 trigger_reg_ring=deque(),
                 rebuild_prio_ring=deque(),
                 rebuild_reg_ring=deque(),
+                now_ts=221.0,
             )
         )
 
-    def test_campaign_pressure_throttles_segments_before_launchable_campaign_starts(self) -> None:
+    def test_campaign_pressure_throttles_segments_when_campaign_count_threshold_is_met(self) -> None:
         root = "/var/www/site"
-        cfg = SimpleNamespace(segment_throttle_during_campaigns=True, enable_campaign_rebuild=True)
+        cfg = SimpleNamespace(
+            segment_throttle_during_campaigns=True,
+            enable_campaign_rebuild=True,
+            campaign_pressure_min_running_sec=120,
+            campaign_pressure_min_running_count=2,
+        )
+        running = {
+            _task_key(root, "campaign_trigger", 104): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 104),
+                task_type="campaign_trigger",
+                entity_id=104,
+                command_str="campaign trigger 104",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=100.0,
+                pid=1004,
+            ),
+            _task_key(root, "campaign_rebuild", 105): RunningTask(
+                row_id=2,
+                root=root,
+                task_key=_task_key(root, "campaign_rebuild", 105),
+                task_type="campaign_rebuild",
+                entity_id=105,
+                command_str="campaign rebuild 105",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=100.0,
+                pid=1005,
+            ),
+        }
 
         self.assertTrue(
             _campaign_pressure_active(
                 cfg,
-                {},
+                running,
                 root,
-                trigger_prio_ring=deque([104]),
+                trigger_prio_ring=deque(),
                 trigger_reg_ring=deque(),
                 rebuild_prio_ring=deque(),
                 rebuild_reg_ring=deque(),
-                trigger_dynamic_blocked=lambda cid: False,
+                now_ts=101.0,
             )
+        )
+
+    def test_campaign_pressure_ignores_launchable_campaign_queue(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(
+            segment_throttle_during_campaigns=True,
+            enable_campaign_rebuild=True,
+            campaign_pressure_min_running_sec=120,
+            campaign_pressure_min_running_count=2,
         )
 
         self.assertFalse(
@@ -416,7 +498,8 @@ class CampaignRingDispatchTests(unittest.TestCase):
                 trigger_reg_ring=deque(),
                 rebuild_prio_ring=deque(),
                 rebuild_reg_ring=deque(),
-                trigger_dynamic_blocked=lambda cid: True,
+                trigger_dynamic_blocked=lambda cid: False,
+                now_ts=100.0,
             )
         )
 

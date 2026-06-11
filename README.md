@@ -60,6 +60,10 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
     time, but starts automatic ring work one task at a time)
   - dependent segment chains share one worker lane; unrelated chains may still
     occupy other segment workers
+  - campaign-pressure segment throttling is threshold-based: queued or
+    short-running campaigns do not throttle segments by themselves; pressure
+    starts when `campaign_pressure_min_running_sec` or
+    `campaign_pressure_min_running_count` is reached
   - two circles for segments and campaigns (`priority` + `regular`) with separate parallel limits
   - `spawn-and-release`: daemon starts command and does not wait for completion
   - process status is tracked asynchronously by PID monitor
@@ -339,6 +343,12 @@ Important:
 - Runtime tuning for large campaigns:
   - `runtime.campaign_limit` controls per-run trigger batch size.
   - `runtime.campaign_limit = 0` (or `off` / `unlimited` via MCC runtime override) omits `--campaign-limit`, so one trigger run can process the whole campaign.
+  - `runtime.campaign_pressure_min_running_sec` defaults to `120`; a single
+    running campaign must live at least this long before segment throttling is
+    treated as campaign pressure.
+  - `runtime.campaign_pressure_min_running_count` defaults to `2`; this many
+    simultaneous campaign workers trigger campaign pressure immediately. Set to
+    `0` to disable the count rule.
   - `runtime.campaign_trigger_audit_interval_sec` bounds the safety audit that
     periodically enqueues published campaigns as explicit
     `mautic:campaigns:trigger -i ID` runs. Set to `0` to disable.

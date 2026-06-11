@@ -120,6 +120,12 @@ monitored_email_parser_instance_settings = {}
 # Rule format (must return `lead_id` column):
 # segment_sql_ring_rules = { "188" = { select_sql = "SELECT l.id AS lead_id FROM {prefix}leads l WHERE l.email IS NOT NULL AND l.email <> ''", depends_on = [] } }
 segment_sql_ring_rules = {}
+# Let heavy campaign activity throttle segment dispatch.
+segment_throttle_during_campaigns = true
+# A single running campaign becomes heavy after this many seconds.
+campaign_pressure_min_running_sec = 120
+# This many simultaneous campaign workers become heavy immediately (0 disables).
+campaign_pressure_min_running_count = 2
 # During throttle run only whitelist segments.
 segment_throttle_whitelist_only = false
 # Allowed whitelist segment parallel slots during whitelist-only throttle.
