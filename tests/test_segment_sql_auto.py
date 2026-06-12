@@ -81,6 +81,42 @@ class SegmentSQLAutoTests(unittest.TestCase):
         )
         self.assertNotIn("ph.date_hit >= DATE_SUB('{now_local}', INTERVAL 30 DAY)", sql)
 
+    def test_page_hit_exact_url_operator_is_sql_managed(self) -> None:
+        filters = (
+            'a:6:{i:0;a:8:{s:6:"object";s:4:"lead";s:4:"glue";s:3:"and";'
+            's:5:"field";s:5:"email";s:4:"type";s:5:"email";s:8:"operator";s:6:"!empty";'
+            's:10:"properties";a:2:{s:6:"filter";N;s:7:"display";N;}s:6:"filter";N;s:7:"display";N;}'
+            'i:1;a:8:{s:6:"object";s:9:"behaviors";s:4:"glue";s:3:"and";'
+            's:5:"field";s:7:"hit_url";s:4:"type";s:4:"text";s:8:"operator";s:8:"contains";'
+            's:10:"properties";a:1:{s:6:"filter";s:5:"dyson";}'
+            's:6:"filter";s:18:"sport-i-rekreacija";s:7:"display";N;}'
+            'i:2;a:6:{s:4:"glue";s:2:"or";s:5:"field";s:5:"email";s:6:"object";s:4:"lead";'
+            's:4:"type";s:5:"email";s:8:"operator";s:6:"!empty";'
+            's:10:"properties";a:2:{s:6:"filter";N;s:7:"display";N;}}'
+            'i:3;a:6:{s:4:"glue";s:3:"and";s:5:"field";s:7:"hit_url";s:6:"object";s:9:"behaviors";'
+            's:4:"type";s:4:"text";s:8:"operator";s:1:"=";'
+            's:10:"properties";a:1:{s:6:"filter";s:15:"aparati-za-kosa";}}'
+            'i:4;a:6:{s:4:"glue";s:2:"or";s:5:"field";s:5:"email";s:6:"object";s:4:"lead";'
+            's:4:"type";s:5:"email";s:8:"operator";s:6:"!empty";'
+            's:10:"properties";a:2:{s:6:"filter";N;s:7:"display";N;}}'
+            'i:5;a:6:{s:4:"glue";s:3:"and";s:5:"field";s:7:"hit_url";s:6:"object";s:9:"behaviors";'
+            's:4:"type";s:4:"text";s:8:"operator";s:1:"=";'
+            's:10:"properties";a:1:{s:6:"filter";s:20:"rachni-pravosmukalki";}}}'
+        )
+
+        rules = detect_auto_sql_segment_rules(
+            [{"id": 204, "filters": filters, "problem_count": 1}],
+            max_clauses=24,
+            problem_threshold=2,
+            lead_columns={"email"},
+        )
+
+        self.assertIn(204, rules)
+        sql = rules[204].select_sql
+        self.assertIn("ph.`url` LIKE '%dyson%'", sql)
+        self.assertIn("ph.`url` = 'aparati-za-kosa'", sql)
+        self.assertIn("ph.`url` = 'rachni-pravosmukalki'", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

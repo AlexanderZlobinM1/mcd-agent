@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.132 - 2026-06-12
+
+- Fixed: SQL segment auto-detection now supports exact `behaviors.hit_url = ...`
+  filters in addition to `contains`/`like`. Page-hit segments with mixed
+  contains/exact URL conditions can stay in the MCD SQL rebuild ring instead of
+  falling back to Mautic's standard segment command.
+
 ## 0.9.131 - 2026-06-11
 
 - Changed: campaign-pressure segment throttling now treats campaigns as heavy

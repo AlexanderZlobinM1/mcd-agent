@@ -122,6 +122,16 @@ def _compile_not_like_any(expr: str, null_expr: str, values: list[str]) -> str |
     return f"({null_expr} IS NULL OR (" + " AND ".join(parts) + "))"
 
 
+def _compile_eq_any(expr: str, values: list[str]) -> str | None:
+    uniq = list(dict.fromkeys([v for v in values if v]))
+    if not uniq:
+        return None
+    parts = [f"{expr} = {_sql_quote(value)}" for value in uniq]
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " OR ".join(parts) + ")"
+
+
 def _date_sql_expr(value: str) -> str | None:
     raw = str(value or "").strip().lower()
     raw = re.sub(r"\s+", " ", raw)
@@ -262,8 +272,6 @@ def _compile_lead_clause(
 def _compile_behavior_clause(clause: dict[str, object]) -> _CompiledClause | None:
     field = str(clause.get("field") or "").strip()
     operator = str(clause.get("operator") or "").strip().lower()
-    if operator not in {"contains", "like"}:
-        return None
     values = _normalize_filter_values(_clause_filter_value(clause))
     if not values:
         return None
@@ -281,11 +289,17 @@ def _compile_behavior_clause(clause: dict[str, object]) -> _CompiledClause | Non
     if target_col is None:
         return None
 
-    like_sql = _compile_like_any(f"ph.`{target_col}`", values)
-    if not like_sql:
+    target_expr = f"ph.`{target_col}`"
+    if operator in {"contains", "like"}:
+        match_sql = _compile_like_any(target_expr, values)
+    elif operator in {"eq", "=", "in"}:
+        match_sql = _compile_eq_any(target_expr, values)
+    else:
         return None
-    where_parts = ["ph.lead_id = l.id", like_sql]
-    page_hit_where_parts = ["ph.lead_id IS NOT NULL", like_sql]
+    if not match_sql:
+        return None
+    where_parts = ["ph.lead_id = l.id", match_sql]
+    page_hit_where_parts = ["ph.lead_id IS NOT NULL", match_sql]
     if days_expr:
         where_parts.append(days_expr)
         page_hit_where_parts.append(days_expr)
