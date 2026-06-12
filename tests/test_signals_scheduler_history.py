@@ -77,7 +77,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                 """,
                 (
                     "scheduler_monitor_plan:abc",
-                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[51,63],"done":[110],"running":[61],"total":4}]}',
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[51,63],"done":[110],"running":[61],"total":4,"item_variants":{"sql":[51]}}]}',
                     now,
                 ),
             )
@@ -94,6 +94,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(payload["planned"][0]["root"], "/var/www/mautic")
         self.assertEqual(payload["planned"][0]["queued"], [51, 63])
         self.assertEqual(payload["planned"][0]["done"], [110])
+        self.assertEqual(payload["planned"][0]["item_variants"], {"sql": [51]})
 
     def test_collect_signals_exposes_planned_scheduler_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -137,7 +138,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                 """,
                 (
                     "scheduler_monitor_plan:def",
-                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[14],"done":[20,51],"running":[],"total":3}]}',
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[14],"done":[20,51],"running":[],"total":3,"item_variants":{"sql":[14,20]}}]}',
                     now,
                 ),
             )
@@ -166,6 +167,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(scheduler["planned"][0]["root"], "/var/www/mautic")
         self.assertEqual(scheduler["planned"][0]["queued"], [14])
         self.assertEqual(scheduler["planned"][0]["done"], [20, 51])
+        self.assertEqual(scheduler["planned"][0]["item_variants"], {"sql": [14, 20]})
 
     def test_collect_monitor_signals_uses_lightweight_scheduler_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -209,7 +211,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                 """,
                 (
                     "scheduler_monitor_plan:ghi",
-                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[73],"done":[20],"running":[51],"total":3}]}',
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[73],"done":[20],"running":[51],"total":3,"item_variants":{"sql":[73]}}]}',
                     now,
                 ),
             )
@@ -225,6 +227,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(scheduler["planned"][0]["queued"], [73])
         self.assertEqual(scheduler["planned"][0]["done"], [20])
         self.assertEqual(scheduler["planned"][0]["running"], [51])
+        self.assertEqual(scheduler["planned"][0]["item_variants"], {"sql": [73]})
         self.assertEqual(payload["details"]["php_console_recent"], [])
 
 

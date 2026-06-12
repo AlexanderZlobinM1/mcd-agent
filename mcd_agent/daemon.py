@@ -2275,6 +2275,7 @@ def _monitor_cycle_snapshot(
     task_type: str,
     planned_ids: list[int] | deque[int] | tuple[int, ...],
     queued_ids: list[int] | deque[int] | tuple[int, ...] | None = None,
+    item_variants: dict[str, list[int] | set[int] | tuple[int, ...]] | None = None,
     cycle_done: dict[tuple[str, str], set[int]],
     running: dict[str, "RunningTask"],
     running_task_types: set[str],
@@ -2306,13 +2307,25 @@ def _monitor_cycle_snapshot(
 
     done_ordered = [sid for sid in planned if sid in done_set]
     queued = [sid for sid in queue_source if sid in planned_set and sid not in done_set and sid not in running_ids]
-    return {
+    payload: dict[str, object] = {
         "task_type": task_type,
         "queued": queued[:200],
         "done": done_ordered[:200],
         "running": sorted(running_ids & planned_set)[:200],
         "total": len(planned),
     }
+    if item_variants:
+        variant_payload: dict[str, list[int]] = {}
+        for variant, ids in item_variants.items():
+            key = str(variant or "").strip().lower()
+            if not key:
+                continue
+            values = [eid for eid in _unique_positive_ids(list(ids)) if eid in planned_set]
+            if values:
+                variant_payload[key] = values[:200]
+        if variant_payload:
+            payload["item_variants"] = variant_payload
+    return payload
 
 
 def _monitor_visible_queued_ids(
@@ -2379,6 +2392,7 @@ def _publish_scheduler_monitor_cycles(
             task_type="segment",
             planned_ids=list(seg_sql_ring) + list(seg_resume_ring) + list(seg_prio_ring) + list(seg_reg_ring),
             queued_ids=segment_queued_ids,
+            item_variants={"sql": list(seg_sql_ring)},
             cycle_done=cycle_done,
             running=running,
             running_task_types={"segment", "segment_sql"},

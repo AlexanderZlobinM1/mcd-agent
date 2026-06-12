@@ -147,6 +147,31 @@ class SchedulerMonitorCycleTests(unittest.TestCase):
             self.assertEqual(cycles["campaign_rebuild"]["done"], [109])
             self.assertEqual(cycles["campaign_rebuild"]["running"], [122])
 
+    def test_segment_cycle_marks_sql_ring_items(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            store = TaskStore(str(db_path))
+            root = "/var/www/mautic"
+            cycle_done: dict[tuple[str, str], set[int]] = {(root, "segment"): {205}}
+
+            _publish_segment_monitor_cycle(
+                store=store,
+                root=root,
+                cycle_done=cycle_done,
+                running={},
+                now_ts=1000.0,
+                seg_sql_ring=deque([204, 205]),
+                seg_resume_ring=deque(),
+                seg_prio_ring=deque([61]),
+                seg_reg_ring=deque(),
+            )
+
+            payload = self._read_payload(db_path, root)
+            cycle = payload["cycles"][0]
+            self.assertEqual(cycle["item_variants"]["sql"], [204, 205])
+            self.assertEqual(cycle["queued"], [204, 61])
+            self.assertEqual(cycle["done"], [205])
+
     def test_campaign_cycle_keeps_cooldown_items_out_of_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "state.db"

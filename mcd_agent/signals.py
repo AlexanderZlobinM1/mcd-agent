@@ -238,16 +238,28 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
             task_type = str(cycle.get("task_type", "") or "").strip()
             if not task_type:
                 continue
+            raw_variants = cycle.get("item_variants") if isinstance(cycle.get("item_variants"), dict) else {}
+            item_variants: dict[str, list[int]] = {}
+            for variant, ids in raw_variants.items():
+                key = str(variant or "").strip().lower()
+                if not key:
+                    continue
+                values = [int(x) for x in list(ids or []) if str(x).strip().isdigit()]
+                if values:
+                    item_variants[key] = values[:200]
+            item = {
+                "root": root,
+                "task_type": task_type,
+                "queued": [int(x) for x in list(cycle.get("queued") or []) if str(x).strip().isdigit()],
+                "done": [int(x) for x in list(cycle.get("done") or []) if str(x).strip().isdigit()],
+                "running": [int(x) for x in list(cycle.get("running") or []) if str(x).strip().isdigit()],
+                "total": int(cycle.get("total", 0) or 0),
+                "updated_at": float(payload.get("updated_at", row["updated_at"] or 0.0) or 0.0),
+            }
+            if item_variants:
+                item["item_variants"] = item_variants
             planned.append(
-                {
-                    "root": root,
-                    "task_type": task_type,
-                    "queued": [int(x) for x in list(cycle.get("queued") or []) if str(x).strip().isdigit()],
-                    "done": [int(x) for x in list(cycle.get("done") or []) if str(x).strip().isdigit()],
-                    "running": [int(x) for x in list(cycle.get("running") or []) if str(x).strip().isdigit()],
-                    "total": int(cycle.get("total", 0) or 0),
-                    "updated_at": float(payload.get("updated_at", row["updated_at"] or 0.0) or 0.0),
-                }
+                item
             )
     duplicate_task_keys = sum(1 for count in key_counts.values() if int(count or 0) > 1)
     return {

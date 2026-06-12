@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.133 - 2026-06-12
+
+- Added: scheduler monitor cycles now preserve SQL-ring segment identity via
+  `item_variants.sql`, allowing MCC realtime monitoring to render SQL segment
+  queue items separately from standard Mautic segment rebuilds.
+- Fixed: lightweight signal collection keeps monitor item variant metadata so
+  SQL segment state survives the MCD -> MCC cache path.
+
 ## 0.9.132 - 2026-06-12
 
 - Fixed: SQL segment auto-detection now supports exact `behaviors.hit_url = ...`
