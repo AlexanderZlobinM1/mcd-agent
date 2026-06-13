@@ -341,6 +341,25 @@ class PluginConflictPathTests(unittest.TestCase):
             self.assertTrue(changed)
             db.align_plugin_version.assert_called_once_with("DemoBundle", "1.2.3")
 
+    def test_m6_plugin_version_prealign_covers_installed_metadataless_plugins(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for bundle, version in (("DemoBundle", "1.2.3"), ("OtherBundle", "2.0.1")):
+                config = root / "plugins" / bundle / "Config" / "config.php"
+                config.parent.mkdir(parents=True)
+                config.write_text(f"<?php\nreturn ['version' => '{version}'];\n", encoding="utf-8")
+            install = SimpleNamespace(root=str(root), mautic_major=6, db={"driver": "pdo_mysql"})
+            selected = [{"bundle": "DemoBundle", "install_bundle": "DemoBundle", "item": {}}]
+            db = SimpleNamespace(align_plugin_version=Mock(side_effect=[1, 1]))
+
+            with patch("mcd_agent.plugins.MauticDB", return_value=db):
+                changed = _prealign_metadataless_plugin_versions(install, selected)
+
+            self.assertTrue(changed)
+            db.align_plugin_version.assert_any_call("DemoBundle", "1.2.3")
+            db.align_plugin_version.assert_any_call("OtherBundle", "2.0.1")
+            self.assertEqual(db.align_plugin_version.call_count, 2)
+
     def test_m6_plugin_version_prealign_skips_entity_plugins(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

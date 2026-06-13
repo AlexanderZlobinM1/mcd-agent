@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.135 - 2026-06-13
+
+- Fixed: Mautic 6 plugin operations now prealign all installed metadata-less
+  plugin DB versions before `mautic:plugin:install`, matching the existing
+  config metadata compatibility patch scope. This prevents unrelated installed
+  plugins with newer manifest versions from crashing reload with
+  `PluginUpdateEvent metadata=null` while updating another plugin.
+- Added: regression coverage for Mautic 6 plugin reload prealign across
+  installed metadata-less plugins.
+
 ## 0.9.134 - 2026-06-13
 
 - Added: campaign trigger dispatch now revalidates due work immediately before

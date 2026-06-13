@@ -1543,7 +1543,7 @@ def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str
 
     changed_any = False
     db: MauticDB | None = None
-    for bundle in _selected_install_bundles(selected_rows):
+    for bundle, _config_path in _plugin_config_metadata_paths(plugins_dir, selected_rows):
         if not _is_valid_bundle_name(bundle):
             continue
         plugin_dir = plugins_dir / bundle
