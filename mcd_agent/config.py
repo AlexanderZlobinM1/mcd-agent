@@ -769,6 +769,11 @@ class AgentConfig:
     campaign_trigger_regular_parallel: int
     campaign_trigger_min_repeat_sec: int
     campaign_trigger_audit_interval_sec: int
+    campaign_trigger_due_guard_enabled: bool
+    campaign_trigger_progress_watchdog_enabled: bool
+    campaign_trigger_progress_watchdog_grace_sec: int
+    campaign_trigger_progress_watchdog_interval_sec: int
+    campaign_trigger_progress_watchdog_stable_checks: int
     campaign_rebuild_min_repeat_sec: int
 
 
@@ -1811,6 +1816,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "campaign_trigger_regular_parallel": "campaign_trigger_regular_parallel",
     "campaign_trigger_min_repeat_sec": "campaign_trigger_min_repeat_sec",
     "campaign_trigger_audit_interval_sec": "campaign_trigger_audit_interval_sec",
+    "campaign_trigger_due_guard_enabled": "campaign_trigger_due_guard_enabled",
+    "campaign_trigger_progress_watchdog_enabled": "campaign_trigger_progress_watchdog_enabled",
+    "campaign_trigger_progress_watchdog_grace_sec": "campaign_trigger_progress_watchdog_grace_sec",
+    "campaign_trigger_progress_watchdog_interval_sec": "campaign_trigger_progress_watchdog_interval_sec",
+    "campaign_trigger_progress_watchdog_stable_checks": "campaign_trigger_progress_watchdog_stable_checks",
     "campaign_rebuild_min_repeat_sec": "campaign_rebuild_min_repeat_sec",
     "enable_campaign_rebuild": "enable_campaign_rebuild",
     "campaign_rebuild_poll_interval_sec": "campaign_rebuild_poll_interval_sec",
@@ -2312,6 +2322,22 @@ def _load_config_inner(path: str) -> AgentConfig:
     campaign_trigger_regular_parallel = int(runtime.get("campaign_trigger_regular_parallel", campaign_regular_parallel))
     campaign_trigger_min_repeat_sec = int(runtime.get("campaign_trigger_min_repeat_sec", 10))
     campaign_trigger_audit_interval_sec = int(runtime.get("campaign_trigger_audit_interval_sec", 300))
+    campaign_trigger_due_guard_enabled = bool(runtime.get("campaign_trigger_due_guard_enabled", True))
+    campaign_trigger_progress_watchdog_enabled = bool(
+        runtime.get("campaign_trigger_progress_watchdog_enabled", True)
+    )
+    campaign_trigger_progress_watchdog_grace_sec = max(
+        0,
+        int(runtime.get("campaign_trigger_progress_watchdog_grace_sec", 180) or 180),
+    )
+    campaign_trigger_progress_watchdog_interval_sec = max(
+        10,
+        int(runtime.get("campaign_trigger_progress_watchdog_interval_sec", 60) or 60),
+    )
+    campaign_trigger_progress_watchdog_stable_checks = max(
+        1,
+        int(runtime.get("campaign_trigger_progress_watchdog_stable_checks", 2) or 2),
+    )
     campaign_rebuild_min_repeat_sec = int(runtime.get("campaign_rebuild_min_repeat_sec", 15))
     segment_sql_orphan_policy = str(runtime.get("segment_sql_orphan_policy", "reclaim_stale")).strip().lower() or "reclaim_stale"
     if segment_sql_orphan_policy not in {"manual", "reclaim_stale"}:
@@ -3122,6 +3148,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         campaign_trigger_regular_parallel=campaign_trigger_regular_parallel,
         campaign_trigger_min_repeat_sec=max(0, campaign_trigger_min_repeat_sec),
         campaign_trigger_audit_interval_sec=max(0, campaign_trigger_audit_interval_sec),
+        campaign_trigger_due_guard_enabled=campaign_trigger_due_guard_enabled,
+        campaign_trigger_progress_watchdog_enabled=campaign_trigger_progress_watchdog_enabled,
+        campaign_trigger_progress_watchdog_grace_sec=campaign_trigger_progress_watchdog_grace_sec,
+        campaign_trigger_progress_watchdog_interval_sec=campaign_trigger_progress_watchdog_interval_sec,
+        campaign_trigger_progress_watchdog_stable_checks=campaign_trigger_progress_watchdog_stable_checks,
         campaign_rebuild_min_repeat_sec=max(0, campaign_rebuild_min_repeat_sec),
     )
     if cfg.disable_whitelist:

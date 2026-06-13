@@ -9,11 +9,13 @@ from unittest.mock import Mock, patch
 
 from mcd_agent import daemon as daemon_mod
 from mcd_agent.daemon import (
+    CampaignTriggerProgressSnapshot,
     RunningTask,
     SQLSegmentRule,
     TaskStore,
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _campaign_pressure_active,
+    _campaign_trigger_progress_watchdog,
     _campaign_trigger_waits_for_rebuild,
     _effective_segment_slot_limit,
     _fill_from_ring,
@@ -40,6 +42,94 @@ class CampaignRingDispatchTests(unittest.TestCase):
         advance_ring_after_launch(ring, 3, remove_on_launch=True)
 
         self.assertEqual(list(ring), [4, 5])
+
+    def test_fill_from_ring_skips_stale_campaign_without_launching(self) -> None:
+        ring = deque([136])
+        cfg = SimpleNamespace(campaign_trigger_min_repeat_sec=0, campaign_trigger_audit_interval_sec=0)
+        store = Mock()
+        running: dict[str, RunningTask] = {}
+
+        launched = _fill_from_ring(
+            ring=ring,
+            ring_limit=1,
+            total_limit=1,
+            root="/var/www/site",
+            task_type="campaign_trigger",
+            running=running,
+            ring_entities={136},
+            config=cfg,
+            store=store,
+            popens={},
+            build_args=Mock(return_value=["php", "bin/console", "mautic:campaigns:trigger", "-i", "136"]),
+            should_skip=lambda eid: True,
+            remove_on_launch=True,
+        )
+
+        self.assertEqual(launched, 0)
+        self.assertEqual(list(ring), [])
+        store.add_running.assert_not_called()
+
+    def test_campaign_trigger_progress_watchdog_kills_done_stale_process(self) -> None:
+        root = "/var/www/site"
+        key = _task_key(root, "campaign_trigger", 136)
+        task = RunningTask(
+            row_id=42,
+            root=root,
+            task_key=key,
+            task_type="campaign_trigger",
+            entity_id=136,
+            command_str="php bin/console mautic:campaigns:trigger -i 136",
+            timeout_sec=0,
+            attempts=1,
+            started_at=100.0,
+            pid=999999,
+        )
+        running = {key: task}
+        store = Mock()
+        snapshot = CampaignTriggerProgressSnapshot(
+            due_event_logs=0,
+            due_root_actions=0,
+            pending_event_logs=0,
+            triggered_event_logs=4439,
+            max_triggered_at="2026-06-12 08:25:59",
+        )
+        state = {
+            key: {
+                "last_check": 0.0,
+                "progress_key": snapshot.progress_key(),
+                "stable_checks": 1,
+            }
+        }
+        cfg = SimpleNamespace(
+            campaign_trigger_progress_watchdog_enabled=True,
+            campaign_trigger_progress_watchdog_grace_sec=1,
+            campaign_trigger_progress_watchdog_interval_sec=10,
+            campaign_trigger_progress_watchdog_stable_checks=2,
+            segment_kill_grace_sec=1,
+        )
+
+        with (
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(daemon_mod, "_kill_pid") as kill_pid,
+        ):
+            stopped = _campaign_trigger_progress_watchdog(
+                config=cfg,
+                store=store,
+                running=running,
+                popens={},
+                task=task,
+                key=key,
+                db_configs_by_root={root: object()},
+                mautic_timezones_by_root={root: "Europe/Belgrade"},
+                state_by_key=state,
+                now_ts=500.0,
+            )
+
+        self.assertTrue(stopped)
+        kill_pid.assert_called_once_with(999999, 1)
+        store.finish.assert_called_once_with(42, state="done", rc=0, note="killed_no_due_no_progress")
+        self.assertNotIn(key, running)
+        self.assertNotIn(key, state)
 
     def test_non_campaign_rings_keep_round_robin_rotation(self) -> None:
         ring = deque([3, 4, 5])

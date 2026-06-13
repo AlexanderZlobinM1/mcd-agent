@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.134 - 2026-06-13
+
+- Added: campaign trigger dispatch now revalidates due work immediately before
+  launching an automatic per-campaign trigger, preventing stale ring entries
+  from relaunching already-completed campaigns.
+- Added: automatic campaign trigger progress watchdog. If a running trigger has
+  no due database work and no event-log progress across repeated factual checks,
+  MCD terminates the stale PHP process and marks the task completed without
+  retrying it.
+- Added: regression coverage for stale campaign-trigger ring skips and
+  progress-watchdog cleanup.
+
 ## 0.9.133 - 2026-06-12
 
 - Added: scheduler monitor cycles now preserve SQL-ring segment identity via
