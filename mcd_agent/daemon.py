@@ -147,6 +147,25 @@ _SQL_IMPORT_PENDING_STATUS_COUNT = (
     "AND (date_started IS NULL "
     "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
 )
+_SQL_IMPORT_MONITOR_ROWS = (
+    "SELECT id, status, date_added, date_started, date_ended "
+    "FROM {prefix}imports "
+    "WHERE is_published = 1 "
+    "AND (status IN (1,2,3,4,5,7) "
+    "OR LOWER(CAST(status AS CHAR)) IN ("
+    "'queued','pending','in_progress','processing','running','delayed',"
+    "'imported','completed','complete','done','success','failed','error','stopped','cancelled','canceled'"
+    ") "
+    "OR date_ended >= DATE_SUB('{now_utc}', INTERVAL 10 MINUTE)) "
+    "ORDER BY "
+    "CASE "
+    "WHEN status IN (2) OR LOWER(CAST(status AS CHAR)) IN ('in_progress','processing','running') THEN 0 "
+    "WHEN status IN (7) OR LOWER(CAST(status AS CHAR)) = 'delayed' THEN 1 "
+    "WHEN status IN (1) OR LOWER(CAST(status AS CHAR)) IN ('queued','pending') THEN 2 "
+    "ELSE 3 END, "
+    "COALESCE(date_started, date_added, date_ended) DESC, id DESC "
+    "LIMIT 80"
+)
 
 
 @dataclass(frozen=True)
@@ -2500,6 +2519,47 @@ def _monitor_cycle_snapshot(
     return payload
 
 
+def _import_monitor_cycle_snapshot(import_monitor: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(import_monitor, dict):
+        return None
+    queued = _unique_positive_ids(list(import_monitor.get("queued") or []))
+    running = _unique_positive_ids(list(import_monitor.get("running") or []))
+    done = _unique_positive_ids(list(import_monitor.get("done") or []))
+    planned = _unique_positive_ids(queued + running + done)
+    payload: dict[str, object] = {
+        "task_type": "import",
+        "queued": queued[:200],
+        "done": done[:200],
+        "running": running[:200],
+        "total": len(planned),
+    }
+    raw_variants = import_monitor.get("item_variants") if isinstance(import_monitor.get("item_variants"), dict) else {}
+    variants: dict[str, list[int]] = {}
+    planned_set = set(planned)
+    for variant, ids in raw_variants.items():
+        key = str(variant or "").strip().lower()
+        if not key:
+            continue
+        values = [eid for eid in _unique_positive_ids(list(ids or [])) if eid in planned_set]
+        if values:
+            variants[key] = values[:200]
+    if variants:
+        payload["item_variants"] = variants
+    raw_statuses = import_monitor.get("item_statuses") if isinstance(import_monitor.get("item_statuses"), dict) else {}
+    statuses: dict[str, str] = {}
+    for raw_id, raw_status in raw_statuses.items():
+        try:
+            eid = int(raw_id)
+        except Exception:
+            continue
+        status = str(raw_status or "").strip().lower()
+        if eid > 0 and eid in planned_set and status:
+            statuses[str(eid)] = status
+    if statuses:
+        payload["item_statuses"] = statuses
+    return payload
+
+
 def _monitor_visible_queued_ids(
     *,
     ring: list[int] | deque[int] | tuple[int, ...],
@@ -2557,6 +2617,7 @@ def _publish_scheduler_monitor_cycles(
     segment_queued_ids: list[int] | None = None,
     campaign_trigger_queued_ids: list[int] | None = None,
     campaign_rebuild_queued_ids: list[int] | None = None,
+    import_monitor: dict[str, object] | None = None,
 ) -> None:
     cycles = [
         _monitor_cycle_snapshot(
@@ -2588,6 +2649,9 @@ def _publish_scheduler_monitor_cycles(
             running_task_types={"campaign_trigger"},
         ),
     ]
+    import_cycle = _import_monitor_cycle_snapshot(import_monitor)
+    if import_cycle is not None:
+        cycles.append(import_cycle)
     payload = {
         "version": 1,
         "root": str(root),
@@ -4525,6 +4589,69 @@ def _fetch_import_pending_count(
     return max(0, int(status_count or configured_count or 0))
 
 
+def _has_import_date_value(raw: object) -> bool:
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    return not text.startswith("0000-00-00")
+
+
+def _classify_import_monitor_row(row: dict[str, object]) -> tuple[str, str, str]:
+    status_raw = str(row.get("status", "") or "").strip().lower()
+    status_raw = status_raw.replace(" ", "_").replace("-", "_")
+    if status_raw in {"2", "in_progress", "processing", "running"}:
+        return "running", "", "processing"
+    if status_raw in {"7", "delayed"}:
+        return "queued", "delayed", "delayed"
+    if status_raw in {"1", "queued", "pending"}:
+        return "queued", "", "queued"
+    if status_raw in {"4", "5", "failed", "error", "stopped", "cancelled", "canceled"}:
+        return "done", "", "error"
+    if status_raw in {"3", "imported", "completed", "complete", "done", "success"}:
+        return "done", "", "success"
+    if _has_import_date_value(row.get("date_ended")):
+        return "done", "", "success"
+    return "queued", "", "queued"
+
+
+def _fetch_import_monitor_snapshot(
+    db: MauticDB,
+    root: str,
+    sql_ctx: dict[str, str],
+) -> dict[str, object]:
+    rows = db.fetch_rows(_SQL_IMPORT_MONITOR_ROWS, limit=80, context=sql_ctx)
+    queued: list[int] = []
+    running: list[int] = []
+    done: list[int] = []
+    variants: dict[str, list[int]] = {}
+    statuses: dict[str, str] = {}
+    for row in rows:
+        try:
+            import_id = int(row.get("id", 0) or 0)
+        except Exception:
+            continue
+        if import_id <= 0:
+            continue
+        lane, variant, status = _classify_import_monitor_row(row)
+        if lane == "running":
+            running.append(import_id)
+        elif lane == "done":
+            done.append(import_id)
+        else:
+            queued.append(import_id)
+        if variant:
+            variants.setdefault(variant, []).append(import_id)
+        if status:
+            statuses[str(import_id)] = status
+    return {
+        "queued": _unique_positive_ids(queued),
+        "running": _unique_positive_ids(running),
+        "done": _unique_positive_ids(done),
+        "item_variants": {k: _unique_positive_ids(v) for k, v in variants.items()},
+        "item_statuses": statuses,
+    }
+
+
 def _running_count(running: dict[str, RunningTask], root: str, task_type_prefix: str) -> int:
     return sum(1 for t in running.values() if t.root == root and t.task_type.startswith(task_type_prefix))
 
@@ -5469,6 +5596,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     throttled: dict[str, bool] = {}
     last_import_poll_ts: dict[str, float] = {}
     import_pending_cache: dict[str, int] = {}
+    import_monitor_cache: dict[str, dict[str, object]] = {}
+    last_import_monitor_warn_ts: dict[str, float] = {}
     segment_last_full_scan_ts: dict[str, float] = {}
     segment_force_full_scan_until: dict[str, float] = {}
     last_cleanup_ts: dict[str, float] = {}
@@ -6265,6 +6394,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             )
                         import_pending_cache[root] = 0
                     last_import_poll_ts[root] = now
+                if cluster_import_allowed:
+                    try:
+                        import_monitor_cache[root] = _fetch_import_monitor_snapshot(db, root, sql_ctx)
+                    except Exception as e:
+                        last_warn = float(last_import_monitor_warn_ts.get(root, 0.0) or 0.0)
+                        if now - last_warn >= 300.0:
+                            last_import_monitor_warn_ts[root] = now
+                            logging.warning("[%s] import monitor query failed: %s", root, e)
+                        import_monitor_cache[root] = {}
+                else:
+                    import_monitor_cache[root] = {}
                 import_pending_now = max(0, int(import_pending_cache.get(root, 0)))
                 import_force_until = float(segment_force_full_scan_until.get(root, 0.0))
                 import_hold_sec = max(120, int(config.import_poll_interval_sec) * 8)
@@ -7364,6 +7504,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         segment_queued_ids=[],
                         campaign_trigger_queued_ids=campaign_trigger_queued_ids,
                         campaign_rebuild_queued_ids=campaign_rebuild_queued_ids,
+                        import_monitor=import_monitor_cache.get(root),
                     )
                     return
                 _publish_scheduler_monitor_cycles(
@@ -7383,6 +7524,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     segment_queued_ids=segment_queued_ids,
                     campaign_trigger_queued_ids=campaign_trigger_queued_ids,
                     campaign_rebuild_queued_ids=campaign_rebuild_queued_ids,
+                    import_monitor=import_monitor_cache.get(root),
                 )
 
             if _import_in_settle(root, now):

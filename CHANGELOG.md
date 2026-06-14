@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.137 - 2026-06-14
+
+- Fixed: realtime monitoring now reads Mautic imports from the local
+  `{prefix}imports` table and publishes actual import ids and states instead
+  of internal MCD task ids.
+- Added: delayed import rows are exposed as queued monitor items with a
+  `delayed` variant, while failed/stopped imports are exposed as finished
+  errors.
+- Added: regression coverage for import monitor payloads and signal passthrough.
+
 ## 0.9.136 - 2026-06-14
 
 - Fixed: campaign trigger due guard now treats Mautic pre-scheduled event-log

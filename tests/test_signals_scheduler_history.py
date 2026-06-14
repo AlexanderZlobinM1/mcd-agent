@@ -77,7 +77,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                 """,
                 (
                     "scheduler_monitor_plan:abc",
-                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[51,63],"done":[110],"running":[61],"total":4,"item_variants":{"sql":[51]}}]}',
+                    '{"root":"/var/www/mautic","updated_at":1234.0,"cycles":[{"task_type":"segment","queued":[51,63],"done":[110],"running":[61],"total":4,"item_variants":{"sql":[51]},"item_statuses":{"51":"queued"}}]}',
                     now,
                 ),
             )
@@ -95,6 +95,7 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(payload["planned"][0]["queued"], [51, 63])
         self.assertEqual(payload["planned"][0]["done"], [110])
         self.assertEqual(payload["planned"][0]["item_variants"], {"sql": [51]})
+        self.assertEqual(payload["planned"][0]["item_statuses"], {"51": "queued"})
 
     def test_collect_signals_exposes_planned_scheduler_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as td:

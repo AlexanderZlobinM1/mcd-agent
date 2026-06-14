@@ -147,6 +147,46 @@ class SchedulerMonitorCycleTests(unittest.TestCase):
             self.assertEqual(cycles["campaign_rebuild"]["done"], [109])
             self.assertEqual(cycles["campaign_rebuild"]["running"], [122])
 
+    def test_import_cycle_publishes_mautic_import_ids_and_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            store = TaskStore(str(db_path))
+            root = "/var/www/mautic"
+
+            _publish_scheduler_monitor_cycles(
+                store=store,
+                root=root,
+                cycle_done={},
+                running={},
+                now_ts=1000.0,
+                seg_sql_ring=deque(),
+                seg_resume_ring=deque(),
+                seg_prio_ring=deque(),
+                seg_reg_ring=deque(),
+                campaign_trigger_prio_ring=deque(),
+                campaign_trigger_reg_ring=deque(),
+                campaign_rebuild_prio_ring=deque(),
+                campaign_rebuild_reg_ring=deque(),
+                import_monitor={
+                    "queued": [252, 253],
+                    "running": [251],
+                    "done": [250],
+                    "item_variants": {"delayed": [253]},
+                    "item_statuses": {"250": "success", "251": "processing", "252": "queued", "253": "delayed"},
+                },
+            )
+
+            payload = self._read_payload(db_path, root)
+            cycle = {cycle["task_type"]: cycle for cycle in payload["cycles"]}["import"]
+            self.assertEqual(cycle["queued"], [252, 253])
+            self.assertEqual(cycle["running"], [251])
+            self.assertEqual(cycle["done"], [250])
+            self.assertEqual(cycle["item_variants"], {"delayed": [253]})
+            self.assertEqual(
+                cycle["item_statuses"],
+                {"250": "success", "251": "processing", "252": "queued", "253": "delayed"},
+            )
+
     def test_segment_cycle_marks_sql_ring_items(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "state.db"

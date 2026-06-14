@@ -258,6 +258,18 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
             }
             if item_variants:
                 item["item_variants"] = item_variants
+            raw_statuses = cycle.get("item_statuses") if isinstance(cycle.get("item_statuses"), dict) else {}
+            item_statuses: dict[str, str] = {}
+            for raw_id, raw_status in raw_statuses.items():
+                try:
+                    item_id = int(raw_id)
+                except Exception:
+                    continue
+                status = str(raw_status or "").strip().lower()
+                if item_id > 0 and status:
+                    item_statuses[str(item_id)] = status
+            if item_statuses:
+                item["item_statuses"] = item_statuses
             planned.append(
                 item
             )
