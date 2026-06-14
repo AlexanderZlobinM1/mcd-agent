@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.142 - 2026-06-14
+
+- Fixed: import scheduler now fast-follows recently active Mautic imports.
+  After an import batch exits, MCD immediately rechecks queued/delayed imports
+  before allowing segment workers to take the shared slot, preserving import
+  priority without increasing idle DB polling.
+- Added: regression coverage for the fast-follow import polling guard.
+
 ## 0.9.141 - 2026-06-14
 
 - Fixed: import scheduler now recovers factual orphaned Mautic background
