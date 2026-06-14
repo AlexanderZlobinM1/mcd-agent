@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.141 - 2026-06-14
+
+- Fixed: import scheduler now recovers factual orphaned Mautic background
+  imports. If a row is left `IN_PROGRESS` but no live `mautic:import` CLI
+  worker exists for the instance after a grace period, MCD requeues it as
+  `DELAYED` so the next normal import batch can resume from the saved line.
+- Safety: the recovery only touches background `IN_PROGRESS` imports with an
+  existing source file and unfinished line counter; manual/browser imports are
+  left alone.
+- Added: regression coverage that import recovery is skipped while a CLI
+  worker is alive and runs only when the worker is absent.
+
 ## 0.9.140 - 2026-06-14
 
 - Fixed: import scheduling now follows Mautic 4/5/6/7 import status

@@ -4614,6 +4614,47 @@ def _import_in_settle(root: str, now_ts: float | None = None) -> bool:
     return False
 
 
+def _root_has_live_import_process(root: str, running: dict[str, RunningTask]) -> bool:
+    if _running_count(running, root, "import") > 0:
+        return True
+    console = str(Path(root) / "bin" / "console")
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return True
+    if proc.returncode != 0:
+        return True
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if "mautic:import" not in lower:
+            continue
+        if console in line or f" {root} " in line:
+            return True
+    return False
+
+
+def _recover_orphaned_imports_if_safe(
+    db: MauticDB,
+    root: str,
+    running: dict[str, RunningTask],
+    *,
+    grace_sec: int = 60,
+) -> int:
+    if _root_has_live_import_process(root, running):
+        return 0
+    try:
+        recovered = db.recover_orphaned_imports(str(Path(root) / "var" / "import"), grace_sec=grace_sec)
+    except Exception as e:
+        logging.warning("[%s] import orphan recovery failed: %s", root, e)
+        return 0
+    if recovered > 0:
+        logging.warning("[%s] recovered orphaned in-progress imports: %s", root, recovered)
+    return max(0, int(recovered or 0))
+
+
 def _fetch_import_pending_count(
     db: MauticDB,
     config: AgentConfig,
@@ -6441,6 +6482,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     import_pending_cache[root] = 0
                 elif cluster_import_allowed and now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
                     try:
+                        _recover_orphaned_imports_if_safe(db, root, running, grace_sec=max(60, config.import_poll_interval_sec * 4))
                         import_pending_cache[root] = _fetch_import_pending_count(db, config, root, sql_ctx)
                     except Exception as e:
                         logging.warning("[%s] import query failed: %s", root, e)

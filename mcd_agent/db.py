@@ -271,6 +271,81 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def recover_orphaned_imports(self, import_dir: str, grace_sec: int = 60, limit: int = 20) -> int:
+        """
+        Requeue background imports left IN_PROGRESS without a live CLI worker.
+
+        Mautic 4/5/6/7 use numeric import statuses consistently:
+        2 = IN_PROGRESS and 7 = DELAYED. Core ghost cleanup waits two hours and
+        marks rows failed while deleting files, which is too destructive for
+        short-lived CLI crashes. MCD only calls this after proving no
+        mautic:import process is alive for the instance.
+        """
+        try:
+            grace = max(30, int(grace_sec or 0))
+        except (TypeError, ValueError):
+            grace = 60
+        try:
+            max_rows = max(1, min(100, int(limit or 20)))
+        except (TypeError, ValueError):
+            max_rows = 20
+        table = self._safe_table(f"{self.cfg.table_prefix}imports")
+        base_dir = Path(str(import_dir or "")).resolve()
+        if not base_dir.exists() or not base_dir.is_dir():
+            return 0
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT `id`, `file`, `line_count`,
+                           CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`properties`, '$.line')), '0') AS UNSIGNED) AS `last_line`
+                    FROM `{table}`
+                    WHERE `is_published` = 1
+                      AND `status` = 2
+                      AND `date_ended` IS NULL
+                      AND `date_modified` < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s SECOND)
+                    ORDER BY `date_modified` ASC, `id` ASC
+                    LIMIT %s
+                    """,
+                    (grace, max_rows),
+                )
+                rows = cur.fetchall() or []
+                recovered = 0
+                for row in rows:
+                    try:
+                        import_id = int(row.get("id") or 0)
+                        line_count = int(row.get("line_count") or 0)
+                        last_line = int(row.get("last_line") or 0)
+                    except Exception:
+                        continue
+                    file_name = Path(str(row.get("file") or "")).name
+                    if import_id <= 0 or not file_name:
+                        continue
+                    if line_count > 0 and last_line >= line_count:
+                        continue
+                    path = (base_dir / file_name).resolve()
+                    try:
+                        if path.parent != base_dir or not path.is_file():
+                            continue
+                    except Exception:
+                        continue
+                    affected = cur.execute(
+                        f"""
+                        UPDATE `{table}`
+                        SET `status` = 7,
+                            `date_ended` = NULL,
+                            `date_modified` = UTC_TIMESTAMP()
+                        WHERE `id` = %s
+                          AND `status` = 2
+                          AND `date_ended` IS NULL
+                        """,
+                        (import_id,),
+                    )
+                    if affected:
+                        recovered += 1
+        return recovered
+
     def align_plugin_version(self, bundle: str, version: str) -> int:
         """
         Align one Mautic plugin DB row to the installed bundle version.
