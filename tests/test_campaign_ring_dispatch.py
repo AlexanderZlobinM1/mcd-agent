@@ -28,6 +28,7 @@ from mcd_agent.daemon import (
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
     _published_segment_whitelist_ids,
+    _recover_orphaned_imports_if_safe,
     _run_sql_segment_ring,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
@@ -475,6 +476,24 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(_classify_import_monitor_row({"status": 5}), ("queued", "stopped", "stopped"))
         self.assertEqual(_classify_import_monitor_row({"status": 6}), ("running", "", "processing"))
         self.assertEqual(_classify_import_monitor_row({"status": 7}), ("queued", "delayed", "delayed"))
+
+    def test_orphaned_import_recovery_skips_when_cli_worker_is_alive(self) -> None:
+        db = SimpleNamespace(recover_orphaned_imports=Mock(return_value=1))
+
+        with patch("mcd_agent.daemon._root_has_live_import_process", return_value=True):
+            recovered = _recover_orphaned_imports_if_safe(db, "/var/www/mautic", {}, grace_sec=60)
+
+        self.assertEqual(recovered, 0)
+        db.recover_orphaned_imports.assert_not_called()
+
+    def test_orphaned_import_recovery_requeues_when_cli_worker_is_absent(self) -> None:
+        db = SimpleNamespace(recover_orphaned_imports=Mock(return_value=2))
+
+        with patch("mcd_agent.daemon._root_has_live_import_process", return_value=False):
+            recovered = _recover_orphaned_imports_if_safe(db, "/var/www/mautic", {}, grace_sec=60)
+
+        self.assertEqual(recovered, 2)
+        db.recover_orphaned_imports.assert_called_once_with("/var/www/mautic/var/import", grace_sec=60)
 
     def test_effective_segment_slot_limit_matches_throttled_profiles(self) -> None:
         cfg = SimpleNamespace(
