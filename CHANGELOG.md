@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.138 - 2026-06-14
+
+- Fixed: runtime version identity now matches the published agent package for
+  the import monitoring release. This prevents self-update from installing code
+  with a newer `pyproject.toml` while `mcd_agent.__version__` still reports the
+  previous build.
+
 ## 0.9.137 - 2026-06-14
 
 - Fixed: realtime monitoring now reads Mautic imports from the local
