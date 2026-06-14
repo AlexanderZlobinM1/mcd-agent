@@ -144,16 +144,16 @@ _IMPORT_PENDING_OVERRIDE_WARN_TS: dict[str, float] = {}
 _SQL_IMPORT_PENDING_STATUS_COUNT = (
     "SELECT COUNT(*) AS cnt FROM {prefix}imports "
     "WHERE is_published = 1 "
-    "AND (status IN (1,2,7) "
-    "OR CAST(status AS CHAR) IN ('pending','in_progress','delayed')) "
+    "AND (status IN (1,7) "
+    "OR LOWER(CAST(status AS CHAR)) IN ('queued','pending','delayed')) "
     "AND (date_started IS NULL "
-    "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
+    "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '0') AS UNSIGNED) < line_count)"
 )
 _SQL_IMPORT_MONITOR_ROWS = (
     "SELECT id, status, date_added, date_started, date_ended "
     "FROM {prefix}imports "
     "WHERE is_published = 1 "
-    "AND (status IN (1,2,3,4,5,7) "
+    "AND (status IN (1,2,3,4,5,6,7) "
     "OR LOWER(CAST(status AS CHAR)) IN ("
     "'queued','pending','in_progress','processing','running','delayed',"
     "'imported','completed','complete','done','success','failed','error','stopped','cancelled','canceled'"
@@ -4646,14 +4646,16 @@ def _has_import_date_value(raw: object) -> bool:
 def _classify_import_monitor_row(row: dict[str, object]) -> tuple[str, str, str]:
     status_raw = str(row.get("status", "") or "").strip().lower()
     status_raw = status_raw.replace(" ", "_").replace("-", "_")
-    if status_raw in {"2", "in_progress", "processing", "running"}:
+    if status_raw in {"2", "6", "in_progress", "processing", "running", "manual"}:
         return "running", "", "processing"
     if status_raw in {"7", "delayed"}:
         return "queued", "delayed", "delayed"
     if status_raw in {"1", "queued", "pending"}:
         return "queued", "", "queued"
-    if status_raw in {"4", "5", "failed", "error", "stopped", "cancelled", "canceled"}:
+    if status_raw in {"4", "failed", "error"}:
         return "done", "", "error"
+    if status_raw in {"5", "stopped", "cancelled", "canceled"}:
+        return "queued", "stopped", "stopped"
     if status_raw in {"3", "imported", "completed", "complete", "done", "success"}:
         return "done", "", "success"
     if _has_import_date_value(row.get("date_ended")):

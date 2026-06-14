@@ -5,12 +5,50 @@ import unittest
 from mcd_agent.config import (
     _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE,
     _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+    _DEFAULT_SQL_IMPORT_PENDING_COUNT,
     _campaign_rebuilds_due_sql,
     _campaign_triggers_due_sql,
+    _import_pending_count_sql,
 )
 
 
 class CampaignDueSqlTests(unittest.TestCase):
+    def test_import_pending_sql_only_counts_launchable_statuses(self) -> None:
+        self.assertIn("status IN (1,7)", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+        self.assertIn("'queued','pending','delayed'", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+        self.assertIn("< line_count", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+        self.assertNotIn("status IN (1,2,7)", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+        self.assertNotIn("in_progress", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+        self.assertNotIn("<= line_count", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
+
+    def test_legacy_import_pending_sql_with_in_progress_is_migrated(self) -> None:
+        previous = (
+            "SELECT COUNT(*) AS cnt FROM {prefix}imports "
+            "WHERE is_published = 1 "
+            "AND (status IN (1,2,7) "
+            "OR CAST(status AS CHAR) IN ('pending','in_progress','delayed'))"
+        )
+
+        self.assertEqual(
+            _import_pending_count_sql({"import_pending_count": previous}),
+            _DEFAULT_SQL_IMPORT_PENDING_COUNT,
+        )
+
+    def test_legacy_import_pending_sql_with_inclusive_final_line_is_migrated(self) -> None:
+        previous = (
+            "SELECT COUNT(*) AS cnt FROM {prefix}imports "
+            "WHERE is_published = 1 "
+            "AND (status IN (1,7) "
+            "OR LOWER(CAST(status AS CHAR)) IN ('queued','pending','delayed')) "
+            "AND (date_started IS NULL "
+            "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)"
+        )
+
+        self.assertEqual(
+            _import_pending_count_sql({"import_pending_count": previous}),
+            _DEFAULT_SQL_IMPORT_PENDING_COUNT,
+        )
+
     def test_trigger_due_catches_date_events_after_publish_down(self) -> None:
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
         self.assertIn("el.is_scheduled = 1", event_log_branch)
