@@ -21,6 +21,7 @@ from mcd_agent.daemon import (
     _campaign_trigger_progress_watchdog,
     _campaign_trigger_should_skip_launch,
     _campaign_trigger_waits_for_rebuild,
+    _classify_import_monitor_row,
     _effective_segment_slot_limit,
     _fill_from_ring,
     _mark_campaign_rebuild_finished,
@@ -465,6 +466,15 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(submit.call_args.kwargs["task_type"], "import")
         self.assertEqual(submit.call_args.kwargs["entity_id"], None)
         self.assertEqual(submit.call_args.kwargs["max_parallel_for_type"], 1)
+
+    def test_import_monitor_uses_mautic_4_to_7_status_constants(self) -> None:
+        self.assertEqual(_classify_import_monitor_row({"status": 1}), ("queued", "", "queued"))
+        self.assertEqual(_classify_import_monitor_row({"status": 2}), ("running", "", "processing"))
+        self.assertEqual(_classify_import_monitor_row({"status": 3}), ("done", "", "success"))
+        self.assertEqual(_classify_import_monitor_row({"status": 4}), ("done", "", "error"))
+        self.assertEqual(_classify_import_monitor_row({"status": 5}), ("queued", "stopped", "stopped"))
+        self.assertEqual(_classify_import_monitor_row({"status": 6}), ("running", "", "processing"))
+        self.assertEqual(_classify_import_monitor_row({"status": 7}), ("queued", "delayed", "delayed"))
 
     def test_effective_segment_slot_limit_matches_throttled_profiles(self) -> None:
         cfg = SimpleNamespace(

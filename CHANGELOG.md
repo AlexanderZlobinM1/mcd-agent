@@ -1,5 +1,19 @@
 # MCD Changelog
 
+## 0.9.140 - 2026-06-14
+
+- Fixed: import scheduling now follows Mautic 4/5/6/7 import status
+  constants. MCD counts only queued/delayed imports as launchable and no
+  longer treats `IN_PROGRESS` rows as a reason to start another
+  `mautic:import` worker.
+- Fixed: import pending SQL now mirrors Mautic's own completion rule by
+  treating delayed imports as pending only while `properties.line < line_count`,
+  avoiding an extra launch after the final batch.
+- Fixed: legacy runtime SQL overrides for import pending checks are migrated
+  away from unsafe `IN_PROGRESS` and inclusive final-line predicates.
+- Added: regression coverage for Mautic import status mapping and import SQL
+  migration.
+
 ## 0.9.139 - 2026-06-14
 
 - Fixed: campaign trigger event-log due checks now follow Mautic's UTC

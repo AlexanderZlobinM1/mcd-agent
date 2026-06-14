@@ -367,6 +367,14 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "ORDER BY q.id"
 )
 _DEFAULT_SQL_CAMPAIGNS_DUE = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
+_DEFAULT_SQL_IMPORT_PENDING_COUNT = (
+    "SELECT COUNT(*) AS cnt FROM {prefix}imports "
+    "WHERE is_published = 1 "
+    "AND (status IN (1,7) "
+    "OR LOWER(CAST(status AS CHAR)) IN ('queued','pending','delayed')) "
+    "AND (date_started IS NULL "
+    "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '0') AS UNSIGNED) < line_count)"
+)
 _LEGACY_CAMPAIGNS_DUE_SQLS = {
     _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT,
     _LEGACY_SQL_CAMPAIGNS_DUE_DEFAULT_DESC,
@@ -1234,6 +1242,21 @@ def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
     )
 
 
+def _is_legacy_import_pending_count_sql(value: object) -> bool:
+    normalized = _normalize_sql_signature(value)
+    if not normalized:
+        return False
+    if "{prefix}imports" not in normalized:
+        return False
+    if "in_progress" in normalized:
+        return True
+    if "status in (1,2,7)" in normalized or "status in (1, 2, 7)" in normalized:
+        return True
+    if "<= line_count" in normalized:
+        return True
+    return False
+
+
 def _campaign_triggers_due_sql(sql_section: dict[str, Any]) -> str:
     explicit = sql_section.get("campaign_triggers_due")
     if explicit is not None:
@@ -1263,6 +1286,15 @@ def _segments_due_sql(sql_section: dict[str, Any]) -> str:
             return _DEFAULT_SQL_SEGMENTS_DUE
         return str(explicit)
     return _DEFAULT_SQL_SEGMENTS_DUE
+
+
+def _import_pending_count_sql(sql_section: dict[str, Any]) -> str:
+    explicit = sql_section.get("import_pending_count")
+    if explicit is not None:
+        if _is_legacy_import_pending_count_sql(explicit):
+            return _DEFAULT_SQL_IMPORT_PENDING_COUNT
+        return str(explicit)
+    return _DEFAULT_SQL_IMPORT_PENDING_COUNT
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1528,6 +1560,10 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
             "campaign_rebuilds_due": (
                 _is_legacy_campaign_rebuilds_due_sql,
                 _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE,
+            ),
+            "import_pending_count": (
+                _is_legacy_import_pending_count_sql,
+                _DEFAULT_SQL_IMPORT_PENDING_COUNT,
             ),
         },
     )
@@ -2840,17 +2876,7 @@ def _load_config_inner(path: str) -> AgentConfig:
                 "WHERE c.is_published = 1",
             )
         ),
-        sql_import_pending_count=str(
-            sql.get(
-                "import_pending_count",
-                "SELECT COUNT(*) AS cnt FROM {prefix}imports "
-                "WHERE is_published = 1 "
-                "AND (status IN (1,2,7) "
-                "OR CAST(status AS CHAR) IN ('pending','in_progress','delayed')) "
-                "AND (date_started IS NULL "
-                "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '1') AS UNSIGNED) <= line_count)",
-            )
-        ),
+        sql_import_pending_count=_import_pending_count_sql(sql),
         cmd_segment_update_template=str(
             commands.get(
                 "segment_update_template",
