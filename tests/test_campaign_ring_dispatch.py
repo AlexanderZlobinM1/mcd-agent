@@ -15,6 +15,8 @@ from mcd_agent.daemon import (
     TaskStore,
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _campaign_pressure_active,
+    _campaign_trigger_event_log_due_exists_sql,
+    _campaign_trigger_event_log_progress_sql,
     _campaign_trigger_progress_watchdog,
     _campaign_trigger_waits_for_rebuild,
     _effective_segment_slot_limit,
@@ -130,6 +132,19 @@ class CampaignRingDispatchTests(unittest.TestCase):
         store.finish.assert_called_once_with(42, state="done", rc=0, note="killed_no_due_no_progress")
         self.assertNotIn(key, running)
         self.assertNotIn(key, state)
+
+    def test_campaign_trigger_guard_counts_prescheduled_rows_as_due(self) -> None:
+        due_sql = _campaign_trigger_event_log_due_exists_sql(21)
+        progress_sql = _campaign_trigger_event_log_progress_sql(21)
+
+        self.assertIn("el.date_triggered IS NULL", due_sql)
+        self.assertIn("el.date_triggered < el.trigger_date", due_sql)
+        self.assertIn("el.is_scheduled = 1", due_sql)
+        self.assertIn("el.trigger_date <= '{now_utc}'", due_sql)
+        self.assertIn("el.trigger_date <= '{now_local}'", due_sql)
+
+        self.assertIn("el.date_triggered < el.trigger_date", progress_sql)
+        self.assertIn("pending_event_logs", progress_sql)
 
     def test_non_campaign_rings_keep_round_robin_rotation(self) -> None:
         ring = deque([3, 4, 5])

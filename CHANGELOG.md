@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.136 - 2026-06-14
+
+- Fixed: campaign trigger due guard now treats Mautic pre-scheduled event-log
+  rows as pending when `date_triggered` is earlier than `trigger_date`. This
+  keeps scheduled campaigns in the trigger lane until the real execution updates
+  `date_triggered` and channel fields.
+- Added: regression coverage and release-checklist acceptance criteria for
+  pre-scheduled Mautic event-log rows.
+
 ## 0.9.135 - 2026-06-13
 
 - Fixed: Mautic 6 plugin operations now prealign all installed metadata-less
