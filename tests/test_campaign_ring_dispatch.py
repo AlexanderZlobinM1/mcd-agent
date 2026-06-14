@@ -14,10 +14,12 @@ from mcd_agent.daemon import (
     SQLSegmentRule,
     TaskStore,
     _CAMPAIGN_REBUILD_FINISHED_AT,
+    _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _campaign_pressure_active,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
     _campaign_trigger_progress_watchdog,
+    _campaign_trigger_should_skip_launch,
     _campaign_trigger_waits_for_rebuild,
     _effective_segment_slot_limit,
     _fill_from_ring,
@@ -38,6 +40,9 @@ from mcd_agent.ring_utils import advance_ring_after_launch
 
 
 class CampaignRingDispatchTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
+
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])
 
@@ -133,16 +138,107 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertNotIn(key, running)
         self.assertNotIn(key, state)
 
+    def test_campaign_trigger_progress_watchdog_kills_stuck_due_process_and_cools_down(self) -> None:
+        root = "/var/www/site"
+        key = _task_key(root, "campaign_trigger", 136)
+        task = RunningTask(
+            row_id=43,
+            root=root,
+            task_key=key,
+            task_type="campaign_trigger",
+            entity_id=136,
+            command_str="php bin/console mautic:campaigns:trigger -i 136",
+            timeout_sec=0,
+            attempts=1,
+            started_at=100.0,
+            pid=999998,
+        )
+        running = {key: task}
+        store = Mock()
+        snapshot = CampaignTriggerProgressSnapshot(
+            due_event_logs=1,
+            due_root_actions=0,
+            pending_event_logs=1,
+            triggered_event_logs=2219,
+            max_triggered_at="2026-06-12 06:04:16",
+        )
+        state = {
+            key: {
+                "last_check": 0.0,
+                "progress_key": snapshot.progress_key(),
+                "stable_checks": 1,
+            }
+        }
+        cfg = SimpleNamespace(
+            campaign_trigger_progress_watchdog_enabled=True,
+            campaign_trigger_progress_watchdog_grace_sec=1,
+            campaign_trigger_progress_watchdog_interval_sec=10,
+            campaign_trigger_progress_watchdog_stable_checks=2,
+            segment_kill_grace_sec=1,
+        )
+
+        with (
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(
+                daemon_mod,
+                "_campaign_trigger_latest_failed_reason",
+                return_value="2026-06-14 15:30:08 Connection timed out.",
+            ),
+            patch.object(daemon_mod, "_kill_pid") as kill_pid,
+        ):
+            stopped = _campaign_trigger_progress_watchdog(
+                config=cfg,
+                store=store,
+                running=running,
+                popens={},
+                task=task,
+                key=key,
+                db_configs_by_root={root: object()},
+                mautic_timezones_by_root={root: "Europe/Belgrade"},
+                state_by_key=state,
+                now_ts=500.0,
+            )
+
+        self.assertTrue(stopped)
+        kill_pid.assert_called_once_with(999998, 1)
+        store.finish.assert_called_once_with(43, state="done", rc=0, note="killed_stuck_due_no_progress")
+        self.assertNotIn(key, running)
+        self.assertNotIn(key, state)
+        until, reason = _CAMPAIGN_TRIGGER_STUCK_UNTIL[(root, 136)]
+        self.assertGreater(until, 500.0)
+        self.assertIn("Connection timed out", reason)
+
+    def test_campaign_trigger_guard_skips_active_stuck_cooldown(self) -> None:
+        root = "/var/www/site"
+        _CAMPAIGN_TRIGGER_STUCK_UNTIL[(root, 136)] = (600.0, "smtp timeout")
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=500.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot") as snapshot,
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=Mock(),
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=136,
+                sql_ctx={},
+            )
+
+        self.assertTrue(skipped)
+        snapshot.assert_not_called()
+        self.assertIn((root, 136), _CAMPAIGN_TRIGGER_STUCK_UNTIL)
+
     def test_campaign_trigger_guard_counts_prescheduled_rows_as_due(self) -> None:
         due_sql = _campaign_trigger_event_log_due_exists_sql(21)
         progress_sql = _campaign_trigger_event_log_progress_sql(21)
 
+        self.assertIn("el.is_scheduled = 1", due_sql)
         self.assertIn("el.date_triggered IS NULL", due_sql)
         self.assertIn("el.date_triggered < el.trigger_date", due_sql)
-        self.assertIn("el.is_scheduled = 1", due_sql)
         self.assertIn("el.trigger_date <= '{now_utc}'", due_sql)
-        self.assertIn("el.trigger_date <= '{now_local}'", due_sql)
+        self.assertNotIn("el.trigger_date <= '{now_local}'", due_sql)
 
+        self.assertIn("el.is_scheduled = 1", progress_sql)
         self.assertIn("el.date_triggered < el.trigger_date", progress_sql)
         self.assertIn("pending_event_logs", progress_sql)
 

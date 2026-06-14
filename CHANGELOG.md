@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.139 - 2026-06-14
+
+- Fixed: campaign trigger event-log due checks now follow Mautic's UTC
+  `trigger_date` semantics and require scheduled event-log rows, preventing
+  automatic triggers from starting hours early on instances with non-UTC UI
+  timezones.
+- Fixed: campaign trigger progress watchdog now also handles stuck due work.
+  If a trigger has factual due rows but no event-log progress across repeated
+  checks, MCD terminates the stuck PHP process and applies a short cooldown to
+  prevent immediate relaunch loops while preserving the failure reason in logs.
+- Added: regression coverage for UTC-only event-log due SQL migration and
+  stuck due campaign-trigger watchdog cooldown.
+
 ## 0.9.138 - 2026-06-14
 
 - Fixed: runtime version identity now matches the published agent package for

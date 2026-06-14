@@ -224,17 +224,18 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "  FROM {prefix}campaign_lead_event_log el "
     "  WHERE el.campaign_id = c.id "
     "    AND ("
-    "      el.date_triggered IS NULL "
-    "      OR ("
-    "        el.is_scheduled = 1 "
-    "        AND el.trigger_date IS NOT NULL "
-    "        AND el.date_triggered < el.trigger_date"
+    "      el.is_scheduled = 1 "
+    "      AND ("
+    "        el.date_triggered IS NULL "
+    "        OR ("
+    "          el.trigger_date IS NOT NULL "
+    "          AND el.date_triggered < el.trigger_date"
+    "        )"
     "      )"
     "    ) "
     "    AND ("
     "      (el.trigger_date IS NOT NULL AND ("
     "        el.trigger_date <= '{now_utc}' "
-    "        OR el.trigger_date <= '{now_local}'"
     "      )) "
     "      OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)"
     "    ) "
@@ -1126,6 +1127,13 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
         "el.trigger_date >= '{window_start_local_7d}'",
     )
     if all(sig in normalized for sig in old_event_log_lower_bound):
+        return True
+    old_event_log_local_time_semantics = (
+        "{prefix}campaign_lead_event_log el",
+        "el.trigger_date <= '{now_utc}'",
+        "el.trigger_date <= '{now_local}'",
+    )
+    if all(sig in normalized for sig in old_event_log_local_time_semantics):
         return True
     old_campaign_event_lower_bound = (
         "{prefix}campaign_events ce",

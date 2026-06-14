@@ -132,7 +132,9 @@ _SEGMENT_DEPENDENCY_FINISH_WINDOW_SEC = 2 * 3600
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
+_CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
+_CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
 _CAMPAIGN_REBUILD_FINISHED_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FILTER_WARN_TS: dict[tuple[str, str], float] = {}
@@ -2220,17 +2222,18 @@ def _campaign_trigger_event_log_due_exists_sql(campaign_id: int) -> str:
         "    FROM {prefix}campaign_lead_event_log el "
         "    WHERE el.campaign_id = c.id "
         "      AND ("
-        "        el.date_triggered IS NULL "
-        "        OR ("
-        "          el.is_scheduled = 1 "
-        "          AND el.trigger_date IS NOT NULL "
-        "          AND el.date_triggered < el.trigger_date"
+        "        el.is_scheduled = 1 "
+        "        AND ("
+        "          el.date_triggered IS NULL "
+        "          OR ("
+        "            el.trigger_date IS NOT NULL "
+        "            AND el.date_triggered < el.trigger_date"
+        "          )"
         "        )"
         "      ) "
         "      AND ("
         "        (el.trigger_date IS NOT NULL AND ("
         "          el.trigger_date <= '{now_utc}' "
-        "          OR el.trigger_date <= '{now_local}'"
         "        )) "
         "        OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)"
         "      ) "
@@ -2289,12 +2292,41 @@ def _campaign_trigger_event_log_progress_sql(campaign_id: int) -> str:
     cid = int(campaign_id)
     return (
         "SELECT "
-        "  SUM(CASE WHEN el.date_triggered IS NULL OR (el.is_scheduled = 1 AND el.trigger_date IS NOT NULL AND el.date_triggered < el.trigger_date) THEN 1 ELSE 0 END) AS pending_event_logs, "
+        "  SUM(CASE WHEN el.is_scheduled = 1 AND (el.date_triggered IS NULL OR (el.trigger_date IS NOT NULL AND el.date_triggered < el.trigger_date)) THEN 1 ELSE 0 END) AS pending_event_logs, "
         "  SUM(CASE WHEN el.date_triggered IS NOT NULL THEN 1 ELSE 0 END) AS triggered_event_logs, "
         "  COALESCE(DATE_FORMAT(MAX(el.date_triggered), '%Y-%m-%d %H:%i:%s'), '') AS max_triggered_at "
         "FROM {prefix}campaign_lead_event_log el "
         f"WHERE el.campaign_id = {cid}"
     )
+
+
+def _campaign_trigger_latest_failed_reason_sql(campaign_id: int) -> str:
+    cid = int(campaign_id)
+    return (
+        "SELECT "
+        "  COALESCE(DATE_FORMAT(fl.date_added, '%Y-%m-%d %H:%i:%s'), '') AS date_added, "
+        "  COALESCE(LEFT(fl.reason, 240), '') AS reason "
+        "FROM {prefix}campaign_lead_event_failed_log fl "
+        "INNER JOIN {prefix}campaign_lead_event_log el ON el.id = fl.log_id "
+        f"WHERE el.campaign_id = {cid} "
+        "ORDER BY fl.date_added DESC "
+        "LIMIT 1"
+    )
+
+
+def _campaign_trigger_latest_failed_reason(db: MauticDB, campaign_id: int, sql_ctx: dict[str, str]) -> str:
+    try:
+        rows = db.fetch_rows(_campaign_trigger_latest_failed_reason_sql(int(campaign_id)), limit=1, context=sql_ctx)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    row = rows[0]
+    reason = str(row.get("reason") or "").strip()
+    date_added = str(row.get("date_added") or "").strip()
+    if not reason:
+        return ""
+    return f"{date_added} {reason}".strip()
 
 
 def _row_int(row: dict[str, object], key: str) -> int:
@@ -2333,6 +2365,21 @@ def _campaign_trigger_should_skip_launch(
 ) -> bool:
     if not bool(getattr(config, "campaign_trigger_due_guard_enabled", True)):
         return False
+    cooldown_key = (str(root), int(campaign_id))
+    cooldown = _CAMPAIGN_TRIGGER_STUCK_UNTIL.get(cooldown_key)
+    now_ts = time.time()
+    if cooldown is not None:
+        until_ts, reason = cooldown
+        if now_ts < float(until_ts):
+            logging.warning(
+                "[%s] campaign_trigger skipped stuck cooldown id=%s until=%s reason=%s",
+                root,
+                int(campaign_id),
+                datetime.fromtimestamp(float(until_ts), timezone.utc).isoformat(),
+                reason or "-",
+            )
+            return True
+        _CAMPAIGN_TRIGGER_STUCK_UNTIL.pop(cooldown_key, None)
     try:
         snapshot = _campaign_trigger_progress_snapshot(db, int(campaign_id), sql_ctx)
     except Exception as e:
@@ -5031,8 +5078,6 @@ def _campaign_trigger_progress_watchdog(
     stable_checks = int(wd.get("stable_checks", 0) or 0) + 1
     wd["stable_checks"] = stable_checks
     wd["due_total"] = snapshot.due_total
-    if snapshot.due_total > 0:
-        return False
     required_checks = max(
         1,
         int(
@@ -5047,17 +5092,30 @@ def _campaign_trigger_progress_watchdog(
     if stable_checks < required_checks:
         return False
 
+    reason = ""
+    try:
+        reason = _campaign_trigger_latest_failed_reason(MauticDB(db_cfg), int(task.entity_id), sql_ctx)
+    except Exception:
+        reason = ""
+    note = "killed_stuck_due_no_progress" if snapshot.due_total > 0 else "killed_no_due_no_progress"
+    cooldown_reason = reason or note
+    _CAMPAIGN_TRIGGER_STUCK_UNTIL[(str(task.root), int(task.entity_id))] = (
+        now_ts + float(_CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC),
+        cooldown_reason,
+    )
     _kill_pid(task.pid, int(getattr(config, "segment_kill_grace_sec", 10) or 10))
-    store.finish(task.row_id, state="done", rc=0, note="killed_no_due_no_progress")
+    store.finish(task.row_id, state="done", rc=0, note=note)
     _mark_campaign_trigger_finished(task.root, task.entity_id)
     running.pop(key, None)
     popens.pop(key, None)
     state_by_key.pop(key, None)
     logging.warning(
-        "[%s] campaign_trigger id=%s killed by progress watchdog: no due work and no DB progress for %s checks",
+        "[%s] campaign_trigger id=%s killed by progress watchdog: due=%s no DB progress for %s checks reason=%s",
         task.root,
         task.entity_id,
+        snapshot.due_total,
         stable_checks,
+        reason or "-",
     )
     return True
 
