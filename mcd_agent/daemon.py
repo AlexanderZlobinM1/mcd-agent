@@ -133,6 +133,7 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
+_IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
@@ -4677,6 +4678,27 @@ def _fetch_import_pending_count(
     return max(0, int(status_count or configured_count or 0))
 
 
+def _import_pending_poll_due(
+    *,
+    config: AgentConfig,
+    root: str,
+    now_ts: float,
+    last_poll_ts: dict[str, float],
+    last_activity_ts: dict[str, float],
+    running: dict[str, "RunningTask"],
+    pending_cache: dict[str, int],
+) -> bool:
+    interval = max(1, int(getattr(config, "import_poll_interval_sec", 15) or 15))
+    if now_ts - float(last_poll_ts.get(root, 0.0) or 0.0) >= float(interval):
+        return True
+    if _running_count(running, root, "import") > 0:
+        return False
+    if max(0, int(pending_cache.get(root, 0) or 0)) > 0:
+        return True
+    last_activity = float(last_activity_ts.get(root, 0.0) or 0.0)
+    return last_activity > 0 and now_ts - last_activity <= _IMPORT_FAST_FOLLOW_SEC
+
+
 def _has_import_date_value(raw: object) -> bool:
     text = str(raw or "").strip()
     if not text:
@@ -5696,6 +5718,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     queue_samples: dict[str, deque[tuple[float, int]]] = {}
     throttled: dict[str, bool] = {}
     last_import_poll_ts: dict[str, float] = {}
+    last_import_activity_ts: dict[str, float] = {}
     import_pending_cache: dict[str, int] = {}
     import_monitor_cache: dict[str, dict[str, object]] = {}
     last_import_monitor_warn_ts: dict[str, float] = {}
@@ -6477,10 +6500,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_ids: list[int] | None = None
                 campaign_trigger_ids: list[int] | None = None
                 campaign_rebuild_ids: list[int] | None = None
+                if _running_count(running, root, "import") > 0:
+                    last_import_activity_ts[root] = now
                 import_settling = _import_in_settle(root, now)
                 if import_settling:
                     import_pending_cache[root] = 0
-                elif cluster_import_allowed and now - last_import_poll_ts.get(root, 0.0) >= max(1, config.import_poll_interval_sec):
+                elif cluster_import_allowed and _import_pending_poll_due(
+                    config=config,
+                    root=root,
+                    now_ts=now,
+                    last_poll_ts=last_import_poll_ts,
+                    last_activity_ts=last_import_activity_ts,
+                    running=running,
+                    pending_cache=import_pending_cache,
+                ):
                     try:
                         _recover_orphaned_imports_if_safe(db, root, running, grace_sec=max(60, config.import_poll_interval_sec * 4))
                         import_pending_cache[root] = _fetch_import_pending_count(db, config, root, sql_ctx)
@@ -7707,6 +7740,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_slot_limit=import_segment_slot_limit,
                 now_ts=now,
             ):
+                last_import_activity_ts[root] = now
                 segment_launched_this_tick += 1
 
             if (

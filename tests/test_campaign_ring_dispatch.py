@@ -24,6 +24,7 @@ from mcd_agent.daemon import (
     _classify_import_monitor_row,
     _effective_segment_slot_limit,
     _fill_from_ring,
+    _import_pending_poll_due,
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
@@ -467,6 +468,53 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(submit.call_args.kwargs["task_type"], "import")
         self.assertEqual(submit.call_args.kwargs["entity_id"], None)
         self.assertEqual(submit.call_args.kwargs["max_parallel_for_type"], 1)
+
+    def test_import_pending_poll_fast_follows_recent_import_activity(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(import_poll_interval_sec=15)
+        running: dict[str, RunningTask] = {}
+
+        self.assertTrue(
+            _import_pending_poll_due(
+                config=cfg,
+                root=root,
+                now_ts=100.0,
+                last_poll_ts={root: 95.0},
+                last_activity_ts={root: 99.0},
+                running=running,
+                pending_cache={root: 0},
+            )
+        )
+
+    def test_import_pending_poll_does_not_fast_poll_while_import_running(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(import_poll_interval_sec=15)
+        running = {
+            _task_key(root, "import", None): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "import", None),
+                task_type="import",
+                entity_id=None,
+                command_str="import",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=90.0,
+                pid=1001,
+            )
+        }
+
+        self.assertFalse(
+            _import_pending_poll_due(
+                config=cfg,
+                root=root,
+                now_ts=100.0,
+                last_poll_ts={root: 95.0},
+                last_activity_ts={root: 99.0},
+                running=running,
+                pending_cache={root: 0},
+            )
+        )
 
     def test_import_monitor_uses_mautic_4_to_7_status_constants(self) -> None:
         self.assertEqual(_classify_import_monitor_row({"status": 1}), ("queued", "", "queued"))
