@@ -764,6 +764,126 @@ def _collect_gluster_state(*, timeout_sec: int = 5) -> dict[str, Any]:
     return out
 
 
+_MYSQL_IDENT_RE = re.compile(r"^[A-Za-z0-9_$]+$")
+
+
+def _quote_mysql_ident(value: object) -> str:
+    raw = str(value or "").strip()
+    if not _MYSQL_IDENT_RE.match(raw):
+        raise ValueError(f"invalid MySQL identifier: {raw!r}")
+    return "`" + raw.replace("`", "``") + "`"
+
+
+def _mysql_datetime_to_utc(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            try:
+                dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _collect_replica_freshness(
+    cur: Any,
+    cfg: AgentConfig,
+    *,
+    now_utc_dt: datetime | None = None,
+) -> dict[str, Any]:
+    enabled = bool(getattr(cfg, "cluster_replica_freshness_enabled", False))
+    max_age_default = max(300, int(getattr(cfg, "cluster_replica_freshness_max_age_sec", 172800) or 172800))
+    checks = getattr(cfg, "cluster_replica_freshness_checks", []) or []
+    out: dict[str, Any] = {
+        "enabled": enabled,
+        "status": "na",
+        "max_age_sec": max_age_default,
+        "checks": [],
+        "errors": [],
+    }
+    if not enabled:
+        return out
+    if not isinstance(checks, list) or not checks:
+        out["status"] = "degraded"
+        out["errors"] = ["no_freshness_checks_configured"]
+        return out
+
+    now_dt = now_utc_dt or datetime.now(timezone.utc)
+    overall_ok = True
+    for raw_check in checks:
+        if not isinstance(raw_check, dict):
+            continue
+        label = str(raw_check.get("label", "") or "").strip()
+        item: dict[str, Any] = {
+            "label": label,
+            "status": "unknown",
+            "latest_utc": None,
+            "age_sec": None,
+            "max_age_sec": max_age_default,
+        }
+        try:
+            database = _quote_mysql_ident(raw_check.get("database"))
+            table = _quote_mysql_ident(raw_check.get("table"))
+            column = _quote_mysql_ident(raw_check.get("column"))
+            order_raw = str(raw_check.get("order_column", "id") or "").strip()
+            if raw_check.get("max_age_sec") is not None:
+                item["max_age_sec"] = max(300, int(raw_check.get("max_age_sec") or max_age_default))
+            if not label:
+                item["label"] = ".".join(
+                    [
+                        str(raw_check.get("database") or "").strip(),
+                        str(raw_check.get("table") or "").strip(),
+                        str(raw_check.get("column") or "").strip(),
+                    ]
+                )
+            if order_raw:
+                order_column = _quote_mysql_ident(order_raw)
+                sql = f"SELECT {column} AS latest FROM {database}.{table} ORDER BY {order_column} DESC LIMIT 1"
+            else:
+                sql = f"SELECT MAX({column}) AS latest FROM {database}.{table}"
+            cur.execute(sql)
+            row = cur.fetchone() or {}
+            latest_dt = _mysql_datetime_to_utc(row.get("latest") if isinstance(row, dict) else None)
+            if latest_dt is None:
+                item["status"] = "stale"
+                item["error"] = "latest_value_missing"
+                overall_ok = False
+            else:
+                age = max(0, int((now_dt - latest_dt).total_seconds()))
+                item["latest_utc"] = latest_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                item["age_sec"] = age
+                if age > int(item["max_age_sec"] or max_age_default):
+                    item["status"] = "stale"
+                    overall_ok = False
+                else:
+                    item["status"] = "ok"
+        except Exception as e:
+            item["status"] = "error"
+            item["error"] = str(e)
+            out["errors"].append(str(e))
+            overall_ok = False
+        out["checks"].append(item)
+
+    if not out["checks"]:
+        out["status"] = "degraded"
+        out["errors"].append("no_valid_freshness_checks")
+    else:
+        out["status"] = "ok" if overall_ok else "degraded"
+    return out
+
+
 def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict[str, Any]:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     haproxy_state = _collect_haproxy_db_state(timeout_sec=max(2, int(timeout_sec)))
@@ -878,6 +998,7 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
                     wsrep_map = _query_map(cur, "SHOW GLOBAL STATUS LIKE 'wsrep_%'")
 
                     replica_row: dict[str, Any] | None = None
+                    replica_freshness: dict[str, Any] | None = None
                     try:
                         cur.execute("SHOW REPLICA STATUS")
                         rr = cur.fetchone()
@@ -893,6 +1014,8 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
                                 replica_row = rr
                         except Exception:
                             replica_row = None
+                    if replica_row is not None:
+                        replica_freshness = _collect_replica_freshness(cur, cfg)
 
             role = "standalone"
             wsrep_on = _to_bool(vars_map.get("wsrep_on"))
@@ -955,8 +1078,24 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
                     "io_running": io_running,
                     "sql_running": sql_running,
                     "seconds_behind": lag,
+                    "source_host": str(
+                        (replica_row or {}).get("Source_Host")
+                        or (replica_row or {}).get("Master_Host")
+                        or ""
+                    ).strip(),
+                    "source_port": _to_int(
+                        (replica_row or {}).get("Source_Port")
+                        if (replica_row or {}).get("Source_Port") is not None
+                        else (replica_row or {}).get("Master_Port")
+                    ),
+                    "source_server_id": _to_int((replica_row or {}).get("Source_Server_Id")),
+                    "sql_state": str((replica_row or {}).get("Replica_SQL_Running_State") or "").strip(),
+                    "last_io_error": str((replica_row or {}).get("Last_IO_Error") or "").strip()[:500],
+                    "last_sql_error": str((replica_row or {}).get("Last_SQL_Error") or "").strip()[:500],
                 }
                 out["replica"] = replica
+                if replica_freshness is not None:
+                    out["replica_freshness"] = replica_freshness
                 healthy = io_running.lower() in {"yes", "on", "1", "running"} and sql_running.lower() in {
                     "yes",
                     "on",
@@ -964,6 +1103,8 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
                     "running",
                 }
                 if lag is not None and lag > 30:
+                    healthy = False
+                if isinstance(replica_freshness, dict) and str(replica_freshness.get("status") or "").lower() == "degraded":
                     healthy = False
                 out["status"] = "ok" if healthy else "degraded"
             return out

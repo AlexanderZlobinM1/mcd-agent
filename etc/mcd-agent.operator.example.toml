@@ -165,6 +165,12 @@ host_template = false
 # When true, cloned host self-registers as new host in MCC and clears template role for the clone.
 template_autopromote_on_clone = true
 
+# Async replica data freshness checks. Keep disabled unless this host is a
+# reporting replica and MCC supplies instance-specific table checks.
+cluster_replica_freshness_enabled = false
+cluster_replica_freshness_max_age_sec = 172800
+cluster_replica_freshness_checks = "[]"
+
 # Mautic 6 core patch policy for PluginUpdateEvent metadata bug.
 # - required : keep host auto-patched by daemon
 # - off      : do not auto-patch (manual only)
