@@ -638,6 +638,62 @@ class CampaignRingDispatchTests(unittest.TestCase):
         db.rebuild_segment_membership.assert_not_called()
         self.assertEqual(list(ring), [22])
 
+    def test_sql_segment_ring_refreshes_mautic_count_cache_after_rebuild(self) -> None:
+        root = "/var/www/site"
+        db = SimpleNamespace(
+            rebuild_segment_membership=Mock(
+                return_value={"selected_count": 17, "inserted_count": 15, "deleted_count": 3}
+            )
+        )
+        cfg = SimpleNamespace(
+            segment_sql_ring_enabled=True,
+            segment_sql_ring_max_per_tick=1,
+            segment_sql_statement_timeout_sec=1800,
+            segment_sql_page_hits_quiet_only=False,
+            segment_sql_min_repeat_sec=0,
+            segment_sql_lock_heartbeat_sec=15,
+            php_bin="/usr/bin/php",
+            mautic_run_as_user="www-data",
+        )
+        store = SimpleNamespace()
+        ring = deque([22])
+        fake_stop = SimpleNamespace(set=Mock())
+        fake_thread = SimpleNamespace(join=Mock())
+
+        with (
+            patch.object(daemon_mod, "_state_node_id", return_value="node-a"),
+            patch.object(daemon_mod, "_segment_sql_try_acquire", return_value=(True, {})),
+            patch.object(daemon_mod, "_segment_sql_start_heartbeat", return_value=(fake_stop, fake_thread)),
+            patch.object(daemon_mod, "_segment_sql_finish") as finish,
+            patch.object(daemon_mod, "_refresh_mautic_segment_count_cache", return_value=True) as refresh_cache,
+        ):
+            launched = _run_sql_segment_ring(
+                config=cfg,
+                store=store,
+                db=db,
+                root=root,
+                ring=ring,
+                rules={22: SQLSegmentRule(segment_id=22, select_sql="SELECT 1 AS lead_id", depends_on=())},
+                active_set={22},
+                done_set=set(),
+                running={},
+                sql_ctx={},
+                now_ts=100.0,
+                now_local=datetime.now(timezone.utc),
+            )
+
+        self.assertEqual(launched, 1)
+        refresh_cache.assert_called_once_with(
+            root=root,
+            segment_id=22,
+            count=15,
+            php_bin="/usr/bin/php",
+            run_as_user="www-data",
+        )
+        finish.assert_called_once()
+        fake_stop.set.assert_called_once()
+        fake_thread.join.assert_called_once_with(timeout=2.0)
+
     def test_campaign_pressure_ignores_short_single_campaign(self) -> None:
         root = "/var/www/site"
         cfg = SimpleNamespace(
