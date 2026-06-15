@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.143 - 2026-06-15
+
+- Fixed: SQL-driven segment rebuilds now refresh Mautic's segment contact
+  count cache after replacing `lead_lists_leads`. This keeps the Mautic segment
+  list UI in sync with direct SQL rebuild results instead of showing stale
+  `No Contacts` badges.
+- Added: regression coverage that SQL-ring rebuilds call the Mautic count-cache
+  refresh helper after successful membership replacement.
+
 ## 0.9.142 - 2026-06-14
 
 - Fixed: import scheduler now fast-follows recently active Mautic imports.

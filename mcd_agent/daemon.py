@@ -1560,6 +1560,58 @@ def _segment_sql_start_heartbeat(
     return stop_event, thread
 
 
+def _refresh_mautic_segment_count_cache(
+    *,
+    root: str,
+    segment_id: int,
+    count: int,
+    php_bin: str,
+    run_as_user: str | None,
+    timeout_sec: int = 30,
+) -> bool:
+    """Refresh Mautic's segment count cache after direct SQL rebuilds."""
+    root_path = Path(root)
+    if not (root_path / "vendor" / "autoload.php").exists() or not (root_path / "app" / "AppKernel.php").exists():
+        return False
+
+    php = str(php_bin or "php").strip() or "php"
+    sid = int(segment_id)
+    contact_count = max(0, int(count))
+    script = f"""
+<?php
+require_once __DIR__ . '/vendor/autoload.php';
+require_once __DIR__ . '/app/AppKernel.php';
+$kernel = new AppKernel('prod', false);
+$kernel->boot();
+$container = $kernel->getContainer();
+$helper = $container->get('mautic.helper.segment.count.cache');
+$helper->setSegmentContactCount({sid}, {contact_count});
+$kernel->shutdown();
+"""
+    cmd = [php]
+    user = str(run_as_user or "").strip()
+    if user:
+        cmd = ["sudo", "-u", user, php]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=script,
+            cwd=str(root_path),
+            text=True,
+            capture_output=True,
+            timeout=max(5, int(timeout_sec)),
+        )
+    except Exception as e:
+        logging.warning("[%s] segment_sql count-cache refresh failed id=%s: %s", root, sid, e)
+        return False
+    if proc.returncode != 0:
+        stderr = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = stderr[-1] if stderr else f"rc={proc.returncode}"
+        logging.warning("[%s] segment_sql count-cache refresh failed id=%s: %s", root, sid, detail)
+        return False
+    return True
+
+
 def _run_sql_segment_ring(
     *,
     config: AgentConfig,
@@ -1644,6 +1696,13 @@ def _run_sql_segment_ring(
                 select_query_template=rule.select_sql,
                 context=sql_ctx,
                 statement_timeout_sec=int(getattr(config, "segment_sql_statement_timeout_sec", 1800) or 1800),
+            )
+            _refresh_mautic_segment_count_cache(
+                root=root,
+                segment_id=sid,
+                count=int(res.get("inserted_count", res.get("selected_count", 0)) or 0),
+                php_bin=str(getattr(config, "php_bin", "php") or "php"),
+                run_as_user=getattr(config, "mautic_run_as_user", None),
             )
             _mark_segment_finished(root, sid, now_ts=now_ts)
             done_set.add(sid)
