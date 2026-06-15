@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 from mcd_agent.config import _normalize_replica_freshness_checks
-from mcd_agent.state_push import _collect_replica_freshness
+from mcd_agent.state_push import _collect_replica_freshness, _galera_routing_eligibility
 
 
 def _cfg(**overrides: object) -> SimpleNamespace:
@@ -39,6 +39,31 @@ class FakeCursor:
 
 
 class ClusterReplicaFreshnessTests(unittest.TestCase):
+    def test_galera_routing_eligibility_requires_primary_synced_ready(self) -> None:
+        ok, reason = _galera_routing_eligibility(
+            {
+                "ready": True,
+                "connected": True,
+                "cluster_status": "Primary",
+                "local_state_comment": "Synced",
+            }
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "primary_synced_ready")
+
+        blocked_cases = [
+            ({"ready": False, "connected": True, "cluster_status": "Primary", "local_state_comment": "Synced"}, "wsrep_ready_off"),
+            ({"ready": True, "connected": False, "cluster_status": "Primary", "local_state_comment": "Synced"}, "wsrep_disconnected"),
+            ({"ready": True, "connected": True, "cluster_status": "non-Primary", "local_state_comment": "Synced"}, "cluster_not_primary"),
+            ({"ready": True, "connected": True, "cluster_status": "Primary", "local_state_comment": "Donor/Desynced"}, "node_not_synced"),
+            ({"ready": True, "connected": True, "cluster_status": "Primary", "local_state_comment": "Joining: receiving State Transfer"}, "node_not_synced"),
+        ]
+        for payload, expected_reason in blocked_cases:
+            with self.subTest(expected_reason=expected_reason):
+                ok, reason = _galera_routing_eligibility(payload)
+                self.assertFalse(ok)
+                self.assertEqual(reason, expected_reason)
+
     def test_disabled_check_is_na(self) -> None:
         out = _collect_replica_freshness(
             FakeCursor(datetime.now(timezone.utc)),

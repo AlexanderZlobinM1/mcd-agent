@@ -58,6 +58,24 @@ _MYSQL_WARN_THROTTLE: dict[str, dict[str, Any]] = {}
 _MYSQL_WARN_THROTTLE_SEC = 300
 
 
+def _galera_routing_eligibility(galera: dict[str, Any]) -> tuple[bool, str]:
+    """Return whether this Galera node is safe for new DB traffic/source use."""
+    ready = _to_bool(galera.get("ready"))
+    connected = _to_bool(galera.get("connected"))
+    cluster_status = str(galera.get("cluster_status") or "").strip().lower()
+    local_state = str(galera.get("local_state_comment") or "").strip().lower()
+
+    if not ready:
+        return False, "wsrep_ready_off"
+    if not connected:
+        return False, "wsrep_disconnected"
+    if cluster_status != "primary":
+        return False, "cluster_not_primary"
+    if local_state != "synced":
+        return False, "node_not_synced"
+    return True, "primary_synced_ready"
+
+
 def _profile_event_cache_key(cfg: AgentConfig) -> str:
     return "|".join(
         [
@@ -1051,12 +1069,11 @@ def _collect_cluster_db_state(cfg: AgentConfig, *, timeout_sec: int = 5) -> dict
                     else _to_float(wsrep_map.get("wsrep_local_send_queue")),
                     "flow_control_paused": _to_float(wsrep_map.get("wsrep_flow_control_paused")),
                 }
+                routing_eligible, routing_reason = _galera_routing_eligibility(galera)
+                galera["routing_eligible"] = routing_eligible
+                galera["routing_reason"] = routing_reason
                 out["galera"] = galera
-                healthy = bool(galera.get("ready")) and bool(galera.get("connected"))
-                if str(galera.get("cluster_status") or "").lower() != "primary":
-                    healthy = False
-                if str(galera.get("local_state_comment") or "").lower() != "synced":
-                    healthy = False
+                healthy = routing_eligible
                 out["status"] = "ok" if healthy else "degraded"
             elif role == "replica":
                 io_running = str(

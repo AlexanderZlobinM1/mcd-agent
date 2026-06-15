@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.145 - 2026-06-15
+
+- Added: Galera DB health now reports explicit routing/source eligibility.
+  A node is eligible only when it is `Primary`, `Synced`, connected and
+  `wsrep_ready=ON`; donor, joiner and non-Primary nodes are marked blocked
+  even if MySQL or systemd still look alive.
+- Changed: cluster DB health uses the same eligibility predicate for its
+  overall `ok/degraded` status, preventing stale direct consumers from treating
+  a recovering Galera node as safe.
+
 ## 0.9.144 - 2026-06-15
 
 - Added: cluster replica DB health can now run configurable data-freshness

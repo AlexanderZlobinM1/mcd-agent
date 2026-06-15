@@ -234,6 +234,11 @@ Notes:
     `max_age_sec`. Prefer `order_column = "id"` for large append-only metric
     tables so the check uses the newest row by index instead of a full `MAX()`
     scan.
+- Cluster Galera route/source eligibility is stricter than a TCP or systemd
+  health check. A Galera node is marked eligible only when it reports
+  `wsrep_cluster_status=Primary`, `wsrep_local_state_comment=Synced`,
+  `wsrep_connected=ON` and `wsrep_ready=ON`. Donor, joiner and non-Primary
+  states are reported as blocked even when MySQL is reachable.
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`
