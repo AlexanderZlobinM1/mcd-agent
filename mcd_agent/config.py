@@ -631,6 +631,9 @@ class AgentConfig:
     cluster_route_import_host: str | None
     cluster_route_backup_host: str | None
     cluster_route_cache_hosts: list[str]
+    cluster_replica_freshness_enabled: bool
+    cluster_replica_freshness_max_age_sec: int
+    cluster_replica_freshness_checks: list[dict[str, Any]]
     host_template: bool
     template_autopromote_on_clone: bool
     mcc_mcd_manifest_url: str | None
@@ -1075,6 +1078,50 @@ def _normalize_json_dict(value: object) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _normalize_replica_freshness_checks(value: object) -> list[dict[str, Any]]:
+    raw = value
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = []
+        raw = parsed
+    if isinstance(raw, dict):
+        items = list(raw.values())
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        database = str(item.get("database", item.get("schema", "")) or "").strip()
+        table = str(item.get("table", "") or "").strip()
+        column = str(item.get("column", item.get("date_column", "")) or "").strip()
+        if not database or not table or not column:
+            continue
+        order_column = str(item.get("order_column", "id") or "").strip()
+        row: dict[str, Any] = {
+            "database": database,
+            "table": table,
+            "column": column,
+            "order_column": order_column,
+            "label": str(item.get("label", f"{database}.{table}.{column}") or "").strip(),
+        }
+        if item.get("max_age_sec") is not None:
+            try:
+                row["max_age_sec"] = max(60, int(item.get("max_age_sec") or 0))
+            except Exception:
+                pass
+        out.append(row)
+    return out
 
 
 def _normalize_backup_dump_timeout(value: object) -> int:
@@ -1994,6 +2041,9 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "cluster_route_import_host": "cluster_route_import_host",
     "cluster_route_backup_host": "cluster_route_backup_host",
     "cluster_route_cache_hosts": "cluster_route_cache_hosts",
+    "cluster_replica_freshness_enabled": "cluster_replica_freshness_enabled",
+    "cluster_replica_freshness_max_age_sec": "cluster_replica_freshness_max_age_sec",
+    "cluster_replica_freshness_checks": "cluster_replica_freshness_checks",
     "plugins_repo_base_url": "plugins_repo_base_url",
     "plugins_repo_fallback_ip": "plugins_repo_fallback_ip",
     "outbound_events_sent_keep_days": "outbound_events_sent_keep_days",
@@ -2460,6 +2510,9 @@ def _load_config_inner(path: str) -> AgentConfig:
             "cluster_route_cache_hosts",
             cluster_routing.get("cache_hosts", []),
         )
+    )
+    cluster_replica_freshness_checks = _normalize_replica_freshness_checks(
+        runtime.get("cluster_replica_freshness_checks", [])
     )
     backup_cluster_authority_role = str(
         runtime.get("backup_cluster_authority_role", backup_cluster.get("authority_role", "replica")) or "replica"
@@ -2941,6 +2994,12 @@ def _load_config_inner(path: str) -> AgentConfig:
         cluster_route_import_host=cluster_route_import_host,
         cluster_route_backup_host=cluster_route_backup_host,
         cluster_route_cache_hosts=cluster_route_cache_hosts,
+        cluster_replica_freshness_enabled=bool(runtime.get("cluster_replica_freshness_enabled", False)),
+        cluster_replica_freshness_max_age_sec=max(
+            300,
+            int(runtime.get("cluster_replica_freshness_max_age_sec", 172800) or 172800),
+        ),
+        cluster_replica_freshness_checks=cluster_replica_freshness_checks,
         host_template=bool(runtime.get("host_template", False)),
         template_autopromote_on_clone=bool(runtime.get("template_autopromote_on_clone", True)),
         mcc_mcd_manifest_url=str(mcc.get("mcd_manifest_url")) if mcc.get("mcd_manifest_url") else None,

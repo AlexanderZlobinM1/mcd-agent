@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.144 - 2026-06-15
+
+- Added: cluster replica DB health can now run configurable data-freshness
+  checks against application tables. This catches stale async replicas whose
+  `Seconds_Behind_Source` is `0` only because their source is itself stale or
+  detached from the Primary Galera component.
+- Added: replica DB health payload now includes source host, source server id,
+  SQL state and compact IO/SQL errors so MCC can show why a replica is not
+  reliable for reporting.
+- Added: regression coverage for stale replica data detection and safe MySQL
+  identifier handling in freshness checks.
+
 ## 0.9.143 - 2026-06-15
 
 - Fixed: SQL-driven segment rebuilds now refresh Mautic's segment contact

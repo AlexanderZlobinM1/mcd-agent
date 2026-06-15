@@ -224,6 +224,16 @@ Notes:
   - `scheduler_duplicate_task_keys`
   - `php_console_stuck`
   - `swap_pressure_level`
+- Cluster replica freshness checks:
+  - `runtime.cluster_replica_freshness_enabled = true` enables application-table
+    freshness checks on async replica nodes.
+  - `runtime.cluster_replica_freshness_max_age_sec` is the default allowed age
+    for the newest row in checked tables.
+  - `runtime.cluster_replica_freshness_checks` is a JSON list of checks with
+    `database`, `table`, `column`, optional `order_column` and optional
+    `max_age_sec`. Prefer `order_column = "id"` for large append-only metric
+    tables so the check uses the newest row by index instead of a full `MAX()`
+    scan.
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml show`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml fetch --json`
 - `python -m mcd_agent runtime-overrides --config ./etc/mcd-agent.example.toml push --json`
