@@ -78,14 +78,17 @@ class PluginConflictPathTests(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertTrue(selected_path.is_dir())
 
-    def test_managed_amazon_ses_conflicts_with_sns_callback_implementations(self) -> None:
+    def test_dependency_matrix_can_make_enhanced_variant_displace_callback_plugins(self) -> None:
         self.assertEqual(
             _exclusive_counterparts(
                 "AmazonSesManagedBundle",
                 {
-                    "plugin_uid": "amazonsesbundle-managed:5-6-7",
-                    "install_bundle": "AmazonSesBundle",
-                    "version": "1.0.36.1",
+                    "dependency_matrix": [
+                        {
+                            "phase": ["selection"],
+                            "selection_conflicts": ["AmazonSnsCallbackBundle", "MauticAmazonSesBundle"],
+                        }
+                    ],
                 },
             ),
             {"AmazonSnsCallbackBundle", "MauticAmazonSesBundle"},
@@ -100,12 +103,25 @@ class PluginConflictPathTests(unittest.TestCase):
             {"AmazonSnsCallbackBundle"},
         )
 
-    def test_callback_plugin_install_removes_managed_amazon_ses_runtime_only_for_1361(self) -> None:
+    def test_dependency_matrix_can_remove_enhanced_runtime_when_callback_is_selected(self) -> None:
         selected = [
             {
                 "bundle": "AmazonSnsCallbackBundle",
                 "install_bundle": "AmazonSnsCallbackBundle",
-                "item": {"bundle": "AmazonSnsCallbackBundle"},
+                "item": {
+                    "bundle": "AmazonSnsCallbackBundle",
+                    "dependency_matrix": [
+                        {
+                            "phase": ["selection"],
+                            "when": {
+                                "version_rules": [
+                                    {"bundle": "AmazonSesBundle", "equals": "1.0.36.1"},
+                                ]
+                            },
+                            "selection_conflicts": ["AmazonSesBundle"],
+                        }
+                    ],
+                },
             }
         ]
 
@@ -118,16 +134,38 @@ class PluginConflictPathTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            removed = _auto_remove_conflicting_installed_bundles(selected, plugins_dir)
+            removed = _auto_remove_conflicting_installed_bundles(
+                selected,
+                plugins_dir,
+                context={
+                    "sender_type": "mautic+ses+api",
+                    "installed_plugins": {
+                        "AmazonSesBundle": "1.0.36.1",
+                    },
+                },
+            )
 
         self.assertEqual(removed, ["AmazonSesBundle"])
 
-    def test_callback_plugin_install_keeps_upstream_amazon_ses_136(self) -> None:
+    def test_dependency_matrix_can_allow_mainstream_runtime_to_coexist(self) -> None:
         selected = [
             {
                 "bundle": "AmazonSnsCallbackBundle",
                 "install_bundle": "AmazonSnsCallbackBundle",
-                "item": {"bundle": "AmazonSnsCallbackBundle"},
+                "item": {
+                    "bundle": "AmazonSnsCallbackBundle",
+                    "dependency_matrix": [
+                        {
+                            "phase": ["selection"],
+                            "when": {
+                                "version_rules": [
+                                    {"bundle": "AmazonSesBundle", "equals": "1.0.36.1"},
+                                ]
+                            },
+                            "selection_conflicts": ["AmazonSesBundle"],
+                        }
+                    ],
+                },
             }
         ]
 
@@ -140,7 +178,16 @@ class PluginConflictPathTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            removed = _auto_remove_conflicting_installed_bundles(selected, plugins_dir)
+            removed = _auto_remove_conflicting_installed_bundles(
+                selected,
+                plugins_dir,
+                context={
+                    "sender_type": "mautic+ses+api",
+                    "installed_plugins": {
+                        "AmazonSesBundle": "1.0.36",
+                    },
+                },
+            )
 
         self.assertEqual(removed, [])
 

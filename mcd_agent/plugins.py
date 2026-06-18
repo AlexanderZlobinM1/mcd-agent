@@ -30,6 +30,7 @@ from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.executor import build_mautic_exec_args, execute_mautic_command_template
 from mcd_agent.host_identity import resolve_agent_identity
+from mcd_agent.plugin_interactions import selection_conflicts_for_rules
 from mcd_agent.runtime_overrides import fetch_runtime_overrides
 from mcd_agent.state_backend import mysql_state_enabled, mysql_state_existing_connection, mysql_state_table_names
 
@@ -69,20 +70,6 @@ _EXCLUSIVE_BUNDLE_PAIRS: dict[str, str] = {
 }
 
 _EXCLUSIVE_BUNDLE_GROUPS: tuple[set[str], ...] = ()
-_AMAZON_SES_CANONICAL_BUNDLE = "AmazonSesBundle"
-_AMAZON_SES_CALLBACK_BUNDLES: set[str] = {
-    "AmazonSnsCallbackBundle",
-    "MauticAmazonSesBundle",
-}
-_AMAZON_SES_FULL_COMPETITOR_BUNDLES: set[str] = {
-    "AmazonSesManagedBundle",
-}
-_AMAZON_SES_FULL_COMPETITOR_UIDS: set[str] = {
-    "amazonsesbundle-managed:5-6-7",
-}
-_AMAZON_SES_FULL_COMPETITOR_VERSIONS: set[str] = {
-    "1.0.36.1",
-}
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -120,38 +107,6 @@ def _install_bundle_for_manifest_bundle(bundle: str, item: dict[str, Any] | None
     if b in _EXCLUSIVE_BUNDLE_PAIRS and b.endswith("Dev"):
         return _EXCLUSIVE_BUNDLE_PAIRS[b]
     return b
-
-
-def _normalize_plugin_version_text(value: str | None) -> str:
-    text = str(value or "").strip().lower()
-    if text.startswith("v"):
-        text = text[1:]
-    return text
-
-
-def _amazon_ses_full_competitor_version(value: str | None) -> bool:
-    return _normalize_plugin_version_text(value) in _AMAZON_SES_FULL_COMPETITOR_VERSIONS
-
-
-def _amazon_ses_full_competitor_selected(bundle: str, item: dict[str, Any] | None = None) -> bool:
-    bundle_name = str(bundle or "").strip()
-    if not bundle_name:
-        return False
-    if bundle_name in _AMAZON_SES_FULL_COMPETITOR_BUNDLES:
-        return True
-    if not isinstance(item, dict):
-        return False
-    plugin_uid = _normalize_plugin_uid(str(item.get("plugin_uid", "") or "").strip())
-    if plugin_uid in _AMAZON_SES_FULL_COMPETITOR_UIDS:
-        return True
-    if str(item.get("install_bundle", "") or "").strip() != _AMAZON_SES_CANONICAL_BUNDLE:
-        return False
-    return _amazon_ses_full_competitor_version(str(item.get("version", "") or "").strip())
-
-
-def _installed_amazon_ses_is_full_competitor(plugins_dir: Path) -> bool:
-    version = _read_installed_version(plugins_dir / _AMAZON_SES_CANONICAL_BUNDLE)
-    return _amazon_ses_full_competitor_version(version)
 
 
 def _color(status: str, no_color: bool) -> str:
@@ -763,10 +718,48 @@ def _normalize_action(raw: str) -> str | None:
     return mapping.get(v)
 
 
-def _exclusive_counterparts(bundle: str, item: dict[str, Any] | None = None) -> set[str]:
+def _installed_plugins_from_dir(plugins_dir: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not plugins_dir.exists() or not plugins_dir.is_dir():
+        return out
+    for child in plugins_dir.iterdir():
+        if not child.is_dir():
+            continue
+        name = str(child.name or "").strip()
+        if not _is_valid_bundle_name(name):
+            continue
+        out[name] = _read_installed_version(child)
+    return out
+
+
+def _plugin_interaction_context(install_root: str, plugins_dir: Path) -> dict[str, Any]:
+    installed_plugins = _installed_plugins_from_dir(plugins_dir)
+    sender_type = ""
+    try:
+        from mcd_agent.state_push import _detect_sender_profile
+
+        sender = _detect_sender_profile(
+            install_root,
+            [{"bundle": bundle, "version": version} for bundle, version in installed_plugins.items()],
+        )
+        sender_type = str((sender or {}).get("sender_type", "") or "").strip().lower()
+    except Exception:
+        sender_type = ""
+    return {
+        "sender_type": sender_type,
+        "installed_plugins": installed_plugins,
+    }
+
+
+def _exclusive_counterparts(
+    bundle: str,
+    item: dict[str, Any] | None = None,
+    *,
+    context: dict[str, Any] | None = None,
+) -> set[str]:
     """
     Returns bundles that are mutually exclusive with `bundle`.
-    Supports hardcoded pairs and optional manifest field `replaces: []`.
+    Supports generic repo metadata plus optional dependency-matrix rules.
     """
     out: set[str] = set()
     bundle_name = str(bundle or "").strip()
@@ -790,20 +783,28 @@ def _exclusive_counterparts(bundle: str, item: dict[str, Any] | None = None) -> 
                 name = str(x or "").strip()
                 if name and _is_valid_bundle_name(name):
                     out.add(name)
-    if _amazon_ses_full_competitor_selected(bundle_name, item):
-        out.update(_AMAZON_SES_CALLBACK_BUNDLES)
+        rules = item.get("dependency_matrix")
+        if rules:
+            ctx = context or {}
+            out.update(
+                selection_conflicts_for_rules(
+                    list(rules or []),
+                    sender_type=str(ctx.get("sender_type", "") or "").strip(),
+                    installed_plugins=dict(ctx.get("installed_plugins") or {}),
+                )
+            )
 
     out.discard(bundle_name)
     return out
 
 
-def _validate_selected_exclusive_conflicts(selected: list[dict[str, Any]]) -> None:
+def _validate_selected_exclusive_conflicts(selected: list[dict[str, Any]], *, context: dict[str, Any] | None = None) -> None:
     selected_set = {str(row.get("bundle", "")).strip() for row in selected if str(row.get("bundle", "")).strip()}
     for row in selected:
         bundle = str(row.get("bundle", "")).strip()
         item = row.get("item")
         item_dict = item if isinstance(item, dict) else None
-        conflicts = sorted(selected_set.intersection(_exclusive_counterparts(bundle, item_dict)))
+        conflicts = sorted(selected_set.intersection(_exclusive_counterparts(bundle, item_dict, context=context)))
         if conflicts:
             raise RuntimeError(
                 f"exclusive plugins selected together: {bundle} and {', '.join(conflicts)}"
@@ -813,6 +814,8 @@ def _validate_selected_exclusive_conflicts(selected: list[dict[str, Any]]) -> No
 def _auto_remove_conflicting_installed_bundles(
     selected: list[dict[str, Any]],
     plugins_dir: Path,
+    *,
+    context: dict[str, Any] | None = None,
 ) -> list[str]:
     """
     Return conflicting bundle keys that must be removed before applying `selected`.
@@ -834,14 +837,12 @@ def _auto_remove_conflicting_installed_bundles(
                 name = str(token or "").strip()
                 if name and _is_valid_bundle_name(name):
                     explicit_replaces.add(name)
-        for conflict in _exclusive_counterparts(bundle, item_dict):
+        for conflict in _exclusive_counterparts(bundle, item_dict, context=context):
             if conflict in selected_set:
                 continue
             if conflict not in explicit_replaces and not ((plugins_dir / conflict).exists() or (plugins_dir / conflict).is_symlink()):
                 continue
             remove.add(conflict)
-        if bundle in _AMAZON_SES_CALLBACK_BUNDLES and _installed_amazon_ses_is_full_competitor(plugins_dir):
-            remove.add(_AMAZON_SES_CANONICAL_BUNDLE)
     return sorted(remove, key=lambda x: x.lower())
 
 
@@ -1043,6 +1044,7 @@ def _build_plugin_rows(
 
     local_bundles = {d.name for d in local_dirs}
     all_bundles = sorted(set(local_bundles) | set(manifest_by_bundle.keys()), key=lambda x: x.lower())
+    interaction_context = _plugin_interaction_context(install_root, plugins_dir)
 
     rows: list[dict[str, Any]] = []
     selectable_idx = 1
@@ -1078,7 +1080,7 @@ def _build_plugin_rows(
             config.plugins_state_filename,
             install_bundle=install_bundle,
         )
-        exclusive_with = sorted(_exclusive_counterparts(bundle, item))
+        exclusive_with = sorted(_exclusive_counterparts(bundle, item, context=interaction_context))
         rows.append(
             {
                 "idx": selectable_idx,
@@ -1376,6 +1378,7 @@ def _cleanup_conflicting_plugin_rows(
     install,
     selected_rows: list[dict[str, Any]],
     *,
+    context: dict[str, Any] | None = None,
     extra_conflicts: list[str] | None = None,
 ) -> None:
     if not install.db:
@@ -1386,7 +1389,7 @@ def _cleanup_conflicting_plugin_rows(
         bundle = str(row.get("bundle", "")).strip()
         item = row.get("item")
         item_dict = item if isinstance(item, dict) else None
-        for other in _exclusive_counterparts(bundle, item_dict):
+        for other in _exclusive_counterparts(bundle, item_dict, context=context):
             if other and other not in selected_set:
                 conflicts.add(other)
     for other in extra_conflicts or []:
@@ -1674,6 +1677,7 @@ def _apply_plugin_file_changes(
     rows_by_bundle: dict[str, dict[str, Any]],
     run_post_steps: bool,
 ) -> bool:
+    plugins_dir = _resolve_plugins_dir(install_root, create=False)
     changed = False
     protected_install_paths = _protected_plugin_path_names(selected) if action != "remove" else set()
     if action != "remove" and auto_remove_bundles:
@@ -1795,6 +1799,7 @@ def _apply_plugin_file_changes(
         logging.info("[%s] plugin %s applied action=%s path=%s", install_root, bundle, action, install_bundle)
 
     compatibility_changed = False
+    interaction_context = _plugin_interaction_context(install_root, plugins_dir)
     if action != "remove" and selected:
         # Compatibility patches are recovery steps too. A previous run can copy
         # plugin files successfully and then fail during Mautic reload, leaving
@@ -1805,7 +1810,12 @@ def _apply_plugin_file_changes(
 
     if changed or compatibility_changed:
         _run_manifest_sql_fixes(config, install, selected)
-        _cleanup_conflicting_plugin_rows(install, selected, extra_conflicts=auto_remove_bundles)
+        _cleanup_conflicting_plugin_rows(
+            install,
+            selected,
+            context=interaction_context,
+            extra_conflicts=auto_remove_bundles,
+        )
         if run_post_steps:
             _run_post_steps(config, install)
     return changed or compatibility_changed
@@ -2476,6 +2486,7 @@ def run_plugins_interactive(
 
     manifest_dir = manifest_url.rsplit("/", 1)[0] + "/"
     plugins_dir = _resolve_plugins_dir(install_root, create=True)
+    interaction_context = _plugin_interaction_context(install_root, plugins_dir)
 
     idx_map: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -2640,7 +2651,7 @@ def run_plugins_interactive(
             continue
 
         try:
-            _validate_selected_exclusive_conflicts(selected)
+            _validate_selected_exclusive_conflicts(selected, context=interaction_context)
         except RuntimeError as e:
             print(f"Selection error: {e}")
             if not sys.stdin.isatty():
@@ -2653,6 +2664,7 @@ def run_plugins_interactive(
             auto_remove_bundles = _auto_remove_conflicting_installed_bundles(
                 selected,
                 plugins_dir,
+                context=interaction_context,
             )
 
         print("Selected:")
