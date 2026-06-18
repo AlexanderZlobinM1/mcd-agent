@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.9.147 - 2026-06-18
+
+- Changed: plugin competition is now driven by MCC repo metadata instead of
+  Amazon-specific code paths in the agent. Each published plugin source can
+  carry a dependency matrix that describes conditional coexistence and
+  displacement rules.
+- Added: plugin manifest consumption now evaluates dependency-matrix selection
+  rules against the live instance context, so mainstream variants can coexist
+  while enhanced variants can evict competitors when their matrix says so.
+- Fixed: plugin DB conflict cleanup now uses the same dependency-matrix result
+  as filesystem cleanup, keeping selected install aliases protected while
+  removing the intended competitors.
+- Added: regression coverage for dependency-matrix driven coexistence and
+  displacement behavior.
+
 ## 0.9.146 - 2026-06-18
 
 - Fixed: Amazon plugin conflict cleanup is now asymmetric. Native
