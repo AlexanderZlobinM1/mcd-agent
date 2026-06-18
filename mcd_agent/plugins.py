@@ -68,13 +68,21 @@ _EXCLUSIVE_BUNDLE_PAIRS: dict[str, str] = {
     "SalesSnapBundleDev": "SalesSnapBundle",
 }
 
-_EXCLUSIVE_BUNDLE_GROUPS: tuple[set[str], ...] = (
-    {
-        "AmazonSesBundle",
-        "MauticAmazonSesBundle",
-        "AmazonSnsCallbackBundle",
-    },
-)
+_EXCLUSIVE_BUNDLE_GROUPS: tuple[set[str], ...] = ()
+_AMAZON_SES_CANONICAL_BUNDLE = "AmazonSesBundle"
+_AMAZON_SES_CALLBACK_BUNDLES: set[str] = {
+    "AmazonSnsCallbackBundle",
+    "MauticAmazonSesBundle",
+}
+_AMAZON_SES_FULL_COMPETITOR_BUNDLES: set[str] = {
+    "AmazonSesManagedBundle",
+}
+_AMAZON_SES_FULL_COMPETITOR_UIDS: set[str] = {
+    "amazonsesbundle-managed:5-6-7",
+}
+_AMAZON_SES_FULL_COMPETITOR_VERSIONS: set[str] = {
+    "1.0.36.1",
+}
 
 
 def _is_valid_bundle_name(name: str) -> bool:
@@ -112,6 +120,38 @@ def _install_bundle_for_manifest_bundle(bundle: str, item: dict[str, Any] | None
     if b in _EXCLUSIVE_BUNDLE_PAIRS and b.endswith("Dev"):
         return _EXCLUSIVE_BUNDLE_PAIRS[b]
     return b
+
+
+def _normalize_plugin_version_text(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("v"):
+        text = text[1:]
+    return text
+
+
+def _amazon_ses_full_competitor_version(value: str | None) -> bool:
+    return _normalize_plugin_version_text(value) in _AMAZON_SES_FULL_COMPETITOR_VERSIONS
+
+
+def _amazon_ses_full_competitor_selected(bundle: str, item: dict[str, Any] | None = None) -> bool:
+    bundle_name = str(bundle or "").strip()
+    if not bundle_name:
+        return False
+    if bundle_name in _AMAZON_SES_FULL_COMPETITOR_BUNDLES:
+        return True
+    if not isinstance(item, dict):
+        return False
+    plugin_uid = _normalize_plugin_uid(str(item.get("plugin_uid", "") or "").strip())
+    if plugin_uid in _AMAZON_SES_FULL_COMPETITOR_UIDS:
+        return True
+    if str(item.get("install_bundle", "") or "").strip() != _AMAZON_SES_CANONICAL_BUNDLE:
+        return False
+    return _amazon_ses_full_competitor_version(str(item.get("version", "") or "").strip())
+
+
+def _installed_amazon_ses_is_full_competitor(plugins_dir: Path) -> bool:
+    version = _read_installed_version(plugins_dir / _AMAZON_SES_CANONICAL_BUNDLE)
+    return _amazon_ses_full_competitor_version(version)
 
 
 def _color(status: str, no_color: bool) -> str:
@@ -750,6 +790,8 @@ def _exclusive_counterparts(bundle: str, item: dict[str, Any] | None = None) -> 
                 name = str(x or "").strip()
                 if name and _is_valid_bundle_name(name):
                     out.add(name)
+    if _amazon_ses_full_competitor_selected(bundle_name, item):
+        out.update(_AMAZON_SES_CALLBACK_BUNDLES)
 
     out.discard(bundle_name)
     return out
@@ -798,6 +840,8 @@ def _auto_remove_conflicting_installed_bundles(
             if conflict not in explicit_replaces and not ((plugins_dir / conflict).exists() or (plugins_dir / conflict).is_symlink()):
                 continue
             remove.add(conflict)
+        if bundle in _AMAZON_SES_CALLBACK_BUNDLES and _installed_amazon_ses_is_full_competitor(plugins_dir):
+            remove.add(_AMAZON_SES_CANONICAL_BUNDLE)
     return sorted(remove, key=lambda x: x.lower())
 
 
@@ -1328,7 +1372,12 @@ def _run_manifest_sql_fixes(config: AgentConfig, install, selected_rows: list[di
                 raise RuntimeError(f"pre_sql failed for {bundle}: {e}") from e
 
 
-def _cleanup_conflicting_plugin_rows(install, selected_rows: list[dict[str, Any]]) -> None:
+def _cleanup_conflicting_plugin_rows(
+    install,
+    selected_rows: list[dict[str, Any]],
+    *,
+    extra_conflicts: list[str] | None = None,
+) -> None:
     if not install.db:
         return
     selected_set = set(_selected_install_bundles(selected_rows))
@@ -1340,6 +1389,10 @@ def _cleanup_conflicting_plugin_rows(install, selected_rows: list[dict[str, Any]
         for other in _exclusive_counterparts(bundle, item_dict):
             if other and other not in selected_set:
                 conflicts.add(other)
+    for other in extra_conflicts or []:
+        name = str(other or "").strip()
+        if name and name not in selected_set:
+            conflicts.add(name)
     if not conflicts:
         return
     escaped = []
@@ -1752,7 +1805,7 @@ def _apply_plugin_file_changes(
 
     if changed or compatibility_changed:
         _run_manifest_sql_fixes(config, install, selected)
-        _cleanup_conflicting_plugin_rows(install, selected)
+        _cleanup_conflicting_plugin_rows(install, selected, extra_conflicts=auto_remove_bundles)
         if run_post_steps:
             _run_post_steps(config, install)
     return changed or compatibility_changed

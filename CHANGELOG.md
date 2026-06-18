@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.9.146 - 2026-06-18
+
+- Fixed: Amazon plugin conflict cleanup is now asymmetric. Native
+  `AmazonSesBundle` no longer globally conflicts with
+  `AmazonSnsCallbackBundle` / `MauticAmazonSesBundle`; only the callback
+  bundles conflict with each other by default.
+- Fixed: selecting the managed Amazon SES source `1.0.36.1` now always
+  auto-removes callback competitors, and selecting a callback bundle now
+  auto-removes `AmazonSesBundle` only when the installed runtime is the full
+  managed `1.0.36.1` variant.
+- Fixed: plugin DB conflict-row cleanup now follows the same computed
+  auto-removal set as filesystem cleanup, preventing stale Amazon competitor
+  rows from surviving a replacement.
+- Added: regression coverage for Amazon SES managed-vs-upstream conflict
+  handling and callback coexistence.
+
 ## 0.9.145 - 2026-06-15
 
 - Added: Galera DB health now reports explicit routing/source eligibility.
