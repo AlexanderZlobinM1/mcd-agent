@@ -78,13 +78,71 @@ class PluginConflictPathTests(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertTrue(selected_path.is_dir())
 
-    def test_amazon_ses_conflicts_with_sns_callback_implementations(self) -> None:
+    def test_managed_amazon_ses_conflicts_with_sns_callback_implementations(self) -> None:
         self.assertEqual(
-            _exclusive_counterparts("AmazonSesBundle"),
-            {"AmazonSesBundleDev", "AmazonSnsCallbackBundle", "MauticAmazonSesBundle"},
+            _exclusive_counterparts(
+                "AmazonSesManagedBundle",
+                {
+                    "plugin_uid": "amazonsesbundle-managed:5-6-7",
+                    "install_bundle": "AmazonSesBundle",
+                    "version": "1.0.36.1",
+                },
+            ),
+            {"AmazonSnsCallbackBundle", "MauticAmazonSesBundle"},
         )
-        self.assertIn("AmazonSesBundle", _exclusive_counterparts("AmazonSnsCallbackBundle"))
-        self.assertIn("AmazonSesBundle", _exclusive_counterparts("MauticAmazonSesBundle"))
+        self.assertEqual(_exclusive_counterparts("AmazonSesBundle"), {"AmazonSesBundleDev"})
+        self.assertEqual(
+            _exclusive_counterparts("AmazonSnsCallbackBundle"),
+            {"MauticAmazonSesBundle"},
+        )
+        self.assertEqual(
+            _exclusive_counterparts("MauticAmazonSesBundle"),
+            {"AmazonSnsCallbackBundle"},
+        )
+
+    def test_callback_plugin_install_removes_managed_amazon_ses_runtime_only_for_1361(self) -> None:
+        selected = [
+            {
+                "bundle": "AmazonSnsCallbackBundle",
+                "install_bundle": "AmazonSnsCallbackBundle",
+                "item": {"bundle": "AmazonSnsCallbackBundle"},
+            }
+        ]
+
+        with TemporaryDirectory() as tmp:
+            plugins_dir = Path(tmp)
+            managed = plugins_dir / "AmazonSesBundle"
+            (managed / "Config").mkdir(parents=True)
+            (managed / "Config" / "config.php").write_text(
+                "<?php\nreturn ['version' => '1.0.36.1'];\n",
+                encoding="utf-8",
+            )
+
+            removed = _auto_remove_conflicting_installed_bundles(selected, plugins_dir)
+
+        self.assertEqual(removed, ["AmazonSesBundle"])
+
+    def test_callback_plugin_install_keeps_upstream_amazon_ses_136(self) -> None:
+        selected = [
+            {
+                "bundle": "AmazonSnsCallbackBundle",
+                "install_bundle": "AmazonSnsCallbackBundle",
+                "item": {"bundle": "AmazonSnsCallbackBundle"},
+            }
+        ]
+
+        with TemporaryDirectory() as tmp:
+            plugins_dir = Path(tmp)
+            upstream = plugins_dir / "AmazonSesBundle"
+            (upstream / "Config").mkdir(parents=True)
+            (upstream / "Config" / "config.php").write_text(
+                "<?php\nreturn ['version' => '1.0.36'];\n",
+                encoding="utf-8",
+            )
+
+            removed = _auto_remove_conflicting_installed_bundles(selected, plugins_dir)
+
+        self.assertEqual(removed, [])
 
     def test_cluster_plugin_reference_is_first_cache_host(self) -> None:
         cfg = SimpleNamespace(
@@ -238,7 +296,7 @@ class PluginConflictPathTests(unittest.TestCase):
         db = SimpleNamespace(execute_sql_template=Mock(return_value=1))
 
         with patch("mcd_agent.plugins.MauticDB", return_value=db):
-            _cleanup_conflicting_plugin_rows(install, rows)
+            _cleanup_conflicting_plugin_rows(install, rows, extra_conflicts=["AmazonSnsCallbackBundle", "MauticAmazonSesBundle"])
 
         sql = db.execute_sql_template.call_args.args[0]
         self.assertNotIn("'AmazonSesBundle'", sql)
