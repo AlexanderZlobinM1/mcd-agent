@@ -16,6 +16,7 @@ from mcd_agent.daemon import (
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _campaign_pressure_active,
+    _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
     _campaign_trigger_progress_watchdog,
@@ -45,6 +46,7 @@ from mcd_agent.ring_utils import advance_ring_after_launch
 class CampaignRingDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
+        _CAMPAIGN_REBUILD_FINISHED_AT.clear()
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])
@@ -312,6 +314,102 @@ class CampaignRingDispatchTests(unittest.TestCase):
                 running={},
             )
         )
+
+    def test_campaign_rebuild_waits_for_running_trigger_same_campaign(self) -> None:
+        root = "/var/www/site"
+        running = {
+            _task_key(root, "campaign_trigger", 163): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 163),
+                task_type="campaign_trigger",
+                entity_id=163,
+                command_str="campaign trigger 163",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=1.0,
+                pid=1001,
+            ),
+            _task_key(root, "campaign_trigger", 164): RunningTask(
+                row_id=2,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 164),
+                task_type="campaign_trigger",
+                entity_id=164,
+                command_str="campaign trigger 164",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=1.0,
+                pid=1002,
+            ),
+        }
+
+        self.assertTrue(
+            _campaign_rebuild_waits_for_trigger(
+                root=root,
+                campaign_id=163,
+                running=running,
+            )
+        )
+        self.assertFalse(
+            _campaign_rebuild_waits_for_trigger(
+                root=root,
+                campaign_id=165,
+                running=running,
+            )
+        )
+
+    def test_campaign_rebuild_ring_skips_id_with_running_trigger(self) -> None:
+        root = "/var/www/site"
+        ring = deque([163, 165])
+        cfg = SimpleNamespace(campaign_rebuild_min_repeat_sec=0, command_timeout_sec=3600)
+        store = Mock()
+        store.has_running_task_key.return_value = False
+        store.last_task_started_at.return_value = 0
+        store.add_running.return_value = 123
+        running = {
+            _task_key(root, "campaign_trigger", 163): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 163),
+                task_type="campaign_trigger",
+                entity_id=163,
+                command_str="campaign trigger 163",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=1.0,
+                pid=1001,
+            )
+        }
+
+        fake_proc = Mock()
+        fake_proc.pid = 2002
+        with patch.object(daemon_mod, "_spawn_command", return_value=fake_proc):
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=1,
+                total_limit=1,
+                root=root,
+                task_type="campaign_rebuild",
+                running=running,
+                ring_entities={163, 165},
+                config=cfg,
+                store=store,
+                popens={},
+                build_args=lambda cid: ["php", "bin/console", "mautic:campaigns:rebuild", "-i", str(cid)],
+                dynamic_blocked=lambda cid: _campaign_rebuild_waits_for_trigger(
+                    root=root,
+                    campaign_id=cid,
+                    running=running,
+                ),
+            )
+
+        self.assertEqual(launched, 1)
+        store.add_running.assert_called_once()
+        added_task = store.add_running.call_args.args[0]
+        self.assertEqual(added_task.task_type, "campaign_rebuild")
+        self.assertEqual(added_task.entity_id, 165)
+        self.assertIn(163, ring)
 
     def test_task_store_persists_last_launch_for_restart_guard(self) -> None:
         with tempfile.NamedTemporaryFile() as tmp:
