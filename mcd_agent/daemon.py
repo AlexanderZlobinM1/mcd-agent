@@ -2322,7 +2322,7 @@ def _campaign_trigger_root_action_due_exists_sql(campaign_id: int) -> str:
         "     AND cld.manually_removed = 0 "
         "     AND cld.date_last_exited IS NULL "
         "    WHERE ce.campaign_id = c.id "
-        "      AND ce.event_type = 'action' "
+        "      AND ce.event_type IN ('action', 'condition') "
         "      AND ce.parent_id IS NULL "
         "      AND ("
         "        ce.trigger_mode IN ('immediate', 'interval') "
