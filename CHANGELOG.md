@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.9.148 - 2026-06-19
+
+- Fixed: campaign trigger scheduling now bootstraps published campaigns whose
+  first/root event is a condition, not only campaigns whose first/root event is
+  an action. This covers segment/field/device conditions that already have
+  active `campaign_leads` but no `campaign_lead_event_log` rows yet; MCD now
+  lets Mautic trigger the campaign so it can evaluate the condition and execute
+  downstream channel actions such as email sends.
+- Fixed: the per-campaign due guard now uses the same root action/condition
+  bootstrap semantics as the scheduler due SQL, preventing audit-planned
+  root-condition campaigns from being skipped as stale with
+  `pending_logs=0 triggered_logs=0`.
+- Added: regression coverage for root-condition campaign bootstrap SQL and the
+  matching trigger due guard.
+
 ## 0.9.147 - 2026-06-18
 
 - Changed: plugin competition is now driven by MCC repo metadata instead of

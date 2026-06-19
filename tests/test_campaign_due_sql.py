@@ -10,6 +10,7 @@ from mcd_agent.config import (
     _campaign_triggers_due_sql,
     _import_pending_count_sql,
 )
+from mcd_agent.daemon import _campaign_trigger_root_action_due_exists_sql
 
 
 class CampaignDueSqlTests(unittest.TestCase):
@@ -120,16 +121,38 @@ class CampaignDueSqlTests(unittest.TestCase):
 
     def test_trigger_due_catches_root_action_campaign_leads_without_event_log(self) -> None:
         self.assertIn("ce.parent_id IS NULL", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("ce.event_type IN ('action', 'condition')", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertIn("ce.trigger_mode IN ('immediate', 'interval')", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertIn("el0.rotation <=> cld.rotation", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertNotIn("el0.event_id = ce.id", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[1]
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", root_bootstrap_branch)
 
+    def test_trigger_due_catches_root_condition_campaign_leads_without_event_log(self) -> None:
+        root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[1]
+
+        self.assertIn("ce.event_type IN ('action', 'condition')", root_bootstrap_branch)
+        self.assertIn("ce.parent_id IS NULL", root_bootstrap_branch)
+        self.assertIn("INNER JOIN {prefix}campaign_leads cld", root_bootstrap_branch)
+        self.assertIn("cld.date_last_exited IS NULL", root_bootstrap_branch)
+        self.assertIn("el0.rotation <=> cld.rotation", root_bootstrap_branch)
+        self.assertNotIn("el0.event_id = ce.id", root_bootstrap_branch)
+
+    def test_trigger_due_guard_catches_root_condition_campaign_leads_without_event_log(self) -> None:
+        guard_sql = _campaign_trigger_root_action_due_exists_sql(162)
+
+        self.assertIn("ce.event_type IN ('action', 'condition')", guard_sql)
+        self.assertIn("ce.parent_id IS NULL", guard_sql)
+        self.assertIn("INNER JOIN {prefix}campaign_leads cld", guard_sql)
+        self.assertIn("el0.rotation <=> cld.rotation", guard_sql)
+        self.assertNotIn("el0.event_id = ce.id", guard_sql)
+
     def test_trigger_due_is_strictly_event_log_driven(self) -> None:
         # Scheduled execution is event-log driven, but root actions also need a
         # bootstrap path: Mautic only creates the event log when the campaign is
-        # triggered for contacts that already exist in campaign_leads.
+        # triggered for contacts that already exist in campaign_leads. Root
+        # conditions need the same bootstrap so Mautic can evaluate the branch
+        # and execute downstream channel actions.
         self.assertIn("FROM {prefix}campaign_lead_event_log el", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertIn("FROM {prefix}campaign_events ce", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertIn("ce.trigger_mode IN ('immediate', 'interval')", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
