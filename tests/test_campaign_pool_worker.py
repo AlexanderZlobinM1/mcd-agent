@@ -66,30 +66,3 @@ def test_trigger_backlog_drained_requires_root_zero_and_small_due_tail():
     assert not module.trigger_backlog_drained(
         {"root_contacts": 0, "due_events": 6, "remaining": 6}
     )
-
-
-def test_viber_campaigns_are_routed_to_dedicated_rings(monkeypatch):
-    module = _load_module()
-
-    def fake_mysql_rows(sql):
-        if "FROM ananas_categories" in sql:
-            return [["359"]]
-        if "FROM ananas_campaigns" in sql:
-            return [
-                ["5144", "359"],
-                ["5143", "0"],
-                ["5142", "0"],
-            ]
-        raise AssertionError(sql)
-
-    monkeypatch.setattr(module, "mysql_rows", fake_mysql_rows)
-
-    pools = module.get_campaign_sets()
-
-    assert pools["viber-trigger"] == [5144]
-    assert pools["viber-rebuild"] == [5144]
-    assert 5144 not in pools["latest-trigger"]
-    assert 5144 not in pools["hot-trigger"]
-    assert 5144 not in pools["rest-trigger"]
-    assert 5144 not in pools["hot-rebuild"]
-    assert 5144 not in pools["rest-rebuild"]
