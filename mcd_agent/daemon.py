@@ -431,6 +431,21 @@ def _campaign_trigger_waits_for_rebuild(
     return rebuilt_at < float(planned_after_ts or 0.0)
 
 
+def _campaign_rebuild_waits_for_trigger(
+    *,
+    root: str,
+    campaign_id: int,
+    running: dict[str, "RunningTask"],
+) -> bool:
+    try:
+        cid = int(campaign_id)
+    except Exception:
+        return False
+    if cid <= 0:
+        return False
+    return _is_running(running, root, "campaign_trigger", cid)
+
+
 def _segment_failure_blocked_ids(store: "TaskStore", root: str) -> set[int]:
     counts = store.recent_task_problem_counts(
         root=root,
@@ -7561,6 +7576,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     sql_ctx=sql_ctx,
                 )
 
+            def _rebuild_waits_for_trigger(cid: int) -> bool:
+                return _campaign_rebuild_waits_for_trigger(
+                    root=root,
+                    campaign_id=int(cid),
+                    running=running,
+                )
+
             def _mark_segment_cycle(sid: int) -> None:
                 _monitor_cycle_mark_launched(
                     monitor_cycle_done,
@@ -7668,6 +7690,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 config=config,
                                 now_ts=now,
                                 running_task_types={"campaign_rebuild", "campaign_update"},
+                                dynamic_blocked=_rebuild_waits_for_trigger,
                             )
                             + _monitor_visible_queued_ids(
                                 ring=reb_reg_ring,
@@ -7677,6 +7700,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 config=config,
                                 now_ts=now,
                                 running_task_types={"campaign_rebuild", "campaign_update"},
+                                dynamic_blocked=_rebuild_waits_for_trigger,
                             )
                         )
                 if config.segment_mode == "classic_loop":
@@ -8159,6 +8183,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         elif reb_reg_ring:
                             next_campaign_id = reb_reg_ring[0]
                             reb_reg_ring.rotate(-1)
+                        if next_campaign_id is not None and _rebuild_waits_for_trigger(int(next_campaign_id)):
+                            next_campaign_id = None
                         if next_campaign_id is not None:
                             launched = _submit_if_slot(
                                 config=config,
@@ -8395,6 +8421,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         template=config.cmd_campaign_rebuild_template,
                         id=cid,
                     ),
+                    dynamic_blocked=_rebuild_waits_for_trigger,
                     remove_on_launch=True,
                     on_launch=_mark_campaign_rebuild_cycle,
                 )
@@ -8417,6 +8444,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             template=config.cmd_campaign_rebuild_template,
                             id=cid,
                         ),
+                        dynamic_blocked=_rebuild_waits_for_trigger,
                         remove_on_launch=True,
                         on_launch=_mark_campaign_rebuild_cycle,
                     )
@@ -8442,6 +8470,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 template=config.cmd_campaign_rebuild_template,
                                 id=cid,
                             ),
+                            dynamic_blocked=_rebuild_waits_for_trigger,
                             remove_on_launch=True,
                             on_launch=_mark_campaign_rebuild_cycle,
                         )
@@ -8464,6 +8493,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 template=config.cmd_campaign_rebuild_template,
                                 id=cid,
                             ),
+                            dynamic_blocked=_rebuild_waits_for_trigger,
                             remove_on_launch=True,
                             on_launch=_mark_campaign_rebuild_cycle,
                         )

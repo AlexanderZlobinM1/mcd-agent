@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.149 - 2026-06-19
+
+- Fixed: campaign rebuild dispatch now waits when the same campaign already has
+  an active trigger run. This prevents MCD from overlapping
+  `mautic:campaigns:rebuild -i ID` with `mautic:campaigns:trigger -i ID`,
+  which can make large sends appear stuck behind Mautic's command lock.
+- Added: regression coverage for same-campaign trigger/rebuild dispatch
+  exclusion.
+
 ## 0.9.148 - 2026-06-19
 
 - Fixed: campaign trigger scheduling now bootstraps published campaigns whose
