@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.160 - 2026-06-21
+
+- Fixed: `composer-move` now forces all Composer layout path keys in target
+  `config/local.php`, including `cache_path`, `log_path`, `tmp_path`,
+  `contact_export_dir`, upload, form upload, and report temp paths. Mautic 6
+  ZIP instances whose source config omitted some of those keys no longer fall
+  back to stale `app/../var` or `app/../media` defaults after the nginx switch.
+
 ## 0.9.159 - 2026-06-21
 
 - Fixed: `composer-move` now recreates Composer runtime directories after cache
