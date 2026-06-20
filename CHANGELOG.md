@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.152 - 2026-06-20
+
+- Fixed: `mautic_db_indexes` service-profile apply now treats MySQL duplicate
+  key races as a successful noop only after refreshing `information_schema` and
+  confirming that the expected index exists with the expected columns. This
+  prevents false service-profile auto-apply failures when another apply run
+  created the index first.
+- Fixed: package metadata version is back in sync with the agent runtime
+  version for the next self-update build.
+- Fixed: legacy Mautic segment dependency expansion now ignores dependency
+  filter references to segments that are not present in the published segment
+  set, preventing deleted parent ids from being scheduled repeatedly.
+
 ## 0.9.151 - 2026-06-20
 
 - Fixed: plugin catalog status now treats an installed semantic version newer
