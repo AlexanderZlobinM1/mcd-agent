@@ -32,6 +32,7 @@ from mcd_agent.cluster_assets import collect_cluster_assets_status
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_readiness import collect_mautic_install_readiness
+from mcd_agent.instance_size import collect_instance_sizes
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.maintenance_mode import collect_maintenance_state
@@ -1773,6 +1774,7 @@ class MCCStatePusher:
             "state_backend": self._state_backend_payload(now_ts),
             "cluster_assets": self._cluster_assets_payload(now_ts, installs),
             "instances": instances,
+            "instance_sizes": collect_instance_sizes(installs),
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         payload.update(agent_version_payload())
