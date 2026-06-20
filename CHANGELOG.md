@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.150 - 2026-06-20
+
+- Added: state push now reports per-instance disk footprint metrics, including
+  Mautic root disk usage, database size, selected subdirectory breakdowns, and
+  per-instance measurement errors for MCC reporting.
+
 ## 0.9.149 - 2026-06-19
 
 - Fixed: campaign rebuild dispatch now waits when the same campaign already has
