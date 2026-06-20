@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.155 - 2026-06-20
+
+- Fixed: manual `mcd-cli self-update apply` now also runs the package/source
+  drift repair path when MCC reports the host is already up to date. This keeps
+  manual repair behavior consistent with daemon auto-update checks.
+
 ## 0.9.154 - 2026-06-20
 
 - Fixed: self-update now keeps the installed venv package in sync with the
