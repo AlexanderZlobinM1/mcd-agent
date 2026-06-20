@@ -109,7 +109,7 @@ def _copy_tree(src: Path, dst: Path, *, ignore: set[str] | None = None) -> None:
 
 def _mutable_path_map(source_root: Path, target_root: Path) -> dict[Path, Path]:
     return {
-        source_root / "plugins": target_root / "plugins",
+        source_root / "plugins": target_root / "docroot" / "plugins",
         source_root / "media": target_root / "docroot" / "media",
         source_root / "themes": target_root / "docroot" / "themes",
         source_root / "translations": target_root / "docroot" / "translations",

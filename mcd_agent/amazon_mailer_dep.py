@@ -10,7 +10,7 @@ import tempfile
 import urllib.request
 
 from mcd_agent.config import AgentConfig
-from mcd_agent.install_type import detect_install_type
+from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
 
 
 AMAZON_MAILER_REQUIRED_BUNDLES: set[str] = {
@@ -300,12 +300,7 @@ def _required_mailer_packages_from_bundles(bundles: set[str]) -> set[str]:
 
 def installed_required_bundles(root: str) -> set[str]:
     out: set[str] = set()
-    candidates = [
-        Path(root) / "plugins",
-        Path(root) / "docroot" / "plugins",
-        Path(root) / "public" / "plugins",
-    ]
-    for base in candidates:
+    for base in plugin_dir_candidates(root):
         if not base.exists() or not base.is_dir():
             continue
         for name in AMAZON_MAILER_REQUIRED_BUNDLES | SENDGRID_MAILER_REQUIRED_BUNDLES:

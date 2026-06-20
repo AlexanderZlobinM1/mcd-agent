@@ -30,6 +30,7 @@ from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.executor import build_mautic_exec_args, execute_mautic_command_template
 from mcd_agent.host_identity import resolve_agent_identity
+from mcd_agent.install_type import plugin_dir_candidates
 from mcd_agent.plugin_interactions import selection_conflicts_for_rules
 from mcd_agent.runtime_overrides import fetch_runtime_overrides
 from mcd_agent.state_backend import mysql_state_enabled, mysql_state_existing_connection, mysql_state_table_names
@@ -1013,12 +1014,7 @@ def _version_cmp(left: str | None, right: str | None) -> int | None:
 
 
 def _resolve_plugins_dir(root: str, create: bool = False) -> Path:
-    base = Path(root)
-    candidates = [
-        base / "plugins",
-        base / "docroot" / "plugins",
-        base / "public" / "plugins",
-    ]
+    candidates = plugin_dir_candidates(root)
     for p in candidates:
         if p.exists() and p.is_dir():
             return p
@@ -1524,9 +1520,7 @@ def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]
                 changed_any = True
                 logging.info("[%s] m4 tx patch (Engine.php) applied: commit=%s rollback=%s", install.root, n_commit, n_rollback)
 
-    hostnet_path = Path(install.root) / "plugins" / "HostnetAuthBundle" / "HostnetAuthBundle.php"
-    if not hostnet_path.exists():
-        hostnet_path = _resolve_plugins_dir(install.root, create=False) / "HostnetAuthBundle" / "HostnetAuthBundle.php"
+    hostnet_path = _resolve_plugins_dir(install.root, create=False) / "HostnetAuthBundle" / "HostnetAuthBundle.php"
     if not hostnet_path.exists():
         return changed_any
     hostnet_text = hostnet_path.read_text(encoding="utf-8", errors="ignore")
