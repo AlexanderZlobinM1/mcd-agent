@@ -81,6 +81,39 @@ class ComposerMoveHelpersTest(unittest.TestCase):
             self.assertNotIn(str(target / "media"), text)
             self.assertNotIn(str(source), text)
 
+    def test_patch_paths_inserts_missing_composer_path_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "zip"
+            target = base / "composer"
+            (target / "config").mkdir(parents=True)
+            (target / "config" / "local.php").write_text(
+                "<?php\n$parameters = array(\n"
+                + "\t'db_driver' => 'pdo_mysql',\n"
+                + "\t'upload_dir' => '"
+                + str(target / "app" / ".." / "media" / "files")
+                + "',\n"
+                + "\t'form_upload_dir' => '"
+                + str(target / "app" / ".." / "media" / "files" / "form")
+                + "',\n"
+                + "\t'report_temp_dir' => '"
+                + str(target / "app" / ".." / "media" / "files" / "temp")
+                + "',\n"
+                + ");\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(_patch_paths_in_local_php(target, source))
+            text = (target / "config" / "local.php").read_text(encoding="utf-8")
+            self.assertIn("'upload_dir' => '" + str(target / "docroot" / "media" / "files") + "'", text)
+            self.assertIn("'form_upload_dir' => '" + str(target / "docroot" / "media" / "files" / "form") + "'", text)
+            self.assertIn("'contact_export_dir' => '" + str(target / "docroot" / "media" / "files" / "temp") + "'", text)
+            self.assertIn("'report_temp_dir' => '" + str(target / "docroot" / "media" / "files" / "temp") + "'", text)
+            self.assertIn("'tmp_path' => '" + str(target / "var" / "tmp") + "'", text)
+            self.assertIn("'cache_path' => '" + str(target / "var" / "cache") + "'", text)
+            self.assertIn("'log_path' => '" + str(target / "var" / "logs") + "'", text)
+            self.assertNotIn("/app/../media", text)
+
     def test_ensure_runtime_dirs_recreates_writable_composer_state_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "composer"

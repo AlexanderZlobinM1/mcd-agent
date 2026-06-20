@@ -155,10 +155,36 @@ def _patch_paths_in_local_php(target_root: Path, source_root: Path) -> bool:
     for src, dst in sorted(_mutable_path_map(source_root, target_root).items(), key=lambda item: len(str(item[0])), reverse=True):
         patched = patched.replace(str(src), str(dst))
     patched = patched.replace(str(source_root), str(target_root))
+    composer_paths = {
+        "upload_dir": target_root / "docroot" / "media" / "files",
+        "form_upload_dir": target_root / "docroot" / "media" / "files" / "form",
+        "contact_export_dir": target_root / "docroot" / "media" / "files" / "temp",
+        "report_temp_dir": target_root / "docroot" / "media" / "files" / "temp",
+        "tmp_path": target_root / "var" / "tmp",
+        "cache_path": target_root / "var" / "cache",
+        "log_path": target_root / "var" / "logs",
+    }
+    for key, value in composer_paths.items():
+        patched = _set_local_php_path(patched, key, str(value))
     if patched != text:
         path.write_text(patched, encoding="utf-8")
         return True
     return False
+
+
+def _set_local_php_path(text: str, key: str, value: str) -> str:
+    quoted = value.replace("\\", "\\\\").replace("'", "\\'")
+    existing = re.compile(r"((?:'|\")" + re.escape(key) + r"(?:'|\")\s*=>\s*)(?:'|\")[^'\"]*(?:'|\")")
+    replaced, count = existing.subn(r"\1'" + quoted + "'", text, count=1)
+    if count:
+        return replaced
+    entry = f"\t'{key}' => '{quoted}',\n"
+    for closing in (r"\n\s*\);", r"\n\s*\];"):
+        match = list(re.finditer(closing, text))
+        if match:
+            pos = match[-1].start() + 1
+            return text[:pos] + entry + text[pos:]
+    return text
 
 
 def _ensure_runtime_dirs(target_root: Path) -> list[str]:
