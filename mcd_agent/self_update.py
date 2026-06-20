@@ -20,7 +20,7 @@ from mcd_agent.cluster_routing import cluster_route_targets
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.state_backend import mysql_state_connection, mysql_state_enabled, mysql_state_table_names
-from mcd_agent.version_identity import agent_version_payload, installed_agent_version
+from mcd_agent.version_identity import agent_version_payload, installed_agent_version, package_agent_version
 
 try:
     import fcntl
@@ -336,6 +336,45 @@ def _install_requirements_for_staged_source(install_dir: Path, staged_src_dir: P
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "pip install failed").strip()
         raise RuntimeError(f"dependency install failed: {detail}")
+
+
+def _install_agent_package_for_source(install_dir: Path, source_dir: Path) -> None:
+    pyproject = source_dir / "pyproject.toml"
+    if not pyproject.exists():
+        raise RuntimeError(f"agent pyproject.toml not found: {pyproject}")
+    venv_python = install_dir / "venv" / "bin" / "python"
+    if not venv_python.exists():
+        raise RuntimeError(f"venv python not found: {venv_python}")
+    cmd = [
+        str(venv_python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--no-deps",
+        "--force-reinstall",
+        str(source_dir),
+    ]
+    proc = subprocess.run(cmd, cwd="/", capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "pip install agent package failed").strip()
+        raise RuntimeError(f"agent package install failed: {detail}")
+
+
+def _agent_package_sync_needed(source_ver: str | None = None) -> bool:
+    source = str(source_ver or installed_agent_version() or "").strip()
+    if not source:
+        return False
+    package = package_agent_version()
+    return package != source
+
+
+def _repair_agent_package_sync(install_dir: Path, source_dir: Path) -> str:
+    before = package_agent_version() or "-"
+    _install_agent_package_for_source(install_dir, source_dir)
+    after = package_agent_version() or "-"
+    return f"agent package sync repaired: package={before}->{after}"
 
 
 def _pre_switch_smoke_check(install_dir: Path, staged_src_dir: Path) -> None:
@@ -1098,12 +1137,17 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     state = _read_state(cfg)
     session_id = str(plan.get("session_id", "")).strip()
     now_s = int(time.time())
+    install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
+    src_dir = install_dir / "src"
     current_installed = installed_agent_version()
     if _semver(target) <= _semver(current_installed):
-        if current_installed != __version__:
+        if current_installed != __version__ or _agent_package_sync_needed(current_installed):
+            repair_note = ""
+            if _agent_package_sync_needed(current_installed):
+                repair_note = "; " + _repair_agent_package_sync(install_dir, src_dir)
             msg = (
                 f"source/running version mismatch repaired: source={current_installed} "
-                f"running={__version__}; service restart scheduled"
+                f"running={__version__}{repair_note}; service restart scheduled"
             )
             state.update(
                 {
@@ -1161,8 +1205,6 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 )
             return False, msg
 
-    install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
-    src_dir = install_dir / "src"
     backup_dir = install_dir / "var" / "backup"
     updates_dir = install_dir / "var" / "updates"
     src_next_dir = updates_dir / f"src.next-{target}"
@@ -1207,6 +1249,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
             os.replace(src_dir, old_src_dir)
         os.replace(src_next_dir, src_dir)
         swapped = True
+        _install_agent_package_for_source(install_dir, src_dir)
 
         release_session(
             cfg,
@@ -1274,6 +1317,8 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                     shutil.rmtree(src_dir)
                 with tarfile.open(backup_path, "r:gz") as tf:
                     tf.extractall(install_dir)
+            if src_dir.exists():
+                _install_agent_package_for_source(install_dir, src_dir)
         except Exception:
             pass
         try:
@@ -1405,12 +1450,16 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
 
     if status in {"up_to_date", "disabled"}:
         current_installed = installed_agent_version()
-        if current_installed != __version__:
+        if current_installed != __version__ or _agent_package_sync_needed(current_installed):
+            install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
+            repair_note = ""
+            if _agent_package_sync_needed(current_installed):
+                repair_note = "; " + _repair_agent_package_sync(install_dir, install_dir / "src")
             _restart_service_async()
             state["last_status"] = "version_mismatch_restart"
             state["last_result"] = (
                 f"source/running version mismatch repaired: source={current_installed} "
-                f"running={__version__}; service restart scheduled"
+                f"running={__version__}{repair_note}; service restart scheduled"
             )
             _clear_active_campaign_process_state(state)
             state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))
@@ -1430,12 +1479,16 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
         target = str(decision.get("target", "")).strip()
         current_installed = installed_agent_version()
         if _semver(target) <= _semver(current_installed):
-            if current_installed != __version__:
+            if current_installed != __version__ or _agent_package_sync_needed(current_installed):
+                install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
+                repair_note = ""
+                if _agent_package_sync_needed(current_installed):
+                    repair_note = "; " + _repair_agent_package_sync(install_dir, install_dir / "src")
                 _restart_service_async()
                 state["last_status"] = "version_mismatch_restart"
                 state["last_result"] = (
                     f"source/running version mismatch repaired: source={current_installed} "
-                    f"running={__version__}; service restart scheduled"
+                    f"running={__version__}{repair_note}; service restart scheduled"
                 )
                 _clear_active_campaign_process_state(state)
                 state["next_check_ts"] = now_s + max(60, int(cfg.mcd_update_wait_retry_sec or 60))

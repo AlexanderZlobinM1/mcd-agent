@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.154 - 2026-06-20
+
+- Fixed: self-update now keeps the installed venv package in sync with the
+  switched `/opt/mcd/src` source tree. Hosts that already had the new source but
+  stale console scripts/site-packages now repair the package install and restart
+  MCD instead of reporting a misleading up-to-date version.
+- Added: agent version reporting now includes the installed package version and
+  marks package/source drift as a version mismatch.
+
 ## 0.9.153 - 2026-06-20
 
 - Added: `mcd-cli composer-move` converts a latest ZIP Mautic 6/7 instance to
