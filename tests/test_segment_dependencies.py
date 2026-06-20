@@ -54,6 +54,22 @@ class SegmentDependencyTests(unittest.TestCase):
         self.assertEqual(dependent_segment_closure({6}, children), {8, 9})
         self.assertEqual(dependency_segment_closure({9}, parents), {6, 8})
 
+    def test_dependency_maps_ignore_references_to_missing_segments(self) -> None:
+        rows = [
+            {
+                "id": 8,
+                "filters": (
+                    'a:1:{i:0;a:5:{s:5:"field";s:8:"leadlist";'
+                    's:6:"filter";a:1:{i:0;s:1:"6";}}}'
+                ),
+            },
+        ]
+
+        children, parents = segment_dependency_maps(rows)
+
+        self.assertEqual(children, {})
+        self.assertEqual(parents, {})
+
     def test_suppresses_mautic7_dependencies_already_rebuilt_by_child_command(self) -> None:
         planned, suppressed = suppress_mautic_cascade_dependencies([6, 8, 9, 10], {8: {6}, 9: {8}})
 

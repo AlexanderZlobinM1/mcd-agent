@@ -55,6 +55,14 @@ def extract_leadlist_filter_segment_ids(filters: object) -> set[int]:
 def segment_dependency_maps(rows: list[dict[str, object]]) -> tuple[dict[int, set[int]], dict[int, set[int]]]:
     children_by_parent: dict[int, set[int]] = {}
     parents_by_child: dict[int, set[int]] = {}
+    valid_ids: set[int] = set()
+    for row in rows:
+        try:
+            child_id = int(row.get("id") or 0)
+        except Exception:
+            child_id = 0
+        if child_id > 0:
+            valid_ids.add(child_id)
     for row in rows:
         try:
             child_id = int(row.get("id") or 0)
@@ -62,7 +70,11 @@ def segment_dependency_maps(rows: list[dict[str, object]]) -> tuple[dict[int, se
             child_id = 0
         if child_id <= 0:
             continue
-        parents = {sid for sid in extract_leadlist_filter_segment_ids(row.get("filters")) if sid != child_id}
+        parents = {
+            sid
+            for sid in extract_leadlist_filter_segment_ids(row.get("filters"))
+            if sid != child_id and sid in valid_ids
+        }
         if not parents:
             continue
         parents_by_child[child_id] = set(parents)

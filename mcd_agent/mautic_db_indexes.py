@@ -141,6 +141,12 @@ def _is_too_many_indexes_error(exc: pymysql.err.OperationalError) -> bool:
     return code == 1069 or "too many keys" in message or "max 64 keys" in message
 
 
+def _is_duplicate_key_error(exc: pymysql.err.OperationalError) -> bool:
+    code = int(exc.args[0]) if exc.args else 0
+    message = str(exc).lower()
+    return code == 1061 or "duplicate key name" in message
+
+
 def _fax_indexes_to_drop(existing: dict[str, tuple[str, ...]]) -> list[str]:
     out: list[str] = []
     for name, columns in existing.items():
@@ -203,6 +209,13 @@ def apply_mautic_db_indexes_to_install(
                         "skipped": skipped,
                         "root": install.root,
                     }
+                if _is_duplicate_key_error(exc):
+                    refreshed = _existing_indexes(conn, db_name=db.name, table=table_name)
+                    existing_by_table[table_name] = refreshed
+                    present, reason = _index_already_present(refreshed, idx)
+                    if present:
+                        skipped.append({"index": idx.name, "reason": f"already_created:{reason}"})
+                        continue
                 if idx.table == "leads" and _is_too_many_indexes_error(exc):
                     fax_indexes = _fax_indexes_to_drop(existing)
                     if not fax_indexes:
