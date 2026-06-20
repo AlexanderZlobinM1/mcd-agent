@@ -15,7 +15,6 @@ from typing import Any
 from urllib import request
 
 from mcd_agent.config import AgentConfig
-from mcd_agent.inventory import InstanceInventory
 
 
 @dataclass
@@ -685,6 +684,8 @@ def install_from_image(
             )
             if rc != 0:
                 raise RuntimeError("certbot failed: " + out)
+
+    from mcd_agent.inventory import InstanceInventory
 
     inv = InstanceInventory(cfg.state_db_path)
     count = inv.rescan(cfg)

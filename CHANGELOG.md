@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.153 - 2026-06-20
+
+- Added: `mcd-cli composer-move` converts a latest ZIP Mautic 6/7 instance to
+  a Composer skeleton copied from MCC image assets. The command creates a new
+  Composer root, copies mutable state from the ZIP source without deleting it,
+  patches target-local paths, preserves the old nginx vhost as a prefixed
+  backup, switches nginx to the Composer `docroot`, and rescans inventory after
+  reload.
+- Changed: image-install inventory imports are lazy so shared artifact helpers
+  can be tested without loading host secret-store dependencies.
+
 ## 0.9.152 - 2026-06-20
 
 - Fixed: `mautic_db_indexes` service-profile apply now treats MySQL duplicate
