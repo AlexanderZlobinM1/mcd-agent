@@ -161,6 +161,23 @@ def _patch_paths_in_local_php(target_root: Path, source_root: Path) -> bool:
     return False
 
 
+def _ensure_runtime_dirs(target_root: Path) -> list[str]:
+    runtime_dirs = [
+        target_root / "var" / "cache",
+        target_root / "var" / "logs",
+        target_root / "var" / "tmp",
+        target_root / "docroot" / "media" / "files",
+        target_root / "docroot" / "media" / "files" / "form",
+        target_root / "docroot" / "media" / "files" / "temp",
+    ]
+    created: list[str] = []
+    for path in runtime_dirs:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o775)
+        created.append(str(path.relative_to(target_root)))
+    return created
+
+
 def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     backup = plan.site_available.with_name(f"zip-backup-{ts}-{plan.site_available.name}")
@@ -252,6 +269,8 @@ def move_zip_to_composer(
             _run(["chown", "-R", "www-data:www-data", str(plan.target_root.parent)], timeout_sec=600)
             for rel in ("var/cache", "var/logs", "var/tmp", "docroot/var/cache", "docroot/var/logs"):
                 shutil.rmtree(plan.target_root / rel, ignore_errors=True)
+            runtime_dirs = _ensure_runtime_dirs(plan.target_root)
+            _run(["chown", "-R", "www-data:www-data", str(plan.target_root / "var"), str(plan.target_root / "docroot" / "media" / "files")], timeout_sec=300)
             print("Switching nginx vhost")
             vhost = _write_switched_vhost(plan)
             rc, out = _run(["nginx", "-t"], timeout_sec=30)
@@ -277,6 +296,7 @@ def move_zip_to_composer(
         "php_version": plan.php_version,
         "copied": copied,
         "local_php_path_patched": path_patched,
+        "runtime_dirs": runtime_dirs,
         "vhost": vhost,
         "instances": count,
     }

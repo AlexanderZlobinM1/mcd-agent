@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.159 - 2026-06-21
+
+- Fixed: `composer-move` now recreates Composer runtime directories after cache
+  cleanup, including `var/cache`, `var/logs`, `var/tmp`, and media upload
+  folders under `docroot/media/files`, with writable permissions before nginx
+  is switched. This prevents migrated instances from missing `var/logs` after
+  the move.
+
 ## 0.9.158 - 2026-06-20
 
 - Fixed: Composer plugin layout now matches live Mautic 7.1.2 installations

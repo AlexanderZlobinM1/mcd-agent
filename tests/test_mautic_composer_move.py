@@ -6,6 +6,7 @@ from pathlib import Path
 
 from mcd_agent.mautic_composer_move import (
     _copy_mutable_state,
+    _ensure_runtime_dirs,
     _image_ref_for_major,
     _patch_paths_in_local_php,
     _php_version_for_major,
@@ -79,6 +80,23 @@ class ComposerMoveHelpersTest(unittest.TestCase):
             self.assertIn(str(target / "var" / "tmp"), text)
             self.assertNotIn(str(target / "media"), text)
             self.assertNotIn(str(source), text)
+
+    def test_ensure_runtime_dirs_recreates_writable_composer_state_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "composer"
+            target.mkdir()
+
+            created = _ensure_runtime_dirs(target)
+
+            self.assertIn("var/logs", created)
+            self.assertIn("var/cache", created)
+            self.assertIn("var/tmp", created)
+            self.assertIn("docroot/media/files/form", created)
+            self.assertIn("docroot/media/files/temp", created)
+            for rel in created:
+                path = target / rel
+                self.assertTrue(path.is_dir())
+                self.assertTrue(path.stat().st_mode & 0o200)
 
 
 if __name__ == "__main__":
