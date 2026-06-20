@@ -981,6 +981,37 @@ def _read_installed_version(plugin_dir: Path) -> str:
     return _extract_version_from_php_text(text)
 
 
+def _version_key(value: str | None) -> tuple[int | str, ...]:
+    text = str(value or "").strip().lstrip("vV")
+    if not text or text == "-":
+        return ()
+    parts: list[int | str] = []
+    for token in re.findall(r"\d+|[A-Za-z]+", text.replace("-", ".")):
+        parts.append(int(token) if token.isdigit() else token.lower())
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _version_cmp(left: str | None, right: str | None) -> int | None:
+    lkey = _version_key(left)
+    rkey = _version_key(right)
+    if not lkey or not rkey:
+        return None
+    size = max(len(lkey), len(rkey))
+    for idx in range(size):
+        lval = lkey[idx] if idx < len(lkey) else 0
+        rval = rkey[idx] if idx < len(rkey) else 0
+        if type(lval) is not type(rval):
+            lval = str(lval)
+            rval = str(rval)
+        if lval < rval:
+            return -1
+        if lval > rval:
+            return 1
+    return 0
+
+
 def _resolve_plugins_dir(root: str, create: bool = False) -> Path:
     base = Path(root)
     candidates = [
@@ -1168,6 +1199,10 @@ def _plugin_status(
         if expected_sha and installed_sha == expected_sha:
             return "OK", "version+sha match", installed_version
         return "OK", "version match", installed_version
+
+    cmp_val = _version_cmp(installed_version, expected_version)
+    if cmp_val is not None and cmp_val > 0:
+        return "OK", f"installed newer than server={expected_version}", installed_version
 
     return "UPDATE", f"installed={installed_version}", installed_version
 
