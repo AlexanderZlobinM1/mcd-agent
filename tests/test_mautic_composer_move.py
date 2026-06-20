@@ -48,7 +48,8 @@ class ComposerMoveHelpersTest(unittest.TestCase):
             self.assertIn("config/local.php", copied)
             self.assertIn("plugins", copied)
             self.assertEqual((target / "config" / "local.php").read_text(encoding="utf-8")[:5], "<?php")
-            self.assertTrue((target / "docroot" / "plugins" / "CustomBundle" / "file.php").exists())
+            self.assertTrue((target / "plugins" / "CustomBundle" / "file.php").exists())
+            self.assertFalse((target / "docroot" / "plugins" / "CustomBundle" / "file.php").exists())
             self.assertTrue((target / "docroot" / "media" / "files" / "a.txt").exists())
             self.assertTrue((target / "var" / "spool" / "keep").exists())
             self.assertFalse((target / "var" / "cache" / "drop").exists())
@@ -60,13 +61,23 @@ class ComposerMoveHelpersTest(unittest.TestCase):
             target = base / "composer"
             (target / "config").mkdir(parents=True)
             (target / "config" / "local.php").write_text(
-                "<?php return ['upload_dir' => '" + str(source / "media") + "'];",
+                "<?php return ["
+                + "'upload_dir' => '"
+                + str(source / "media" / "files")
+                + "', 'plugins_path' => '"
+                + str(source / "plugins")
+                + "', 'tmp_path' => '"
+                + str(source / "var" / "tmp")
+                + "'];",
                 encoding="utf-8",
             )
 
             self.assertTrue(_patch_paths_in_local_php(target, source))
             text = (target / "config" / "local.php").read_text(encoding="utf-8")
-            self.assertIn(str(target / "media"), text)
+            self.assertIn(str(target / "docroot" / "media" / "files"), text)
+            self.assertIn(str(target / "plugins"), text)
+            self.assertIn(str(target / "var" / "tmp"), text)
+            self.assertNotIn(str(target / "media"), text)
             self.assertNotIn(str(source), text)
 
 
