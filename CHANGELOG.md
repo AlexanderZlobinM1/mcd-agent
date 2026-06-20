@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.151 - 2026-06-20
+
+- Fixed: plugin catalog status now treats an installed semantic version newer
+  than the published server version as current. Custom builds such as
+  `1.0.36.1` no longer show as `UPDATE` against upstream `1.0.36`.
+
 ## 0.9.150 - 2026-06-20
 
 - Added: state push now reports per-instance disk footprint metrics, including

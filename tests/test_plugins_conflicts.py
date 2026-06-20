@@ -28,10 +28,32 @@ from mcd_agent.plugins import (
     _prealign_metadataless_plugin_versions,
     _run_manifest_sql_fixes,
     _exclusive_counterparts,
+    _plugin_status,
 )
 
 
 class PluginConflictPathTests(unittest.TestCase):
+    def test_plugin_status_treats_custom_patch_version_as_current(self) -> None:
+        with TemporaryDirectory() as tmp:
+            plugins_dir = Path(tmp)
+            cfg = plugins_dir / "AmazonSesBundle" / "Config"
+            cfg.mkdir(parents=True)
+            (cfg / "config.php").write_text(
+                "<?php\nreturn ['version' => '1.0.36.1'];\n",
+                encoding="utf-8",
+            )
+
+            status, reason, installed = _plugin_status(
+                plugins_dir,
+                {"bundle": "AmazonSesUpstreamBundle", "version": "1.0.36", "install_bundle": "AmazonSesBundle"},
+                ".mcd-plugin-state.json",
+                install_bundle="AmazonSesBundle",
+            )
+
+            self.assertEqual(status, "OK")
+            self.assertEqual(installed, "1.0.36.1")
+            self.assertIn("installed newer", reason)
+
     def test_selected_install_bundle_is_protected_from_conflict_aliases(self) -> None:
         selected = [
             {
