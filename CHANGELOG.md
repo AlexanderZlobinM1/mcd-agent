@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.156 - 2026-06-20
+
+- Fixed: agent package sync now removes stale `mcd_agent-*.dist-info`
+  metadata before reinstalling from `/opt/mcd/src`, so package metadata,
+  console scripts and imported source report the same version after repair.
+
 ## 0.9.155 - 2026-06-20
 
 - Fixed: manual `mcd-cli self-update apply` now also runs the package/source
