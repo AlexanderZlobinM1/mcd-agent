@@ -33,7 +33,7 @@ from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.instance_size import collect_instance_sizes
-from mcd_agent.install_type import detect_install_type
+from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.maintenance_mode import collect_maintenance_state
 from mcd_agent.mautic_version_cache import collect_mautic_version
@@ -1153,14 +1153,8 @@ def _candidate_roots(root: str) -> list[Path]:
 
 
 def _collect_installed_plugins(root: str, limit: int = 200) -> list[dict[str, str]]:
-    base = Path(root)
-    candidates = [
-        base / "plugins",
-        base / "docroot" / "plugins",
-        base / "public" / "plugins",
-    ]
     plugins_dir = None
-    for p in candidates:
+    for p in plugin_dir_candidates(root):
         if p.exists() and p.is_dir():
             plugins_dir = p
             break

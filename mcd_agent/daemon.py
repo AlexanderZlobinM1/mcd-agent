@@ -26,6 +26,7 @@ from mcd_agent.config import (
     runtime_effective_map,
     upsert_runtime_values,
 )
+from mcd_agent.install_type import plugin_dir_candidates
 from mcd_agent.backup import (
     backup_lock_active,
     backup_profile_sync_from_config,
@@ -537,13 +538,7 @@ def _instance_has_viber_plugin(inst: object) -> bool:
     root = str(getattr(inst, "root", "") or "").strip()
     if not root:
         return False
-    base = Path(root)
-    candidates = [
-        base / "plugins",
-        base / "docroot" / "plugins",
-        base / "public" / "plugins",
-    ]
-    for plugins_dir in candidates:
+    for plugins_dir in plugin_dir_candidates(root):
         if not plugins_dir.exists() or not plugins_dir.is_dir():
             continue
         try:
@@ -1114,8 +1109,7 @@ _HOUSEKEEPING_ALLOWED_FLAGS = {
 
 
 def _housekeeping_plugin_installed(root: str) -> bool:
-    base = Path(root)
-    for p in (base / "plugins", base / "docroot" / "plugins", base / "public" / "plugins"):
+    for p in plugin_dir_candidates(root):
         if (p / "LeuchtfeuerHousekeepingBundle").is_dir():
             return True
     return False

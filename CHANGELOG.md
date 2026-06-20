@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.158 - 2026-06-20
+
+- Fixed: Composer plugin layout now matches live Mautic 7.1.2 installations
+  such as `default7`, `grubinshowroom`, and `gmt`: custom plugins live under
+  `docroot/plugins`, not root-level `plugins`. `composer-move` copies ZIP
+  plugins to `docroot/plugins`, rewrites any plugin absolute paths to that
+  target, and shared plugin discovery now prefers `docroot/plugins` for
+  Composer roots while keeping root-level `plugins` for ZIP installs. Cluster
+  asset checks also use Composer `docroot/app/bundles` before legacy
+  `app/bundles`.
+
 ## 0.9.157 - 2026-06-20
 
 - Fixed: `composer-move` now copies ZIP plugins into the Composer root
