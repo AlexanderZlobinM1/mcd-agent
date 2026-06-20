@@ -121,7 +121,7 @@ from mcd_agent.service_profiles import fetch_service_profile, service_profiles_a
 from mcd_agent.signals import collect_signals, format_signals_json, format_signals_text
 from mcd_agent.state_push import push_state_now, queue_profile_event
 from mcd_agent.state_backend import create_state_database_with_admin, state_backend_status, state_database_exists
-from mcd_agent.self_update import apply_update, check_with_mcc, update_status
+from mcd_agent.self_update import apply_update, check_with_mcc, maybe_auto_update, update_status
 from mcd_agent.tuner import format_tune_result, tune_segments
 from mcd_agent.uninstall import run_uninstall
 from mcd_agent.version_identity import agent_version_payload, installed_agent_version
@@ -3504,6 +3504,10 @@ def main() -> int:
             print("MCC update slots are busy; retry in 60s")
             return 2
         if st in {"up_to_date", "disabled"}:
+            msg, _retry = maybe_auto_update(cfg, force=True)
+            if msg:
+                print(msg)
+                return 0
             print(json.dumps(decision, ensure_ascii=True))
             return 0
         if st not in {"update", "update_available"}:
