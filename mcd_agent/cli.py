@@ -92,6 +92,7 @@ from mcd_agent.instance_migrate import (
 )
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.mautic_composer_move import move_zip_to_composer
 from mcd_agent.mautic_image_install import install_from_image
 from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
 from mcd_agent.mautic6_core_patch import (
@@ -1686,6 +1687,14 @@ def _build_parser() -> argparse.ArgumentParser:
     img.add_argument("--no-certbot", action="store_true")
     img.add_argument("--json", action="store_true")
 
+    cmove = sub.add_parser("composer-move", help="Move a zip Mautic instance to a Composer skeleton")
+    cmove.add_argument("--config", default=default_cfg)
+    cmove.add_argument("--root", required=True)
+    cmove.add_argument("--domain", required=True)
+    cmove.add_argument("--mautic-major", type=int, required=True)
+    cmove.add_argument("--yes", action="store_true")
+    cmove.add_argument("--json", action="store_true")
+
     hub = sub.add_parser("interactive", help="Unified interactive menu")
     hub.add_argument("--config", default=default_cfg)
     hub.add_argument("--root")
@@ -2612,6 +2621,33 @@ def main() -> int:
         if bool(args.json):
             print(json.dumps(result, ensure_ascii=True, indent=2))
         _push_state_after_change(cfg, "mautic-image-install")
+        return 0
+
+    if args.cmd == "composer-move":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        if bool(args.json):
+            with contextlib.redirect_stdout(sys.stderr):
+                result = move_zip_to_composer(
+                    cfg,
+                    root=str(args.root),
+                    domain=str(args.domain),
+                    mautic_major=int(args.mautic_major or 0),
+                    yes=bool(args.yes),
+                )
+        else:
+            result = move_zip_to_composer(
+                cfg,
+                root=str(args.root),
+                domain=str(args.domain),
+                mautic_major=int(args.mautic_major or 0),
+                yes=bool(args.yes),
+            )
+        if bool(args.json):
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        _push_state_after_change(cfg, "composer-move")
         return 0
 
     if args.cmd == "reload-config":

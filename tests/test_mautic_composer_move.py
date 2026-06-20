@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from mcd_agent.mautic_composer_move import (
+    _copy_mutable_state,
+    _image_ref_for_major,
+    _patch_paths_in_local_php,
+    _php_version_for_major,
+    _short,
+)
+
+
+class ComposerMoveHelpersTest(unittest.TestCase):
+    def test_major_maps_to_skeleton_and_php(self) -> None:
+        self.assertEqual(_image_ref_for_major(6), "composer6-skeleton")
+        self.assertEqual(_image_ref_for_major(7), "composer7-skeleton")
+        self.assertEqual(_php_version_for_major(6), "8.3")
+        self.assertEqual(_php_version_for_major(7), "8.4")
+
+    def test_short_name_uses_first_domain_label(self) -> None:
+        self.assertEqual(_short("Example-Shop.sales-snap.com"), "example_shop")
+
+    def test_copy_mutable_state_to_composer_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "zip"
+            target = base / "composer"
+            (source / "config").mkdir(parents=True)
+            (source / "config" / "local.php").write_text(
+                "<?php return ['tmp_path' => '" + str(source / "var" / "tmp") + "'];",
+                encoding="utf-8",
+            )
+            (source / "plugins" / "CustomBundle").mkdir(parents=True)
+            (source / "plugins" / "CustomBundle" / "file.php").write_text("ok", encoding="utf-8")
+            (source / "media" / "files").mkdir(parents=True)
+            (source / "media" / "files" / "a.txt").write_text("asset", encoding="utf-8")
+            (source / "var" / "cache").mkdir(parents=True)
+            (source / "var" / "cache" / "drop").write_text("cache", encoding="utf-8")
+            (source / "var" / "spool").mkdir(parents=True)
+            (source / "var" / "spool" / "keep").write_text("queue", encoding="utf-8")
+            target.mkdir()
+
+            copied = _copy_mutable_state(source, target)
+
+            self.assertIn("config/local.php", copied)
+            self.assertIn("plugins", copied)
+            self.assertEqual((target / "config" / "local.php").read_text(encoding="utf-8")[:5], "<?php")
+            self.assertTrue((target / "docroot" / "plugins" / "CustomBundle" / "file.php").exists())
+            self.assertTrue((target / "docroot" / "media" / "files" / "a.txt").exists())
+            self.assertTrue((target / "var" / "spool" / "keep").exists())
+            self.assertFalse((target / "var" / "cache" / "drop").exists())
+
+    def test_patch_paths_only_in_target_local_php(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "zip"
+            target = base / "composer"
+            (target / "config").mkdir(parents=True)
+            (target / "config" / "local.php").write_text(
+                "<?php return ['upload_dir' => '" + str(source / "media") + "'];",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(_patch_paths_in_local_php(target, source))
+            text = (target / "config" / "local.php").read_text(encoding="utf-8")
+            self.assertIn(str(target / "media"), text)
+            self.assertNotIn(str(source), text)
+
+
+if __name__ == "__main__":
+    unittest.main()

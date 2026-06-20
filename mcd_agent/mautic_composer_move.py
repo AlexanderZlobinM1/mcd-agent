@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+import json
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+from typing import Any
+
+from mcd_agent.config import AgentConfig
+from mcd_agent.mautic_image_install import _artifact_url, _download, _run, _safe_extract
+
+
+@dataclass
+class ComposerMovePlan:
+    source_root: Path
+    target_root: Path
+    nginx_root: Path
+    domain: str
+    image_ref: str
+    php_version: str
+    site_available: Path
+    site_enabled: Path | None
+
+
+def _domain(raw: str) -> str:
+    domain = str(raw or "").strip().lower().rstrip(".")
+    if not re.match(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", domain):
+        raise RuntimeError(f"invalid domain: {raw}")
+    return domain
+
+
+def _short(raw: str) -> str:
+    first = _domain(raw).split(".", 1)[0]
+    value = re.sub(r"[^a-z0-9_]+", "_", first).strip("_")
+    if not value:
+        raise RuntimeError("empty instance short name")
+    return value[:48].rstrip("_")
+
+
+def _image_ref_for_major(major: int) -> str:
+    if int(major or 0) == 6:
+        return "composer6-skeleton"
+    if int(major or 0) == 7:
+        return "composer7-skeleton"
+    raise RuntimeError(f"composer skeleton is not configured for Mautic major {major}")
+
+
+def _php_version_for_major(major: int) -> str:
+    return "8.4" if int(major or 0) >= 7 else "8.3"
+
+
+def _target_root(domain: str) -> Path:
+    short = _short(domain)
+    base = Path("/var/www") / short / "public_html"
+    if not base.exists() and not base.parent.exists():
+        return base
+    prefixed = Path("/var/www") / f"composer-{short}" / "public_html"
+    if not prefixed.exists() and not prefixed.parent.exists():
+        return prefixed
+    for idx in range(2, 100):
+        candidate = Path("/var/www") / f"composer-{short}-{idx}" / "public_html"
+        if not candidate.exists() and not candidate.parent.exists():
+            return candidate
+    raise RuntimeError(f"no free target root found for {domain}")
+
+
+def _find_site(domain: str, source_root: Path) -> tuple[Path, Path | None]:
+    candidates: list[Path] = []
+    for root in (Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/sites-available")):
+        if not root.exists():
+            continue
+        for path in sorted(root.iterdir()):
+            try:
+                real = path.resolve()
+                text = real.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if domain in text and str(source_root) in text:
+                candidates.append(real)
+            elif domain in text and not candidates:
+                candidates.append(real)
+    if not candidates:
+        raise RuntimeError(f"nginx vhost for {domain} was not found")
+    site_available = candidates[0]
+    enabled = Path("/etc/nginx/sites-enabled") / site_available.name
+    return site_available, enabled if enabled.exists() or enabled.is_symlink() else None
+
+
+def _copy_tree(src: Path, dst: Path, *, ignore: set[str] | None = None) -> None:
+    if not src.exists():
+        return
+    ignore = ignore or set()
+    if dst.exists():
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_dir():
+        shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*sorted(ignore)) if ignore else None)
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _copy_mutable_state(source_root: Path, target_root: Path) -> list[str]:
+    copied: list[str] = []
+    local_php = source_root / "config" / "local.php"
+    if not local_php.exists():
+        local_php = source_root / "app" / "config" / "local.php"
+    if not local_php.exists():
+        raise RuntimeError("source local.php was not found")
+    dst_local = target_root / "config" / "local.php"
+    dst_local.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(local_php, dst_local)
+    copied.append("config/local.php")
+
+    for rel in ("plugins", "media", "themes", "translations", "templates"):
+        src = source_root / rel
+        dst = target_root / "docroot" / rel
+        if src.exists():
+            _copy_tree(src, dst)
+            copied.append(rel)
+
+    src_var = source_root / "var"
+    if src_var.exists():
+        _copy_tree(src_var, target_root / "var", ignore={"cache", "logs", "tmp", "sessions"})
+        copied.append("var")
+
+    for rel in (".env.local", ".env"):
+        src = source_root / rel
+        if src.exists():
+            _copy_tree(src, target_root / rel)
+            copied.append(rel)
+
+    return copied
+
+
+def _patch_paths_in_local_php(target_root: Path, source_root: Path) -> bool:
+    path = target_root / "config" / "local.php"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    patched = text.replace(str(source_root), str(target_root))
+    if patched != text:
+        path.write_text(patched, encoding="utf-8")
+        return True
+    return False
+
+
+def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    backup = plan.site_available.with_name(f"zip-backup-{ts}-{plan.site_available.name}")
+    shutil.copy2(plan.site_available, backup)
+    text = plan.site_available.read_text(encoding="utf-8", errors="replace")
+    old = str(plan.source_root)
+    new = str(plan.nginx_root)
+    if old not in text:
+        root_re = re.compile(r"(^\s*root\s+)([^;]+)(;)", re.MULTILINE)
+        text, count = root_re.subn(lambda m: m.group(1) + new + m.group(3), text, count=1)
+        if count <= 0:
+            raise RuntimeError(f"no nginx root directive found in {plan.site_available}")
+    else:
+        text = text.replace(old, new)
+    plan.site_available.write_text(text, encoding="utf-8")
+    if plan.site_enabled is not None and not plan.site_enabled.exists() and not plan.site_enabled.is_symlink():
+        plan.site_enabled.symlink_to(plan.site_available)
+    return {"active": str(plan.site_available), "backup": str(backup)}
+
+
+def _preflight(plan: ComposerMovePlan) -> list[str]:
+    problems: list[str] = []
+    if os.geteuid() != 0:
+        problems.append("must run as root")
+    if not plan.source_root.exists():
+        problems.append(f"source root does not exist: {plan.source_root}")
+    if plan.target_root.exists() or plan.target_root.parent.exists():
+        problems.append(f"target root already exists: {plan.target_root}")
+    if not Path(f"/run/php/php{plan.php_version}-fpm.sock").exists():
+        problems.append(f"missing PHP-FPM socket: /run/php/php{plan.php_version}-fpm.sock")
+    for cmd in ("tar", "nginx"):
+        if not shutil.which(cmd):
+            problems.append(f"missing command: {cmd}")
+    if not str(plan.image_ref or "").strip():
+        problems.append("image_ref is required")
+    return problems
+
+
+def move_zip_to_composer(
+    cfg: AgentConfig,
+    *,
+    root: str,
+    domain: str,
+    mautic_major: int,
+    yes: bool = False,
+) -> dict[str, Any]:
+    if not yes:
+        raise RuntimeError("--yes is required")
+    if not str(cfg.mcc_token or "").strip():
+        raise RuntimeError("mcc.token is not configured")
+    source_root = Path(root).resolve()
+    d = _domain(domain)
+    image_ref = _image_ref_for_major(int(mautic_major or 0))
+    php_version = _php_version_for_major(int(mautic_major or 0))
+    target_root = _target_root(d)
+    site_available, site_enabled = _find_site(d, source_root)
+    plan = ComposerMovePlan(
+        source_root=source_root,
+        target_root=target_root,
+        nginx_root=target_root / "docroot",
+        domain=d,
+        image_ref=image_ref,
+        php_version=php_version,
+        site_available=site_available,
+        site_enabled=site_enabled,
+    )
+    print(f"Preflight: {d} {source_root} -> {target_root} via {image_ref}")
+    problems = _preflight(plan)
+    if problems:
+        for p in problems:
+            print(f"preflight_error: {p}")
+        raise RuntimeError("preflight failed")
+
+    with tempfile.TemporaryDirectory(prefix="mcd-composer-move-") as td:
+        tmp = Path(td)
+        files_tgz = tmp / "files.tar.gz"
+        print("Downloading composer skeleton")
+        _download(_artifact_url(cfg, image_ref, "files"), str(cfg.mcc_token), files_tgz)
+        print("Extracting composer skeleton")
+        plan.target_root.parent.mkdir(parents=True, exist_ok=False)
+        plan.target_root.mkdir(parents=True, exist_ok=False)
+        try:
+            with tarfile.open(files_tgz, "r:gz") as tf:
+                _safe_extract(tf, plan.target_root)
+            print("Copying mutable state")
+            copied = _copy_mutable_state(plan.source_root, plan.target_root)
+            path_patched = _patch_paths_in_local_php(plan.target_root, plan.source_root)
+            print("Fixing permissions")
+            _run(["chown", "-R", "www-data:www-data", str(plan.target_root.parent)], timeout_sec=600)
+            for rel in ("var/cache", "var/logs", "var/tmp", "docroot/var/cache", "docroot/var/logs"):
+                shutil.rmtree(plan.target_root / rel, ignore_errors=True)
+            print("Switching nginx vhost")
+            vhost = _write_switched_vhost(plan)
+            rc, out = _run(["nginx", "-t"], timeout_sec=30)
+            if rc != 0:
+                raise RuntimeError("nginx -t failed: " + out)
+            _run(["systemctl", "reload", "nginx"], timeout_sec=30)
+        except Exception:
+            shutil.rmtree(plan.target_root.parent, ignore_errors=True)
+            raise
+
+    from mcd_agent.inventory import InstanceInventory
+
+    inv = InstanceInventory(cfg.state_db_path)
+    count = inv.rescan(cfg)
+    print(f"Rescan complete: {count} instances")
+    return {
+        "status": "ok",
+        "domain": plan.domain,
+        "source_root": str(plan.source_root),
+        "target_root": str(plan.target_root),
+        "nginx_root": str(plan.nginx_root),
+        "image_ref": plan.image_ref,
+        "php_version": plan.php_version,
+        "copied": copied,
+        "local_php_path_patched": path_patched,
+        "vhost": vhost,
+        "instances": count,
+    }
