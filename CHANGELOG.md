@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.157 - 2026-06-20
+
+- Fixed: `composer-move` now copies ZIP plugins into the Composer root
+  `plugins/` directory instead of the public `docroot/plugins/` tree, and
+  rewrites `local.php` mutable paths to their Composer layout targets before
+  the generic root replacement. Media upload/report paths now point at
+  `docroot/media`, preventing migrated instances from keeping broken
+  `target/media` absolute paths.
+
 ## 0.9.156 - 2026-06-20
 
 - Fixed: agent package sync now removes stale `mcd_agent-*.dist-info`

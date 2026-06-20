@@ -107,6 +107,16 @@ def _copy_tree(src: Path, dst: Path, *, ignore: set[str] | None = None) -> None:
         shutil.copy2(src, dst)
 
 
+def _mutable_path_map(source_root: Path, target_root: Path) -> dict[Path, Path]:
+    return {
+        source_root / "plugins": target_root / "plugins",
+        source_root / "media": target_root / "docroot" / "media",
+        source_root / "themes": target_root / "docroot" / "themes",
+        source_root / "translations": target_root / "docroot" / "translations",
+        source_root / "templates": target_root / "docroot" / "templates",
+    }
+
+
 def _copy_mutable_state(source_root: Path, target_root: Path) -> list[str]:
     copied: list[str] = []
     local_php = source_root / "config" / "local.php"
@@ -119,12 +129,10 @@ def _copy_mutable_state(source_root: Path, target_root: Path) -> list[str]:
     shutil.copy2(local_php, dst_local)
     copied.append("config/local.php")
 
-    for rel in ("plugins", "media", "themes", "translations", "templates"):
-        src = source_root / rel
-        dst = target_root / "docroot" / rel
+    for src, dst in _mutable_path_map(source_root, target_root).items():
         if src.exists():
             _copy_tree(src, dst)
-            copied.append(rel)
+            copied.append(str(src.relative_to(source_root)))
 
     src_var = source_root / "var"
     if src_var.exists():
@@ -143,7 +151,10 @@ def _copy_mutable_state(source_root: Path, target_root: Path) -> list[str]:
 def _patch_paths_in_local_php(target_root: Path, source_root: Path) -> bool:
     path = target_root / "config" / "local.php"
     text = path.read_text(encoding="utf-8", errors="replace")
-    patched = text.replace(str(source_root), str(target_root))
+    patched = text
+    for src, dst in sorted(_mutable_path_map(source_root, target_root).items(), key=lambda item: len(str(item[0])), reverse=True):
+        patched = patched.replace(str(src), str(dst))
+    patched = patched.replace(str(source_root), str(target_root))
     if patched != text:
         path.write_text(patched, encoding="utf-8")
         return True
