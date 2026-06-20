@@ -345,6 +345,21 @@ def _install_agent_package_for_source(install_dir: Path, source_dir: Path) -> No
     venv_python = install_dir / "venv" / "bin" / "python"
     if not venv_python.exists():
         raise RuntimeError(f"venv python not found: {venv_python}")
+    site_proc = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "import site; print(site.getsitepackages()[0])",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if site_proc.returncode == 0:
+        site_dir = Path((site_proc.stdout or "").strip())
+        if site_dir.exists():
+            for dist_info in site_dir.glob("mcd_agent-*.dist-info"):
+                if dist_info.is_dir():
+                    shutil.rmtree(dist_info)
     cmd = [
         str(venv_python),
         "-m",
