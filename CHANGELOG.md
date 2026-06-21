@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.161 - 2026-06-21
+
+- Fixed: per-instance storage backups now enforce retention by copy count after
+  a successful run. The retention prune now recognises instance timestamp
+  directories such as `20260621-010203`, protects the current backup directory,
+  and removes matching MCC backup index entries for pruned directories.
+
 ## 0.9.160 - 2026-06-21
 
 - Fixed: `composer-move` now forces all Composer layout path keys in target

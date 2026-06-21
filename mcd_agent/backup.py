@@ -30,6 +30,7 @@ from mcd_agent.secret_store import SecretStore
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RETENTION_DIR_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|\d{8}-\d{6})$")
 _PROFILE_ROW_ID = 1
 _MYDUMPER_FLAG_CACHE: dict[tuple[str, str], bool] = {}
 _XTRABACKUP_FLAG_CACHE: dict[tuple[str, str], bool] = {}
@@ -388,15 +389,77 @@ def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path
     return target
 
 
-def _prune_by_copies(parent: Path, keep: int) -> list[str]:
+def _backup_retention_candidate_dirs(parent: Path) -> list[Path]:
+    if not parent.exists():
+        return []
+    candidates = [
+        x
+        for x in parent.iterdir()
+        if x.is_dir() and not x.is_symlink() and _RETENTION_DIR_RE.match(x.name)
+    ]
+    candidates.sort(key=lambda x: x.name, reverse=True)
+    return candidates
+
+
+def _prune_storage_index_entries(mount_path: Path | None, removed_dirs: list[Path]) -> int:
+    if not mount_path or not removed_dirs:
+        return 0
+    index_dir = mount_path / "mcc-backups-index.d"
+    if not index_dir.exists() or not index_dir.is_dir():
+        return 0
+    removed_rel: set[str] = set()
+    for path in removed_dirs:
+        try:
+            rel = _path_rel_to(mount_path, path)
+        except Exception:
+            continue
+        if rel and rel != ".":
+            removed_rel.add(rel.strip("/"))
+    if not removed_rel:
+        return 0
+    removed_count = 0
+    for index_file in index_dir.glob("*.json"):
+        try:
+            payload = json.loads(index_file.read_text(encoding="utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                continue
+            backup_dir = str(payload.get("backup_dir") or "").strip().lstrip("/")
+            manifest_path = str(payload.get("manifest_path") or "").strip().lstrip("/")
+            for rel in removed_rel:
+                prefix = rel.rstrip("/") + "/"
+                if backup_dir == rel or manifest_path == f"{prefix}mcc-backup-manifest.json" or manifest_path.startswith(prefix):
+                    index_file.unlink(missing_ok=True)
+                    removed_count += 1
+                    break
+        except Exception:
+            continue
+    return removed_count
+
+
+def _prune_by_copies(
+    parent: Path,
+    keep: int,
+    *,
+    protected: set[Path] | None = None,
+    mount_path: Path | None = None,
+) -> list[str]:
     removed: list[str] = []
     if keep <= 0 or not parent.exists():
         return removed
-    candidates = [x for x in parent.iterdir() if x.is_dir() and _DATE_RE.match(x.name)]
-    candidates.sort(key=lambda x: x.name, reverse=True)
-    for old in candidates[keep:]:
-        subprocess.run(["rm", "-rf", str(old)], check=False)
+    candidates = _backup_retention_candidate_dirs(parent)
+    protected_resolved = {p.resolve(strict=False) for p in (protected or set())}
+    protected_candidates = {
+        p
+        for p in candidates
+        if p.resolve(strict=False) in protected_resolved
+    }
+    unprotected_keep = max(0, int(keep) - len(protected_candidates))
+    removed_paths: list[Path] = []
+    for old in [p for p in candidates if p not in protected_candidates][unprotected_keep:]:
+        shutil.rmtree(old, ignore_errors=True)
         removed.append(old.name)
+        removed_paths.append(old)
+    _prune_storage_index_entries(mount_path, removed_paths)
     return removed
 
 
@@ -4206,6 +4269,12 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
         bytes_written = int(db_bytes) + int(file_bytes)
         os.replace(tmp_dir, final_dir)
         tmp_dir = None
+        retention_removed = _prune_by_copies(
+            remote_parent,
+            cfg.backup_retention_copies,
+            protected={final_dir},
+            mount_path=mount_path,
+        )
         storage_usage = _storage_usage(mount_path)
         marker = {
             "status": "ok",
@@ -4233,6 +4302,8 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
             "files_archive_path": str(final_dir / files_archive.name),
             "restorable_as_image": True,
         }
+        if retention_removed:
+            marker["retention_removed"] = retention_removed
         if inst.mautic_major:
             marker["mautic_major"] = int(inst.mautic_major)
         if isinstance(storage_usage, dict):
@@ -4263,6 +4334,7 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
                 "last_duration_sec": duration,
                 "last_backup_path": str(final_dir),
                 "last_bytes_written": bytes_written,
+                "last_retention_removed": retention_removed,
                 "history": [
                     {
                         "ts": _utc_now_iso(),
@@ -4272,6 +4344,7 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
                         "bytes_written": bytes_written,
                         "instances_with_db": 1,
                         "instance": inst.name,
+                        "retention_removed": retention_removed,
                     }
                 ]
                 + history[:19],
@@ -4435,7 +4508,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 + ", ".join(sorted(failed_incomplete))
             )
         if method != "xtrabackup":
-            _prune_by_copies(remote_parent, cfg.backup_retention_copies)
+            _prune_by_copies(remote_parent, cfg.backup_retention_copies, mount_path=mount_path)
         if final_dir.exists():
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").strip().lower() == "ok":
@@ -4634,6 +4707,16 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             if retention_removed:
                 marker["retention_removed"] = retention_removed
                 _write_marker(final_dir, marker)
+        else:
+            retention_removed = _prune_by_copies(
+                remote_parent,
+                cfg.backup_retention_copies,
+                protected={final_dir},
+                mount_path=mount_path,
+            )
+            if retention_removed:
+                marker["retention_removed"] = retention_removed
+                _write_marker(final_dir, marker)
         _write_storage_backup_manifest_and_index(
             mount_path=mount_path,
             backup_dir=final_dir,
@@ -4657,6 +4740,8 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             hist_item["base_backup_path"] = xtrabackup_base_path
             hist_item["space_pruned"] = xtrabackup_space_removed
             hist_item["retention_removed"] = retention_removed
+        elif retention_removed:
+            hist_item["retention_removed"] = retention_removed
         history = [hist_item] + history[:19]
         success_state.update(
             {
@@ -4674,6 +4759,8 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             success_state["last_chain_id"] = xtrabackup_chain_id
             success_state["last_base_backup_path"] = xtrabackup_base_path
             success_state["last_space_pruned"] = xtrabackup_space_removed
+            success_state["last_retention_removed"] = retention_removed
+        elif retention_removed:
             success_state["last_retention_removed"] = retention_removed
         if isinstance(storage_usage, dict):
             success_state["last_storage_total_bytes"] = int(storage_usage.get("total_bytes") or 0)
@@ -5133,7 +5220,7 @@ def backup_prune(config: AgentConfig, root: str | None = None) -> BackupResult:
         if _backup_method(cfg) == "xtrabackup":
             removed = _prune_xtrabackup_retention(remote_parent, cfg)
         else:
-            removed = _prune_by_copies(remote_parent, cfg.backup_retention_copies)
+            removed = _prune_by_copies(remote_parent, cfg.backup_retention_copies, mount_path=mount_path)
         return BackupResult(
             ok=True,
             message=f"prune done, removed={len(removed)}",
