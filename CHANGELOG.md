@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.162 - 2026-06-22
+
+- Added: APT service profiles can now prepare bare hosts with explicit database
+  repository targets for Percona Server 8.4, Percona XtraDB Cluster 8.4,
+  MySQL 8.4, MariaDB 11.4, and legacy Percona 8.0. Percona 8.4 setup uses the
+  LTS channels with HTTPS repositories so MCC host preparation does not depend
+  on existing database package auto-detection.
+
 ## 0.9.161 - 2026-06-21
 
 - Fixed: per-instance storage backups now enforce retention by copy count after
