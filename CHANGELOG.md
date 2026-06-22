@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.168 - 2026-06-22
+
+- Fixed: instance migration and ZIP-to-Composer migration nginx vhosts now keep
+  Mautic's public `/app/assets/` and `/app/bundles/*/Assets/` paths reachable
+  before private `/app` deny rules. This prevents migrated Composer installs
+  from rendering missing admin icons/fonts while keeping application internals
+  blocked.
+- Fixed: nginx baseline normalization now repairs the same public asset rules
+  on already-migrated vhosts and modernizes deprecated `listen ... http2`
+  syntax to `http2 on;` on nginx versions that support it.
+
 ## 0.9.167 - 2026-06-22
 
 - Fixed: nginx baseline now creates the Debian-compatible

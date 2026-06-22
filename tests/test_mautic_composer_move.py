@@ -4,13 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import mcd_agent.mautic_composer_move as mautic_composer_move
 from mcd_agent.mautic_composer_move import (
+    ComposerMovePlan,
     _copy_mutable_state,
     _ensure_runtime_dirs,
     _image_ref_for_major,
     _patch_paths_in_local_php,
     _php_version_for_major,
     _short,
+    _write_switched_vhost,
 )
 
 
@@ -130,6 +133,53 @@ class ComposerMoveHelpersTest(unittest.TestCase):
                 path = target / rel
                 self.assertTrue(path.is_dir())
                 self.assertTrue(path.stat().st_mode & 0o200)
+
+    def test_switched_vhost_preserves_public_app_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "zip"
+            target = base / "composer"
+            nginx_root = target / "docroot"
+            site = base / "site.conf"
+            source.mkdir()
+            nginx_root.mkdir(parents=True)
+            site.write_text(
+                """server {
+    listen 443 ssl http2;
+    server_name example.com;
+    root SOURCE_ROOT;
+
+    location ~ /app/ {
+        deny all;
+    }
+}
+""".replace("SOURCE_ROOT", str(source)),
+                encoding="utf-8",
+            )
+            plan = ComposerMovePlan(
+                source_root=source,
+                target_root=target,
+                nginx_root=nginx_root,
+                domain="example.com",
+                image_ref="composer6-skeleton",
+                php_version="8.3",
+                site_available=site,
+                site_enabled=None,
+            )
+
+            old_http2 = mautic_composer_move._nginx_supports_http2_directive
+            try:
+                mautic_composer_move._nginx_supports_http2_directive = lambda: True
+                _write_switched_vhost(plan)
+            finally:
+                mautic_composer_move._nginx_supports_http2_directive = old_http2
+
+            text = site.read_text(encoding="utf-8")
+            self.assertIn(f"root {nginx_root};", text)
+            self.assertIn("^/app/bundles/.*/Assets/", text)
+            self.assertIn("^/app/assets/", text)
+            self.assertLess(text.index("^/app/assets/"), text.index("location ~ /app/"))
+            self.assertIn("http2 on;", text)
 
 
 if __name__ == "__main__":

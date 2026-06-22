@@ -25,7 +25,12 @@ from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_image_install import _mysql_admin_base, _mysql_exec, _quote_ident, _quote_sql
 from mcd_agent.models import DBConfig
 from mcd_agent.models import MauticInstall
-from mcd_agent.nginx_baseline import ensure_nginx_baseline
+from mcd_agent.nginx_baseline import (
+    _nginx_supports_http2_directive,
+    ensure_mautic_public_app_asset_locations,
+    ensure_nginx_baseline,
+    normalize_legacy_http2_listen,
+)
 
 
 _MIN_TARGET_HEADROOM_BYTES = 5 * 1024 * 1024 * 1024
@@ -785,6 +790,8 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
     }}
 }}
 """
+    content = ensure_mautic_public_app_asset_locations(content)
+    content = normalize_legacy_http2_listen(content, modern_http2=_nginx_supports_http2_directive())
     site.write_text(content, encoding="utf-8")
     enabled.parent.mkdir(parents=True, exist_ok=True)
     if enabled.exists() or enabled.is_symlink():
