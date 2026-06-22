@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import grp
+import pwd
 from pathlib import Path
 import re
 import shutil
@@ -125,6 +127,32 @@ def _database_state() -> dict[str, Any]:
     }
 
 
+def _path_state(path: str) -> dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        return {"path": path, "exists": False, "is_dir": False}
+    try:
+        st = p.stat()
+        try:
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except Exception:
+            owner = str(st.st_uid)
+        try:
+            group = grp.getgrgid(st.st_gid).gr_name
+        except Exception:
+            group = str(st.st_gid)
+        return {
+            "path": path,
+            "exists": True,
+            "is_dir": p.is_dir(),
+            "owner": owner,
+            "group": group,
+            "mode": oct(st.st_mode & 0o777),
+        }
+    except Exception as exc:
+        return {"path": path, "exists": True, "is_dir": False, "error": str(exc)}
+
+
 def collect_mautic_install_readiness() -> dict[str, Any]:
     reconcile_ipv6_runtime_from_intent()
     composer_exists, composer_version = _cmd_version("composer", ["--version"])
@@ -144,13 +172,19 @@ def collect_mautic_install_readiness() -> dict[str, Any]:
             "version": nginx_version,
         },
         "php": php,
-        "composer": {"installed": bool(composer_exists), "version": composer_version},
+        "composer": {
+            "installed": bool(composer_exists),
+            "version": composer_version,
+            "path": shutil.which("composer") or "",
+        },
         "node": {
             "installed": bool(node_exists),
             "version": node_version,
+            "path": shutil.which("node") or "",
             "version_tuple": _version_tuple(node_version) if node_version else [0, 0, 0],
         },
-        "npm": {"installed": bool(npm_exists), "version": npm_version},
+        "npm": {"installed": bool(npm_exists), "version": npm_version, "path": shutil.which("npm") or ""},
         "certbot": {"installed": bool(certbot_exists), "version": certbot_version},
         "database": _database_state(),
+        "paths": {"var_www": _path_state("/var/www")},
     }
