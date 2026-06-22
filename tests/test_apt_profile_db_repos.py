@@ -19,6 +19,27 @@ import mcd_agent.apt_profile as apt_profile
 
 
 class AptProfileDbRepoTests(unittest.TestCase):
+    def test_hosts_local_fqdn_entry_replaces_unqualified_hostname(self) -> None:
+        src = "127.0.0.1 localhost\n65.108.101.82 MauticFarm-02\n"
+
+        desired, fqdn = apt_profile._desired_hosts_with_local_fqdn(
+            src,
+            ip="65.108.101.82",
+            hostname="MauticFarm-02",
+            suffix="localdomain",
+        )
+
+        self.assertEqual(fqdn, "MauticFarm-02.localdomain")
+        self.assertIn("65.108.101.82 MauticFarm-02.localdomain MauticFarm-02\n", desired)
+        self.assertNotIn("65.108.101.82 MauticFarm-02\n", desired)
+
+    def test_services_for_present_packages_maps_core_daemons(self) -> None:
+        services = apt_profile._services_for_present_packages(
+            ["nginx", "redis", "php8.3-fpm", "mariadb-server", "mariadb-client", "sendmail", "nginx"]
+        )
+
+        self.assertEqual(services, ["nginx", "redis-server", "php8.3-fpm", "mariadb", "sendmail"])
+
     def test_percona84_setup_uses_lts_channel_and_https_scheme(self) -> None:
         calls: list[str] = []
         old_run = apt_profile.subprocess.run

@@ -50,6 +50,126 @@ def _int(value: Any, default: int, min_v: int = 0, max_v: int = 86400) -> int:
     return out
 
 
+def _primary_ipv4(timeout_sec: int = 5) -> str:
+    proc = _run(["sh", "-c", "hostname -I 2>/dev/null | tr ' ' '\\n' | grep -E '^[0-9]+(\\.[0-9]+){3}$' | grep -v '^127\\.' | head -n1"], timeout_sec=timeout_sec)
+    value = (proc.stdout or "").strip().splitlines()
+    if value:
+        return value[0].strip()
+    proc2 = _run(["sh", "-c", "ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i==\"src\") {print $(i+1); exit}}'"], timeout_sec=timeout_sec)
+    value2 = (proc2.stdout or "").strip().splitlines()
+    return value2[0].strip() if value2 else ""
+
+
+def _desired_hosts_with_local_fqdn(text: str, *, ip: str, hostname: str, suffix: str = "localdomain") -> tuple[str, str]:
+    short = str(hostname or "").strip().split(".", 1)[0]
+    clean_suffix = re.sub(r"[^A-Za-z0-9.-]+", "", str(suffix or "localdomain").strip()).strip(".") or "localdomain"
+    if not short or not ip or "." in str(hostname or "").strip():
+        return text, ""
+    fqdn = f"{short}.{clean_suffix}"
+    desired = f"{ip} {fqdn} {short}"
+    lines = str(text or "").splitlines()
+    out: list[str] = []
+    done = False
+    changed = False
+    for raw in lines:
+        parts = raw.split()
+        if not done and parts and parts[0] == ip:
+            out.append(desired)
+            done = True
+            if raw.strip() != desired:
+                changed = True
+            continue
+        if short in parts[1:] or fqdn in parts[1:]:
+            changed = True
+            continue
+        out.append(raw)
+    if not done:
+        out.append(desired)
+        changed = True
+    if not changed:
+        return text, ""
+    return "\n".join(out).rstrip("\n") + "\n", fqdn
+
+
+def ensure_local_fqdn_hosts_entry(*, suffix: str = "localdomain") -> tuple[bool, str]:
+    proc = _run(["hostname"], timeout_sec=5)
+    hostname = (proc.stdout or "").strip().splitlines()[0].strip() if (proc.stdout or "").strip() else ""
+    if not hostname or "." in hostname:
+        return False, "hosts_fqdn:skipped"
+    ip = _primary_ipv4(timeout_sec=5)
+    if not ip:
+        return False, "hosts_fqdn:no_primary_ipv4"
+    hosts_path = Path("/etc/hosts")
+    try:
+        current = hosts_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        return False, f"hosts_fqdn:read_failed:{e}"
+    desired, fqdn = _desired_hosts_with_local_fqdn(current, ip=ip, hostname=hostname, suffix=suffix)
+    if not fqdn:
+        return False, "hosts_fqdn:already_ok"
+    try:
+        backup = hosts_path.with_name(f"hosts.mcd-pre-fqdn-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+        shutil.copy2(hosts_path, backup)
+        hosts_path.write_text(desired, encoding="utf-8")
+        hosts_path.chmod(0o644)
+    except Exception as e:
+        return False, f"hosts_fqdn:write_failed:{e}"
+    return True, f"hosts_fqdn:{fqdn}"
+
+
+def _services_for_present_packages(packages: list[str]) -> list[str]:
+    mapping: dict[str, list[str]] = {
+        "nginx": ["nginx"],
+        "redis": ["redis-server"],
+        "redis-server": ["redis-server"],
+        "sendmail": ["sendmail"],
+        "mariadb-server": ["mariadb"],
+        "mariadb-client": [],
+        "mysql-server": ["mysql"],
+        "percona-server-server": ["mysql"],
+        "percona-xtradb-cluster-server": ["mysql"],
+    }
+    out: list[str] = []
+    for raw in packages:
+        name = str(raw or "").strip().lower()
+        if not name:
+            continue
+        if name.startswith("php") and name.endswith("-fpm"):
+            out.append(name)
+            continue
+        if name.startswith("php") and re.match(r"^php\d+\.\d+-fpm$", name):
+            out.append(name)
+            continue
+        out.extend(mapping.get(name, []))
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for svc in out:
+        if svc in seen:
+            continue
+        seen.add(svc)
+        dedup.append(svc)
+    return dedup
+
+
+def _enable_start_services(services: list[str], *, timeout_sec: int = 45) -> tuple[list[str], list[str]]:
+    actions: list[str] = []
+    errors: list[str] = []
+    for raw in services:
+        service = str(raw or "").strip()
+        if not service:
+            continue
+        p = _run(["systemctl", "enable", "--now", service], timeout_sec=timeout_sec)
+        if p.returncode == 0:
+            actions.append(f"service_started:{service}")
+            continue
+        msg = (p.stderr or p.stdout or "").strip()
+        if "does not exist" in msg or "not found" in msg or "not be found" in msg:
+            actions.append(f"service_missing:{service}")
+            continue
+        errors.append(f"service_start_failed:{service}:{msg or p.returncode}")
+    return actions, errors
+
+
 def _normalize_source_line(line: str) -> str:
     x = line.split("#", 1)[0].strip()
     x = re.sub(r"\s+", " ", x)
@@ -1808,7 +1928,9 @@ def apply_apt_profile(
                 "unattended_upgrades",
                 "repair_repos_on_error",
                 "apt_update",
+                "ensure_local_fqdn_hosts",
                 "optional_package_ops",
+                "ensure_package_services_started",
                 "zabbix_mysql_monitor_bootstrap",
             ],
             "current": current,
@@ -1835,6 +1957,9 @@ def apply_apt_profile(
         profile.get("nginx_official_stable_profile_enabled", profile.get("ensure_nginx_official_stable_repo")),
         False,
     )
+    ensure_local_fqdn_hosts = _bool(profile.get("ensure_local_fqdn_hosts"), True)
+    local_fqdn_suffix = str(profile.get("local_fqdn_suffix", "localdomain") or "localdomain")
+    ensure_package_services_started = _bool(profile.get("ensure_package_services_started"), True)
     upgrade_mode = str(profile.get("upgrade_mode", "none")).strip().lower() or "none"
     packages_present = [str(x).strip() for x in list(profile.get("packages_present", []) or []) if str(x).strip()]
     packages_absent = [str(x).strip() for x in list(profile.get("packages_absent", []) or []) if str(x).strip()]
@@ -1929,11 +2054,28 @@ def apply_apt_profile(
             if not retry_errors:
                 actions.append("apt_update_repair_ok")
 
+    if ensure_local_fqdn_hosts:
+        changed_hosts, hosts_msg = ensure_local_fqdn_hosts_entry(suffix=local_fqdn_suffix)
+        actions.append(hosts_msg)
+        if changed_hosts:
+            changed.append("/etc/hosts")
+    else:
+        actions.append("hosts_fqdn:disabled")
+
     if packages_present:
         cmd = ["apt-get", "install", "-y"] + packages_present
         p = _run(cmd, timeout_sec=refresh_timeout_sec)
         if p.returncode == 0:
             actions.append(f"packages_present:{len(packages_present)}")
+            if ensure_package_services_started:
+                svc_actions, svc_errors = _enable_start_services(
+                    _services_for_present_packages(packages_present),
+                    timeout_sec=max(45, min(int(refresh_timeout_sec), 180)),
+                )
+                actions.extend(svc_actions)
+                errors.extend(svc_errors)
+            else:
+                actions.append("package_services_start:disabled")
         else:
             errors.append((p.stderr or p.stdout or "apt install failed").strip())
     if packages_absent:
