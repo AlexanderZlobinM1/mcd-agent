@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.164 - 2026-06-22
+
+- Added: APT service profiles can now prepare migration-ready hosts by
+  installing Node.js 20/npm from NodeSource, installing the verified official
+  Composer binary at `/usr/local/bin/composer`, and creating `/var/www` with
+  `www-data:www-data` ownership and `0755` mode when requested by MCC.
+- Added: install readiness now reports Composer/Node/npm command paths and
+  `/var/www` state so MCC `Prepare` / `Check / Fix` can show concrete missing
+  prerequisites instead of hiding them under a generic APT profile check.
+
 ## 0.9.163 - 2026-06-22
 
 - Fixed: APT service profiles now ensure a local FQDN mapping in `/etc/hosts`

@@ -170,6 +170,156 @@ def _enable_start_services(services: list[str], *, timeout_sec: int = 45) -> tup
     return actions, errors
 
 
+def _version_tuple(raw: str) -> tuple[int, int, int]:
+    nums = [int(x) for x in re.findall(r"\d+", str(raw or ""))[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return int(nums[0]), int(nums[1]), int(nums[2])
+
+
+def _cmd_first_line(cmd: list[str], *, timeout_sec: int = 10) -> tuple[int, str]:
+    p = _run(cmd, timeout_sec=timeout_sec)
+    line = (p.stdout or p.stderr or "").strip().splitlines()
+    return int(p.returncode), line[0].strip() if line else ""
+
+
+def _nodejs20_satisfied() -> tuple[bool, str]:
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    if not node or not npm:
+        return False, "node_or_npm_missing"
+    rc, line = _cmd_first_line([node, "--version"], timeout_sec=8)
+    if rc != 0:
+        return False, "node_version_failed"
+    if _version_tuple(line) < (20, 0, 0):
+        return False, f"node_too_old:{line or '-'}"
+    npm_rc, npm_line = _cmd_first_line([npm, "--version"], timeout_sec=8)
+    if npm_rc != 0:
+        return False, "npm_version_failed"
+    return True, f"nodejs20:{line or '-'} npm:{npm_line or '-'}"
+
+
+def _ensure_nodejs20(*, timeout_sec: int) -> tuple[bool, list[str], list[str]]:
+    ok, reason = _nodejs20_satisfied()
+    if ok:
+        return False, ["nodejs20:already_ok:" + reason], []
+    actions = [f"nodejs20:prepare:{reason}"]
+    errors: list[str] = []
+    script = (
+        "set -euo pipefail; "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get purge -y nodejs libnode-dev nodejs-doc npm >/dev/null 2>&1 || true; "
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; "
+        "apt-get install -y nodejs"
+    )
+    p = subprocess.run(
+        ["bash", "-lc", script],
+        capture_output=True,
+        text=True,
+        timeout=max(60, int(timeout_sec)),
+        env={**os.environ, "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C", "LANG": "C"},
+    )
+    if p.returncode != 0:
+        errors.append((p.stderr or p.stdout or "nodejs20 install failed").strip())
+        return False, actions, errors
+    ok_after, reason_after = _nodejs20_satisfied()
+    if not ok_after:
+        errors.append(f"nodejs20 validation failed:{reason_after}")
+        return False, actions, errors
+    actions.append("nodejs20:installed:" + reason_after)
+    return True, actions, []
+
+
+def _composer_global_satisfied() -> tuple[bool, str]:
+    composer = shutil.which("composer")
+    if not composer:
+        return False, "composer_missing"
+    rc, line = _cmd_first_line([composer, "--version"], timeout_sec=10)
+    if rc != 0:
+        return False, "composer_version_failed"
+    if Path(composer) != Path("/usr/local/bin/composer"):
+        return False, f"composer_not_global:{composer}"
+    www_data = shutil.which("runuser")
+    if www_data:
+        p = _run(["runuser", "-u", "www-data", "--", composer, "--version"], timeout_sec=20)
+        if p.returncode != 0:
+            return False, "composer_www_data_check_failed"
+    return True, f"{composer}:{line or '-'}"
+
+
+def _ensure_composer_global(*, timeout_sec: int) -> tuple[bool, list[str], list[str]]:
+    ok, reason = _composer_global_satisfied()
+    if ok:
+        return False, ["composer_global:already_ok:" + reason], []
+    if not shutil.which("php"):
+        return False, ["composer_global:prepare:" + reason], ["composer_global:php_cli_missing"]
+    actions = [f"composer_global:prepare:{reason}"]
+    errors: list[str] = []
+    try:
+        with urlrequest.urlopen("https://composer.github.io/installer.sig", timeout=20) as resp:
+            expected_sig = resp.read().decode("ascii", errors="ignore").strip()
+        with urlrequest.urlopen("https://getcomposer.org/installer", timeout=45) as resp:
+            installer = resp.read()
+    except Exception as e:
+        return False, actions, [f"composer_global:download_failed:{e}"]
+    got_sig = hashlib.sha384(installer).hexdigest()
+    if not expected_sig or got_sig.lower() != expected_sig.lower():
+        return False, actions, ["composer_global:installer_signature_mismatch"]
+    with tempfile.NamedTemporaryFile(prefix="composer-setup-", suffix=".php", delete=False) as tmp:
+        tmp.write(installer)
+        setup_path = Path(tmp.name)
+    try:
+        p = _run(["php", str(setup_path), "--install-dir=/usr/local/bin", "--filename=composer"], timeout_sec=max(45, int(timeout_sec)))
+        if p.returncode != 0:
+            errors.append((p.stderr or p.stdout or "composer install failed").strip())
+            return False, actions, errors
+        Path("/usr/local/bin/composer").chmod(0o755)
+    finally:
+        try:
+            setup_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    ok_after, reason_after = _composer_global_satisfied()
+    if not ok_after:
+        errors.append(f"composer_global validation failed:{reason_after}")
+        return False, actions, errors
+    actions.append("composer_global:installed:" + reason_after)
+    return True, actions, []
+
+
+def _ensure_var_www() -> tuple[bool, str, list[str]]:
+    path = Path("/var/www")
+    changed = False
+    errors: list[str] = []
+    try:
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            changed = True
+        if not path.is_dir():
+            return changed, "var_www:not_directory", ["var_www:not_directory"]
+        try:
+            import grp
+            import pwd
+
+            uid = pwd.getpwnam("www-data").pw_uid
+            gid = grp.getgrnam("www-data").gr_gid
+            st = path.stat()
+            if st.st_uid != uid or st.st_gid != gid:
+                os.chown(path, uid, gid)
+                changed = True
+        except Exception as e:
+            errors.append(f"var_www:chown_failed:{e}")
+        mode = path.stat().st_mode & 0o777
+        if mode != 0o755:
+            path.chmod(0o755)
+            changed = True
+    except Exception as e:
+        return changed, f"var_www:failed:{e}", [f"var_www:failed:{e}"]
+    if errors:
+        return changed, "var_www:warning", errors
+    return changed, "var_www:ok", []
+
+
 def _normalize_source_line(line: str) -> str:
     x = line.split("#", 1)[0].strip()
     x = re.sub(r"\s+", " ", x)
@@ -1931,6 +2081,9 @@ def apply_apt_profile(
                 "ensure_local_fqdn_hosts",
                 "optional_package_ops",
                 "ensure_package_services_started",
+                "ensure_nodejs20",
+                "ensure_composer_global",
+                "ensure_var_www",
                 "zabbix_mysql_monitor_bootstrap",
             ],
             "current": current,
@@ -1960,6 +2113,9 @@ def apply_apt_profile(
     ensure_local_fqdn_hosts = _bool(profile.get("ensure_local_fqdn_hosts"), True)
     local_fqdn_suffix = str(profile.get("local_fqdn_suffix", "localdomain") or "localdomain")
     ensure_package_services_started = _bool(profile.get("ensure_package_services_started"), True)
+    ensure_nodejs20 = _bool(profile.get("ensure_nodejs20"), False)
+    ensure_composer_global = _bool(profile.get("ensure_composer_global"), False)
+    ensure_var_www = _bool(profile.get("ensure_var_www"), False)
     upgrade_mode = str(profile.get("upgrade_mode", "none")).strip().lower() or "none"
     packages_present = [str(x).strip() for x in list(profile.get("packages_present", []) or []) if str(x).strip()]
     packages_absent = [str(x).strip() for x in list(profile.get("packages_absent", []) or []) if str(x).strip()]
@@ -2078,6 +2234,34 @@ def apply_apt_profile(
                 actions.append("package_services_start:disabled")
         else:
             errors.append((p.stderr or p.stdout or "apt install failed").strip())
+
+    if ensure_nodejs20:
+        node_changed, node_actions, node_errors = _ensure_nodejs20(timeout_sec=max(90, int(refresh_timeout_sec)))
+        actions.extend(node_actions)
+        errors.extend(node_errors)
+        if node_changed:
+            changed.append("/usr/bin/node")
+    else:
+        actions.append("nodejs20:disabled")
+
+    if ensure_composer_global:
+        composer_changed, composer_actions, composer_errors = _ensure_composer_global(timeout_sec=max(90, int(refresh_timeout_sec)))
+        actions.extend(composer_actions)
+        errors.extend(composer_errors)
+        if composer_changed:
+            changed.append("/usr/local/bin/composer")
+    else:
+        actions.append("composer_global:disabled")
+
+    if ensure_var_www:
+        var_changed, var_msg, var_errors = _ensure_var_www()
+        actions.append(var_msg)
+        errors.extend(var_errors)
+        if var_changed:
+            changed.append("/var/www")
+    else:
+        actions.append("var_www:disabled")
+
     if packages_absent:
         cmd = ["apt-get", "purge", "-y"] + packages_absent
         p = _run(cmd, timeout_sec=refresh_timeout_sec)

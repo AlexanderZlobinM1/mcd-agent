@@ -40,6 +40,42 @@ class AptProfileDbRepoTests(unittest.TestCase):
 
         self.assertEqual(services, ["nginx", "redis-server", "php8.3-fpm", "mariadb", "sendmail"])
 
+    def test_nodejs20_satisfied_requires_node20_and_npm(self) -> None:
+        old_which = apt_profile.shutil.which
+        old_cmd = apt_profile._cmd_first_line
+        try:
+            apt_profile.shutil.which = lambda name: {"node": "/usr/bin/node", "npm": "/usr/bin/npm"}.get(name)
+
+            def fake_cmd(cmd, **_kwargs):
+                if cmd[0] == "/usr/bin/node":
+                    return 0, "v20.20.2"
+                if cmd[0] == "/usr/bin/npm":
+                    return 0, "10.8.2"
+                return 1, ""
+
+            apt_profile._cmd_first_line = fake_cmd
+            ok, reason = apt_profile._nodejs20_satisfied()
+        finally:
+            apt_profile.shutil.which = old_which
+            apt_profile._cmd_first_line = old_cmd
+
+        self.assertTrue(ok)
+        self.assertIn("nodejs20", reason)
+
+    def test_composer_global_rejects_distro_binary(self) -> None:
+        old_which = apt_profile.shutil.which
+        old_cmd = apt_profile._cmd_first_line
+        try:
+            apt_profile.shutil.which = lambda name: "/usr/bin/composer" if name == "composer" else None
+            apt_profile._cmd_first_line = lambda _cmd, **_kwargs: (0, "Composer version 2.8.0")
+            ok, reason = apt_profile._composer_global_satisfied()
+        finally:
+            apt_profile.shutil.which = old_which
+            apt_profile._cmd_first_line = old_cmd
+
+        self.assertFalse(ok)
+        self.assertIn("composer_not_global", reason)
+
     def test_percona84_setup_uses_lts_channel_and_https_scheme(self) -> None:
         calls: list[str] = []
         old_run = apt_profile.subprocess.run
