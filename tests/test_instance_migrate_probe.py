@@ -189,6 +189,31 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "target database password is required"):
             instance_migrate._target_db_from_direct_values(name="baza_test", user="korisnik_test", password="")
 
+    def test_target_relay_preflight_can_clean_selected_target_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "target" / "public_html"
+            root.mkdir(parents=True)
+            (root / "index.php").write_text("<?php\n", encoding="utf-8")
+            sql: list[str] = []
+
+            with (
+                patch.object(instance_migrate, "_target_db_exists", return_value=True),
+                patch.object(instance_migrate, "_mysql_exec", side_effect=lambda q: sql.append(q) or ""),
+                patch.object(instance_migrate.shutil, "which", return_value="/usr/bin/tool"),
+            ):
+                payload = instance_migrate.preflight_target_relay(
+                    target_root=str(root),
+                    target_db_name="baza_testmove",
+                    wipe_target_root=True,
+                    wipe_target_db=True,
+                )
+
+        self.assertTrue(payload["ok"])
+        self.assertFalse(root.exists())
+        self.assertTrue(any("DROP DATABASE IF EXISTS `baza_testmove`" in q for q in sql))
+        self.assertIn("target root removed: " + str(root.resolve()), payload["cleanup"])
+        self.assertIn("target database dropped: baza_testmove", payload["cleanup"])
+
     def test_letsencrypt_stream_has_safe_relative_members(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             live = Path(td) / "etc" / "letsencrypt" / "live" / "example.com"

@@ -1886,6 +1886,7 @@ def _build_parser() -> argparse.ArgumentParser:
     inst_migrate.add_argument("--domains-json", default="[]")
     inst_migrate.add_argument("--php-version")
     inst_migrate.add_argument("--wipe-target", action="store_true")
+    inst_migrate.add_argument("--wipe-target-db", action="store_true")
     inst_migrate.add_argument("--json", action="store_true")
 
     upd = sub.add_parser("self-update", help="MCD self-update via MCC approved/test/lts/cluster channels")
@@ -3373,6 +3374,8 @@ def main() -> int:
             payload = preflight_target_relay(
                 target_root=str(args.target_root or "").strip(),
                 target_db_name=str(args.target_db_name or "").strip(),
+                wipe_target_root=bool(args.wipe_target),
+                wipe_target_db=bool(args.wipe_target_db),
             )
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0 if bool(payload.get("ok", False)) else 1

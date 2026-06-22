@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.166 - 2026-06-22
+
+- Added: instance migration target preflight now supports explicit destructive
+  cleanup flags for retrying failed migrations: `--wipe-target` removes the
+  chosen target root after safety checks, and `--wipe-target-db` drops the
+  chosen target database. Without these flags, existing target artifacts still
+  block migration startup.
+
 ## 0.9.165 - 2026-06-22
 
 - Fixed: nginx baseline now creates the Debian-style
