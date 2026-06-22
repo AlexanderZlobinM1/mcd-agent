@@ -17,6 +17,13 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertIn("Strict-Transport-Security", snippet)
         self.assertIn("X-Frame-Options", snippet)
 
+    def test_fastcgi_php_snippet_supports_official_nginx_packages(self) -> None:
+        snippet = nginx_baseline._desired_fastcgi_php_snippet()
+
+        self.assertIn("fastcgi_split_path_info", snippet)
+        self.assertIn("fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;", snippet)
+        self.assertIn("include fastcgi_params;", snippet)
+
     def test_insert_hardening_include_per_server_after_server_name(self) -> None:
         src = """server {
     listen 80;
@@ -143,16 +150,20 @@ add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
             snippets.mkdir()
             hardening = snippets / "mcd-mautic-hardening.conf"
             hardening.write_text(nginx_baseline._desired_hardening_snippet(), encoding="utf-8")
+            fastcgi = snippets / "fastcgi-php.conf"
+            fastcgi.write_text(nginx_baseline._desired_fastcgi_php_snippet(), encoding="utf-8")
 
             old_conf = nginx_baseline.NGINX_CONF
             old_available = nginx_baseline.SITES_AVAILABLE
             old_enabled = nginx_baseline.SITES_ENABLED
             old_snippet = nginx_baseline.HARDENING_SNIPPET
+            old_fastcgi = nginx_baseline.FASTCGI_PHP_SNIPPET
             try:
                 nginx_baseline.NGINX_CONF = nginx_conf
                 nginx_baseline.SITES_AVAILABLE = root / "sites-available"
                 nginx_baseline.SITES_ENABLED = root / "sites-enabled"
                 nginx_baseline.HARDENING_SNIPPET = hardening
+                nginx_baseline.FASTCGI_PHP_SNIPPET = fastcgi
 
                 self.assertFalse(nginx_baseline.nginx_baseline_satisfied())
             finally:
@@ -160,6 +171,7 @@ add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
                 nginx_baseline.SITES_AVAILABLE = old_available
                 nginx_baseline.SITES_ENABLED = old_enabled
                 nginx_baseline.HARDENING_SNIPPET = old_snippet
+                nginx_baseline.FASTCGI_PHP_SNIPPET = old_fastcgi
 
     def test_ensure_sites_directories_creates_debian_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -232,6 +244,26 @@ add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
             self.assertTrue((available / "legacy.example.com.conf").is_file())
             self.assertTrue((enabled / "legacy.example.com.conf").is_symlink())
             self.assertEqual((enabled / "legacy.example.com.conf").resolve(), (available / "legacy.example.com.conf").resolve())
+
+    def test_write_fastcgi_php_snippet_creates_missing_compat_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            snippets = root / "snippets"
+            fastcgi = snippets / "fastcgi-php.conf"
+            backup = root / "backup"
+
+            old_snippets = nginx_baseline.SNIPPETS_DIR
+            old_fastcgi = nginx_baseline.FASTCGI_PHP_SNIPPET
+            try:
+                nginx_baseline.SNIPPETS_DIR = snippets
+                nginx_baseline.FASTCGI_PHP_SNIPPET = fastcgi
+                actions = nginx_baseline._write_fastcgi_php_snippet(backup, {})
+            finally:
+                nginx_baseline.SNIPPETS_DIR = old_snippets
+                nginx_baseline.FASTCGI_PHP_SNIPPET = old_fastcgi
+
+            self.assertEqual(actions, ["fastcgi_php_snippet"])
+            self.assertEqual(fastcgi.read_text(encoding="utf-8"), nginx_baseline._desired_fastcgi_php_snippet())
 
 
 if __name__ == "__main__":

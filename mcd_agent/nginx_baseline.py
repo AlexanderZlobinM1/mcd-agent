@@ -16,6 +16,7 @@ SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 CONF_D = Path("/etc/nginx/conf.d")
 SNIPPETS_DIR = Path("/etc/nginx/snippets")
 HARDENING_SNIPPET = SNIPPETS_DIR / "mcd-mautic-hardening.conf"
+FASTCGI_PHP_SNIPPET = SNIPPETS_DIR / "fastcgi-php.conf"
 SECURITY_HEADERS_SNIPPET = SNIPPETS_DIR / "security-headers.conf"
 HARDENING_INCLUDE = "include /etc/nginx/snippets/mcd-mautic-hardening.conf;"
 BACKUP_ROOT = Path("/var/backups/mcd-nginx-baseline")
@@ -115,6 +116,8 @@ def nginx_baseline_satisfied() -> bool:
     if _sites_enabled_has_non_conf_entries():
         return False
     if _read_text(HARDENING_SNIPPET) != _desired_hardening_snippet():
+        return False
+    if _read_text(FASTCGI_PHP_SNIPPET) != _desired_fastcgi_php_snippet():
         return False
     if SECURITY_HEADERS_SNIPPET.exists() and SECURITY_HEADERS_START not in _read_text(SECURITY_HEADERS_SNIPPET):
         return False
@@ -227,6 +230,18 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 """
 
 
+def _desired_fastcgi_php_snippet() -> str:
+    return """# Managed by MCD. Compatibility snippet for nginx.org packages without Debian fastcgi snippets.
+fastcgi_split_path_info ^(.+?\\.php)(/.*)$;
+try_files $fastcgi_script_name =404;
+set $path_info $fastcgi_path_info;
+fastcgi_param PATH_INFO $path_info;
+fastcgi_index index.php;
+fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+include fastcgi_params;
+"""
+
+
 def _write_hardening_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
     desired = _desired_hardening_snippet()
     current = _read_text(HARDENING_SNIPPET)
@@ -236,6 +251,17 @@ def _write_hardening_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot])
     _snapshot(HARDENING_SNIPPET, backup_dir, snapshots)
     HARDENING_SNIPPET.write_text(desired, encoding="utf-8")
     return ["mautic_hardening_snippet"]
+
+
+def _write_fastcgi_php_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    desired = _desired_fastcgi_php_snippet()
+    current = _read_text(FASTCGI_PHP_SNIPPET)
+    if current == desired:
+        return []
+    SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
+    _snapshot(FASTCGI_PHP_SNIPPET, backup_dir, snapshots)
+    FASTCGI_PHP_SNIPPET.write_text(desired, encoding="utf-8")
+    return ["fastcgi_php_snippet"]
 
 
 def _active_add_header_present(text: str, header: str) -> bool:
@@ -511,6 +537,10 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
         hardening_actions = _write_hardening_snippet(backup_dir, snapshots)
         if hardening_actions:
             actions.extend(hardening_actions)
+            changed = True
+        fastcgi_actions = _write_fastcgi_php_snippet(backup_dir, snapshots)
+        if fastcgi_actions:
+            actions.extend(fastcgi_actions)
             changed = True
         header_actions = _ensure_security_headers_snippet(backup_dir, snapshots)
         if header_actions:
