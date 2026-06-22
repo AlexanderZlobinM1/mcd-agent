@@ -13,6 +13,11 @@ from typing import Any
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.mautic_image_install import _artifact_url, _download, _run, _safe_extract
+from mcd_agent.nginx_baseline import (
+    _nginx_supports_http2_directive,
+    ensure_mautic_public_app_asset_locations,
+    normalize_legacy_http2_listen,
+)
 
 
 @dataclass
@@ -218,6 +223,8 @@ def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
             raise RuntimeError(f"no nginx root directive found in {plan.site_available}")
     else:
         text = text.replace(old, new)
+    text = ensure_mautic_public_app_asset_locations(text)
+    text = normalize_legacy_http2_listen(text, modern_http2=_nginx_supports_http2_directive())
     plan.site_available.write_text(text, encoding="utf-8")
     if plan.site_enabled is not None and not plan.site_enabled.exists() and not plan.site_enabled.is_symlink():
         plan.site_enabled.symlink_to(plan.site_available)

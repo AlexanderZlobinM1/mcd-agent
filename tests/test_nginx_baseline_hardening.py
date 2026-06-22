@@ -24,6 +24,85 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertIn("fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;", snippet)
         self.assertIn("include fastcgi_params;", snippet)
 
+    def test_public_app_asset_locations_precede_private_app_deny(self) -> None:
+        src = """server {
+    server_name example.com;
+    root /var/www/example/public_html/docroot;
+
+    location ~* ^/(?:app|bin|config|vendor|var)/ {
+        deny all;
+    }
+}
+"""
+
+        out = nginx_baseline.ensure_mautic_public_app_asset_locations(src)
+
+        self.assertIn("^/app/bundles/.*/Assets/", out)
+        self.assertIn("^/app/assets/", out)
+        self.assertLess(out.index("^/app/assets/"), out.index("^/(?:app|bin|config|vendor|var)"))
+        self.assertEqual(nginx_baseline.ensure_mautic_public_app_asset_locations(out), out)
+
+    def test_legacy_http2_listen_is_modernized_when_supported(self) -> None:
+        src = """server {
+    listen 80;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name example.com;
+}
+"""
+
+        out = nginx_baseline.normalize_legacy_http2_listen(src, modern_http2=True)
+
+        self.assertIn("listen 443 ssl;", out)
+        self.assertIn("listen [::]:443 ssl;", out)
+        self.assertEqual(out.count("http2 on;"), 1)
+        self.assertNotIn("ssl http2;", out)
+
+    def test_server_config_normalization_updates_active_vhost(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            available = root / "sites-available"
+            enabled = root / "sites-enabled"
+            backup = root / "backup"
+            available.mkdir()
+            enabled.mkdir()
+            site = available / "example.com.conf"
+            site.write_text(
+                """server {
+    listen 443 ssl http2;
+    server_name example.com;
+
+    location ~* ^/(?:app|bin|config|vendor|var)/ {
+        deny all;
+    }
+}
+""",
+                encoding="utf-8",
+            )
+            (enabled / site.name).symlink_to(site)
+
+            old_available = nginx_baseline.SITES_AVAILABLE
+            old_enabled = nginx_baseline.SITES_ENABLED
+            old_conf_d = nginx_baseline.CONF_D
+            old_http2 = nginx_baseline._nginx_supports_http2_directive
+            try:
+                nginx_baseline.SITES_AVAILABLE = available
+                nginx_baseline.SITES_ENABLED = enabled
+                nginx_baseline.CONF_D = root / "conf.d"
+                nginx_baseline._nginx_supports_http2_directive = lambda: True
+                actions = nginx_baseline._ensure_server_config_normalization(backup, {})
+            finally:
+                nginx_baseline.SITES_AVAILABLE = old_available
+                nginx_baseline.SITES_ENABLED = old_enabled
+                nginx_baseline.CONF_D = old_conf_d
+                nginx_baseline._nginx_supports_http2_directive = old_http2
+
+            text = site.read_text(encoding="utf-8")
+            self.assertIn("mautic_public_app_assets:example.com.conf", actions)
+            self.assertIn("http2_listen_modernized:example.com.conf", actions)
+            self.assertIn("^/app/assets/", text)
+            self.assertIn("http2 on;", text)
+
     def test_insert_hardening_include_per_server_after_server_name(self) -> None:
         src = """server {
     listen 80;
