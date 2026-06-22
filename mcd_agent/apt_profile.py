@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -128,6 +129,7 @@ def _services_for_present_packages(packages: list[str]) -> list[str]:
         "mysql-server": ["mysql"],
         "percona-server-server": ["mysql"],
         "percona-xtradb-cluster-server": ["mysql"],
+        "zabbix-agent2": ["zabbix-agent2"],
     }
     out: list[str] = []
     for raw in packages:
@@ -652,6 +654,8 @@ _NGINX_OFFICIAL_KEY_URL = "https://nginx.org/keys/nginx_signing.key"
 _NGINX_OFFICIAL_KEYRING = Path("/usr/share/keyrings/nginx-archive-keyring.gpg")
 _NGINX_OFFICIAL_SOURCE = Path("/etc/apt/sources.list.d/nginx.list")
 _NGINX_OFFICIAL_FINGERPRINT = "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+_ZABBIX_AGENT_DROPIN = Path("/etc/zabbix/zabbix_agent2.d/99-mcd-server.conf")
+_ZABBIX_AGENT_BASE_CONF = Path("/etc/zabbix/zabbix_agent2.conf")
 
 
 def _ubuntu_codename() -> str:
@@ -669,6 +673,24 @@ def _ubuntu_codename() -> str:
     except Exception:
         pass
     raise RuntimeError("ubuntu codename not detected")
+
+
+def _os_release_value(key: str) -> str:
+    wanted = str(key or "").strip()
+    if not wanted:
+        return ""
+    try:
+        for raw in Path("/etc/os-release").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not raw.startswith(f"{wanted}="):
+                continue
+            return raw.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        return ""
+    return ""
+
+
+def _ubuntu_version_id() -> str:
+    return _os_release_value("VERSION_ID") or "24.04"
 
 
 def _gpg_keyring_has_fingerprint(path: Path, fingerprint: str) -> bool:
@@ -939,6 +961,43 @@ def _run_mysql84_repo_setup(*, timeout_sec: int) -> tuple[bool, str]:
         return True, "mysql_repo_setup:8.4"
     msg = (p.stderr or p.stdout or "").strip()
     return False, msg or "mysql_repo_setup:8.4 failed"
+
+
+def _zabbix_agent_repo_present(version: str) -> bool:
+    v = str(version or "").strip() or "7.0"
+    txt = _all_sources_text_lower()
+    return "repo.zabbix.com" in txt and f"/zabbix/{v}/" in txt
+
+
+def _ensure_zabbix_agent_repo(version: str, *, timeout_sec: int) -> tuple[bool, str]:
+    v = re.sub(r"[^0-9.]", "", str(version or "").strip()) or "7.0"
+    ubuntu_version = _ubuntu_version_id()
+    deb_name = f"zabbix-release_latest_{v}+ubuntu{ubuntu_version}_all.deb"
+    url = f"https://repo.zabbix.com/zabbix/{v}/ubuntu/pool/main/z/zabbix-release/{deb_name}"
+    with tempfile.NamedTemporaryFile(prefix="zabbix-release-", suffix=".deb", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        try:
+            with urlrequest.urlopen(url, timeout=max(20, min(int(timeout_sec), 90))) as resp:
+                tmp_path.write_bytes(resp.read())
+        except Exception as e:
+            return False, f"zabbix_repo_download_failed:{e}"
+        if tmp_path.stat().st_size <= 0:
+            return False, "zabbix_repo_download_empty"
+        p = _run(["dpkg", "-i", str(tmp_path)], timeout_sec=max(30, int(timeout_sec)))
+        if p.returncode != 0:
+            p2 = _run(["apt-get", "install", "-y", str(tmp_path)], timeout_sec=max(30, int(timeout_sec)))
+            if p2.returncode != 0:
+                msg = (p2.stderr or p2.stdout or p.stderr or p.stdout or "").strip()
+                return False, msg or "zabbix_repo_install_failed"
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if not _zabbix_agent_repo_present(v):
+        return False, "zabbix_repo_source_not_detected_after_install"
+    return True, f"zabbix_agent_repo:{v}"
 
 
 def _now_utc_iso() -> str:
@@ -1334,6 +1393,37 @@ def _apply_repo_profiles(
             else:
                 _mark("ondrej_nginx", status="error", applied=False, reason=msg, attempted_once=False)
                 errors.append(f"ondrej_nginx_profile:{msg}")
+
+    zbx_agent_enabled = _bool(profile.get("zabbix_agent_enabled"), False)
+    zbx_repo_enabled = _bool(profile.get("zabbix_agent_repo_enabled"), zbx_agent_enabled)
+    zbx_repo_once = _bool(profile.get("zabbix_agent_repo_apply_once"), True)
+    zbx_repo_version = re.sub(r"[^0-9.]", "", str(profile.get("zabbix_agent_repo_version", "7.0") or "7.0")) or "7.0"
+    zbx_row = profiles.get("zabbix_agent_repo") if isinstance(profiles.get("zabbix_agent_repo"), dict) else {}
+    zbx_same_profile = str(zbx_row.get("profile_hash", "") or "") == profile_hash
+    if not zbx_agent_enabled:
+        actions.append("zabbix_agent_repo:disabled")
+    elif not zbx_repo_enabled:
+        actions.append("zabbix_agent_repo:repo_disabled")
+    elif (
+        zbx_repo_once
+        and bool(zbx_row.get("applied", False))
+        and zbx_same_profile
+        and _zabbix_agent_repo_present(zbx_repo_version)
+        and not force_rescan
+    ):
+        actions.append("zabbix_agent_repo:skip_once")
+    else:
+        if _zabbix_agent_repo_present(zbx_repo_version):
+            _mark("zabbix_agent_repo", status="already_present", applied=True)
+            actions.append(f"zabbix_agent_repo:already_present:{zbx_repo_version}")
+        else:
+            ok, msg = _ensure_zabbix_agent_repo(zbx_repo_version, timeout_sec=max(30, int(timeout_sec)))
+            if ok:
+                _mark("zabbix_agent_repo", status="applied", applied=True)
+                actions.append(msg)
+            else:
+                _mark("zabbix_agent_repo", status="error", applied=False, reason=msg, attempted_once=False)
+                errors.append(f"zabbix_agent_repo:{msg}")
 
     marker["updated_at_utc"] = now
     _write_json(marker_path, marker)
@@ -1978,6 +2068,281 @@ def ensure_zabbix_mysql_monitor_user(
     }
 
 
+def _normalize_ip_networks(raw: Any) -> list[str]:
+    items = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        try:
+            network = str(ipaddress.ip_network(value, strict=False))
+        except Exception:
+            try:
+                network = str(ipaddress.ip_address(value))
+            except Exception:
+                continue
+        if network in seen:
+            continue
+        seen.add(network)
+        out.append(network)
+    return out
+
+
+def _read_key_value_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _zabbix_agent_include_present(text: str) -> bool:
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("include=") and "zabbix_agent2.d" in line:
+            return True
+    return False
+
+
+def _desired_zabbix_agent_dropin(profile: dict[str, Any]) -> dict[str, str]:
+    server = str(profile.get("zabbix_agent_server", "") or "").strip()
+    active = str(profile.get("zabbix_agent_server_active", "") or "").strip() or server
+    hostname = str(profile.get("zabbix_agent_hostname", "") or "").strip()
+    port = str(_int(profile.get("zabbix_agent_port"), 10050, 1, 65535))
+    out = {
+        "Server": server,
+        "ServerActive": active,
+        "ListenPort": port,
+    }
+    if hostname:
+        out["Hostname"] = hostname
+    return out
+
+
+def _write_zabbix_agent_dropin(profile: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+    actions: list[str] = []
+    errors: list[str] = []
+    desired = _desired_zabbix_agent_dropin(profile)
+    if not desired.get("Server"):
+        return False, actions, ["zabbix_agent_server_missing"]
+
+    if _ZABBIX_AGENT_BASE_CONF.exists():
+        try:
+            base = _ZABBIX_AGENT_BASE_CONF.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            return False, actions, [f"zabbix_agent_base_conf_read_failed:{e}"]
+        if not _zabbix_agent_include_present(base):
+            try:
+                _ZABBIX_AGENT_BASE_CONF.write_text(
+                    base.rstrip("\n")
+                    + "\n\n# managed by mcd service profile\n"
+                    + "Include=/etc/zabbix/zabbix_agent2.d/*.conf\n",
+                    encoding="utf-8",
+                )
+                actions.append(f"zabbix_agent_include_added:{_ZABBIX_AGENT_BASE_CONF}")
+            except Exception as e:
+                return False, actions, [f"zabbix_agent_base_conf_write_failed:{e}"]
+
+    lines = ["# managed by mcd service profile (zabbix agent endpoint)"]
+    for key in ("Server", "ServerActive", "Hostname", "ListenPort"):
+        value = desired.get(key)
+        if value:
+            lines.append(f"{key}={value}")
+    content = "\n".join(lines).rstrip("\n") + "\n"
+    try:
+        changed = _write_if_changed(_ZABBIX_AGENT_DROPIN, content)
+        _ZABBIX_AGENT_DROPIN.chmod(0o644)
+    except Exception as e:
+        return False, actions, [f"zabbix_agent_dropin_write_failed:{e}"]
+    actions.append(f"zabbix_agent_dropin:{'changed' if changed else 'already_ok'}")
+    return bool(changed), actions, errors
+
+
+def _service_active(name: str, *, timeout_sec: int = 5) -> bool:
+    p = _run(["systemctl", "is-active", name], timeout_sec=timeout_sec)
+    return p.returncode == 0 and (p.stdout or "").strip() == "active"
+
+
+def _service_enabled(name: str, *, timeout_sec: int = 5) -> bool:
+    p = _run(["systemctl", "is-enabled", name], timeout_sec=timeout_sec)
+    return p.returncode == 0 and (p.stdout or "").strip() in {"enabled", "enabled-runtime"}
+
+
+def _tcp_port_listening(port: int, *, timeout_sec: int = 5) -> bool:
+    ss = shutil.which("ss")
+    if not ss:
+        return False
+    p = _run([ss, "-ltn"], timeout_sec=timeout_sec)
+    if p.returncode != 0:
+        return False
+    needle = f":{int(port)}"
+    for raw in (p.stdout or "").splitlines():
+        line = raw.strip()
+        if needle in line:
+            return True
+    return False
+
+
+def _ufw_active() -> bool:
+    if not shutil.which("ufw"):
+        return False
+    p = _run(["ufw", "status"], timeout_sec=8)
+    first = (p.stdout or p.stderr or "").strip().splitlines()
+    return p.returncode == 0 and bool(first) and first[0].strip().lower() == "status: active"
+
+
+def _ensure_zabbix_agent_firewall(profile: dict[str, Any]) -> tuple[list[str], list[str]]:
+    if not _bool(profile.get("zabbix_agent_firewall_enabled"), True):
+        return ["zabbix_agent_firewall:disabled"], []
+    port = _int(profile.get("zabbix_agent_port"), 10050, 1, 65535)
+    sources = _normalize_ip_networks(profile.get("zabbix_agent_firewall_sources"))
+    if not sources:
+        return ["zabbix_agent_firewall:no_sources"], []
+    actions: list[str] = []
+    errors: list[str] = []
+
+    if _ufw_active():
+        for src in sources:
+            p = _run(
+                ["ufw", "allow", "proto", "tcp", "from", src, "to", "any", "port", str(port), "comment", "mcd zabbix agent"],
+                timeout_sec=20,
+            )
+            if p.returncode == 0:
+                actions.append(f"zabbix_agent_firewall_ufw:{src}:{port}")
+            else:
+                errors.append(f"zabbix_agent_firewall_ufw:{src}:{(p.stderr or p.stdout or p.returncode)}")
+        return actions, errors
+
+    iptables = shutil.which("iptables")
+    iptables_save = shutil.which("iptables-save")
+    if not iptables:
+        return ["zabbix_agent_firewall:iptables_missing"], []
+    for src in sources:
+        check = _run([iptables, "-w", "-C", "INPUT", "-p", "tcp", "-s", src, "--dport", str(port), "-j", "ACCEPT"], timeout_sec=10)
+        if check.returncode == 0:
+            actions.append(f"zabbix_agent_firewall_iptables:already_present:{src}:{port}")
+            continue
+        add = _run([iptables, "-w", "-I", "INPUT", "1", "-p", "tcp", "-s", src, "--dport", str(port), "-j", "ACCEPT"], timeout_sec=10)
+        if add.returncode == 0:
+            actions.append(f"zabbix_agent_firewall_iptables:added:{src}:{port}")
+        else:
+            errors.append(f"zabbix_agent_firewall_iptables:{src}:{(add.stderr or add.stdout or add.returncode)}")
+    rules_path = Path("/etc/iptables/rules.v4")
+    if iptables_save and rules_path.parent.exists() and not errors:
+        save = _run([iptables_save], timeout_sec=15)
+        if save.returncode == 0:
+            try:
+                rules_path.write_text(save.stdout or "", encoding="utf-8")
+                actions.append(f"zabbix_agent_firewall_saved:{rules_path}")
+            except Exception as e:
+                errors.append(f"zabbix_agent_firewall_save_failed:{e}")
+    return actions, errors
+
+
+def collect_zabbix_agent_state(profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    prof = profile if isinstance(profile, dict) else {}
+    enabled = _bool(prof.get("zabbix_agent_enabled"), False)
+    desired = _desired_zabbix_agent_dropin(prof)
+    installed = _dpkg_installed_versions(timeout_sec=12).get("zabbix-agent2", "")
+    dropin_values = _read_key_value_file(_ZABBIX_AGENT_DROPIN)
+    port = _int(prof.get("zabbix_agent_port"), 10050, 1, 65535)
+    active = _service_active("zabbix-agent2", timeout_sec=4)
+    service_enabled = _service_enabled("zabbix-agent2", timeout_sec=4)
+    listening = _tcp_port_listening(port, timeout_sec=4)
+    config_matches = True
+    mismatches: list[str] = []
+    for key, wanted in desired.items():
+        if not wanted:
+            continue
+        got = str(dropin_values.get(key, "") or "").strip()
+        if got != str(wanted):
+            config_matches = False
+            mismatches.append(key)
+    if not enabled:
+        status = "disabled"
+        message = "disabled by MCC profile"
+    elif not installed:
+        status = "missing"
+        message = "zabbix-agent2 package is not installed"
+    elif desired.get("Server") and not config_matches:
+        status = "config_mismatch"
+        message = "managed drop-in does not match MCC Zabbix settings"
+    elif not active:
+        status = "inactive"
+        message = "zabbix-agent2 service is not active"
+    elif not listening:
+        status = "not_listening"
+        message = f"zabbix-agent2 is not listening on tcp/{port}"
+    else:
+        status = "ok"
+        message = f"zabbix-agent2 {installed}, active"
+    return {
+        "status": status,
+        "message": message,
+        "enabled": bool(enabled),
+        "installed": bool(installed),
+        "version": str(installed or ""),
+        "service": {"active": bool(active), "enabled": bool(service_enabled)},
+        "dropin": {
+            "path": str(_ZABBIX_AGENT_DROPIN),
+            "present": bool(_ZABBIX_AGENT_DROPIN.exists()),
+            "values": dropin_values,
+            "matches": bool(config_matches),
+            "mismatches": mismatches,
+        },
+        "desired": desired,
+        "listen_port": int(port),
+        "listening": bool(listening),
+        "firewall_sources": _normalize_ip_networks(prof.get("zabbix_agent_firewall_sources")),
+    }
+
+
+def ensure_zabbix_agent(profile: dict[str, Any], *, timeout_sec: int = 90) -> dict[str, Any]:
+    if not _bool(profile.get("zabbix_agent_enabled"), False):
+        return {"status": "disabled", "reason": "zabbix_agent_disabled"}
+    if not str(profile.get("zabbix_agent_server", "") or "").strip():
+        return {"status": "error", "reason": "zabbix_agent_server_missing"}
+    installed = _dpkg_installed_versions(timeout_sec=12).get("zabbix-agent2", "")
+    if not installed:
+        return {"status": "error", "reason": "zabbix-agent2 package missing after package install"}
+    actions: list[str] = []
+    errors: list[str] = []
+    _, cfg_actions, cfg_errors = _write_zabbix_agent_dropin(profile)
+    actions.extend(cfg_actions)
+    errors.extend(cfg_errors)
+    fw_actions, fw_errors = _ensure_zabbix_agent_firewall(profile)
+    actions.extend(fw_actions)
+    errors.extend(fw_errors)
+    if not errors:
+        p = _run(["systemctl", "enable", "--now", "zabbix-agent2"], timeout_sec=max(30, int(timeout_sec)))
+        if p.returncode == 0:
+            actions.append("zabbix_agent_service:enabled_started")
+        else:
+            errors.append(f"zabbix_agent_service_start_failed:{(p.stderr or p.stdout or p.returncode)}")
+        p2 = _run(["systemctl", "restart", "zabbix-agent2"], timeout_sec=max(30, int(timeout_sec)))
+        if p2.returncode == 0:
+            actions.append("zabbix_agent_service:restarted")
+        else:
+            errors.append(f"zabbix_agent_service_restart_failed:{(p2.stderr or p2.stdout or p2.returncode)}")
+    state = collect_zabbix_agent_state(profile)
+    if errors:
+        return {"status": "error", "reason": "; ".join(str(x) for x in errors[:5]), "actions": actions, "state": state}
+    if str(state.get("status", "")) != "ok":
+        return {"status": "error", "reason": str(state.get("message") or state.get("status") or "zabbix_agent_not_ok"), "actions": actions, "state": state}
+    return {"status": "applied", "actions": actions, "state": state}
+
+
 def _collect_wazuh_agent_state_for_push() -> dict[str, Any]:
     try:
         from mcd_agent.wazuh_profile import collect_wazuh_agent_state
@@ -2002,6 +2367,7 @@ def collect_apt_state(
     *,
     timeout_sec: int = 45,
     cfg: Any | None = None,
+    profile: dict[str, Any] | None = None,
     auto_bootstrap_zabbix: bool = True,
 ) -> dict[str, Any]:
     pending_info, pending_err = _pending_updates(timeout_sec=max(10, int(timeout_sec)))
@@ -2034,6 +2400,7 @@ def collect_apt_state(
         if bool(auto_bootstrap_zabbix)
         else collect_zabbix_mysql_monitor_state(cfg=cfg)
     )
+    zbx_agent_payload = collect_zabbix_agent_state(profile=profile)
     return {
         "status": status,
         "level": level,
@@ -2049,6 +2416,7 @@ def collect_apt_state(
         "phasing_packages": list(pending_info.get("phasing_packages", []) or [])[:200],
         "held_packages": list(pending_info.get("held_packages", []) or [])[:200],
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "zabbix_agent": zbx_agent_payload,
         "zabbix_mysql_monitor": zbx_payload,
         "wazuh_agent": _collect_wazuh_agent_state_for_push(),
         "repo_profiles": collect_apt_repo_profiles_state(cfg=cfg),
@@ -2067,7 +2435,7 @@ def apply_apt_profile(
     if profile is None:
         profile = {}
     if dry_run:
-        current = collect_apt_state(timeout_sec=25, cfg=cfg, auto_bootstrap_zabbix=False)
+        current = collect_apt_state(timeout_sec=25, cfg=cfg, profile=profile, auto_bootstrap_zabbix=False)
         return {
             "status": "planned",
             "actions": [
@@ -2084,6 +2452,9 @@ def apply_apt_profile(
                 "ensure_nodejs20",
                 "ensure_composer_global",
                 "ensure_var_www",
+                "zabbix_agent_repo",
+                "zabbix_agent_config",
+                "zabbix_agent_firewall",
                 "zabbix_mysql_monitor_bootstrap",
             ],
             "current": current,
@@ -2235,6 +2606,19 @@ def apply_apt_profile(
         else:
             errors.append((p.stderr or p.stdout or "apt install failed").strip())
 
+    zbx_agent_result = ensure_zabbix_agent(profile, timeout_sec=max(45, int(refresh_timeout_sec)))
+    zbx_agent_status = str(zbx_agent_result.get("status", "") or "").strip().lower()
+    if zbx_agent_status in {"applied", "disabled"}:
+        actions.append(f"zabbix_agent:{zbx_agent_status}")
+        for act in list(zbx_agent_result.get("actions", []) or []):
+            actions.append(str(act))
+    elif zbx_agent_status == "error":
+        errors.append(f"zabbix_agent:{str(zbx_agent_result.get('reason', 'unknown_error'))}")
+        for act in list(zbx_agent_result.get("actions", []) or []):
+            actions.append(str(act))
+    else:
+        actions.append(f"zabbix_agent:{zbx_agent_status or 'unknown'}")
+
     if ensure_nodejs20:
         node_changed, node_actions, node_errors = _ensure_nodejs20(timeout_sec=max(90, int(refresh_timeout_sec)))
         actions.extend(node_actions)
@@ -2297,7 +2681,9 @@ def apply_apt_profile(
     else:
         actions.append(f"zabbix_mysql_monitor:{zbx_status or 'unknown'}")
 
-    state = collect_apt_state(timeout_sec=45, cfg=cfg, auto_bootstrap_zabbix=False)
+    state = collect_apt_state(timeout_sec=45, cfg=cfg, profile=profile, auto_bootstrap_zabbix=False)
+    if isinstance(zbx_agent_result.get("state"), dict):
+        state["zabbix_agent"] = zbx_agent_result.get("state")
     state["zabbix_mysql_monitor"] = zbx_result
     if errors:
         # Preserve explicit action errors together with state-derived errors.

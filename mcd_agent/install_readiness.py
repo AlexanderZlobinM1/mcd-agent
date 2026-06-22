@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from typing import Any
 
+from mcd_agent.apt_profile import collect_zabbix_agent_state
 from mcd_agent.env import ipv6_runtime_disabled, ipv6_status, reconcile_ipv6_runtime_from_intent
 
 
@@ -186,5 +187,6 @@ def collect_mautic_install_readiness() -> dict[str, Any]:
         "npm": {"installed": bool(npm_exists), "version": npm_version, "path": shutil.which("npm") or ""},
         "certbot": {"installed": bool(certbot_exists), "version": certbot_version},
         "database": _database_state(),
+        "zabbix_agent": collect_zabbix_agent_state(profile={"zabbix_agent_enabled": True}),
         "paths": {"var_www": _path_state("/var/www")},
     }

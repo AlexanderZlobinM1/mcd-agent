@@ -33,6 +33,7 @@ class WazuhServiceProfileTests(unittest.TestCase):
         old_pending = apt_profile._pending_updates
         old_duplicates = apt_profile.detect_duplicate_list_sources
         old_zabbix = apt_profile.collect_zabbix_mysql_monitor_state
+        old_zabbix_agent = apt_profile.collect_zabbix_agent_state
         old_repo_profiles = apt_profile.collect_apt_repo_profiles_state
         old_unattended = apt_profile.collect_unattended_upgrade_state
         old_wazuh = apt_profile._collect_wazuh_agent_state_for_push
@@ -51,6 +52,7 @@ class WazuhServiceProfileTests(unittest.TestCase):
             )
             apt_profile.detect_duplicate_list_sources = lambda: {"count": 0, "items": []}
             apt_profile.collect_zabbix_mysql_monitor_state = lambda cfg=None: {"status": "ok"}
+            apt_profile.collect_zabbix_agent_state = lambda profile=None: {"status": "disabled"}
             apt_profile.collect_apt_repo_profiles_state = lambda cfg=None: {}
             apt_profile.collect_unattended_upgrade_state = lambda: {"status": "ok"}
             apt_profile._collect_wazuh_agent_state_for_push = lambda: {
@@ -64,6 +66,7 @@ class WazuhServiceProfileTests(unittest.TestCase):
             apt_profile._pending_updates = old_pending
             apt_profile.detect_duplicate_list_sources = old_duplicates
             apt_profile.collect_zabbix_mysql_monitor_state = old_zabbix
+            apt_profile.collect_zabbix_agent_state = old_zabbix_agent
             apt_profile.collect_apt_repo_profiles_state = old_repo_profiles
             apt_profile.collect_unattended_upgrade_state = old_unattended
             apt_profile._collect_wazuh_agent_state_for_push = old_wazuh

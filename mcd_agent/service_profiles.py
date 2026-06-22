@@ -949,6 +949,7 @@ def service_profiles_apply_once(
             profile,
             dry_run=dry_run,
             cfg=cfg,
+            force_zabbix_bootstrap=not bool(dry_run),
             force_repo_rescan=bool(force_apt_repo_rescan),
         )
     result_status, reason = _service_profile_apply_outcome(applied)
