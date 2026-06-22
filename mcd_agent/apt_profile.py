@@ -610,7 +610,16 @@ def _run_mariadb_repo_setup(version: str, *, timeout_sec: int) -> tuple[bool, st
 
 def _run_percona_repo_setup(target: str, *, timeout_sec: int) -> tuple[bool, str]:
     ch = str(target or "").strip().lower()
-    if ch not in {"ps80", "pxc80"}:
+    aliases = {
+        "ps84": "ps-84-lts",
+        "ps-84": "ps-84-lts",
+        "ps84lts": "ps-84-lts",
+        "pxc84": "pxc-84-lts",
+        "pxc-84": "pxc-84-lts",
+        "pxc84lts": "pxc-84-lts",
+    }
+    ch = aliases.get(ch, ch)
+    if ch not in {"ps80", "pxc80", "ps-84-lts", "pxc-84-lts"}:
         return False, f"percona_repo_setup:unsupported_target:{ch or '-'}"
     script = (
         "set -euo pipefail; "
@@ -621,7 +630,7 @@ def _run_percona_repo_setup(target: str, *, timeout_sec: int) -> tuple[bool, str
         "dpkg -i \"$deb\" >/dev/null 2>&1 || apt-get install -y \"$deb\" >/dev/null 2>&1; "
         "fi; "
         "percona-release disable all >/dev/null 2>&1 || true; "
-        f"percona-release setup -y {ch}"
+        f"percona-release setup -y {ch} --scheme https"
     )
     p = subprocess.run(
         ["bash", "-lc", script],
@@ -797,6 +806,8 @@ def _detect_db_repo_target(*, timeout_sec: int = 20) -> dict[str, str]:
     for pkg, ver in installed.items():
         if pkg.startswith("percona-xtradb-cluster-server"):
             mm = _version_mm(ver)
+            if mm == "8.4":
+                return {"profile": "percona_cluster_8_4", "action": "ensure", "reason": "detected_percona_cluster", "package": pkg, "version": ver}
             if mm == "8.0" or not mm:
                 return {"profile": "percona_cluster_8_0", "action": "ensure", "reason": "detected_percona_cluster", "package": pkg, "version": ver}
             return {"profile": "none", "action": "none", "reason": f"unsupported_percona_cluster_{mm or 'unknown'}", "package": pkg, "version": ver}
@@ -804,6 +815,8 @@ def _detect_db_repo_target(*, timeout_sec: int = 20) -> dict[str, str]:
     for pkg, ver in installed.items():
         if pkg.startswith("percona-server-server"):
             mm = _version_mm(ver)
+            if mm == "8.4":
+                return {"profile": "percona_server_8_4", "action": "ensure", "reason": "detected_percona_server", "package": pkg, "version": ver}
             if mm == "8.0" or not mm:
                 return {"profile": "percona_server_8_0", "action": "ensure", "reason": "detected_percona_server", "package": pkg, "version": ver}
             return {"profile": "none", "action": "none", "reason": f"unsupported_percona_server_{mm or 'unknown'}", "package": pkg, "version": ver}
@@ -844,6 +857,10 @@ def _repo_profile_present(profile_key: str) -> bool:
         return ("repo.percona.com" in txt) and ("ps80" in txt or "ps-80" in txt)
     if key == "percona_cluster_8_0":
         return ("repo.percona.com" in txt) and ("pxc80" in txt or "pxc-80" in txt)
+    if key == "percona_server_8_4":
+        return ("repo.percona.com" in txt) and ("ps-84-lts" in txt or "ps84" in txt)
+    if key == "percona_cluster_8_4":
+        return ("repo.percona.com" in txt) and ("pxc-84-lts" in txt or "pxc84" in txt)
     if key == "mysql_8_4":
         return ("repo.mysql.com" in txt) and ("mysql-8.4" in txt or "mysql-8.4-lts" in txt)
     if key == "mysql_8_0":
@@ -907,7 +924,22 @@ def _apply_repo_profiles(
     elif db_once and bool(db_row.get("applied", False)) and db_same_profile and not force_rescan:
         actions.append("db_repo_profile:skip_once")
     else:
-        detected = _detect_db_repo_target(timeout_sec=max(10, int(timeout_sec)))
+        explicit_db_target = str(profile.get("db_repo_profile_target", "") or "").strip().lower()
+        if explicit_db_target in {
+            "mariadb_11_4",
+            "mysql_8_4",
+            "percona_server_8_4",
+            "percona_cluster_8_4",
+            "percona_server_8_0",
+            "percona_cluster_8_0",
+        }:
+            detected = {
+                "profile": explicit_db_target,
+                "action": "ensure",
+                "reason": "explicit_db_repo_profile_target",
+            }
+        else:
+            detected = _detect_db_repo_target(timeout_sec=max(10, int(timeout_sec)))
         det_profile = str(detected.get("profile", "none") or "none")
         det_action = str(detected.get("action", "none") or "none")
         if det_action in {"none", "skip"}:
@@ -925,8 +957,12 @@ def _apply_repo_profiles(
                         str(profile.get("mariadb_repo_setup_version", "mariadb-11.4")),
                         timeout_sec=max(30, int(timeout_sec)),
                     )
+                elif det_profile == "percona_server_8_4":
+                    ok, msg = _run_percona_repo_setup("ps-84-lts", timeout_sec=max(30, int(timeout_sec)))
                 elif det_profile == "percona_server_8_0":
                     ok, msg = _run_percona_repo_setup("ps80", timeout_sec=max(30, int(timeout_sec)))
+                elif det_profile == "percona_cluster_8_4":
+                    ok, msg = _run_percona_repo_setup("pxc-84-lts", timeout_sec=max(30, int(timeout_sec)))
                 elif det_profile == "percona_cluster_8_0":
                     ok, msg = _run_percona_repo_setup("pxc80", timeout_sec=max(30, int(timeout_sec)))
                 elif det_profile == "mysql_8_4":
