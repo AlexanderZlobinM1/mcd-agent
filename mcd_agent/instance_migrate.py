@@ -25,11 +25,14 @@ from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_image_install import _mysql_admin_base, _mysql_exec, _quote_ident, _quote_sql
 from mcd_agent.models import DBConfig
 from mcd_agent.models import MauticInstall
+from mcd_agent.nginx_baseline import ensure_nginx_baseline
 
 
 _MIN_TARGET_HEADROOM_BYTES = 5 * 1024 * 1024 * 1024
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_$-]{1,64}$")
+NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 
 
 def _utc_now() -> str:
@@ -684,9 +687,20 @@ def _nginx_web_root(root: Path) -> Path:
     return root
 
 
+def _ensure_nginx_sites_layout() -> None:
+    baseline = ensure_nginx_baseline(reload_service=False)
+    if str(baseline.get("status") or "").strip().lower() == "error":
+        raise RuntimeError("nginx baseline failed: " + str(baseline.get("error") or baseline))
+    for path in (NGINX_SITES_AVAILABLE, NGINX_SITES_ENABLED):
+        if path.exists() and not path.is_dir():
+            raise RuntimeError(f"nginx sites path is not a directory: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+
+
 def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> str:
     if not domains:
         raise RuntimeError("at least one domain is required for nginx vhost")
+    _ensure_nginx_sites_layout()
     php = _detect_php_version(php_version)
     if not php:
         raise RuntimeError("target PHP-FPM version is not available")
@@ -695,8 +709,8 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
         raise RuntimeError(f"target PHP-FPM socket is missing: {sock}")
     primary = domains[0]
     web_root = _nginx_web_root(root)
-    site = Path("/etc/nginx/sites-available") / f"{primary}.conf"
-    enabled = Path("/etc/nginx/sites-enabled") / f"{primary}.conf"
+    site = NGINX_SITES_AVAILABLE / f"{primary}.conf"
+    enabled = NGINX_SITES_ENABLED / f"{primary}.conf"
     server_names = " ".join(domains)
     cert_live = Path("/etc/letsencrypt/live") / primary
     ssl_block = ""

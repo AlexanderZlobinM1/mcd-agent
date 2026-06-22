@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.165 - 2026-06-22
+
+- Fixed: nginx baseline now creates the Debian-style
+  `/etc/nginx/sites-available` and `/etc/nginx/sites-enabled` directories when
+  the official nginx.org package does not provide them. Host preparation and
+  `Check / Fix` APT profile application now converge this layout before
+  Mautic vhosts are written.
+- Fixed: instance migration target finalization now verifies and creates the
+  nginx sites layout before writing the migrated vhost, preventing Composer
+  migrations to freshly prepared official-nginx hosts from failing at
+  `target web config`.
+
 ## 0.9.164 - 2026-06-22
 
 - Added: APT service profiles can now prepare migration-ready hosts by

@@ -131,6 +131,55 @@ add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
         self.assertEqual(set(files), {site.resolve(), confd.resolve()})
 
+    def test_baseline_requires_sites_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            nginx_conf = root / "nginx.conf"
+            nginx_conf.write_text(
+                "user www-data;\nhttp {\n    include /etc/nginx/sites-enabled/*.conf;\n}\n",
+                encoding="utf-8",
+            )
+            snippets = root / "snippets"
+            snippets.mkdir()
+            hardening = snippets / "mcd-mautic-hardening.conf"
+            hardening.write_text(nginx_baseline._desired_hardening_snippet(), encoding="utf-8")
+
+            old_conf = nginx_baseline.NGINX_CONF
+            old_available = nginx_baseline.SITES_AVAILABLE
+            old_enabled = nginx_baseline.SITES_ENABLED
+            old_snippet = nginx_baseline.HARDENING_SNIPPET
+            try:
+                nginx_baseline.NGINX_CONF = nginx_conf
+                nginx_baseline.SITES_AVAILABLE = root / "sites-available"
+                nginx_baseline.SITES_ENABLED = root / "sites-enabled"
+                nginx_baseline.HARDENING_SNIPPET = hardening
+
+                self.assertFalse(nginx_baseline.nginx_baseline_satisfied())
+            finally:
+                nginx_baseline.NGINX_CONF = old_conf
+                nginx_baseline.SITES_AVAILABLE = old_available
+                nginx_baseline.SITES_ENABLED = old_enabled
+                nginx_baseline.HARDENING_SNIPPET = old_snippet
+
+    def test_ensure_sites_directories_creates_debian_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            available = root / "sites-available"
+            enabled = root / "sites-enabled"
+
+            old_available = nginx_baseline.SITES_AVAILABLE
+            old_enabled = nginx_baseline.SITES_ENABLED
+            try:
+                nginx_baseline.SITES_AVAILABLE = available
+                nginx_baseline.SITES_ENABLED = enabled
+                actions = nginx_baseline._ensure_sites_directories()
+                self.assertEqual(actions, [f"created:{available}", f"created:{enabled}"])
+                self.assertTrue(available.is_dir())
+                self.assertTrue(enabled.is_dir())
+            finally:
+                nginx_baseline.SITES_AVAILABLE = old_available
+                nginx_baseline.SITES_ENABLED = old_enabled
+
     def test_normalize_sites_enabled_symlink_requires_conf_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
