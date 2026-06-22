@@ -381,19 +381,57 @@ def _prepare_target_db(db: DBConfig) -> None:
     _mysql_exec("FLUSH PRIVILEGES")
 
 
-def preflight_target_relay(*, target_root: str, target_db_name: str) -> dict[str, Any]:
+def _assert_safe_target_wipe_path(target: Path) -> None:
+    resolved = target.resolve()
+    protected = {
+        Path("/"),
+        Path("/var"),
+        Path("/var/www"),
+        Path("/etc"),
+        Path("/usr"),
+        Path("/opt"),
+        Path("/home"),
+        Path("/root"),
+        Path("/tmp"),
+    }
+    if resolved in protected:
+        raise RuntimeError(f"refusing to wipe protected target path: {resolved}")
+    if len(resolved.parts) < 3:
+        raise RuntimeError(f"refusing to wipe shallow target path: {resolved}")
+
+
+def preflight_target_relay(
+    *,
+    target_root: str,
+    target_db_name: str,
+    wipe_target_root: bool = False,
+    wipe_target_db: bool = False,
+) -> dict[str, Any]:
     target = Path(target_root).resolve()
     if not str(target).startswith("/"):
         raise RuntimeError("target root must be absolute")
     problems: list[str] = []
+    cleanup: list[str] = []
     if target.exists() and any(target.iterdir()):
-        problems.append(f"target root already exists and is not empty: {target}")
+        if wipe_target_root:
+            try:
+                _assert_safe_target_wipe_path(target)
+                shutil.rmtree(target)
+                cleanup.append(f"target root removed: {target}")
+            except Exception as exc:
+                problems.append(f"target root cleanup failed: {exc}")
+        else:
+            problems.append(f"target root already exists and is not empty: {target}")
     if not _DB_IDENT_RE.match(str(target_db_name or "")):
         problems.append(f"invalid target database name: {target_db_name}")
     else:
         try:
             if _target_db_exists(str(target_db_name)):
-                problems.append(f"target database already exists: {target_db_name}")
+                if wipe_target_db:
+                    _mysql_exec(f"DROP DATABASE IF EXISTS {_quote_ident(str(target_db_name))}")
+                    cleanup.append(f"target database dropped: {target_db_name}")
+                else:
+                    problems.append(f"target database already exists: {target_db_name}")
         except Exception as exc:
             problems.append(f"target database preflight failed: {exc}")
     for cmd in ("tar", "gzip", "nginx", "php"):
@@ -404,6 +442,9 @@ def preflight_target_relay(*, target_root: str, target_db_name: str) -> dict[str
         "ok": not problems,
         "target_root": str(target),
         "target_db_name": str(target_db_name or ""),
+        "wipe_target_root": bool(wipe_target_root),
+        "wipe_target_db": bool(wipe_target_db),
+        "cleanup": cleanup,
         "problems": problems,
     }
 
