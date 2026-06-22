@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.167 - 2026-06-22
+
+- Fixed: nginx baseline now creates the Debian-compatible
+  `/etc/nginx/snippets/fastcgi-php.conf` snippet on official nginx.org hosts.
+  Fresh host preparation, Check/Fix, image installs and instance migrations no
+  longer fail final nginx validation when the package lacks Debian's
+  `snippets/fastcgi-php.conf` file.
+
 ## 0.9.166 - 2026-06-22
 
 - Added: instance migration target preflight now supports explicit destructive
