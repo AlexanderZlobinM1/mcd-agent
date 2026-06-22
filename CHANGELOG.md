@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.163 - 2026-06-22
+
+- Fixed: APT service profiles now ensure a local FQDN mapping in `/etc/hosts`
+  before package installation, preventing sendmail post-install scripts from
+  sleeping on bare hosts with unqualified hostnames.
+- Fixed: bare-host package preparation now enables and starts core services
+  installed by the package profile, including nginx, Redis, PHP-FPM, MariaDB,
+  MySQL/Percona, and sendmail.
+
 ## 0.9.162 - 2026-06-22
 
 - Added: APT service profiles can now prepare bare hosts with explicit database
