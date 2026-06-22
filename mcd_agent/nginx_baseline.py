@@ -102,6 +102,8 @@ def nginx_baseline_satisfied() -> bool:
     """Cheap read-only check for the SalesSnap nginx layout baseline."""
     if not _nginx_present():
         return True
+    if not SITES_AVAILABLE.is_dir() or not SITES_ENABLED.is_dir():
+        return False
     if NGINX_CONF.exists():
         text = _read_text(NGINX_CONF)
         if not _has_www_data_user(text):
@@ -366,6 +368,17 @@ def _ensure_hardening_includes(backup_dir: Path, snapshots: dict[Path, _Snapshot
     return actions
 
 
+def _ensure_sites_directories() -> list[str]:
+    actions: list[str] = []
+    for path in (SITES_AVAILABLE, SITES_ENABLED):
+        if path.exists() and not path.is_dir():
+            raise RuntimeError(f"nginx sites path is not a directory: {path}")
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            actions.append(f"created:{path}")
+    return actions
+
+
 def _convert_sites_enabled_regular_files(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
     actions: list[str] = []
     if not SITES_ENABLED.exists():
@@ -473,6 +486,10 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
     changed = False
 
     try:
+        dir_actions = _ensure_sites_directories()
+        if dir_actions:
+            actions.extend(dir_actions)
+            changed = True
         if NGINX_CONF.exists():
             original = _read_text(NGINX_CONF)
             desired, conf_actions = _desired_nginx_conf(original)

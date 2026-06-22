@@ -319,6 +319,26 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         self.assertLess(events.index("maintenance_on"), events.index("db_import:single"))
         self.assertLess(events.index("db_import:single"), events.index("patch_db"))
 
+    def test_nginx_sites_layout_is_created_for_target_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            available = root / "sites-available"
+            enabled = root / "sites-enabled"
+
+            old_available = instance_migrate.NGINX_SITES_AVAILABLE
+            old_enabled = instance_migrate.NGINX_SITES_ENABLED
+            try:
+                instance_migrate.NGINX_SITES_AVAILABLE = available
+                instance_migrate.NGINX_SITES_ENABLED = enabled
+                with patch.object(instance_migrate, "ensure_nginx_baseline", return_value={"status": "ok"}):
+                    instance_migrate._ensure_nginx_sites_layout()
+
+                self.assertTrue(available.is_dir())
+                self.assertTrue(enabled.is_dir())
+            finally:
+                instance_migrate.NGINX_SITES_AVAILABLE = old_available
+                instance_migrate.NGINX_SITES_ENABLED = old_enabled
+
     def test_source_db_stream_prefers_mariadb_dump_without_events(self) -> None:
         class FakeInventory:
             def __init__(self, _path: str) -> None:
