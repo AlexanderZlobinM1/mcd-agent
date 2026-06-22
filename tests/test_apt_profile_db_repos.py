@@ -35,10 +35,56 @@ class AptProfileDbRepoTests(unittest.TestCase):
 
     def test_services_for_present_packages_maps_core_daemons(self) -> None:
         services = apt_profile._services_for_present_packages(
-            ["nginx", "redis", "php8.3-fpm", "mariadb-server", "mariadb-client", "sendmail", "nginx"]
+            ["nginx", "redis", "php8.3-fpm", "mariadb-server", "mariadb-client", "sendmail", "zabbix-agent2", "nginx"]
         )
 
-        self.assertEqual(services, ["nginx", "redis-server", "php8.3-fpm", "mariadb", "sendmail"])
+        self.assertEqual(services, ["nginx", "redis-server", "php8.3-fpm", "mariadb", "sendmail", "zabbix-agent2"])
+
+    def test_zabbix_agent_state_ok_when_dropin_and_service_match(self) -> None:
+        old_dpkg = apt_profile._dpkg_installed_versions
+        old_read = apt_profile._read_key_value_file
+        old_active = apt_profile._service_active
+        old_enabled = apt_profile._service_enabled
+        old_listening = apt_profile._tcp_port_listening
+        old_exists = apt_profile.Path.exists
+        try:
+            apt_profile._dpkg_installed_versions = lambda **_kwargs: {"zabbix-agent2": "1:7.0.14-1+ubuntu24.04"}
+            apt_profile._read_key_value_file = lambda _path: {
+                "Server": "65.109.226.152",
+                "ServerActive": "65.109.226.152",
+                "Hostname": "MauticFarm-02",
+                "ListenPort": "10050",
+            }
+            apt_profile._service_active = lambda _name, **_kwargs: True
+            apt_profile._service_enabled = lambda _name, **_kwargs: True
+            apt_profile._tcp_port_listening = lambda _port, **_kwargs: True
+            apt_profile.Path.exists = lambda self: True if str(self) == "/etc/zabbix/zabbix_agent2.d/99-mcd-server.conf" else old_exists(self)
+
+            state = apt_profile.collect_zabbix_agent_state(
+                {
+                    "zabbix_agent_enabled": True,
+                    "zabbix_agent_server": "65.109.226.152",
+                    "zabbix_agent_server_active": "65.109.226.152",
+                    "zabbix_agent_hostname": "MauticFarm-02",
+                    "zabbix_agent_port": 10050,
+                }
+            )
+        finally:
+            apt_profile._dpkg_installed_versions = old_dpkg
+            apt_profile._read_key_value_file = old_read
+            apt_profile._service_active = old_active
+            apt_profile._service_enabled = old_enabled
+            apt_profile._tcp_port_listening = old_listening
+            apt_profile.Path.exists = old_exists
+
+        self.assertEqual(state["status"], "ok")
+        self.assertTrue(state["dropin"]["matches"])
+        self.assertTrue(state["service"]["active"])
+
+    def test_zabbix_agent_firewall_sources_normalize_ip_literals_only(self) -> None:
+        sources = apt_profile._normalize_ip_networks(["65.109.226.152", "bad.host", "10.0.0.0/24", "65.109.226.152"])
+
+        self.assertEqual(sources, ["65.109.226.152/32", "10.0.0.0/24"])
 
     def test_nodejs20_satisfied_requires_node20_and_npm(self) -> None:
         old_which = apt_profile.shutil.which

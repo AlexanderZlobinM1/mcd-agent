@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.169 - 2026-06-23
+
+- Added: APT service profiles can now install and configure `zabbix-agent2`
+  from the official Zabbix repository, write a managed agent2 drop-in with MCC
+  server/active server/hostname settings, allow the Zabbix server through the
+  host firewall, and report concrete Zabbix agent readiness back to MCC.
+- Fixed: explicit APT service-profile applies now retry the Zabbix/MySQL
+  monitor bootstrap path instead of remaining stuck behind an old failed
+  one-shot marker.
+
 ## 0.9.168 - 2026-06-22
 
 - Fixed: instance migration and ZIP-to-Composer migration nginx vhosts now keep
