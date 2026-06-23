@@ -1954,6 +1954,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bkp.add_argument("--profile-json-file", help="JSON file with backup profile payload for profile-set")
     bkp.add_argument("--profile-json-stdin", action="store_true", help="Read backup profile JSON payload from stdin")
     bkp.add_argument("--replace", action="store_true", help="Replace backup profile payload instead of merge")
+    bkp.add_argument("--skip-prepare-check", action="store_true", help="Store backup profile without package/storage/DB verification")
     bkp.add_argument("--json", action="store_true")
 
     custom = sub.add_parser("custom", help="Run custom script from MCC manifest")
@@ -3832,8 +3833,15 @@ def main() -> int:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise RuntimeError("backup profile payload must be a JSON object")
-            backup_profile_set(cfg, payload, merge=not bool(args.replace))
+            result = backup_profile_set(
+                cfg,
+                payload,
+                merge=not bool(args.replace),
+                prepare_check=not bool(args.skip_prepare_check),
+            )
             masked = backup_profile_masked(cfg)
+            if isinstance(result.get("_prepare_check"), dict):
+                masked["_prepare_check"] = result["_prepare_check"]
             print(json.dumps(masked, ensure_ascii=True, indent=2))
             _push_state_after_change(cfg, "backup-profile-set")
             return 0

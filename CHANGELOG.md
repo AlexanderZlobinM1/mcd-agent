@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.171 - 2026-06-23
+
+- Fixed: `backup profile-set` now prepares and verifies backup readiness before
+  persisting the profile. The agent validates storage auth, installs required
+  backup tools when auto-install is enabled, verifies Mautic DB connectivity,
+  mounts the configured storage, and performs a small write/delete probe. Failed
+  checks leave the previous backup profile untouched.
+- Added: `backup profile-set --skip-prepare-check` remains available for
+  emergency operator recovery when a profile must be stored without live
+  verification.
+
 ## 0.9.170 - 2026-06-23
 
 - Safety: service-profile daemon runs are now advisory-only dry runs. MCD no
