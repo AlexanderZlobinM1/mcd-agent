@@ -1021,70 +1021,15 @@ def backup_profile_sync_from_config(cfg: AgentConfig) -> dict[str, Any]:
     merged = _deep_merge(current, from_cfg)
     if merged == current:
         return {"status": "ok", "changed": False, "keys": []}
-    backup_profile_set(cfg, from_cfg, merge=True, sync_config=False)
+    backup_profile_set(cfg, from_cfg, merge=True, sync_config=False, prepare_check=False)
     return {"status": "ok", "changed": True, "keys": sorted(from_cfg.keys())}
 
 
-def backup_profile_set(
-    cfg: AgentConfig,
-    payload: dict[str, Any],
-    *,
-    merge: bool = True,
-    sync_config: bool = True,
-) -> dict[str, Any]:
-    current = backup_profile_get(cfg) if merge else {}
-    merged = _deep_merge(current, payload)
-    token = _profile_crypto(cfg).encrypt(json.dumps(merged, ensure_ascii=True, separators=(",", ":")))
-    con = _profile_store_conn(cfg)
-    try:
-        con.execute(
-            """
-            INSERT INTO backup_profile(id, payload_enc, updated_at)
-            VALUES(?,?,?)
-            ON CONFLICT(id) DO UPDATE SET payload_enc=excluded.payload_enc, updated_at=excluded.updated_at
-            """,
-            (_PROFILE_ROW_ID, token, time.time()),
-        )
-        con.commit()
-    finally:
-        con.close()
-    if sync_config:
-        try:
-            _sync_profile_payload_to_config(cfg, merged)
-        except Exception:
-            # Non-fatal: profile DB is authoritative for backup runtime.
-            pass
-    return merged
-
-
-def _mask_value(v: str | None) -> str:
-    if not v:
-        return ""
-    if len(v) <= 3:
-        return "***"
-    return v[:1] + "***" + v[-1:]
-
-
-def backup_profile_masked(cfg: AgentConfig) -> dict[str, Any]:
-    p = backup_profile_get(cfg)
-    out = json.loads(json.dumps(p, ensure_ascii=True)) if p else {}
-    storage = out.get("storage")
-    if isinstance(storage, dict) and storage.get("password") is not None:
-        storage["password"] = _mask_value(str(storage.get("password") or ""))
-    mysql = out.get("mysql")
-    if isinstance(mysql, dict) and mysql.get("password") is not None:
-        mysql["password"] = _mask_value(str(mysql.get("password") or ""))
-    return out
-
-
-def _effective_cfg(cfg: AgentConfig) -> AgentConfig:
-    p = backup_profile_get(cfg)
-    if not p:
-        return cfg
-    storage = p.get("storage") if isinstance(p.get("storage"), dict) else {}
-    mysql = p.get("mysql") if isinstance(p.get("mysql"), dict) else {}
-    archive = p.get("archive") if isinstance(p.get("archive"), dict) else {}
-    backup = _profile_backup_payload(p)
+def _cfg_with_profile_payload(cfg: AgentConfig, payload: dict[str, Any]) -> AgentConfig:
+    storage = payload.get("storage") if isinstance(payload.get("storage"), dict) else {}
+    mysql = payload.get("mysql") if isinstance(payload.get("mysql"), dict) else {}
+    archive = payload.get("archive") if isinstance(payload.get("archive"), dict) else {}
+    backup = _profile_backup_payload(payload)
     out = cfg
     if backup:
         out = replace(
@@ -1122,6 +1067,131 @@ def _effective_cfg(cfg: AgentConfig) -> AgentConfig:
             else out.backup_archive_paths,
         )
     return out
+
+
+def _backup_profile_prepare_check(cfg: AgentConfig, payload: dict[str, Any]) -> dict[str, Any]:
+    check_cfg = _cfg_with_profile_payload(cfg, payload)
+    _validate_cfg(check_cfg)
+    tool_state = _ensure_backup_tools(check_cfg)
+
+    instances = _list_instances(check_cfg)
+    db_instances = [x for x in instances if x.db]
+    method = _backup_method(check_cfg)
+    if method == "mydumper" and not db_instances:
+        raise RuntimeError("No instances with DB credentials found in inventory")
+    if method == "xtrabackup" and not db_instances and not (
+        check_cfg.backup_mysql_user and check_cfg.backup_mysql_password
+    ):
+        raise RuntimeError("No DB credentials found for xtrabackup ([backup.mysql] required when inventory has no DB)")
+
+    checked_dbs: list[str] = []
+    for inst in db_instances:
+        db = _effective_db_for_instance(check_cfg, inst)
+        _mysql_capture(check_cfg, db, "SELECT 1")
+        checked_dbs.append(db.name)
+
+    mount_path = Path(check_cfg.backup_mount_base_dir) / _host_slug(check_cfg)
+    lock_path = _lock_path(check_cfg)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("backup lock is busy; cannot verify backup profile now")
+        _mount(check_cfg, mount_path)
+        remote_parent = mount_path / _format_remote_dir(check_cfg.backup_remote_root_dir, _host_name(check_cfg))
+        remote_parent.mkdir(parents=True, exist_ok=True)
+        probe_path = remote_parent / f".mcd-profile-check-{int(time.time())}.tmp"
+        probe_path.write_text("ok\n", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+    finally:
+        try:
+            _unmount(mount_path, check_cfg.backup_unmount_timeout_sec)
+        except Exception:
+            pass
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "method": method,
+        "tools": tool_state,
+        "instances": len(instances),
+        "db_instances": len(db_instances),
+        "checked_databases": checked_dbs,
+    }
+
+
+def backup_profile_set(
+    cfg: AgentConfig,
+    payload: dict[str, Any],
+    *,
+    merge: bool = True,
+    sync_config: bool = True,
+    prepare_check: bool = True,
+) -> dict[str, Any]:
+    current = backup_profile_get(cfg) if merge else {}
+    merged = _deep_merge(current, payload)
+    prepare_result: dict[str, Any] | None = None
+    if prepare_check:
+        prepare_result = _backup_profile_prepare_check(cfg, merged)
+    token = _profile_crypto(cfg).encrypt(json.dumps(merged, ensure_ascii=True, separators=(",", ":")))
+    con = _profile_store_conn(cfg)
+    try:
+        con.execute(
+            """
+            INSERT INTO backup_profile(id, payload_enc, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(id) DO UPDATE SET payload_enc=excluded.payload_enc, updated_at=excluded.updated_at
+            """,
+            (_PROFILE_ROW_ID, token, time.time()),
+        )
+        con.commit()
+    finally:
+        con.close()
+    if sync_config:
+        try:
+            _sync_profile_payload_to_config(cfg, merged)
+        except Exception:
+            # Non-fatal: profile DB is authoritative for backup runtime.
+            pass
+    if prepare_result is not None:
+        merged["_prepare_check"] = prepare_result
+    return merged
+
+
+def _mask_value(v: str | None) -> str:
+    if not v:
+        return ""
+    if len(v) <= 3:
+        return "***"
+    return v[:1] + "***" + v[-1:]
+
+
+def backup_profile_masked(cfg: AgentConfig) -> dict[str, Any]:
+    p = backup_profile_get(cfg)
+    out = json.loads(json.dumps(p, ensure_ascii=True)) if p else {}
+    storage = out.get("storage")
+    if isinstance(storage, dict) and storage.get("password") is not None:
+        storage["password"] = _mask_value(str(storage.get("password") or ""))
+    mysql = out.get("mysql")
+    if isinstance(mysql, dict) and mysql.get("password") is not None:
+        mysql["password"] = _mask_value(str(mysql.get("password") or ""))
+    return out
+
+
+def _effective_cfg(cfg: AgentConfig) -> AgentConfig:
+    p = backup_profile_get(cfg)
+    if not p:
+        return cfg
+    return _cfg_with_profile_payload(cfg, p)
 
 
 def _validate_cfg(cfg: AgentConfig) -> None:
