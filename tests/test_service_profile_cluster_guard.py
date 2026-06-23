@@ -151,6 +151,23 @@ class ServiceProfileClusterGuardTests(unittest.TestCase):
         cleanup_legacy.assert_not_called()
         cleanup_profile.assert_not_called()
 
+    def test_cluster_mysql_profile_raises_connection_floor(self) -> None:
+        sanitized = service_profiles._sanitize_cluster_mysql_profile(
+            {
+                "scope": "pxc",
+                "cluster_safe": True,
+                "max_connections": 600,
+                "thread_cache_size": 128,
+                "open_files_limit": 65535,
+                "table_open_cache": 8000,
+            }
+        )
+
+        self.assertEqual(sanitized["max_connections"], 2000)
+        self.assertEqual(sanitized["thread_cache_size"], 256)
+        self.assertEqual(sanitized["open_files_limit"], 262144)
+        self.assertEqual(sanitized["table_open_cache"], 8000)
+
 
 if __name__ == "__main__":
     unittest.main()

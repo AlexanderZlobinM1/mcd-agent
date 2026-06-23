@@ -400,8 +400,9 @@ def _sanitize_cluster_mysql_profile(profile: dict[str, Any]) -> dict[str, Any]:
     Keep Galera/PXC service-profile writes inside the proven safe envelope.
 
     Cluster nodes are not standalone MySQL boxes. A too-aggressive profile can
-    amplify certification stalls across every node, so even a profile explicitly
-    marked cluster-safe is bounded here before any file or dynamic SET GLOBAL is
+    amplify certification stalls across every node, while a too-low connection
+    ceiling can starve WSREP internal sessions. Even profiles explicitly marked
+    cluster-safe are normalized here before any file or dynamic SET GLOBAL is
     attempted.
     """
     out = dict(profile)
@@ -410,14 +411,19 @@ def _sanitize_cluster_mysql_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "innodb_redo_log_capacity_mb": 4_096,
         "innodb_io_capacity": 12_000,
         "innodb_io_capacity_max": 24_000,
-        "max_connections": 600,
-        "thread_cache_size": 128,
+        "max_connections": 2_000,
+        "thread_cache_size": 256,
         "table_open_cache": 8_000,
         "table_definition_cache": 4_000,
-        "open_files_limit": 65_535,
+        "open_files_limit": 262_144,
         "tmp_table_size_mb": 256,
         "max_heap_table_size_mb": 256,
         "max_allowed_packet_mb": 64,
+    }
+    floors = {
+        "max_connections": 2_000,
+        "thread_cache_size": 256,
+        "open_files_limit": 262_144,
     }
     for key, cap in caps.items():
         raw = out.get(key)
@@ -429,6 +435,9 @@ def _sanitize_cluster_mysql_profile(profile: dict[str, Any]) -> dict[str, Any]:
             continue
         if val > cap:
             out[key] = cap
+        floor = floors.get(key)
+        if floor is not None and val < floor:
+            out[key] = floor
     out["cluster_safe"] = True
     out["scope"] = str(out.get("scope") or "pxc").strip() or "pxc"
     return out
