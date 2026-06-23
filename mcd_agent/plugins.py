@@ -1370,172 +1370,6 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
     raise RuntimeError(f"mautic:plugin:install failed: {out}")
 
 
-def _sql_exists(db: MauticDB, query: str, context: dict[str, str] | None = None) -> bool:
-    try:
-        return db.fetch_count(query, context=context) > 0
-    except Exception:
-        return False
-
-
-def _ensure_viber_message_schema(install) -> list[str]:
-    if not install.db:
-        return []
-    db = MauticDB(install.db)
-    prefix = str(getattr(install.db, "table_prefix", "") or "")
-    ctx = {"prefix": prefix}
-    actions: list[str] = []
-
-    alerts = "{prefix}viber_message_alerts"
-    if not _sql_exists(
-        db,
-        """
-        SELECT COUNT(*)
-        FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME = '{prefix}viber_message_alerts'
-        """,
-        ctx,
-    ):
-        db.execute_sql_template(
-            """
-            CREATE TABLE `{prefix}viber_message_alerts` (
-                `type` VARCHAR(191) NOT NULL,
-                `sent_at` DATETIME NOT NULL COMMENT '(DC2Type:datetime_immutable)',
-                INDEX `ss_type_sent_at` (`type`, `sent_at`),
-                PRIMARY KEY(`type`)
-            ) DEFAULT CHARACTER SET utf8mb4 COLLATE `utf8mb4_unicode_ci` ENGINE = InnoDB ROW_FORMAT = DYNAMIC
-            """,
-            ctx,
-        )
-        actions.append("created:viber_message_alerts")
-
-    stats_table = f"{prefix}viber_message_stats"
-    if not _sql_exists(
-        db,
-        """
-        SELECT COUNT(*)
-        FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME = '{prefix}viber_message_stats'
-        """,
-        ctx,
-    ):
-        return actions
-
-    fk_specs = [
-        {
-            "column": "contact_id",
-            "ref_table": "leads",
-            "constraint": "FK_E6CE4384E7A1254A",
-            "index": "IDX_E6CE4384E7A1254A",
-        },
-        {
-            "column": "campaign_event_id",
-            "ref_table": "campaign_events",
-            "constraint": "FK_E6CE438443873EF4",
-            "index": "IDX_E6CE438443873EF4",
-        },
-        {
-            "column": "form_action_id",
-            "ref_table": "form_actions",
-            "constraint": "FK_E6CE4384EC324F39",
-            "index": "IDX_E6CE4384EC324F39",
-        },
-    ]
-    for spec in fk_specs:
-        column = str(spec["column"])
-        ref_table = str(spec["ref_table"])
-        constraint = str(spec["constraint"])
-        index = str(spec["index"])
-        if not db.table_has_column("{prefix}viber_message_stats", column):
-            continue
-        if not _sql_exists(
-            db,
-            f"""
-            SELECT COUNT(*)
-            FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = '{{prefix}}{ref_table}'
-            """,
-            ctx,
-        ):
-            continue
-        if not _sql_exists(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = '{prefix}viber_message_stats'
-              AND INDEX_NAME = '__index__'
-            """.replace("__index__", index),
-            ctx,
-        ):
-            db.execute_sql_template(
-                f"CREATE INDEX `{index}` ON `{{prefix}}viber_message_stats` (`{column}`)",
-                ctx,
-            )
-            actions.append(f"created-index:{index}")
-        if _sql_exists(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM information_schema.KEY_COLUMN_USAGE
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = '{prefix}viber_message_stats'
-              AND CONSTRAINT_NAME = '__constraint__'
-              AND REFERENCED_TABLE_NAME IS NOT NULL
-            """.replace("__constraint__", constraint),
-            ctx,
-        ):
-            continue
-        db.execute_sql_template(
-            f"""
-            UPDATE `{{prefix}}viber_message_stats` s
-            LEFT JOIN `{{prefix}}{ref_table}` r ON r.`id` = s.`{column}`
-            SET s.`{column}` = NULL
-            WHERE s.`{column}` IS NOT NULL
-              AND r.`id` IS NULL
-            """,
-            ctx,
-        )
-        db.execute_sql_template(
-            f"""
-            ALTER TABLE `{{prefix}}viber_message_stats`
-            ADD CONSTRAINT `{constraint}` FOREIGN KEY (`{column}`)
-            REFERENCES `{{prefix}}{ref_table}` (`id`) ON DELETE SET NULL
-            """,
-            ctx,
-        )
-        actions.append(f"created-fk:{constraint}")
-    return actions
-
-
-def _run_viber_schema_repairs(install, selected_rows: list[dict[str, Any]]) -> list[str]:
-    selected_names: set[str] = set()
-    for row in selected_rows:
-        bundle = str(row.get("bundle", "") or "").strip()
-        install_bundle = str(row.get("install_bundle", "") or "").strip()
-        item = row.get("item") if isinstance(row.get("item"), dict) else {}
-        selected_names.update(
-            x.lower()
-            for x in [
-                bundle,
-                install_bundle,
-                str(item.get("bundle", "") or ""),
-                str(item.get("install_bundle", "") or ""),
-                str(item.get("display_name", "") or ""),
-            ]
-            if str(x or "").strip()
-        )
-    if not any("viber" in name for name in selected_names):
-        return []
-    actions = _ensure_viber_message_schema(install)
-    if actions:
-        logging.info("[%s] viber schema repair: %s", install.root, ",".join(actions))
-    return actions
-
-
 def _run_post_steps(config: AgentConfig, install) -> None:
     if config.plugins_post_cache_clear:
         _run_plugin_cache_clear(config, install)
@@ -2013,7 +1847,6 @@ def _apply_plugin_file_changes(
         )
         if run_post_steps:
             _run_post_steps(config, install)
-        _run_viber_schema_repairs(install, selected)
     return changed or compatibility_changed
 
 
@@ -2575,7 +2408,6 @@ def _run_cluster_plugin_operation(
                 node_status="plugin_install",
             )
             _run_plugin_install_reload(config, install)
-            _run_viber_schema_repairs(install, selected)
         _cluster_plugin_set_phase(
             config,
             key,

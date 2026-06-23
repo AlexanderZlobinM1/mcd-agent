@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.174 - 2026-06-23
+
+- Changed: removed the Viber-specific schema repair from the generic plugin
+  installer. Viber schema repair now belongs to the SalesSnapViberBundle
+  package itself, so future plugin fixes ship with plugin versions instead of
+  agent-specific hardcoding.
+
 ## 0.9.173 - 2026-06-23
 
 - Fixed: Viber plugin install/update now runs a narrow schema repair after
