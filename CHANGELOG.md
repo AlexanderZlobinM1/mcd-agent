@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.172 - 2026-06-23
+
+- Fixed: backup profile verification release aligned with MCC storage-asset auth
+  preservation. Agents still reject unverified profiles before persistence, so
+  MCC storage asset bugs cannot leave a host with a newly saved but unusable
+  backup profile.
+
 ## 0.9.171 - 2026-06-23
 
 - Fixed: `backup profile-set` now prepares and verifies backup readiness before
