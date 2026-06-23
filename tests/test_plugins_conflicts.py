@@ -27,6 +27,7 @@ from mcd_agent.plugins import (
     _plugin_config_metadata_paths,
     _prealign_metadataless_plugin_versions,
     _run_manifest_sql_fixes,
+    _run_viber_schema_repairs,
     _exclusive_counterparts,
     _plugin_status,
 )
@@ -387,6 +388,55 @@ class PluginConflictPathTests(unittest.TestCase):
         db.table_has_column.assert_called_once_with("{prefix}plugins", "metadata")
         db.execute_sql_template.assert_not_called()
         run_template.assert_called_once()
+
+    def test_viber_schema_repair_creates_alerts_and_missing_foreign_keys(self) -> None:
+        install = SimpleNamespace(root="/var/www/ss/public_html", db=SimpleNamespace(table_prefix="ss_"))
+        rows = [{"bundle": "SalesSnapViberBundle", "install_bundle": "SalesSnapViberBundle", "item": {}}]
+
+        def fetch_count(sql: str, context: dict[str, str] | None = None) -> int:
+            rendered = sql.format(prefix="ss_")
+            if "information_schema.TABLES" in rendered and "ss_viber_message_alerts" in rendered:
+                return 0
+            if "information_schema.TABLES" in rendered and "ss_viber_message_stats" in rendered:
+                return 1
+            if "information_schema.TABLES" in rendered and any(
+                name in rendered for name in ("ss_leads", "ss_campaign_events", "ss_form_actions")
+            ):
+                return 1
+            if "information_schema.STATISTICS" in rendered:
+                return 1
+            if "information_schema.KEY_COLUMN_USAGE" in rendered:
+                return 0
+            return 0
+
+        db = SimpleNamespace(
+            fetch_count=Mock(side_effect=fetch_count),
+            table_has_column=Mock(return_value=True),
+            execute_sql_template=Mock(return_value=1),
+        )
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db):
+            actions = _run_viber_schema_repairs(install, rows)
+
+        self.assertIn("created:viber_message_alerts", actions)
+        self.assertIn("created-fk:FK_E6CE4384E7A1254A", actions)
+        self.assertIn("created-fk:FK_E6CE438443873EF4", actions)
+        self.assertIn("created-fk:FK_E6CE4384EC324F39", actions)
+        sql = "\n".join(call.args[0] for call in db.execute_sql_template.call_args_list)
+        self.assertIn("CREATE TABLE `{prefix}viber_message_alerts`", sql)
+        self.assertIn("ADD CONSTRAINT `FK_E6CE4384E7A1254A`", sql)
+        self.assertIn("ADD CONSTRAINT `FK_E6CE438443873EF4`", sql)
+        self.assertIn("ADD CONSTRAINT `FK_E6CE4384EC324F39`", sql)
+
+    def test_viber_schema_repair_skips_non_viber_selection(self) -> None:
+        install = SimpleNamespace(root="/var/www/ss/public_html", db=SimpleNamespace(table_prefix="ss_"))
+        rows = [{"bundle": "DemoBundle", "install_bundle": "DemoBundle", "item": {}}]
+
+        with patch("mcd_agent.plugins.MauticDB") as db_cls:
+            actions = _run_viber_schema_repairs(install, rows)
+
+        self.assertEqual(actions, [])
+        db_cls.assert_not_called()
 
     def test_plugin_config_metadata_patch_adds_metadata_without_core_patch(self) -> None:
         with TemporaryDirectory() as tmp:
