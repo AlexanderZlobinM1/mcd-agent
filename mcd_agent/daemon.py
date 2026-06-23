@@ -6243,16 +6243,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 for comp in components:
                     if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
                         continue
-                    res = service_profiles_apply_once(config, component=comp, dry_run=False)
+                    # Automatic service-profile runs are advisory only. Writing
+                    # host configs or changing packages requires an explicit
+                    # operator command through mcd-cli service-profile
+                    # apply/rescan.
+                    res = service_profiles_apply_once(config, component=comp, dry_run=True)
                     status = str(res.get("status", "")).strip().lower()
                     if status == "ok":
                         applied = res.get("apply")
                         if isinstance(applied, dict):
-                            logging.info("service-profile %s apply: %s", comp, applied.get("status", "ok"))
+                            logging.info("service-profile %s advisory check: %s", comp, applied.get("status", "ok"))
                     elif status == "skipped":
                         logging.info("service-profile %s skipped: %s", comp, res.get("reason", "-"))
                     else:
-                        logging.warning("service-profile %s apply failed: %s", comp, res.get("reason", "unknown"))
+                        logging.warning("service-profile %s advisory check failed: %s", comp, res.get("reason", "unknown"))
                 next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
             except Exception as e:
                 logging.warning("service-profile auto-apply failed: %s", e)

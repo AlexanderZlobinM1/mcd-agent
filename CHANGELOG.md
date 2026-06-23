@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.170 - 2026-06-23
+
+- Safety: service-profile daemon runs are now advisory-only dry runs. MCD no
+  longer rewrites MySQL, PHP-FPM, sysctl, APT, Wazuh, or DB index state from the
+  automatic loop; real mutations require an explicit `mcd-cli service-profile
+  apply` or `rescan` operator command.
+- Fixed: Galera/PXC MySQL service-profile sanitization now preserves operational
+  connection headroom by flooring cluster `max_connections` at 2000,
+  `thread_cache_size` at 256, and `open_files_limit` at 262144 instead of
+  rewriting large clusters back to the unsafe 600-connection profile.
+- Fixed: Mautic DB index maintenance now imports `pymysql.err` explicitly so
+  duplicate-index race handling keeps working with current PyMySQL builds.
+
 ## 0.9.169 - 2026-06-23
 
 - Added: APT service profiles can now install and configure `zabbix-agent2`

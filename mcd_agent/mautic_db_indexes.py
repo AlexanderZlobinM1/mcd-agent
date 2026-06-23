@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import types
 from typing import Any
 
 import pymysql
@@ -17,6 +18,12 @@ _LOCAL_SOCKET_CANDIDATES = (
     "/var/run/mysqld/mysqld.sock",
     "/tmp/mysql.sock",
 )
+
+_PYMYSQL_ERR = getattr(pymysql, "err", None)
+if _PYMYSQL_ERR is None:
+    _PYMYSQL_ERR = types.SimpleNamespace(OperationalError=Exception)
+    setattr(pymysql, "err", _PYMYSQL_ERR)
+_PYMYSQL_OPERATIONAL_ERROR = getattr(_PYMYSQL_ERR, "OperationalError", Exception)
 
 
 @dataclass(frozen=True)
@@ -135,13 +142,13 @@ def _drop_index_sql(table_name: str, index_name: str) -> str:
     )
 
 
-def _is_too_many_indexes_error(exc: pymysql.err.OperationalError) -> bool:
+def _is_too_many_indexes_error(exc: _PYMYSQL_OPERATIONAL_ERROR) -> bool:
     code = int(exc.args[0]) if exc.args else 0
     message = str(exc).lower()
     return code == 1069 or "too many keys" in message or "max 64 keys" in message
 
 
-def _is_duplicate_key_error(exc: pymysql.err.OperationalError) -> bool:
+def _is_duplicate_key_error(exc: _PYMYSQL_OPERATIONAL_ERROR) -> bool:
     code = int(exc.args[0]) if exc.args else 0
     message = str(exc).lower()
     return code == 1061 or "duplicate key name" in message
@@ -196,7 +203,7 @@ def apply_mautic_db_indexes_to_install(
                     cur.execute(f"SET SESSION innodb_lock_wait_timeout={max(1, int(lock_wait_timeout_sec))}")
                     cur.execute(sql)
                 applied.append(idx.name)
-            except pymysql.err.OperationalError as exc:
+            except _PYMYSQL_OPERATIONAL_ERROR as exc:
                 code = int(exc.args[0]) if exc.args else 0
                 if code in {1205, 1213}:
                     return {
@@ -230,7 +237,7 @@ def apply_mautic_db_indexes_to_install(
                                 existing.pop(fax_idx, None)
                             cur.execute(sql)
                         applied.append(idx.name)
-                    except pymysql.err.OperationalError as retry_exc:
+                    except _PYMYSQL_OPERATIONAL_ERROR as retry_exc:
                         retry_code = int(retry_exc.args[0]) if retry_exc.args else 0
                         if retry_code in {1205, 1213}:
                             return {
