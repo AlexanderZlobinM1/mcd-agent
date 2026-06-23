@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.173 - 2026-06-23
+
+- Fixed: Viber plugin install/update now runs a narrow schema repair after
+  Mautic plugin reload. MCD creates the missing `viber_message_alerts` table
+  and adds the missing `viber_message_stats` foreign keys/indexes
+  idempotently, while clearing orphan references before constraint creation.
+  This avoids unsafe full `doctrine:schema:update --force` runs on production
+  instances.
+
 ## 0.9.172 - 2026-06-23
 
 - Fixed: backup profile verification release aligned with MCC storage-asset auth
