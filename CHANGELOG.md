@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.176 - 2026-06-25
+
+- Fixed: Composer migration now marks the old ZIP root as retired after a
+  successful vhost switch, and discovery skips retired roots. This prevents the
+  MCC cache from keeping the old ZIP install as the active instance after the
+  web server has moved to the Composer docroot.
+
 ## 0.9.175 - 2026-06-25
 
 - Fixed: Composer migration now rewrites nginx `fastcgi_pass` to the selected

@@ -19,6 +19,8 @@ from mcd_agent.nginx_baseline import (
     normalize_legacy_http2_listen,
 )
 
+RETIRED_INSTANCE_MARKER = ".mcd-retired-after-composer-move"
+
 
 @dataclass
 class ComposerMovePlan:
@@ -237,6 +239,19 @@ def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
     return {"active": str(plan.site_available), "backup": str(backup)}
 
 
+def _mark_source_root_retired(plan: ComposerMovePlan) -> str:
+    marker = plan.source_root / RETIRED_INSTANCE_MARKER
+    payload = {
+        "reason": "composer_move_completed",
+        "domain": plan.domain,
+        "target_root": str(plan.target_root),
+        "nginx_root": str(plan.nginx_root),
+        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(marker)
+
+
 def _preflight(plan: ComposerMovePlan) -> list[str]:
     problems: list[str] = []
     if os.geteuid() != 0:
@@ -316,6 +331,7 @@ def move_zip_to_composer(
             if rc != 0:
                 raise RuntimeError("nginx -t failed: " + out)
             _run(["systemctl", "reload", "nginx"], timeout_sec=30)
+            retired_marker = _mark_source_root_retired(plan)
         except Exception:
             shutil.rmtree(plan.target_root.parent, ignore_errors=True)
             raise
@@ -336,6 +352,7 @@ def move_zip_to_composer(
         "copied": copied,
         "local_php_path_patched": path_patched,
         "runtime_dirs": runtime_dirs,
+        "source_retired_marker": retired_marker,
         "vhost": vhost,
         "instances": count,
     }
