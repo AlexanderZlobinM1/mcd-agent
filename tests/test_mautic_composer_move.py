@@ -5,11 +5,13 @@ import unittest
 from pathlib import Path
 
 import mcd_agent.mautic_composer_move as mautic_composer_move
+from mcd_agent.discovery import _is_retired_instance_root
 from mcd_agent.mautic_composer_move import (
     ComposerMovePlan,
     _copy_mutable_state,
     _ensure_runtime_dirs,
     _image_ref_for_major,
+    _mark_source_root_retired,
     _patch_paths_in_local_php,
     _php_version_for_major,
     _short,
@@ -183,6 +185,31 @@ class ComposerMoveHelpersTest(unittest.TestCase):
             self.assertIn("^/app/assets/", text)
             self.assertLess(text.index("^/app/assets/"), text.index("location ~ /app/"))
             self.assertIn("http2 on;", text)
+
+    def test_composer_move_retired_marker_hides_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "zip"
+            target = base / "composer"
+            nginx_root = target / "docroot"
+            source.mkdir()
+            nginx_root.mkdir(parents=True)
+            plan = ComposerMovePlan(
+                source_root=source,
+                target_root=target,
+                nginx_root=nginx_root,
+                domain="example.com",
+                image_ref="composer6-skeleton",
+                php_version="8.3",
+                site_available=base / "site.conf",
+                site_enabled=None,
+            )
+
+            marker = _mark_source_root_retired(plan)
+
+            self.assertTrue(Path(marker).exists())
+            self.assertTrue(_is_retired_instance_root(str(source)))
+            self.assertIn(str(target), Path(marker).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
