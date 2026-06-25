@@ -223,6 +223,12 @@ def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
             raise RuntimeError(f"no nginx root directive found in {plan.site_available}")
     else:
         text = text.replace(old, new)
+    target_sock = f"unix:/var/run/php/php{plan.php_version}-fpm.sock"
+    text = re.sub(
+        r"unix:/(?:var/)?run/php/php[0-9]+\.[0-9]+-fpm\.sock",
+        target_sock,
+        text,
+    )
     text = ensure_mautic_public_app_asset_locations(text)
     text = normalize_legacy_http2_listen(text, modern_http2=_nginx_supports_http2_directive())
     plan.site_available.write_text(text, encoding="utf-8")
