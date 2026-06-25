@@ -148,6 +148,7 @@ class ComposerMoveHelpersTest(unittest.TestCase):
     listen 443 ssl http2;
     server_name example.com;
     root SOURCE_ROOT;
+    fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
 
     location ~ /app/ {
         deny all;
@@ -176,6 +177,8 @@ class ComposerMoveHelpersTest(unittest.TestCase):
 
             text = site.read_text(encoding="utf-8")
             self.assertIn(f"root {nginx_root};", text)
+            self.assertIn("fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;", text)
+            self.assertNotIn("php8.2-fpm.sock", text)
             self.assertIn("^/app/bundles/.*/Assets/", text)
             self.assertIn("^/app/assets/", text)
             self.assertLess(text.index("^/app/assets/"), text.index("location ~ /app/"))

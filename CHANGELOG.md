@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.175 - 2026-06-25
+
+- Fixed: Composer migration now rewrites nginx `fastcgi_pass` to the selected
+  PHP-FPM socket when switching the vhost to the Composer `docroot`. This avoids
+  leaving Composer Mautic 6/7 installs behind an older PHP-FPM service after a
+  successful move.
+
 ## 0.9.174 - 2026-06-23
 
 - Changed: removed the Viber-specific schema repair from the generic plugin
