@@ -198,6 +198,18 @@ def _format_remote_dir(root_dir: str, instance_name: str) -> str:
     return f"{base}/{name}"
 
 
+def _is_deleted_instances_remote_root(value: str | None) -> bool:
+    cleaned = str(value or "").strip().strip("/").lower()
+    return cleaned == "mcc/deleted-instances" or cleaned.endswith("/deleted-instances")
+
+
+def _host_backup_remote_root_dir(cfg: AgentConfig) -> str:
+    root = str(cfg.backup_remote_root_dir or "backup").strip().strip("/")
+    if _is_deleted_instances_remote_root(root):
+        return "backup"
+    return root or "backup"
+
+
 def _write_marker(path: Path, payload: dict[str, Any]) -> None:
     _json_write(path / ".mcd-backup.json", payload)
 
@@ -316,6 +328,102 @@ def _write_storage_backup_manifest_and_index(
     except Exception:
         # Indexing must never turn a completed backup into a failed backup.
         return
+
+
+def _write_storage_index_entry(mount_path: Path, manifest_path: Path, manifest: dict[str, Any]) -> None:
+    manifest_rel = _path_rel_to(mount_path, manifest_path)
+    index_entry = dict(manifest)
+    index_entry["manifest_path"] = manifest_rel
+    index_entry["backup_dir"] = _path_rel_to(mount_path, manifest_path.parent)
+    digest = re.sub(r"[^A-Za-z0-9_.-]+", "-", index_entry["backup_dir"]).strip(".-")
+    if not digest:
+        digest = f"backup-{int(time.time())}"
+    index_dir = mount_path / "mcc-backups-index.d"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    _json_write(index_dir / f"{digest[:160]}.json", index_entry)
+
+
+def _write_host_backup_instance_manifests(
+    *,
+    mount_path: Path,
+    backup_dir: Path,
+    marker: dict[str, Any],
+    instances: list[MauticInstall],
+) -> None:
+    if str(marker.get("method") or "").strip().lower() != "mydumper":
+        return
+    dumped_raw = marker.get("dumped_instances")
+    if not isinstance(dumped_raw, list) or not dumped_raw:
+        return
+    by_uid: dict[str, MauticInstall] = {}
+    by_name: dict[str, MauticInstall] = {}
+    by_db: dict[str, MauticInstall] = {}
+    for inst in instances:
+        if inst.instance_uid:
+            by_uid[str(inst.instance_uid)] = inst
+        if inst.name:
+            by_name[str(inst.name)] = inst
+        if inst.db and inst.db.name:
+            by_db[str(inst.db.name)] = inst
+    files_archive = backup_dir / "files.tar.gz"
+    if not files_archive.exists():
+        files_archive = backup_dir / str(marker.get("files_archive_path") or "").split("/")[-1]
+    host_backup_rel = _path_rel_to(mount_path, backup_dir)
+    for raw in dumped_raw:
+        if not isinstance(raw, dict):
+            continue
+        uid = str(raw.get("instance_uid") or "").strip()
+        name = str(raw.get("instance_name") or "").strip()
+        db_name = str(raw.get("database") or "").strip()
+        inst = by_uid.get(uid) or by_name.get(name) or by_db.get(db_name)
+        if inst is None:
+            continue
+        sidecar_dir = backup_dir.parent / "instances" / _instance_slug(inst) / backup_dir.name
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        db_rel = str(raw.get("path") or "").strip()
+        if not db_rel and uid and db_name:
+            db_rel = f"databases/{uid}__{db_name}"
+        db_path = backup_dir / db_rel if db_rel else Path()
+        files_asset: dict[str, Any] = {}
+        if files_archive.exists() and files_archive.is_file():
+            files_asset = {
+                "path": _path_rel_to(sidecar_dir, files_archive),
+                "bytes": _asset_bytes(files_archive),
+                "type": "tar.gz",
+                "shared_host_archive": True,
+            }
+        db_asset: dict[str, Any] = {}
+        if db_path.exists():
+            db_asset = {
+                "path": _path_rel_to(sidecar_dir, db_path),
+                "bytes": _asset_bytes(db_path),
+                "type": "directory",
+            }
+        source_domain = inst.primary_domain or inst.name or name or uid
+        manifest = {
+            "schema": "mcc.backup.manifest.v1",
+            "kind": "mcc.instance_backup.from_host_mydumper",
+            "label": source_domain,
+            "created_at_utc": str(marker.get("ts_utc") or _utc_now_iso()),
+            "source_host": str(marker.get("host_name") or ""),
+            "source_domain": source_domain,
+            "source_webroot": str(inst.root or raw.get("root") or ""),
+            "source_database": db_name,
+            "source_instance_uid": uid,
+            "mautic_major": int(inst.mautic_major or marker.get("mautic_major") or 0),
+            "mautic_version": str(getattr(inst, "mautic_version", "") or marker.get("mautic_version") or ""),
+            "method": "mydumper",
+            "backup_path": _path_rel_to(mount_path, sidecar_dir),
+            "parent_backup_dir": host_backup_rel,
+            "bytes_written": int(raw.get("bytes") or 0),
+            "files_asset": files_asset,
+            "db_asset": db_asset,
+            "restore_scope": "instance",
+            "restorable_as_image": bool(files_asset.get("path") and db_asset.get("path")),
+        }
+        manifest_path = sidecar_dir / "mcc-backup-manifest.json"
+        _json_write(manifest_path, manifest)
+        _write_storage_index_entry(mount_path, manifest_path, manifest)
 
 
 def _verify_dump_dir(path: Path) -> tuple[bool, str, int]:
@@ -459,6 +567,13 @@ def _prune_by_copies(
         shutil.rmtree(old, ignore_errors=True)
         removed.append(old.name)
         removed_paths.append(old)
+        sidecar_parent = parent / "instances"
+        if sidecar_parent.exists() and sidecar_parent.is_dir():
+            for inst_dir in sidecar_parent.iterdir():
+                sidecar = inst_dir / old.name
+                if sidecar.exists() and sidecar.is_dir() and not sidecar.is_symlink():
+                    shutil.rmtree(sidecar, ignore_errors=True)
+                    removed_paths.append(sidecar)
     _prune_storage_index_entries(mount_path, removed_paths)
     return removed
 
@@ -1139,6 +1254,8 @@ def backup_profile_set(
 ) -> dict[str, Any]:
     current = backup_profile_get(cfg) if merge else {}
     merged = _deep_merge(current, payload)
+    if "remote_root_dir" not in payload and _is_deleted_instances_remote_root(str(merged.get("remote_root_dir") or "")):
+        merged["remote_root_dir"] = "backup"
     prepare_result: dict[str, Any] | None = None
     if prepare_check:
         prepare_result = _backup_profile_prepare_check(cfg, merged)
@@ -4258,8 +4375,15 @@ def _select_instance_for_backup(instances: list[MauticInstall], selector: str | 
     raise RuntimeError(f"instance not found for backup selector: {raw}")
 
 
-def _instance_remote_parent(cfg: AgentConfig, mount_path: Path, host_name: str, inst: MauticInstall) -> Path:
-    base = str(cfg.backup_remote_root_dir or "backup").strip().strip("/")
+def _instance_remote_parent(
+    cfg: AgentConfig,
+    mount_path: Path,
+    host_name: str,
+    inst: MauticInstall,
+    *,
+    remote_root_dir: str | None = None,
+) -> Path:
+    base = str(remote_root_dir or cfg.backup_remote_root_dir or "backup").strip().strip("/")
     parts = [p for p in [base, host_name, "instances", _instance_slug(inst)] if p]
     current = mount_path
     for part in parts:
@@ -4267,7 +4391,12 @@ def _instance_remote_parent(cfg: AgentConfig, mount_path: Path, host_name: str, 
     return current
 
 
-def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupResult:
+def backup_instance_run(
+    config: AgentConfig,
+    root: str | None = None,
+    *,
+    remote_root_dir: str | None = None,
+) -> BackupResult:
     cfg = _effective_cfg(replace(config, backup_method="mydumper"))
     state_path = _state_path(cfg)
     state = _json_read(state_path)
@@ -4298,7 +4427,7 @@ def backup_instance_run(config: AgentConfig, root: str | None = None) -> BackupR
         if not inst.db:
             raise RuntimeError(f"instance has no DB credentials: {inst.name}")
         effective_db = _effective_db_for_instance(cfg, inst)
-        remote_parent = _instance_remote_parent(cfg, mount_path, host_name, inst)
+        remote_parent = _instance_remote_parent(cfg, mount_path, host_name, inst, remote_root_dir=remote_root_dir)
         backup_name = _fmt_local_ts()
         tmp_dir = remote_parent / f".incomplete-{backup_name}"
         final_dir = remote_parent / backup_name
@@ -4530,7 +4659,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
     lock_path = _lock_path(cfg)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
-    remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, host_name)
+    remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), host_name)
     date_dir = _fmt_local_date()
     tmp_dir = remote_parent / f".incomplete-{date_dir}-{_fmt_local_ts()}"
     final_dir = remote_parent / date_dir
@@ -4582,6 +4711,19 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
         if final_dir.exists():
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").strip().lower() == "ok":
+                _write_storage_backup_manifest_and_index(
+                    mount_path=mount_path,
+                    backup_dir=final_dir,
+                    marker=marker,
+                    kind=f"mcc.host_backup.{method}",
+                )
+                if method == "mydumper":
+                    _write_host_backup_instance_manifests(
+                        mount_path=mount_path,
+                        backup_dir=final_dir,
+                        marker=marker,
+                        instances=instances,
+                    )
                 duration = int(time.monotonic() - start_monotonic)
                 storage_usage = _storage_usage(mount_path)
                 existing_bytes: int | None
@@ -4711,6 +4853,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                         "database": effective_db.name,
                         "method": "mydumper",
                         "bytes": one_bytes,
+                        "path": _path_rel_to(tmp_dir, db_dir),
                     }
                 )
         bytes_written = total_bytes
@@ -4793,6 +4936,13 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             marker=marker,
             kind=f"mcc.host_backup.{method}",
         )
+        if method == "mydumper":
+            _write_host_backup_instance_manifests(
+                mount_path=mount_path,
+                backup_dir=final_dir,
+                marker=marker,
+                instances=instances,
+            )
 
         duration = int(time.monotonic() - start_monotonic)
         success_state = dict(run_state)
@@ -4914,7 +5064,7 @@ def backup_preflight(config: AgentConfig, root: str | None = None) -> BackupResu
 
         host_name = _host_name(cfg)
         mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
-        remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, host_name)
+        remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), host_name)
         probe_dir = remote_parent / f".preflight-{_fmt_local_ts()}"
         _mount(cfg, mount_path)
         try:
@@ -4980,7 +5130,7 @@ def backup_restore(
     state = _json_read(state_path)
     host_name = _host_name(cfg)
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
-    remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, host_name)
+    remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), host_name)
     start_monotonic = time.monotonic()
 
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -5282,7 +5432,7 @@ def backup_prune(config: AgentConfig, root: str | None = None) -> BackupResult:
     cfg = _effective_cfg(config)
     _validate_cfg(cfg)
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
-    remote_parent = mount_path / _format_remote_dir(cfg.backup_remote_root_dir, _host_name(cfg))
+    remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), _host_name(cfg))
     removed: list[str] = []
     try:
         _mount(cfg, mount_path)
