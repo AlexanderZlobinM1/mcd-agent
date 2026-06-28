@@ -341,6 +341,16 @@ Important:
 - Mautic timezone:
   - parsed from `local.php` (`default_timezone`/`timezone`) and stored in instance inventory
   - used for quiet-window jobs (contacts cleanup) so daemon behavior follows instance timezone.
+- Per-instance PHP runtime:
+  - Mautic `local.php` remains the source of truth for instance timezone; MCD does not duplicate it in `.mcd/` runtime metadata.
+  - `mcd-cli instance-runtime status --json` reports which nginx vhost files can be materialized.
+  - `mcd-cli instance-runtime apply` generates per-instance PHP-FPM pools in `/opt/mcd/generated/php/<version>/fpm/pools/`.
+  - MCD connects those pools through one FPM include file `/etc/php/<version>/fpm/pool.d/99-mcd.conf` containing `include=/etc/php/<version>/fpm/pool.d/mcd/*.conf`.
+  - `/etc/php/<version>/fpm/pool.d/mcd` is a symlink to the generated pools directory; individual pool files are not scattered in `/etc`.
+  - Matching nginx vhosts are rewritten from the shared socket (`/run/php/php<version>-fpm.sock`) to the instance socket (`/run/php/php<version>-fpm-mcd-<slug>.sock`).
+  - MCD also writes `/opt/mcd/generated/instances/<slug>/php`, a CLI wrapper with the same timezone and PHP limits for `bin/console` execution, and links it from `{instance}/.mcd/php`.
+  - Global `conf.d/*.ini` files are host-wide and must not be used for per-instance timezone. Web isolation requires an FPM pool; CLI isolation requires the wrapper.
+  - Apply validates `php-fpm<version> -t` and `nginx -t` before reload and restores snapshots on validation failure.
 - Runtime execution user:
   - `runtime.mautic_run_as_user` (default `www-data`) is used for Mautic console commands.
 - Filesystem permissions watchdog:

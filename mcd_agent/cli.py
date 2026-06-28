@@ -76,6 +76,7 @@ from mcd_agent.executor import (
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.instance_delete import delete_instance_artifacts
+from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.instance_migrate import (
     collect_source_probe,
     finalize_target_relay,
@@ -1889,6 +1890,14 @@ def _build_parser() -> argparse.ArgumentParser:
     inst_migrate.add_argument("--wipe-target-db", action="store_true")
     inst_migrate.add_argument("--json", action="store_true")
 
+    inst_runtime = sub.add_parser("instance-runtime", help="Materialize per-instance PHP-FPM/CLI runtime")
+    inst_runtime.add_argument("--config", default=default_cfg)
+    inst_runtime.add_argument("op", choices=["status", "apply"], nargs="?", default="status")
+    inst_runtime.add_argument("--root", help="Instance root, uid, name, or primary domain")
+    inst_runtime.add_argument("--dry-run", action="store_true", help="Plan only; do not write files")
+    inst_runtime.add_argument("--no-reload", action="store_true", help="Do not reload php-fpm/nginx after a successful apply")
+    inst_runtime.add_argument("--json", action="store_true")
+
     upd = sub.add_parser("self-update", help="MCD self-update via MCC approved/test/lts/cluster channels")
     upd.add_argument("--config", default=default_cfg)
     upd.add_argument("op", choices=["check", "apply", "status"], nargs="?", default="status")
@@ -3479,6 +3488,50 @@ def main() -> int:
         else:
             print(format_source_probe_text(payload))
         return 0 if bool(payload.get("ok", False)) else 1
+
+    if args.cmd == "instance-runtime":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        inv = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inv, cfg)
+        installs = inv.list_instances()
+        dry_run = bool(args.dry_run) or str(args.op) == "status"
+        payload = apply_instance_runtime(
+            installs,
+            root=args.root,
+            dry_run=dry_run,
+            reload_services=not bool(args.no_reload),
+        )
+        if bool(args.json):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            print(
+                "instance runtime: status={status} changed={changed} dry_run={dry_run}".format(
+                    status=str(payload.get("status", "unknown")),
+                    changed=1 if bool(payload.get("changed")) else 0,
+                    dry_run=1 if bool(payload.get("dry_run")) else 0,
+                )
+            )
+            for row in payload.get("instances", []) if isinstance(payload.get("instances"), list) else []:
+                nginx_files = row.get("nginx_files", [])
+                php_versions = row.get("php_versions", [])
+                print(
+                    "root={root} status={status} timezone={timezone} php={php} files={files}{reason}".format(
+                        root=str(row.get("root") or ""),
+                        status=str(row.get("status") or ""),
+                        timezone=str(row.get("timezone") or ""),
+                        php=",".join(str(x) for x in php_versions if x),
+                        files=len(nginx_files) if isinstance(nginx_files, list) else 0,
+                        reason=(" reason=" + str(row.get("reason") or "")) if row.get("reason") else "",
+                    )
+                )
+            if payload.get("reason"):
+                print("reason=" + str(payload.get("reason")))
+        if str(payload.get("status")) == "ok" and not dry_run:
+            _push_state_after_change(cfg, "instance-runtime")
+        return 0 if str(payload.get("status")) == "ok" else 1
 
     if args.cmd == "self-update":
         cfg = load_config(args.config)

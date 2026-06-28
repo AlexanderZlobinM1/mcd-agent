@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.9.178 - 2026-06-28
+
+- Added: per-instance PHP runtime materialization. MCD now derives the
+  instance timezone from Mautic `local.php`, generates per-instance PHP-FPM
+  pools under `/opt/mcd/generated/php/<version>/fpm/pools`, includes them via
+  `/etc/php/<version>/fpm/pool.d/99-mcd.conf` and the `pool.d/mcd` symlink
+  directory, rewrites matching nginx vhosts to the instance socket, and writes
+  a matching CLI wrapper under `/opt/mcd/generated/instances/<slug>/php`.
+- Safety: instance runtime apply validates `php-fpm -t` and `nginx -t` before
+  reload and restores snapshots if validation fails.
+- Fixed: repairing only the generated FPM include/symlink now counts as a
+  runtime change and reloads PHP-FPM/nginx, so daemon self-repair cannot leave
+  a restored include unapplied.
+- Added: `mcd-cli instance-runtime status|apply` for operator inspection and
+  controlled convergence of per-instance PHP runtime.
+
 ## 0.9.176 - 2026-06-25
 
 - Fixed: Composer migration now marks the old ZIP root as retired after a
