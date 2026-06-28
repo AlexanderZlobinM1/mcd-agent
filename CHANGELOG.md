@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.179 - 2026-06-28
+
+- Fixed: per-instance runtime now detects legacy nginx PHP-FPM sockets written
+  as `/var/run/php/php<version>-fpm.sock` as well as `/run/php/...`. This covers
+  older single-instance vhosts such as AnanasMK and Benu and lets them receive
+  the per-instance FPM pool and CLI wrapper.
+
 ## 0.9.178 - 2026-06-28
 
 - Added: per-instance PHP runtime materialization. MCD now derives the
