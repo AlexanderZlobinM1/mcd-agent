@@ -18,7 +18,7 @@ NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 GENERATED_ROOT = Path("/opt/mcd/generated")
 BACKUP_ROOT = Path("/var/backups/mcd-instance-runtime")
 
-_FASTCGI_SHARED_RE = re.compile(r"fastcgi_pass\s+unix:/run/php/php(?P<version>\d+\.\d+)-fpm\.sock;")
+_FASTCGI_SHARED_RE = re.compile(r"fastcgi_pass\s+unix:/(?:var/)?run/php/php(?P<version>\d+\.\d+)-fpm\.sock;")
 _FASTCGI_MCD_RE = re.compile(r"fastcgi_pass\s+unix:/run/php/php(?P<version>\d+\.\d+)-fpm-mcd-[^;]+\.sock;")
 _SERVER_NAME_RE = re.compile(r"^\s*server_name\s+([^;]+);", flags=re.MULTILINE)
 _ROOT_RE = re.compile(r"^\s*root\s+([^;]+);", flags=re.MULTILINE)
