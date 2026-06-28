@@ -88,6 +88,7 @@ def render_mautic_command(
     console = _resolve_console_path(root)
     if not console:
         raise FileNotFoundError(f"Console not found in root: {root}")
+    php_bin = _resolve_instance_php_bin(root=root, php_bin=php_bin)
 
     render_params = dict(params)
     has_campaign_limit_param = "campaign_limit" in render_params
@@ -107,6 +108,16 @@ def render_mautic_command(
     if run_as_user:
         cmd = ["sudo", "-u", run_as_user] + cmd
     return cmd
+
+
+def _resolve_instance_php_bin(*, root: str, php_bin: str) -> str:
+    wrapper = Path(root) / ".mcd" / "php"
+    if not wrapper.exists():
+        return php_bin
+    requested = Path(str(php_bin or "")).name
+    if requested and not requested.startswith("php"):
+        return php_bin
+    return str(wrapper)
 
 
 def command_task_type(command: str) -> str | None:

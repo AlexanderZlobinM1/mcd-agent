@@ -59,6 +59,7 @@ from mcd_agent.executor import render_mautic_command
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
+from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
@@ -5716,6 +5717,24 @@ def _refresh_instance_db_maps(
             mautic_timezones_by_root.pop(root, None)
 
 
+def _apply_instance_runtime_guard(installs: list[MauticInstall], *, reason: str) -> None:
+    try:
+        payload = apply_instance_runtime(installs, reload_services=True)
+    except Exception as e:
+        logging.warning("instance runtime apply failed (%s): %s", reason, e)
+        return
+    status = str(payload.get("status", "")).strip().lower()
+    if status != "ok":
+        logging.warning("instance runtime apply failed (%s): %s", reason, payload.get("reason", "unknown"))
+        return
+    if bool(payload.get("changed", False)):
+        logging.info(
+            "instance runtime applied (%s): actions=%s",
+            reason,
+            ",".join(str(x) for x in payload.get("actions", []) if x) or "-",
+        )
+
+
 def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     logging.info("MCD loop started")
     base_config = config
@@ -5759,6 +5778,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         installs = inventory.list_instances()
     _sync_segment_whitelist_file(config, installs)
     _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
+    _apply_instance_runtime_guard(installs, reason="startup")
     segment_sql_rings: dict[str, deque[int]] = {}
     segment_sql_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
     segment_sql_active_sets: dict[str, set[int]] = {}
@@ -5900,6 +5920,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 )
                 count = inventory.rescan(config, preserve_manual=True)
                 installs = inventory.list_instances()
+                _apply_instance_runtime_guard(installs, reason="inventory-auto-rescan")
                 after_sig = "|".join(
                     sorted(f"{getattr(inst, 'instance_uid', '')}:{getattr(inst, 'root', '')}" for inst in installs)
                 )
@@ -6482,6 +6503,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         if now >= next_plan_refresh_at:
             installs = inventory.list_instances()
             _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
+            _apply_instance_runtime_guard(installs, reason="plan-refresh")
             logging.info("Instance inventory count: %d", len(installs))
             if (config.profile_name or "").strip().lower() == "passive":
                 for inst in installs:
