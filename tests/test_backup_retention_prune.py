@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcd_agent.backup import _backup_retention_candidate_dirs, _prune_by_copies
+from mcd_agent.backup import (
+    _backup_retention_candidate_dirs,
+    _prune_by_copies,
+    _write_host_backup_instance_manifests,
+)
+from mcd_agent.models import DBConfig, MauticInstall
 
 
 class BackupRetentionPruneTests(unittest.TestCase):
@@ -67,6 +72,89 @@ class BackupRetentionPruneTests(unittest.TestCase):
             self.assertTrue((index_dir / "20260620-010000.json").exists())
             self.assertFalse((index_dir / "20260619-010000.json").exists())
             self.assertFalse((index_dir / "20260618-010000.json").exists())
+
+    def test_prune_removes_host_backup_instance_sidecars_and_index_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mount = Path(td)
+            parent = mount / "backup" / "host-a"
+            for name in ("2026-06-18", "2026-06-19", "2026-06-20"):
+                (parent / name).mkdir(parents=True)
+                sidecar = parent / "instances" / "site-a.example.com" / name
+                sidecar.mkdir(parents=True)
+                (sidecar / "mcc-backup-manifest.json").write_text("{}\n", encoding="utf-8")
+            index_dir = mount / "mcc-backups-index.d"
+            index_dir.mkdir()
+            old_rel = "backup/host-a/instances/site-a.example.com/2026-06-18"
+            (index_dir / "old-sidecar.json").write_text(
+                json.dumps({"backup_dir": old_rel, "manifest_path": f"{old_rel}/mcc-backup-manifest.json"}) + "\n",
+                encoding="utf-8",
+            )
+
+            removed = _prune_by_copies(parent, 2, protected={parent / "2026-06-20"}, mount_path=mount)
+
+            self.assertEqual(removed, ["2026-06-18"])
+            self.assertFalse((parent / "2026-06-18").exists())
+            self.assertFalse((parent / "instances" / "site-a.example.com" / "2026-06-18").exists())
+            self.assertFalse((index_dir / "old-sidecar.json").exists())
+
+    def test_host_backup_writes_per_instance_sidecar_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mount = Path(td)
+            backup_dir = mount / "backup" / "host-a" / "2026-06-28"
+            db_dir = backup_dir / "databases" / "site-a__baza_site_a"
+            db_dir.mkdir(parents=True)
+            (db_dir / "metadata").write_text("ok\n", encoding="utf-8")
+            (db_dir / "table.sql.gz").write_text("sql\n", encoding="utf-8")
+            (backup_dir / "files.tar.gz").write_text("files\n", encoding="utf-8")
+            marker = {
+                "status": "ok",
+                "ts_utc": "2026-06-28T00:00:00+00:00",
+                "host_name": "host-a",
+                "method": "mydumper",
+                "dumped_instances": [
+                    {
+                        "instance_uid": "site-a",
+                        "instance_name": "site-a.example.com",
+                        "database": "baza_site_a",
+                        "bytes": 123,
+                        "path": "databases/site-a__baza_site_a",
+                    }
+                ],
+            }
+            inst = MauticInstall(
+                instance_uid="site-a",
+                name="site-a.example.com",
+                root="/var/www/site-a/public_html",
+                console_path="/var/www/site-a/public_html/bin/console",
+                primary_domain="site-a.example.com",
+                mautic_major=6,
+                db=DBConfig("localhost", 3306, "baza_site_a", "u", "p", ""),
+            )
+
+            _write_host_backup_instance_manifests(
+                mount_path=mount,
+                backup_dir=backup_dir,
+                marker=marker,
+                instances=[inst],
+            )
+
+            sidecar_manifest = (
+                mount
+                / "backup"
+                / "host-a"
+                / "instances"
+                / "site-a.example.com"
+                / "2026-06-28"
+                / "mcc-backup-manifest.json"
+            )
+            self.assertTrue(sidecar_manifest.exists())
+            payload = json.loads(sidecar_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(payload["kind"], "mcc.instance_backup.from_host_mydumper")
+            self.assertEqual(payload["source_domain"], "site-a.example.com")
+            self.assertEqual(payload["source_database"], "baza_site_a")
+            self.assertEqual(payload["parent_backup_dir"], "backup/host-a/2026-06-28")
+            self.assertEqual(payload["restore_scope"], "instance")
+            self.assertTrue((mount / "mcc-backups-index.d" / "backup-host-a-instances-site-a.example.com-2026-06-28.json").exists())
 
 
 if __name__ == "__main__":

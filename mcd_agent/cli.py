@@ -1960,6 +1960,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bkp.add_argument("--date", help="Restore from backup date folder YYYY-MM-DD")
     bkp.add_argument("--path", help="Restore from explicit backup path")
+    bkp.add_argument("--remote-root-dir", help="One-shot remote root override for instance-run")
     bkp.add_argument("--profile-json-file", help="JSON file with backup profile payload for profile-set")
     bkp.add_argument("--profile-json-stdin", action="store_true", help="Read backup profile JSON payload from stdin")
     bkp.add_argument("--replace", action="store_true", help="Replace backup profile payload instead of merge")
@@ -3806,7 +3807,7 @@ def main() -> int:
             _push_state_after_change(cfg, "backup-run")
             return 0 if res.ok else 1
         if args.op == "instance-run":
-            res = backup_instance_run(cfg, args.root)
+            res = backup_instance_run(cfg, args.root, remote_root_dir=args.remote_root_dir)
             if args.json:
                 print(
                     json.dumps(

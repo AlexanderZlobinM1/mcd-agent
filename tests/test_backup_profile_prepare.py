@@ -59,6 +59,28 @@ class BackupProfilePrepareTests(unittest.TestCase):
             self.assertEqual(persisted["storage"]["host"], "box")
             self.assertNotIn("_prepare_check", persisted)
 
+    def test_storage_only_profile_set_repairs_deleted_instances_remote_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _cfg(Path(td))
+
+            with patch("mcd_agent.backup._backup_profile_prepare_check", return_value={"status": "ok"}):
+                backup_profile_set(
+                    cfg,
+                    {
+                        "storage": {"host": "box", "user": "u", "password": "secret"},
+                        "remote_root_dir": "mcc/deleted-instances",
+                    },
+                    prepare_check=True,
+                )
+                backup_profile_set(
+                    cfg,
+                    {"storage": {"host": "box", "user": "u", "password": "secret"}},
+                    prepare_check=True,
+                )
+
+            persisted = backup_profile_get(cfg)
+            self.assertEqual(persisted["remote_root_dir"], "backup")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,21 @@
 # MCD Changelog
 
+## 0.9.180 - 2026-06-28
+
+- Fixed: regular host backups no longer inherit the pre-delete
+  `mcc/deleted-instances` remote root. Storage-only profile updates repair that
+  polluted root back to `backup`, and host backup run/preflight/prune/restore
+  defensively avoid using the deleted-instances namespace.
+- Added: host-level mydumper backups now publish per-instance sidecar
+  `mcc-backup-manifest.json` files and storage index entries. A single
+  multi-instance backup can therefore appear as separate MCC restore cards
+  without duplicating the stored backup payload.
+- Added: `mcd-cli backup instance-run --remote-root-dir <path>` for one-shot
+  pre-delete backup placement without persisting that path into the host's
+  normal backup profile.
+- Fixed: backup retention removes per-instance sidecar manifests/index entries
+  when the parent host backup date is pruned.
+
 ## 0.9.179 - 2026-06-28
 
 - Fixed: per-instance runtime now detects legacy nginx PHP-FPM sockets written
