@@ -1890,7 +1890,7 @@ def _build_parser() -> argparse.ArgumentParser:
     inst_migrate.add_argument("--wipe-target-db", action="store_true")
     inst_migrate.add_argument("--json", action="store_true")
 
-    inst_runtime = sub.add_parser("instance-runtime", help="Materialize per-instance PHP-FPM/CLI runtime")
+    inst_runtime = sub.add_parser("instance-runtime", help="Normalize instance PHP runtime")
     inst_runtime.add_argument("--config", default=default_cfg)
     inst_runtime.add_argument("op", choices=["status", "apply"], nargs="?", default="status")
     inst_runtime.add_argument("--root", help="Instance root, uid, name, or primary domain")

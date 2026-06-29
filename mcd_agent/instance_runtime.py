@@ -141,33 +141,6 @@ def _php_versions_for_file(text: str) -> set[str]:
     return {x for x in out if x}
 
 
-def _pool_conf(version: str, inst: MauticInstall, slug: str) -> str:
-    tz = _instance_timezone(inst)
-    sock = f"/run/php/php{version}-fpm-mcd-{slug}.sock"
-    root = str(Path(inst.root))
-    return f"""; Managed by MCD. Generated per-instance PHP-FPM pool.
-[mcd-{slug}]
-user = www-data
-group = www-data
-listen = {sock}
-listen.owner = www-data
-listen.group = www-data
-listen.mode = 0660
-chdir = {root}
-pm = ondemand
-pm.max_children = 12
-pm.process_idle_timeout = 20s
-pm.max_requests = 500
-php_admin_value[date.timezone] = {tz}
-php_admin_value[memory_limit] = 512M
-php_admin_value[max_execution_time] = 300
-php_admin_value[max_input_time] = 300
-php_admin_value[max_input_vars] = 5000
-php_admin_value[upload_max_filesize] = 64M
-php_admin_value[post_max_size] = 64M
-"""
-
-
 def _wrapper_script(version: str, inst: MauticInstall, slug: str) -> str:
     tz = _instance_timezone(inst)
     php = shutil.which(f"php{version}") or f"/usr/bin/php{version}"
@@ -239,37 +212,73 @@ def _restore_snapshots(snapshots: dict[Path, _Snapshot]) -> None:
                 shutil.copy2(snap.backup, path)
 
 
-def _install_fpm_include(version: str, backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+def _unlink_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _remove_file_if_exists(path: Path, backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    _snapshot(path, backup_dir, snapshots)
+    _unlink_path(path)
+    return True
+
+
+def _is_managed_include(path: Path) -> bool:
+    if not path.exists() or path.is_symlink():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "Managed by MCD" in text and "pool.d/mcd/*.conf" in text
+
+
+def _active_mcd_socket_versions() -> set[str]:
+    versions: set[str] = set()
+    for path in _active_nginx_files():
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        versions.update(m.group("version") for m in _FASTCGI_MCD_RE.finditer(text))
+    return {x for x in versions if x}
+
+
+def _cleanup_fpm_include_if_unused(version: str, backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
     actions: list[str] = []
+    if version in _active_mcd_socket_versions():
+        return actions
     pool_d = PHP_ETC_ROOT / version / "fpm" / "pool.d"
     include_file = pool_d / "99-mcd.conf"
     link = pool_d / "mcd"
     generated = GENERATED_ROOT / "php" / version / "fpm" / "pools"
-    pool_d.mkdir(parents=True, exist_ok=True)
-    _snapshot(include_file, backup_dir, snapshots)
-    _snapshot(link, backup_dir, snapshots)
-    generated.mkdir(parents=True, exist_ok=True)
+
+    if _is_managed_include(include_file):
+        if _remove_file_if_exists(include_file, backup_dir, snapshots):
+            actions.append(f"fpm_include_removed:{version}")
+
     if link.exists() or link.is_symlink():
-        if not link.is_symlink() or os.readlink(link) != str(generated):
-            if link.is_dir() and not link.is_symlink():
-                raise RuntimeError(f"refusing to replace non-symlink directory: {link}")
-            link.unlink()
-            link.symlink_to(generated)
-            actions.append(f"fpm_link:{version}")
-    else:
-        link.symlink_to(generated)
-        actions.append(f"fpm_link:{version}")
-    include_text = "; Managed by MCD. Includes generated per-instance FPM pools.\ninclude=/etc/php/{}/fpm/pool.d/mcd/*.conf\n".format(version)
-    if _write_if_changed(include_file, include_text):
-        actions.append(f"fpm_include:{version}")
+        if link.is_symlink() and os.readlink(link) == str(generated):
+            if _remove_file_if_exists(link, backup_dir, snapshots):
+                actions.append(f"fpm_link_removed:{version}")
+
     return actions
 
 
-def _rewrite_nginx_file(path: Path, version: str, slug: str) -> bool:
+def _cleanup_instance_pool(version: str, slug: str, backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> bool:
+    pool_path = GENERATED_ROOT / "php" / version / "fpm" / "pools" / f"mcd-{slug}.conf"
+    return _remove_file_if_exists(pool_path, backup_dir, snapshots)
+
+
+def _rewrite_nginx_file_to_shared(path: Path, version: str) -> bool:
     text = path.read_text(encoding="utf-8", errors="ignore")
-    new = _FASTCGI_SHARED_RE.sub(
+    new = _FASTCGI_MCD_RE.sub(
         lambda m: (
-            f"fastcgi_pass unix:/run/php/php{version}-fpm-mcd-{slug}.sock;"
+            f"fastcgi_pass unix:/run/php/php{version}-fpm.sock;"
             if m.group("version") == version
             else m.group(0)
         ),
@@ -307,6 +316,7 @@ def apply_instance_runtime(
     actions: list[str] = []
     changed = False
     fpm_versions: set[str] = set()
+    fpm_config_changed_versions: set[str] = set()
     results: list[dict[str, Any]] = []
     try:
         for inst in selected:
@@ -331,15 +341,10 @@ def apply_instance_runtime(
                 continue
             for version in sorted(inst_versions):
                 fpm_versions.add(version)
-                include_actions = _install_fpm_include(version, backup_dir, snapshots)
-                if include_actions:
+                if _cleanup_instance_pool(version, slug, backup_dir, snapshots):
                     changed = True
-                    actions.extend(include_actions)
-                pool_path = GENERATED_ROOT / "php" / version / "fpm" / "pools" / f"mcd-{slug}.conf"
-                _snapshot(pool_path, backup_dir, snapshots)
-                if _write_if_changed(pool_path, _pool_conf(version, inst, slug)):
-                    changed = True
-                    actions.append(f"pool:{slug}:{version}")
+                    fpm_config_changed_versions.add(version)
+                    actions.append(f"pool_removed:{slug}:{version}")
                 wrapper_dir = GENERATED_ROOT / "instances" / slug
                 wrapper_path = wrapper_dir / "php"
                 _snapshot(wrapper_path, backup_dir, snapshots)
@@ -362,12 +367,17 @@ def apply_instance_runtime(
                     actions.append(f"instance_wrapper:{slug}:{version}")
                 for path in matched:
                     _snapshot(path, backup_dir, snapshots)
-                    if _rewrite_nginx_file(path, version, slug):
+                    if _rewrite_nginx_file_to_shared(path, version):
                         changed = True
-                        actions.append(f"nginx:{path}:{slug}:{version}")
+                        actions.append(f"nginx_shared:{path}:{version}")
+                include_actions = _cleanup_fpm_include_if_unused(version, backup_dir, snapshots)
+                if include_actions:
+                    changed = True
+                    fpm_config_changed_versions.add(version)
+                    actions.extend(include_actions)
         if dry_run:
             return {"status": "ok", "changed": False, "dry_run": True, "instances": results, "actions": actions}
-        for version in sorted(fpm_versions):
+        for version in sorted(fpm_config_changed_versions):
             proc = _run([f"php-fpm{version}", "-t"], timeout_sec=30)
             if proc.returncode != 0:
                 raise RuntimeError(f"php-fpm{version} -t failed: {(proc.stderr or proc.stdout or '').strip()}")
@@ -377,7 +387,7 @@ def apply_instance_runtime(
                 raise RuntimeError(f"nginx -t failed: {(proc.stderr or proc.stdout or '').strip()}")
         reload_actions: list[str] = []
         if changed and reload_services:
-            for version in sorted(fpm_versions):
+            for version in sorted(fpm_config_changed_versions):
                 ok, msg = _service_reload(f"php{version}-fpm")
                 reload_actions.append(msg)
                 if not ok:
