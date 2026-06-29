@@ -123,11 +123,14 @@ def nginx_baseline_satisfied() -> bool:
     if SECURITY_HEADERS_SNIPPET.exists() and SECURITY_HEADERS_START not in _read_text(SECURITY_HEADERS_SNIPPET):
         return False
     modern_http2 = _nginx_supports_http2_directive()
+    strip_ipv6_listens = _ipv6_listen_forbidden()
     for path in _active_server_config_files():
         text = _read_text(path)
         if HARDENING_INCLUDE not in text:
             return False
         if ensure_mautic_public_app_asset_locations(text) != text:
+            return False
+        if strip_ipv6_listens and remove_ipv6_listen_directives(text) != text:
             return False
         if normalize_legacy_http2_listen(text, modern_http2=modern_http2) != text:
             return False
@@ -343,6 +346,33 @@ def _nginx_supports_http2_directive() -> bool:
     return bool(version and version >= (1, 25, 1))
 
 
+def _ipv6_listen_forbidden() -> bool:
+    try:
+        from mcd_agent.env import ipv6_runtime_disabled, ipv6_status
+
+        return ipv6_runtime_disabled(ipv6_status()) is True
+    except Exception:
+        return False
+
+
+_IPV6_LISTEN_RE = re.compile(r"^\s*listen\s+\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\](?::\d+)?(?:\s+[^;#]*)?\s*;", re.IGNORECASE)
+
+
+def remove_ipv6_listen_directives(text: str) -> str:
+    if "[" not in text or "listen" not in text:
+        return text
+    out: list[str] = []
+    changed = False
+    for raw in text.splitlines():
+        if not raw.lstrip().startswith("#") and _IPV6_LISTEN_RE.match(raw):
+            changed = True
+            continue
+        out.append(raw)
+    if not changed:
+        return text
+    return "\n".join(out).rstrip("\n") + ("\n" if text.endswith("\n") else "")
+
+
 def normalize_legacy_http2_listen(text: str, *, modern_http2: bool) -> str:
     """Convert deprecated `listen ... http2` syntax when nginx supports `http2 on`."""
     if not modern_http2 or "http2" not in text:
@@ -543,12 +573,16 @@ def _ensure_hardening_includes(backup_dir: Path, snapshots: dict[Path, _Snapshot
 def _ensure_server_config_normalization(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
     actions: list[str] = []
     modern_http2 = _nginx_supports_http2_directive()
+    strip_ipv6_listens = _ipv6_listen_forbidden()
     for path in _active_server_config_files():
         original = _read_text(path)
         if not original or "server" not in original:
             continue
         desired = ensure_mautic_public_app_asset_locations(original)
         asset_changed = desired != original
+        after_ipv6 = remove_ipv6_listen_directives(desired) if strip_ipv6_listens else desired
+        ipv6_changed = after_ipv6 != desired
+        desired = after_ipv6
         after_http2 = normalize_legacy_http2_listen(desired, modern_http2=modern_http2)
         http2_changed = after_http2 != desired
         desired = after_http2
@@ -558,6 +592,8 @@ def _ensure_server_config_normalization(backup_dir: Path, snapshots: dict[Path, 
         path.write_text(desired, encoding="utf-8")
         if asset_changed:
             actions.append(f"mautic_public_app_assets:{path.name}")
+        if ipv6_changed:
+            actions.append(f"ipv6_listen_removed:{path.name}")
         if http2_changed:
             actions.append(f"http2_listen_modernized:{path.name}")
     return actions

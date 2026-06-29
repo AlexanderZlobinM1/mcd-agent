@@ -31,6 +31,7 @@ from mcd_agent.nginx_baseline import (
     ensure_nginx_baseline,
     normalize_legacy_http2_listen,
 )
+from mcd_agent.nginx_templates import render_nginx_template
 
 
 _MIN_TARGET_HEADROOM_BYTES = 5 * 1024 * 1024 * 1024
@@ -760,36 +761,21 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
     server_names = " ".join(domains)
     cert_live = Path("/etc/letsencrypt/live") / primary
     ssl_block = ""
-    listen = "listen 80;\n    listen [::]:80;"
+    listen = "listen 80;"
     if (cert_live / "fullchain.pem").exists() and (cert_live / "privkey.pem").exists():
-        listen = "listen 80;\n    listen [::]:80;\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;"
+        listen = "listen 80;\n    listen 443 ssl http2;"
         ssl_block = f"""
     ssl_certificate /etc/letsencrypt/live/{primary}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{primary}/privkey.pem;
 """
-    content = f"""server {{
-    {listen}
-    server_name {server_names};
-    root {web_root};
-    index index.php index.html index.htm;
-{ssl_block}
-    client_max_body_size 128m;
-
-    location / {{
-        try_files $uri /index.php$is_args$args;
-    }}
-
-    location ~ \\.php$ {{
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:{sock};
-        fastcgi_read_timeout 300;
-    }}
-
-    location ~* ^/(?:app|bin|config|vendor|var)/ {{
-        deny all;
-    }}
-}}
-"""
+    content = render_nginx_template(
+        "instance_migrate_vhost.conf",
+        LISTEN_DIRECTIVES=listen,
+        SERVER_NAMES=server_names,
+        WEB_ROOT=web_root,
+        SSL_BLOCK=ssl_block,
+        FASTCGI_SOCKET=sock,
+    )
     content = ensure_mautic_public_app_asset_locations(content)
     content = normalize_legacy_http2_listen(content, modern_http2=_nginx_supports_http2_directive())
     site.write_text(content, encoding="utf-8")

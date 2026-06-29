@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+from importlib import resources
 
 from mcd_agent.models import DBConfig, MauticInstall
 import mcd_agent.instance_migrate as instance_migrate
@@ -363,6 +364,12 @@ class InstanceMigrateProbeTests(unittest.TestCase):
             finally:
                 instance_migrate.NGINX_SITES_AVAILABLE = old_available
                 instance_migrate.NGINX_SITES_ENABLED = old_enabled
+
+    def test_generated_target_nginx_vhost_is_ipv4_only(self) -> None:
+        template = resources.files("mcd_agent.templates.nginx").joinpath("instance_migrate_vhost.conf").read_text(encoding="utf-8")
+
+        self.assertIn("{{LISTEN_DIRECTIVES}}", template)
+        self.assertNotIn("listen [::]", template)
 
     def test_source_db_stream_prefers_mariadb_dump_without_events(self) -> None:
         class FakeInventory:
