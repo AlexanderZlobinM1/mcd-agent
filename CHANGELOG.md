@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.181 - 2026-06-29
+
+- Changed: instance runtime now rolls nginx vhosts back to the shared default
+  PHP-FPM socket instead of generating and selecting per-instance PHP-FPM
+  pools. The Mautic campaign date/time UI timezone issue is handled by the
+  Mautic Locale Fix plugin, so per-instance FPM pools are no longer needed.
+- Cleanup: instance runtime removes managed `mcd-*` pool files plus the
+  managed `pool.d/99-mcd.conf` include and `pool.d/mcd` symlink once no active
+  nginx vhost still references an MCD per-instance socket. The per-instance
+  `.mcd/php` CLI wrapper remains for stable console execution.
+
 ## 0.9.180 - 2026-06-28
 
 - Fixed: regular host backups no longer inherit the pre-delete
