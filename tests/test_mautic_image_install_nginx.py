@@ -4,6 +4,7 @@ import tempfile
 import sys
 import types
 import unittest
+from importlib import resources
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +41,12 @@ class MauticImageInstallNginxTests(unittest.TestCase):
             (root / "index.php").write_text("<?php\n", encoding="utf-8")
 
             self.assertEqual(_nginx_web_root(root), root)
+
+    def test_generated_nginx_vhost_is_ipv4_only(self) -> None:
+        template = resources.files("mcd_agent.templates.nginx").joinpath("mautic_image_vhost.conf").read_text(encoding="utf-8")
+
+        self.assertIn("listen 80;", template)
+        self.assertNotIn("listen [::]", template)
 
 
 class MauticImageInstallMysqlCredentialTests(unittest.TestCase):

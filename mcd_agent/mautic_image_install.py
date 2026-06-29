@@ -15,6 +15,7 @@ from typing import Any
 from urllib import request
 
 from mcd_agent.config import AgentConfig
+from mcd_agent.nginx_templates import render_nginx_template
 
 
 @dataclass
@@ -536,36 +537,12 @@ def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
     site = Path("/etc/nginx/sites-available") / f"{plan.domain}.conf"
     site.parent.mkdir(parents=True, exist_ok=True)
     web_root = _nginx_web_root(plan.webroot)
-    content = f"""server {{
-    listen 80;
-    listen [::]:80;
-    server_name {plan.domain};
-    root {web_root};
-    index index.php index.html;
-    client_max_body_size 128M;
-
-    location / {{
-        try_files $uri /index.php$is_args$args;
-    }}
-
-    location ~ \\.php$ {{
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php{plan.php_version}-fpm.sock;
-    }}
-
-    location ~* ^/(?:config|vendor|node_modules|tests|var|\\.git)(?:/|$) {{
-        deny all;
-    }}
-
-    location ~* ^/(?:composer\\.(?:json|lock)|package(?:-lock)?\\.json|yarn\\.lock|pnpm-lock\\.yaml|symfony\\.lock|webpack\\.config\\.js|tsconfig\\.json|phpunit\\.xml(?:\\.dist)?|codeception\\.yml|SECURITY\\.md|README(?:\\..*)?|CHANGELOG(?:\\..*)?|\\.env(?:\\..*)?)$ {{
-        deny all;
-    }}
-
-    location ~* /\\.(?!well-known/) {{
-        deny all;
-    }}
-}}
-"""
+    content = render_nginx_template(
+        "mautic_image_vhost.conf",
+        DOMAIN=plan.domain,
+        WEB_ROOT=web_root,
+        PHP_VERSION=plan.php_version,
+    )
     site.write_text(content, encoding="utf-8")
     enabled = Path("/etc/nginx/sites-enabled") / site.name
     enabled.parent.mkdir(parents=True, exist_ok=True)

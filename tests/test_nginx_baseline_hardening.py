@@ -58,6 +58,25 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertEqual(out.count("http2 on;"), 1)
         self.assertNotIn("ssl http2;", out)
 
+    def test_ipv6_listen_directives_are_removed_for_ipv4_only_hosts(self) -> None:
+        src = """server {
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # listen [::]:8080;
+    server_name example.com;
+}
+"""
+
+        out = nginx_baseline.remove_ipv6_listen_directives(src)
+
+        self.assertIn("listen 80;", out)
+        self.assertIn("listen 443 ssl;", out)
+        self.assertNotIn("listen [::]:80;", out)
+        self.assertNotIn("listen [::]:443 ssl;", out)
+        self.assertIn("# listen [::]:8080;", out)
+
     def test_server_config_normalization_updates_active_vhost(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -85,22 +104,74 @@ class NginxBaselineHardeningTests(unittest.TestCase):
             old_enabled = nginx_baseline.SITES_ENABLED
             old_conf_d = nginx_baseline.CONF_D
             old_http2 = nginx_baseline._nginx_supports_http2_directive
+            old_ipv6 = nginx_baseline._ipv6_listen_forbidden
             try:
                 nginx_baseline.SITES_AVAILABLE = available
                 nginx_baseline.SITES_ENABLED = enabled
                 nginx_baseline.CONF_D = root / "conf.d"
                 nginx_baseline._nginx_supports_http2_directive = lambda: True
+                nginx_baseline._ipv6_listen_forbidden = lambda: False
                 actions = nginx_baseline._ensure_server_config_normalization(backup, {})
             finally:
                 nginx_baseline.SITES_AVAILABLE = old_available
                 nginx_baseline.SITES_ENABLED = old_enabled
                 nginx_baseline.CONF_D = old_conf_d
                 nginx_baseline._nginx_supports_http2_directive = old_http2
+                nginx_baseline._ipv6_listen_forbidden = old_ipv6
 
             text = site.read_text(encoding="utf-8")
             self.assertIn("mautic_public_app_assets:example.com.conf", actions)
             self.assertIn("http2_listen_modernized:example.com.conf", actions)
             self.assertIn("^/app/assets/", text)
+            self.assertIn("http2 on;", text)
+
+    def test_server_config_normalization_removes_ipv6_listen_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            available = root / "sites-available"
+            enabled = root / "sites-enabled"
+            backup = root / "backup"
+            available.mkdir()
+            enabled.mkdir()
+            site = available / "example.com.conf"
+            site.write_text(
+                """server {
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name example.com;
+}
+""",
+                encoding="utf-8",
+            )
+            (enabled / site.name).symlink_to(site)
+
+            old_available = nginx_baseline.SITES_AVAILABLE
+            old_enabled = nginx_baseline.SITES_ENABLED
+            old_conf_d = nginx_baseline.CONF_D
+            old_http2 = nginx_baseline._nginx_supports_http2_directive
+            old_ipv6 = nginx_baseline._ipv6_listen_forbidden
+            try:
+                nginx_baseline.SITES_AVAILABLE = available
+                nginx_baseline.SITES_ENABLED = enabled
+                nginx_baseline.CONF_D = root / "conf.d"
+                nginx_baseline._nginx_supports_http2_directive = lambda: True
+                nginx_baseline._ipv6_listen_forbidden = lambda: True
+                actions = nginx_baseline._ensure_server_config_normalization(backup, {})
+            finally:
+                nginx_baseline.SITES_AVAILABLE = old_available
+                nginx_baseline.SITES_ENABLED = old_enabled
+                nginx_baseline.CONF_D = old_conf_d
+                nginx_baseline._nginx_supports_http2_directive = old_http2
+                nginx_baseline._ipv6_listen_forbidden = old_ipv6
+
+            text = site.read_text(encoding="utf-8")
+            self.assertIn("ipv6_listen_removed:example.com.conf", actions)
+            self.assertIn("http2_listen_modernized:example.com.conf", actions)
+            self.assertIn("listen 80;", text)
+            self.assertIn("listen 443 ssl;", text)
+            self.assertNotIn("[::]", text)
             self.assertIn("http2 on;", text)
 
     def test_insert_hardening_include_per_server_after_server_name(self) -> None:

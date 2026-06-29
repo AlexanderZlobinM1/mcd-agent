@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.182 - 2026-06-30
+
+- Fixed: new nginx vhosts created by Mautic image install and instance
+  migration are IPv4-only and no longer write `listen [::]` directives.
+- Changed: those generated nginx vhosts now come from package template files
+  under `mcd_agent/templates/nginx/`, so future vhost text changes can be made
+  by replacing templates rather than editing generator logic.
+- Fixed: nginx baseline normalization removes IPv6 `listen` directives from
+  active vhosts when the host reports IPv6 disabled through MCD environment
+  state.
+
 ## 0.9.181 - 2026-06-29
 
 - Changed: instance runtime now rolls nginx vhosts back to the shared default
