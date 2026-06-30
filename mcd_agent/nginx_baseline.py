@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,41 @@ BACKUP_ROOT = Path("/var/backups/mcd-nginx-baseline")
 SECURITY_HEADERS_START = "# mcd-security-headers-extra start"
 SECURITY_HEADERS_END = "# mcd-security-headers-extra end"
 MAUTIC_PUBLIC_APP_ASSETS_COMMENT = "MCD public Mautic app assets"
+CLOUDFLARE_REAL_IP_FILE = CONF_D / "10-mcd-cloudflare-real-ip.conf"
+CLOUDFLARE_REAL_IP_MARKER = "# Managed by MCD host baseline: trust Cloudflare edge and pass client IP to PHP/Mautic."
+CLOUDFLARE_REAL_IP_CIDRS = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+]
+_CLOUDFLARE_REAL_IP_PROFILE_KEYS = {
+    "cloudflare_real_ip_enabled",
+    "cloudflare_real_ip_target_file",
+    "cloudflare_real_ip_header",
+    "cloudflare_real_ip_cidrs",
+    "cloudflare_real_ip_set_real_ip_from",
+    "cloudflare_real_ip_recursive",
+    "cloudflare_real_ip_remove_when_disabled",
+}
 
 
 @dataclass
@@ -62,6 +98,16 @@ def _has_sites_enabled_include(text: str) -> bool:
         if not line or line.startswith("#"):
             continue
         if re.match(r"^include\s+/etc/nginx/sites-enabled/[^;]*;", line):
+            return True
+    return False
+
+
+def _has_conf_d_include(text: str) -> bool:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^include\s+/etc/nginx/conf\.d/[^;]*;", line):
             return True
     return False
 
@@ -109,6 +155,8 @@ def nginx_baseline_satisfied() -> bool:
     if NGINX_CONF.exists():
         text = _read_text(NGINX_CONF)
         if not _has_www_data_user(text):
+            return False
+        if not _has_conf_d_include(text):
             return False
         if not _has_sites_enabled_include(text):
             return False
@@ -196,20 +244,38 @@ def _desired_nginx_conf(text: str) -> tuple[str, list[str]]:
     if user_changed:
         actions.append("user_www_data")
 
-    text_after_user = "\n".join(out)
-    if _has_sites_enabled_include(text_after_user):
-        return text_after_user.rstrip("\n") + "\n", actions
-
-    inserted = False
-    final: list[str] = []
-    for raw in out:
-        final.append(raw)
-        if not inserted and re.match(r"^\s*http\s*\{", raw):
+    def insert_http_include(lines: list[str], directive: str) -> tuple[list[str], bool]:
+        inserted = False
+        out_lines: list[str] = []
+        for idx, raw in enumerate(lines):
+            out_lines.append(raw)
+            if inserted or not re.match(r"^\s*http\s*\{", raw):
+                continue
+            insert_at = len(out_lines)
+            while insert_at < len(lines):
+                nxt = lines[insert_at].strip()
+                if not nxt.startswith("include "):
+                    break
+                insert_at += 1
             indent = raw[: len(raw) - len(raw.lstrip())] + "    "
-            final.append(f"{indent}include /etc/nginx/sites-enabled/*.conf;")
+            out_lines.extend(lines[idx + 1:insert_at])
+            out_lines.append(f"{indent}{directive}")
+            out_lines.extend(lines[insert_at:])
             inserted = True
-    if inserted:
-        actions.append("sites_enabled_include")
+            return out_lines, True
+        return out_lines, False
+
+    final = list(out)
+    text_after_user = "\n".join(final)
+    if not _has_conf_d_include(text_after_user):
+        final, inserted = insert_http_include(final, "include /etc/nginx/conf.d/*.conf;")
+        if inserted:
+            actions.append("conf_d_include")
+    text_after_conf_d = "\n".join(final)
+    if not _has_sites_enabled_include(text_after_conf_d):
+        final, inserted = insert_http_include(final, "include /etc/nginx/sites-enabled/*.conf;")
+        if inserted:
+            actions.append("sites_enabled_include")
     return "\n".join(final).rstrip("\n") + "\n", actions
 
 
@@ -704,6 +770,201 @@ def _reload_nginx() -> tuple[bool, str]:
             return True, "nginx_reload:ok"
         return False, msg or "nginx reload failed"
     return True, "nginx_reload:skipped_no_service_manager"
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    raw = str(value or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def cloudflare_real_ip_profile_present(profile: dict[str, Any] | None) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    return any(key in profile for key in _CLOUDFLARE_REAL_IP_PROFILE_KEYS)
+
+
+def _cloudflare_real_ip_enabled(profile: dict[str, Any] | None) -> bool | None:
+    if not cloudflare_real_ip_profile_present(profile):
+        return None
+    return _as_bool((profile or {}).get("cloudflare_real_ip_enabled"), False)
+
+
+def _cloudflare_real_ip_target_file(profile: dict[str, Any] | None) -> Path:
+    raw = str((profile or {}).get("cloudflare_real_ip_target_file") or CLOUDFLARE_REAL_IP_FILE).strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = CONF_D / path
+    if path.suffix != ".conf":
+        raise ValueError("cloudflare real-ip target must be a .conf file")
+    try:
+        path.relative_to(CONF_D)
+    except ValueError:
+        raise ValueError("cloudflare real-ip target must live under /etc/nginx/conf.d") from None
+    return path
+
+
+def _cloudflare_real_ip_header(profile: dict[str, Any] | None) -> str:
+    raw = str((profile or {}).get("cloudflare_real_ip_header") or "CF-Connecting-IP").strip()
+    if not re.match(r"^[A-Za-z0-9_-]+$", raw):
+        raise ValueError("cloudflare real-ip header contains invalid characters")
+    return raw
+
+
+def _cloudflare_real_ip_cidrs(profile: dict[str, Any] | None) -> list[str]:
+    raw = None
+    if isinstance(profile, dict):
+        raw = profile.get("cloudflare_real_ip_cidrs")
+        if raw is None:
+            raw = profile.get("cloudflare_real_ip_set_real_ip_from")
+    src = raw if isinstance(raw, list) else CLOUDFLARE_REAL_IP_CIDRS
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in src:
+        try:
+            cidr = str(ipaddress.ip_network(str(item).strip(), strict=False))
+        except Exception:
+            continue
+        if cidr in seen:
+            continue
+        seen.add(cidr)
+        out.append(cidr)
+    return out or list(CLOUDFLARE_REAL_IP_CIDRS)
+
+
+def _desired_cloudflare_real_ip_config(profile: dict[str, Any] | None) -> str:
+    header = _cloudflare_real_ip_header(profile)
+    recursive = "on" if _as_bool((profile or {}).get("cloudflare_real_ip_recursive"), True) else "off"
+    lines = [CLOUDFLARE_REAL_IP_MARKER]
+    lines.extend(f"set_real_ip_from {cidr};" for cidr in _cloudflare_real_ip_cidrs(profile))
+    lines.append(f"real_ip_header {header};")
+    lines.append(f"real_ip_recursive {recursive};")
+    return "\n".join(lines) + "\n"
+
+
+def cloudflare_real_ip_state(profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        target = _cloudflare_real_ip_target_file(profile)
+        enabled = _cloudflare_real_ip_enabled(profile)
+        desired = _desired_cloudflare_real_ip_config(profile)
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
+    exists = target.exists()
+    current = _read_text(target) if exists else ""
+    included = _has_conf_d_include(_read_text(NGINX_CONF)) if NGINX_CONF.exists() else False
+    managed = CLOUDFLARE_REAL_IP_MARKER in current if current else False
+    matches = bool(exists and current == desired)
+    desired_cidrs = _cloudflare_real_ip_cidrs(profile)
+    current_cidrs = re.findall(r"^\s*set_real_ip_from\s+([^;#\s]+)\s*;", current, flags=re.MULTILINE)
+    current_header_match = re.search(r"^\s*real_ip_header\s+([^;#\s]+)\s*;", current, flags=re.MULTILINE)
+    current_header = current_header_match.group(1) if current_header_match else ""
+    recursive_on = bool(re.search(r"^\s*real_ip_recursive\s+on\s*;", current, flags=re.MULTILINE | re.IGNORECASE))
+
+    if enabled is True:
+        if not _nginx_present():
+            status = "pending"
+            message = "nginx is not installed"
+        elif not exists:
+            status = "missing"
+            message = f"{target} is missing"
+        elif not included:
+            status = "drift"
+            message = "nginx.conf does not include /etc/nginx/conf.d/*.conf"
+        elif not matches:
+            status = "drift"
+            message = "managed Cloudflare real-ip template differs from desired state"
+        else:
+            status = "ok"
+            message = f"{target} active"
+    elif enabled is False:
+        if exists and managed and _as_bool((profile or {}).get("cloudflare_real_ip_remove_when_disabled"), True):
+            status = "drift"
+            message = "managed Cloudflare real-ip file is present while edge mode is direct"
+        else:
+            status = "disabled"
+            message = "disabled by profile"
+    else:
+        status = "present" if exists else "absent"
+        message = f"{target} present" if exists else f"{target} absent"
+
+    return {
+        "status": status,
+        "message": message,
+        "enabled": enabled,
+        "target_file": str(target),
+        "exists": bool(exists),
+        "managed": bool(managed),
+        "matches": bool(matches),
+        "included": bool(included),
+        "real_ip_header": current_header,
+        "real_ip_recursive": "on" if recursive_on else ("off" if "real_ip_recursive" in current else ""),
+        "cidr_count": len(current_cidrs),
+        "desired_cidr_count": len(desired_cidrs),
+    }
+
+
+def ensure_cloudflare_real_ip(profile: dict[str, Any] | None, *, reload_service: bool = True) -> dict[str, Any]:
+    if not cloudflare_real_ip_profile_present(profile):
+        return {"status": "skipped", "reason": "profile_not_configured"}
+    if os.geteuid() != 0:
+        raise RuntimeError("cloudflare real-ip apply requires root")
+    target = _cloudflare_real_ip_target_file(profile)
+    enabled = _cloudflare_real_ip_enabled(profile) is True
+    remove_when_disabled = _as_bool((profile or {}).get("cloudflare_real_ip_remove_when_disabled"), True)
+    before = _read_text(target) if target.exists() else None
+
+    if not enabled:
+        if target.exists() and CLOUDFLARE_REAL_IP_MARKER in (before or "") and remove_when_disabled:
+            target.unlink()
+            test_ok, test_msg = _nginx_test()
+            if not test_ok:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(before or "", encoding="utf-8")
+                return {"status": "error", "reason": test_msg, "changed_files": [str(target)], "rolled_back": True}
+            actions = ["cloudflare_real_ip:removed", test_msg]
+            if reload_service:
+                reload_ok, reload_msg = _reload_nginx()
+                actions.append(reload_msg if reload_ok else "nginx_reload:failed")
+                if not reload_ok:
+                    return {"status": "error", "reason": reload_msg, "actions": actions, "changed_files": [str(target)]}
+            return {"status": "applied", "actions": actions, "changed_files": [str(target)], "state": cloudflare_real_ip_state(profile)}
+        return {"status": "disabled", "actions": ["cloudflare_real_ip:disabled"], "changed_files": [], "state": cloudflare_real_ip_state(profile)}
+
+    if not _nginx_present():
+        return {"status": "skipped", "reason": "nginx_absent"}
+
+    baseline = ensure_nginx_baseline(reload_service=False)
+    if str(baseline.get("status", "")).lower() == "error":
+        return {"status": "error", "reason": str(baseline.get("error", "nginx baseline failed")), "baseline": baseline}
+
+    desired = _desired_cloudflare_real_ip_config(profile)
+    if before == desired:
+        return {"status": "noop", "actions": ["cloudflare_real_ip:already_ok"], "changed_files": [], "state": cloudflare_real_ip_state(profile)}
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(desired, encoding="utf-8")
+    test_ok, test_msg = _nginx_test()
+    if not test_ok:
+        if before is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.write_text(before, encoding="utf-8")
+        return {"status": "error", "reason": test_msg, "changed_files": [str(target)], "rolled_back": True}
+
+    actions = ["cloudflare_real_ip:written", test_msg]
+    if isinstance(baseline.get("actions"), list):
+        actions.extend(f"nginx_baseline:{x}" for x in baseline.get("actions", []))
+    if reload_service:
+        reload_ok, reload_msg = _reload_nginx()
+        actions.append(reload_msg if reload_ok else "nginx_reload:failed")
+        if not reload_ok:
+            return {"status": "error", "reason": reload_msg, "actions": actions, "changed_files": [str(target)]}
+    return {"status": "applied", "actions": actions, "changed_files": [str(target)], "state": cloudflare_real_ip_state(profile)}
 
 
 def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
