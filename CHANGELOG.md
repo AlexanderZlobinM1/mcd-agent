@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.188 - 2026-06-30
+
+- Fixed: one-shot instance backups written under a `deleted-instances`
+  storage namespace are now manual-delete-only. `backup instance-run` records
+  `retention_skipped_reason=deleted_instances_manual_delete_only` for those
+  pre-delete backups and no longer prunes older deleted-instance backups by the
+  normal retention copy count. Regular host and instance backups keep their
+  existing retention behavior.
+
 ## 0.9.187 - 2026-06-30
 
 - Fixed: `backup profile-set` now accepts backup-level `enabled`, `method`,

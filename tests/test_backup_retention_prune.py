@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
 
 from mcd_agent.backup import (
     _backup_retention_candidate_dirs,
+    _instance_backup_retention_enabled,
     _prune_by_copies,
     _write_host_backup_instance_manifests,
 )
@@ -24,6 +26,20 @@ class BackupRetentionPruneTests(unittest.TestCase):
             names = [p.name for p in _backup_retention_candidate_dirs(parent)]
 
         self.assertEqual(names, ["20260620-010203", "2026-06-19"])
+
+    def test_deleted_instances_instance_backups_are_manual_delete_only(self) -> None:
+        cfg = SimpleNamespace(backup_remote_root_dir="backup")
+
+        self.assertTrue(_instance_backup_retention_enabled(cfg, None))  # type: ignore[arg-type]
+        self.assertTrue(_instance_backup_retention_enabled(cfg, "backup"))  # type: ignore[arg-type]
+        self.assertFalse(_instance_backup_retention_enabled(cfg, "mcc/deleted-instances"))  # type: ignore[arg-type]
+        self.assertFalse(_instance_backup_retention_enabled(cfg, "mcc/deleted-instances/zepter"))  # type: ignore[arg-type]
+        self.assertFalse(_instance_backup_retention_enabled(cfg, "/archive/deleted-instances/"))  # type: ignore[arg-type]
+
+    def test_persisted_deleted_instances_root_is_manual_delete_only(self) -> None:
+        cfg = SimpleNamespace(backup_remote_root_dir="mcc/deleted-instances")
+
+        self.assertFalse(_instance_backup_retention_enabled(cfg, None))  # type: ignore[arg-type]
 
     def test_prune_keeps_protected_current_backup_and_removes_old_index_entries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
