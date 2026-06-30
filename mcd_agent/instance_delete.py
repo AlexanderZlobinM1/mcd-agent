@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -334,6 +335,77 @@ def _plan_public(plan: InstanceDeletePlan) -> dict[str, Any]:
     }
 
 
+def _chmod_tree_for_delete(path: Path) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+    try:
+        walker = os.walk(path, topdown=False, onerror=lambda _exc: None)
+        for root, dirs, files in walker:
+            root_path = Path(root)
+            for name in files:
+                try:
+                    os.chmod(root_path / name, 0o600)
+                except Exception:
+                    pass
+            for name in dirs:
+                try:
+                    os.chmod(root_path / name, 0o700)
+                except Exception:
+                    pass
+            try:
+                os.chmod(root_path, 0o700)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _remaining_tree_entries(path: Path, *, limit: int = 20) -> list[str]:
+    out: list[str] = []
+    try:
+        for child in path.rglob("*"):
+            try:
+                out.append(str(child.relative_to(path)))
+            except Exception:
+                out.append(str(child))
+            if len(out) >= limit:
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _remove_instance_root(path: Path, *, attempts: int = 6, sleep_sec: float = 0.2) -> None:
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        if not path.exists():
+            return
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+            _chmod_tree_for_delete(path)
+            time.sleep(float(sleep_sec) * float(attempt + 1))
+            continue
+        if not path.exists():
+            return
+        last_error = OSError(f"directory still exists after rmtree: {path}")
+        _chmod_tree_for_delete(path)
+        time.sleep(float(sleep_sec) * float(attempt + 1))
+
+    remaining = _remaining_tree_entries(path)
+    detail = str(last_error or "directory still exists").strip()
+    if remaining:
+        detail += "; remaining entries: " + ", ".join(remaining)
+        if len(remaining) >= 20:
+            detail += ", ..."
+    raise RuntimeError(f"failed to remove instance root {path}: {detail}")
+
+
 def delete_instance_artifacts(
     cfg: AgentConfig,
     *,
@@ -406,7 +478,7 @@ def delete_instance_artifacts(
         if not plan.root.exists():
             result["warnings"].append(f"root already absent: {plan.root}")
         else:
-            shutil.rmtree(plan.root)
+            _remove_instance_root(plan.root)
             result["deleted"]["files"] = True
 
     try:
