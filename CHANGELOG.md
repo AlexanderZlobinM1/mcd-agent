@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.189 - 2026-06-30
+
+- Fixed: `mcd-cli instance-delete --delete-files` now removes the selected
+  instance root with retries and permission repair. Delete operations no longer
+  fail with `[Errno 39] Directory not empty` when the agent scanner or runtime
+  metadata recreates `.mcd` entries during the removal window, and failures now
+  report the remaining entries for diagnosis.
+
 ## 0.9.188 - 2026-06-30
 
 - Fixed: one-shot instance backups written under a `deleted-instances`

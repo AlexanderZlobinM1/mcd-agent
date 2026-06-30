@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import mcd_agent.instance_delete as instance_delete
 
@@ -65,6 +67,35 @@ class InstanceDeleteNginxTests(unittest.TestCase):
             (self.available / enabled.name).read_text(encoding="utf-8"),
             "server { server_name legacy.sales-snap.com; }\n",
         )
+
+    def test_remove_instance_root_retries_after_directory_not_empty(self) -> None:
+        root = Path(self.tmp.name) / "public_html"
+        (root / ".mcd").mkdir(parents=True)
+        (root / ".mcd" / "mautic.version").write_text("7.1.2\n", encoding="utf-8")
+        original_rmtree = shutil.rmtree
+        calls = 0
+
+        def flaky_rmtree(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("[Errno 39] Directory not empty")
+            original_rmtree(path)
+
+        with patch.object(instance_delete.shutil, "rmtree", side_effect=flaky_rmtree):
+            instance_delete._remove_instance_root(root, attempts=3, sleep_sec=0)
+
+        self.assertGreaterEqual(calls, 2)
+        self.assertFalse(root.exists())
+
+    def test_remove_instance_root_reports_remaining_entries(self) -> None:
+        root = Path(self.tmp.name) / "public_html"
+        (root / ".mcd").mkdir(parents=True)
+        (root / ".mcd" / "mautic.version").write_text("7.1.2\n", encoding="utf-8")
+
+        with patch.object(instance_delete.shutil, "rmtree", side_effect=OSError("[Errno 39] Directory not empty")):
+            with self.assertRaisesRegex(RuntimeError, r"mautic\.version"):
+                instance_delete._remove_instance_root(root, attempts=2, sleep_sec=0)
 
 
 if __name__ == "__main__":
