@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import contextlib
 import io
+from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from mcd_agent import cli
+import mcd_agent.instance_delete as instance_delete
+from mcd_agent.inventory import InstanceInventory
 
 
 class _Inventory:
@@ -67,6 +71,52 @@ class InstanceDeleteCliTests(unittest.TestCase):
             self.assertEqual(cli.main(), 0)
 
         self.assertEqual(calls, [{"root": "/var/www/ss/public_html", "allow_missing_absolute": True}])
+
+    def test_delete_plan_uses_inventory_db_when_local_php_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "public_html"
+            root.mkdir()
+            db_path = tmp_path / "mcd-state.db"
+            inv = InstanceInventory(str(db_path))
+            inv.add_or_update_manual(
+                name="broken-site",
+                root=str(root),
+                console_path=str(root / "bin" / "console"),
+                local_php_path=None,
+                mautic_major=7,
+                db_host="localhost",
+                db_port=3306,
+                db_name="baza_broken_site",
+                db_user="korisnik_broken_site",
+                db_password="secret",
+                db_table_prefix="",
+            )
+            cfg = SimpleNamespace(state_db_path=str(db_path))
+
+            with patch.object(instance_delete, "_safe_root", return_value=root.resolve(strict=False)):
+                plan = instance_delete.build_delete_plan(cfg=cfg, root=str(root), delete_db=True)
+
+        self.assertEqual(plan.db_name, "baza_broken_site")
+        self.assertEqual(plan.db_host, "localhost")
+        self.assertEqual(plan.db_user, "korisnik_broken_site")
+        self.assertEqual(plan.db_password, "secret")
+
+    def test_delete_plan_allows_explicit_db_name_without_local_php_db_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "public_html"
+            root.mkdir()
+
+            with patch.object(instance_delete, "_safe_root", return_value=root.resolve(strict=False)):
+                plan = instance_delete.build_delete_plan(
+                    root=str(root),
+                    db_name="baza_partial_delete",
+                    delete_db=True,
+                )
+
+        self.assertEqual(plan.db_name, "baza_partial_delete")
+        self.assertEqual(plan.db_host, "")
+        self.assertEqual(plan.db_user, "")
 
     def test_manual_command_main_still_requires_inventory_match(self) -> None:
         calls: list[dict[str, object]] = []

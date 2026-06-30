@@ -1,5 +1,19 @@
 # MCD Changelog
 
+## 0.9.192 - 2026-06-30
+
+- Fixed: `mcd-cli instance-delete --delete-db` now falls back to the local MCD
+  instance inventory for database credentials when `local.php` is missing or
+  incomplete, allowing partial deletes to finish instead of failing with
+  "database name is unavailable".
+- Fixed: recovery deletes with an explicit `--db-name` can now drop the local
+  database through the root MariaDB socket even when the old instance no longer
+  has a readable DB user in `local.php` or inventory.
+- Fixed: `mcd-cli instance-delete --delete-files` now quarantines the selected
+  root path before recursive removal and repeats the delete if the original
+  root is recreated during the removal window, making stale instance folders
+  disappear reliably after a successful pre-delete backup.
+
 ## 0.9.191 - 2026-06-30
 
 - Fixed: the absolute-root delete recovery path is now wired to the

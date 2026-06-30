@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.localphp import parse_local_php
+from mcd_agent.models import DBConfig
 
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -261,8 +262,25 @@ def _disable_nginx_vhost(path: Path) -> tuple[bool, str]:
     return True, f"moved regular enabled config to sites-available and disabled: {path}"
 
 
+def _inventory_db_for_root(cfg: AgentConfig | None, root: Path) -> DBConfig | None:
+    state_db_path = str(getattr(cfg, "state_db_path", "") or "").strip()
+    if not state_db_path:
+        return None
+    try:
+        from mcd_agent.inventory import InstanceInventory
+
+        inventory = InstanceInventory(state_db_path)
+        for inst in inventory.list_instances():
+            if Path(inst.root).resolve(strict=False) == root and inst.db is not None:
+                return inst.db
+    except Exception:
+        return None
+    return None
+
+
 def build_delete_plan(
     *,
+    cfg: AgentConfig | None = None,
     root: str,
     domains: list[str] | None = None,
     db_name: str | None = None,
@@ -287,11 +305,13 @@ def build_delete_plan(
     if site_domain and site_domain not in seen_domains:
         cleaned_domains.append(site_domain)
 
-    final_db_name = str(db_name or local_cfg.get("db_name", "") or "").strip()
-    db_host = str(local_cfg.get("db_host", "") or "").strip().lower()
-    db_port = str(local_cfg.get("db_port", "") or "").strip()
-    db_user = str(local_cfg.get("db_user", "") or "").strip()
-    db_password = str(local_cfg.get("db_password", "") or "")
+    inventory_db = _inventory_db_for_root(cfg, target_root) if delete_db else None
+    explicit_db_name = str(db_name or "").strip()
+    final_db_name = str(explicit_db_name or local_cfg.get("db_name", "") or (inventory_db.name if inventory_db else "") or "").strip()
+    db_host = str(local_cfg.get("db_host", "") or (inventory_db.host if inventory_db else "") or "").strip().lower()
+    db_port = str(local_cfg.get("db_port", "") or (inventory_db.port if inventory_db else "") or "").strip()
+    db_user = str(local_cfg.get("db_user", "") or (inventory_db.user if inventory_db else "") or "").strip()
+    db_password = str(local_cfg.get("db_password", "") or (inventory_db.password if inventory_db else "") or "")
     if delete_db:
         if not final_db_name:
             raise RuntimeError("database name is unavailable; local.php is missing or incomplete")
@@ -299,7 +319,7 @@ def build_delete_plan(
             raise RuntimeError(f"unsafe database name: {final_db_name}")
         if db_host not in _LOCAL_DB_HOSTS:
             raise RuntimeError(f"refusing to drop non-local database host: {db_host}")
-        if not db_user:
+        if not db_user and not explicit_db_name:
             raise RuntimeError("database user is unavailable; local.php is missing or incomplete")
 
     nginx_paths = _nginx_candidates(target_root, cleaned_domains) if delete_vhost else []
@@ -377,27 +397,57 @@ def _remaining_tree_entries(path: Path, *, limit: int = 20) -> list[str]:
     return out
 
 
+def _quarantine_instance_root(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    base = path.parent / f".mcd-delete-{path.name}-{stamp}-{os.getpid()}"
+    for idx in range(100):
+        target = base if idx == 0 else path.parent / f"{base.name}-{idx}"
+        try:
+            path.rename(target)
+            return target
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"failed to allocate delete quarantine path for {path}")
+
+
 def _remove_instance_root(path: Path, *, attempts: int = 6, sleep_sec: float = 0.2) -> None:
     last_error: Exception | None = None
+    target = path
     for attempt in range(max(1, int(attempts))):
-        if not path.exists():
+        if not path.exists() and not target.exists():
             return
+        if target == path and path.exists():
+            _chmod_tree_for_delete(path)
+            try:
+                target = _quarantine_instance_root(path)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                last_error = exc
+                target = path
         try:
-            shutil.rmtree(path)
+            shutil.rmtree(target)
         except FileNotFoundError:
-            return
+            if not path.exists():
+                return
+            target = path
+            continue
         except OSError as exc:
             last_error = exc
-            _chmod_tree_for_delete(path)
+            _chmod_tree_for_delete(target)
             time.sleep(float(sleep_sec) * float(attempt + 1))
             continue
-        if not path.exists():
+        if not target.exists() and not path.exists():
             return
-        last_error = OSError(f"directory still exists after rmtree: {path}")
-        _chmod_tree_for_delete(path)
+        if not target.exists() and path.exists():
+            target = path
+            continue
+        last_error = OSError(f"directory still exists after rmtree: {target}")
+        _chmod_tree_for_delete(target)
         time.sleep(float(sleep_sec) * float(attempt + 1))
 
-    remaining = _remaining_tree_entries(path)
+    remaining_root = target if target.exists() else path
+    remaining = _remaining_tree_entries(remaining_root)
     detail = str(last_error or "directory still exists").strip()
     if remaining:
         detail += "; remaining entries: " + ", ".join(remaining)
@@ -421,6 +471,7 @@ def delete_instance_artifacts(
     if not (delete_files or delete_vhost or delete_db):
         raise RuntimeError("select at least one deletion target")
     plan = build_delete_plan(
+        cfg=cfg,
         root=root,
         domains=domains,
         db_name=db_name,

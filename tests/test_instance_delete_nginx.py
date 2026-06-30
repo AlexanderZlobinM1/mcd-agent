@@ -88,6 +88,27 @@ class InstanceDeleteNginxTests(unittest.TestCase):
         self.assertGreaterEqual(calls, 2)
         self.assertFalse(root.exists())
 
+    def test_remove_instance_root_deletes_root_recreated_after_quarantine(self) -> None:
+        root = Path(self.tmp.name) / "public_html"
+        (root / ".mcd").mkdir(parents=True)
+        (root / ".mcd" / "mautic.version").write_text("7.1.2\n", encoding="utf-8")
+        original_rmtree = shutil.rmtree
+        calls = 0
+
+        def rmtree_and_recreate(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            original_rmtree(path)
+            if calls == 1:
+                (root / ".mcd").mkdir(parents=True)
+                (root / ".mcd" / "mautic.version").write_text("7.1.2\n", encoding="utf-8")
+
+        with patch.object(instance_delete.shutil, "rmtree", side_effect=rmtree_and_recreate):
+            instance_delete._remove_instance_root(root, attempts=3, sleep_sec=0)
+
+        self.assertGreaterEqual(calls, 2)
+        self.assertFalse(root.exists())
+
     def test_remove_instance_root_reports_remaining_entries(self) -> None:
         root = Path(self.tmp.name) / "public_html"
         (root / ".mcd").mkdir(parents=True)
