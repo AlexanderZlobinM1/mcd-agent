@@ -55,6 +55,7 @@ from mcd_agent.cluster_assets import guard_cluster_assets
 from mcd_agent.custom_scripts import cached_custom_manifest_keys, cleanup_custom_cache, fetch_custom_manifest
 from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
+from mcd_agent.email_counters import repair_campaign_email_counters
 from mcd_agent.executor import render_mautic_command
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
@@ -135,9 +136,12 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
+_CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
+_CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 _IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
+_CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
 _CAMPAIGN_REBUILD_FINISHED_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FILTER_WARN_TS: dict[tuple[str, str], float] = {}
@@ -2406,6 +2410,26 @@ def _row_int(row: dict[str, object], key: str) -> int:
         return 0
 
 
+def _parse_mysql_datetime_ts(raw: str) -> float | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(value[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            continue
+    return None
+
+
+def _campaign_trigger_recent_enough(raw_max_triggered_at: str, now_ts: float) -> bool:
+    ts = _parse_mysql_datetime_ts(raw_max_triggered_at)
+    if ts is None:
+        return False
+    age = float(now_ts) - float(ts)
+    return age <= float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC)
+
+
 def _campaign_trigger_progress_snapshot(
     db: MauticDB,
     campaign_id: int,
@@ -2423,6 +2447,45 @@ def _campaign_trigger_progress_snapshot(
         triggered_event_logs=_row_int(row, "triggered_event_logs"),
         max_triggered_at=str(row.get("max_triggered_at") or ""),
     )
+
+
+def _campaign_email_counter_reconcile(
+    *,
+    db: MauticDB,
+    root: str,
+    campaign_id: int | None,
+    reason: str,
+    force: bool = False,
+) -> dict[str, object] | None:
+    if campaign_id is None:
+        return None
+    key = (str(root), int(campaign_id))
+    now_ts = time.time()
+    if not force:
+        last_ts = float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.get(key, 0.0) or 0.0)
+        if last_ts > 0 and now_ts - last_ts < float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC):
+            return None
+    _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT[key] = now_ts
+    try:
+        payload = repair_campaign_email_counters(db, int(campaign_id))
+    except Exception as e:
+        logging.warning("[%s] email counter reconcile failed campaign_id=%s reason=%s: %s", root, campaign_id, reason, e)
+        return None
+    mismatches = int(payload.get("mismatches", 0) or 0)
+    repaired = int(payload.get("repaired", 0) or 0)
+    skipped = int(payload.get("skipped", 0) or 0)
+    if mismatches or repaired or skipped:
+        logging.info(
+            "[%s] email counter reconcile campaign_id=%s reason=%s checked=%s mismatches=%s repaired=%s skipped=%s",
+            root,
+            int(campaign_id),
+            reason,
+            int(payload.get("checked", 0) or 0),
+            mismatches,
+            repaired,
+            skipped,
+        )
+    return payload
 
 
 def _campaign_trigger_should_skip_launch(
@@ -2465,6 +2528,13 @@ def _campaign_trigger_should_skip_launch(
         snapshot.triggered_event_logs,
         snapshot.max_triggered_at or "-",
     )
+    if snapshot.triggered_event_logs > 0 and _campaign_trigger_recent_enough(snapshot.max_triggered_at, now_ts):
+        _campaign_email_counter_reconcile(
+            db=db,
+            root=root,
+            campaign_id=int(campaign_id),
+            reason="stale-complete-skip",
+        )
     return True
 
 
@@ -5240,6 +5310,14 @@ def _campaign_trigger_progress_watchdog(
     _kill_pid(task.pid, int(getattr(config, "segment_kill_grace_sec", 10) or 10))
     store.finish(task.row_id, state="done", rc=0, note=note)
     _mark_campaign_trigger_finished(task.root, task.entity_id)
+    if snapshot.due_total == 0:
+        _campaign_email_counter_reconcile(
+            db=MauticDB(db_cfg),
+            root=task.root,
+            campaign_id=task.entity_id,
+            reason="watchdog-no-due-finish",
+            force=True,
+        )
     running.pop(key, None)
     popens.pop(key, None)
     state_by_key.pop(key, None)
@@ -5300,6 +5378,15 @@ def _monitor_running(
                     _mark_campaign_rebuild_finished(task.root, task.entity_id, now_ts=now)
                 if rc == 0 and task.task_type == "campaign_trigger":
                     _mark_campaign_trigger_finished(task.root, task.entity_id)
+                    db_cfg = db_configs.get(str(task.root))
+                    if db_cfg is not None:
+                        _campaign_email_counter_reconcile(
+                            db=MauticDB(db_cfg),
+                            root=task.root,
+                            campaign_id=task.entity_id,
+                            reason="trigger-exit",
+                            force=True,
+                        )
                 if rc == 0 and task.task_type == "import":
                     _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
                 running.pop(key, None)
