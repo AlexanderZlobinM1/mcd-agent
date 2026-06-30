@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.187 - 2026-06-30
+
+- Fixed: `backup profile-set` now accepts backup-level `enabled`, `method`,
+  and `retention_copies` fields and applies them to the effective runtime
+  config before readiness validation. MCC-triggered operation backups can now
+  enable backup on hosts where `[backup].enabled=false` instead of failing
+  profile verification before a required pre-delete backup starts.
+
 ## 0.9.186 - 2026-06-30
 
 - Added: APT service profiles can now enforce the nginx Cloudflare real-IP
