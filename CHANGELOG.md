@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.190 - 2026-06-30
+
+- Fixed: `mcd-cli instance-delete` can now finish a partially completed delete
+  when the instance inventory row is already gone but MCC passes the absolute
+  `/var/www/...` root. Other operations still require a discovered inventory
+  match.
+
 ## 0.9.189 - 2026-06-30
 
 - Fixed: `mcd-cli instance-delete --delete-files` now removes the selected

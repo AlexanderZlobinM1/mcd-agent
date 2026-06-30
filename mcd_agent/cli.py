@@ -502,7 +502,7 @@ def _default_config_path() -> str:
     return candidates[0]
 
 
-def _select_root_for_ops(cfg, root: str | None) -> str:
+def _select_root_for_ops(cfg, root: str | None, *, allow_missing_absolute: bool = False) -> str:
     inv = InstanceInventory(cfg.state_db_path)
     ensure_seeded(inv, cfg)
     installs = inv.list_instances()
@@ -510,6 +510,8 @@ def _select_root_for_ops(cfg, root: str | None) -> str:
         for inst in installs:
             if inst.root == root or inst.instance_uid == root:
                 return inst.root
+        if allow_missing_absolute and Path(root).is_absolute():
+            return root
         raise RuntimeError(f"Mautic install not found for root: {root}")
     if not installs:
         raise RuntimeError("No Mautic install found")
@@ -2135,7 +2137,7 @@ def main() -> int:
         if note:
             print(f"NOTICE: {note}")
         try:
-            root = _select_root_for_ops(cfg, args.root)
+            root = _select_root_for_ops(cfg, args.root, allow_missing_absolute=True)
         except Exception as e:
             print(str(e))
             return 2
