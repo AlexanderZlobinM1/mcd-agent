@@ -200,7 +200,8 @@ def _format_remote_dir(root_dir: str, instance_name: str) -> str:
 
 def _is_deleted_instances_remote_root(value: str | None) -> bool:
     cleaned = str(value or "").strip().strip("/").lower()
-    return cleaned == "mcc/deleted-instances" or cleaned.endswith("/deleted-instances")
+    parts = [part for part in cleaned.split("/") if part]
+    return "deleted-instances" in parts
 
 
 def _host_backup_remote_root_dir(cfg: AgentConfig) -> str:
@@ -208,6 +209,13 @@ def _host_backup_remote_root_dir(cfg: AgentConfig) -> str:
     if _is_deleted_instances_remote_root(root):
         return "backup"
     return root or "backup"
+
+
+def _instance_backup_retention_enabled(cfg: AgentConfig, remote_root_dir: str | None = None) -> bool:
+    root = str(
+        remote_root_dir if remote_root_dir is not None else cfg.backup_remote_root_dir or "backup"
+    ).strip().strip("/")
+    return not _is_deleted_instances_remote_root(root)
 
 
 def _write_marker(path: Path, payload: dict[str, Any]) -> None:
@@ -4498,12 +4506,17 @@ def backup_instance_run(
         bytes_written = int(db_bytes) + int(file_bytes)
         os.replace(tmp_dir, final_dir)
         tmp_dir = None
-        retention_removed = _prune_by_copies(
-            remote_parent,
-            cfg.backup_retention_copies,
-            protected={final_dir},
-            mount_path=mount_path,
-        )
+        retention_removed: list[str] = []
+        retention_skipped_reason = ""
+        if _instance_backup_retention_enabled(cfg, remote_root_dir):
+            retention_removed = _prune_by_copies(
+                remote_parent,
+                cfg.backup_retention_copies,
+                protected={final_dir},
+                mount_path=mount_path,
+            )
+        else:
+            retention_skipped_reason = "deleted_instances_manual_delete_only"
         storage_usage = _storage_usage(mount_path)
         marker = {
             "status": "ok",
@@ -4533,6 +4546,8 @@ def backup_instance_run(
         }
         if retention_removed:
             marker["retention_removed"] = retention_removed
+        if retention_skipped_reason:
+            marker["retention_skipped_reason"] = retention_skipped_reason
         if inst.mautic_major:
             marker["mautic_major"] = int(inst.mautic_major)
         if isinstance(storage_usage, dict):
@@ -4574,6 +4589,7 @@ def backup_instance_run(
                         "instances_with_db": 1,
                         "instance": inst.name,
                         "retention_removed": retention_removed,
+                        "retention_skipped_reason": retention_skipped_reason,
                     }
                 ]
                 + history[:19],
