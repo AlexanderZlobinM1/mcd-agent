@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.184 - 2026-06-30
+
+- Guarded: PHP service profile now writes a dedicated CLI opcache drop-in
+  instead of reusing the FPM drop-in content. CLI tuning remains limited to
+  opcache and realpath cache values, so host defaults such as
+  `memory_limit=-1`, timezone, upload limits, timeouts, and session settings
+  stay controlled by the normal PHP CLI config.
+
 ## 0.9.183 - 2026-06-30
 
 - Fixed: per-instance PHP CLI wrappers now run with `memory_limit=-1` instead
