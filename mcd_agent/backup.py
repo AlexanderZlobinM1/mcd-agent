@@ -1065,10 +1065,27 @@ def _profile_archive_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _profile_backup_payload(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    if "enabled" in payload:
+        raw_enabled = payload.get("enabled")
+        if isinstance(raw_enabled, str):
+            out["enabled"] = raw_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            out["enabled"] = bool(raw_enabled)
+    if "method" in payload:
+        method = _normalize_backup_method(payload.get("method"))
+        if method:
+            out["method"] = method
     if "remote_root_dir" in payload:
         remote_root = str(payload.get("remote_root_dir") or "").strip().strip("/")
         if remote_root:
             out["remote_root_dir"] = remote_root
+    if "retention_copies" in payload:
+        try:
+            copies = int(payload.get("retention_copies"))
+            if copies > 0:
+                out["retention_copies"] = copies
+        except Exception:
+            pass
     return out
 
 
@@ -1149,9 +1166,18 @@ def _cfg_with_profile_payload(cfg: AgentConfig, payload: dict[str, Any]) -> Agen
     if backup:
         out = replace(
             out,
+            backup_enabled=bool(backup.get("enabled"))
+            if "enabled" in backup
+            else out.backup_enabled,
+            backup_method=str(backup.get("method")).strip()
+            if backup.get("method")
+            else out.backup_method,
             backup_remote_root_dir=str(backup.get("remote_root_dir")).strip()
             if backup.get("remote_root_dir")
             else out.backup_remote_root_dir,
+            backup_retention_copies=int(backup.get("retention_copies"))
+            if backup.get("retention_copies") is not None
+            else out.backup_retention_copies,
         )
     if storage:
         out = replace(
@@ -1322,13 +1348,17 @@ def _validate_cfg(cfg: AgentConfig) -> None:
         raise RuntimeError("backup storage auth is not configured (key_file or password required)")
 
 
-def _backup_method(cfg: AgentConfig) -> str:
-    method = str(getattr(cfg, "backup_method", "mydumper") or "mydumper").strip().lower()
+def _normalize_backup_method(raw: Any) -> str:
+    method = str(raw or "mydumper").strip().lower()
     if method in {"logical", "dump", "mydump"}:
         return "mydumper"
     if method in {"physical", "xtra", "xtrabackup"}:
         return "xtrabackup"
     return method
+
+
+def _backup_method(cfg: AgentConfig) -> str:
+    return _normalize_backup_method(getattr(cfg, "backup_method", "mydumper"))
 
 
 def _apt_install_packages(packages: list[str]) -> None:
