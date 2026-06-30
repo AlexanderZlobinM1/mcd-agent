@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.185 - 2026-06-30
+
+- Added: MCD now audits and safely repairs Mautic `emails.sent_count` drift
+  after completed campaign trigger runs. This reconciles the denormalized UI
+  counter upward to the actual `email_stats` count only when the related email
+  has no pending campaign event-log work, covering large sends where Mautic
+  wrote send stats but crashed before updating the cached email counter.
+- Added: `mcd-cli email-counters audit|repair --campaign-id <id>` for
+  controlled operator verification and repair without raw manual SQL.
+
 ## 0.9.184 - 2026-06-30
 
 - Guarded: PHP service profile now writes a dedicated CLI opcache drop-in

@@ -13,6 +13,7 @@ from mcd_agent.daemon import (
     RunningTask,
     SQLSegmentRule,
     TaskStore,
+    _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT,
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _campaign_pressure_active,
@@ -46,6 +47,7 @@ from mcd_agent.ring_utils import advance_ring_after_launch
 class CampaignRingDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
+        _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.clear()
         _CAMPAIGN_REBUILD_FINISHED_AT.clear()
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
@@ -232,6 +234,37 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertTrue(skipped)
         snapshot.assert_not_called()
         self.assertIn((root, 136), _CAMPAIGN_TRIGGER_STUCK_UNTIL)
+
+    def test_campaign_trigger_guard_reconciles_stale_complete_email_counter(self) -> None:
+        root = "/var/www/site"
+        snapshot = CampaignTriggerProgressSnapshot(
+            due_event_logs=0,
+            due_root_actions=0,
+            pending_event_logs=0,
+            triggered_event_logs=169709,
+            max_triggered_at="2026-06-30 08:27:02",
+        )
+        db = Mock()
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1782817200.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(
+                daemon_mod,
+                "repair_campaign_email_counters",
+                return_value={"checked": 1, "mismatches": 1, "repaired": 1, "skipped": 0},
+            ) as repair,
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=db,
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=557,
+                sql_ctx={},
+            )
+
+        self.assertTrue(skipped)
+        repair.assert_called_once_with(db, 557)
 
     def test_campaign_trigger_guard_counts_prescheduled_rows_as_due(self) -> None:
         due_sql = _campaign_trigger_event_log_due_exists_sql(21)

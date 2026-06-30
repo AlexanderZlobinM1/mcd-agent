@@ -61,6 +61,7 @@ from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_script
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
 from mcd_agent.discovery import discover_mautic
+from mcd_agent.email_counters import audit_campaign_email_counters, repair_campaign_email_counters
 from mcd_agent.env import (
     build_policy_plan,
     default_policy,
@@ -516,6 +517,31 @@ def _select_root_for_ops(cfg, root: str | None) -> str:
         roots = ", ".join(x.root for x in installs)
         raise RuntimeError(f"Multiple installs found, pass --root: {roots}")
     return installs[0].root
+
+
+def _select_instance_for_ops(cfg, root: str | None):
+    inv = InstanceInventory(cfg.state_db_path)
+    ensure_seeded(inv, cfg)
+    installs = inv.list_instances()
+    target = str(root or "").strip()
+    if target:
+        for inst in installs:
+            domains = [str(x).strip().lower() for x in (getattr(inst, "domains", []) or [])]
+            if (
+                inst.root == target
+                or inst.instance_uid == target
+                or inst.name == target
+                or str(inst.primary_domain or "").strip().lower() == target.lower()
+                or target.lower() in domains
+            ):
+                return inst
+        raise RuntimeError(f"Mautic install not found for root: {target}")
+    if not installs:
+        raise RuntimeError("No Mautic install found")
+    if len(installs) > 1:
+        roots = ", ".join(x.root for x in installs)
+        raise RuntimeError(f"Multiple installs found, pass --root: {roots}")
+    return installs[0]
 
 
 def _run_manual_command_with_scheduler(
@@ -1636,6 +1662,16 @@ def _build_parser() -> argparse.ArgumentParser:
     lock_cleanup.add_argument("--max-rows", type=int, default=20)
     lock_cleanup.add_argument("--json", action="store_true")
 
+    email_counters = sub.add_parser(
+        "email-counters",
+        help="Audit/repair Mautic email sent_count drift after campaign trigger completion",
+    )
+    email_counters.add_argument("--config", default=default_cfg)
+    email_counters.add_argument("--root", help="Mautic root, instance uid, name, or domain")
+    email_counters.add_argument("--campaign-id", type=int, required=True)
+    email_counters.add_argument("op", choices=["audit", "repair"], nargs="?", default="audit")
+    email_counters.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -2399,6 +2435,68 @@ def main() -> int:
                 if str(row.get("file_lock_status") or "") == "error":
                     print(f"  file_lock_reason={str(row.get('file_lock_reason') or '')}")
             print(f"cutoff_utc={cutoff_utc}")
+        return 0
+
+    if args.cmd == "email-counters":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        try:
+            inst = _select_instance_for_ops(cfg, getattr(args, "root", None))
+            if not inst.db:
+                raise RuntimeError(f"Mautic install has no DB config: {inst.root}")
+            db = MauticDB(inst.db)
+            if str(args.op or "audit") == "repair":
+                payload = repair_campaign_email_counters(db, int(args.campaign_id))
+            else:
+                payload = audit_campaign_email_counters(db, int(args.campaign_id))
+            payload["root"] = inst.root
+            payload["instance_uid"] = inst.instance_uid
+            payload["name"] = inst.name
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"email-counters failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            print(
+                "email-counters {mode}: root={root} campaign_id={campaign_id} "
+                "checked={checked} mismatches={mismatches} repairable={repairable} repaired={repaired} skipped={skipped}".format(
+                    mode=str(payload.get("mode") or args.op),
+                    root=str(payload.get("root") or ""),
+                    campaign_id=int(payload.get("campaign_id", 0) or 0),
+                    checked=int(payload.get("checked", 0) or 0),
+                    mismatches=int(payload.get("mismatches", 0) or 0),
+                    repairable=int(payload.get("repairable", 0) or 0),
+                    repaired=int(payload.get("repaired", 0) or 0),
+                    skipped=int(payload.get("skipped", 0) or 0),
+                )
+            )
+            for row in payload.get("emails", []):
+                if not isinstance(row, dict):
+                    continue
+                drift = int(row.get("drift", 0) or 0)
+                if drift == 0:
+                    continue
+                print(
+                    "  email_id={email_id} cached={cached} actual={actual} drift={drift} "
+                    "pending={pending} global_pending={global_pending} status={status} reason={reason}".format(
+                        email_id=int(row.get("email_id", 0) or 0),
+                        cached=int(row.get("cached_sent_count", 0) or 0),
+                        actual=int(row.get("actual_sent_count", 0) or 0),
+                        drift=drift,
+                        pending=int(row.get("campaign_pending_event_logs", 0) or 0),
+                        global_pending=int(row.get("global_pending_event_logs", 0) or 0),
+                        status=str(row.get("status") or ""),
+                        reason=str(row.get("reason") or ""),
+                    )
+                )
+        if str(args.op or "audit") == "repair" and int(payload.get("repaired", 0) or 0) > 0:
+            _push_state_after_change(cfg, "email-counters-repair")
         return 0
 
     if args.cmd == "exec":
