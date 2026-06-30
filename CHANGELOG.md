@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.191 - 2026-06-30
+
+- Fixed: the absolute-root delete recovery path is now wired to the
+  `instance-delete` command itself. Manual Mautic command shortcuts continue to
+  require a discovered inventory match.
+
 ## 0.9.190 - 2026-06-30
 
 - Fixed: `mcd-cli instance-delete` can now finish a partially completed delete

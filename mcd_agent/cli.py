@@ -2137,7 +2137,7 @@ def main() -> int:
         if note:
             print(f"NOTICE: {note}")
         try:
-            root = _select_root_for_ops(cfg, args.root, allow_missing_absolute=True)
+            root = _select_root_for_ops(cfg, args.root)
         except Exception as e:
             print(str(e))
             return 2
@@ -2195,7 +2195,7 @@ def main() -> int:
         if note:
             print(f"NOTICE: {note}")
         try:
-            root = _select_root_for_ops(cfg, args.root)
+            root = _select_root_for_ops(cfg, args.root, allow_missing_absolute=True)
         except Exception as e:
             print(str(e))
             return 2
