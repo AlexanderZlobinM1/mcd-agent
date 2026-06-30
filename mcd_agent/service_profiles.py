@@ -278,6 +278,26 @@ def _build_opcache_override(profile: dict[str, Any]) -> str:
     )
 
 
+def _build_cli_opcache_override(profile: dict[str, Any]) -> str:
+    opcache_mem = int(profile.get("opcache_memory_mb", 128) or 128)
+    php_profile = profile.get("php")
+    if not isinstance(php_profile, dict):
+        php_profile = {}
+    realpath_cache_size_kb = int(php_profile.get("realpath_cache_size_kb", 16384) or 16384)
+    realpath_cache_ttl_sec = int(php_profile.get("realpath_cache_ttl_sec", 600) or 600)
+    return (
+        "; managed by mcd service profile (php-cli hardware-safe tuning)\n"
+        "opcache.enable=1\n"
+        f"opcache.memory_consumption={opcache_mem}\n"
+        "opcache.interned_strings_buffer=16\n"
+        "opcache.max_accelerated_files=20000\n"
+        "opcache.revalidate_freq=2\n"
+        "opcache.validate_timestamps=1\n"
+        f"realpath_cache_size={realpath_cache_size_kb}K\n"
+        f"realpath_cache_ttl={realpath_cache_ttl_sec}\n"
+    )
+
+
 def _build_redis_sessions_override(profile: dict[str, Any]) -> str:
     save_handler = str(profile.get("redis_session_save_handler", "redis")).strip() or "redis"
     save_path = str(profile.get("redis_session_save_path", "tcp://127.0.0.1:6379?database=10")).strip() or "tcp://127.0.0.1:6379?database=10"
@@ -720,6 +740,7 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
 
     pool_content = _build_pool_override(profile)
     opcache_content = _build_opcache_override(profile)
+    cli_opcache_content = _build_cli_opcache_override(profile)
     redis_sessions_enabled = bool(profile.get("redis_sessions_enabled", True))
     redis_content = _build_redis_sessions_override(profile)
     sysctl_content = _build_sysctl_override(profile)
@@ -755,7 +776,7 @@ def apply_php_fpm_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run:
             changed.append(str(pool_override))
         if _write_file(opcache_fpm, opcache_content):
             changed.append(str(opcache_fpm))
-        if _write_file(opcache_cli, opcache_content):
+        if _write_file(opcache_cli, cli_opcache_content):
             changed.append(str(opcache_cli))
         if redis_sessions_enabled:
             if _write_file(redis_fpm, redis_content):
