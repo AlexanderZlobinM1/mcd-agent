@@ -148,7 +148,7 @@ def _wrapper_script(version: str, inst: MauticInstall, slug: str) -> str:
 # Managed by MCD. Per-instance PHP CLI wrapper.
 exec {php} \\
   -d date.timezone='{tz}' \\
-  -d memory_limit='512M' \\
+  -d memory_limit='-1' \\
   -d max_execution_time='300' \\
   -d max_input_time='300' \\
   -d max_input_vars='5000' \\

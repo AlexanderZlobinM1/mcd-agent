@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.183 - 2026-06-30
+
+- Fixed: per-instance PHP CLI wrappers now run with `memory_limit=-1` instead
+  of forcing `512M`. Large Mautic campaign trigger/rebuild runs can otherwise
+  OOM inside AWS/Guzzle/Doctrine, get retried by MCD in chunks, and stretch a
+  daytime newsletter into the night.
+
 ## 0.9.182 - 2026-06-30
 
 - Fixed: new nginx vhosts created by Mautic image install and instance

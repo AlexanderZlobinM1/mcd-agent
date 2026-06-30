@@ -73,6 +73,7 @@ server {{
             self.assertFalse((generated / "php" / "8.3" / "fpm" / "pools" / "mcd-merkurosiguranje.conf").exists())
             self.assertIn("fastcgi_pass unix:/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
             self.assertIn("-d date.timezone='Europe/Belgrade'", wrapper.read_text(encoding="utf-8"))
+            self.assertIn("-d memory_limit='-1'", wrapper.read_text(encoding="utf-8"))
             self.assertTrue(instance_wrapper.is_symlink())
             self.assertEqual(instance_wrapper.resolve(), wrapper.resolve())
 
