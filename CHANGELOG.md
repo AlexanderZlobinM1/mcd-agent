@@ -1,5 +1,19 @@
 # MCD Changelog
 
+## 0.9.186 - 2026-06-30
+
+- Added: APT service profiles can now enforce the nginx Cloudflare real-IP
+  baseline from host edge-mode intent. Cloudflare-proxied hosts write the
+  managed `/etc/nginx/conf.d/10-mcd-cloudflare-real-ip.conf` template with
+  `CF-Connecting-IP`, Cloudflare CIDRs, `nginx -t` validation, rollback, and
+  reload; direct-origin hosts remove only that MCD-managed trust file.
+- Added: Mautic install readiness and APT state now report Cloudflare real-IP
+  drift so MCC Check/Fix Host can surface and repair missing client-IP
+  forwarding instead of hiding it behind generic nginx package checks.
+- Changed: nginx baseline now requires `/etc/nginx/conf.d/*.conf` to be
+  included from `nginx.conf`, keeping managed host-level nginx templates active
+  alongside the existing `sites-enabled` layout.
+
 ## 0.9.185 - 2026-06-30
 
 - Added: MCD now audits and safely repairs Mautic `emails.sent_count` drift

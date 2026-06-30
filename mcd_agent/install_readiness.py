@@ -11,6 +11,7 @@ from typing import Any
 
 from mcd_agent.apt_profile import collect_zabbix_agent_state
 from mcd_agent.env import ipv6_runtime_disabled, ipv6_status, reconcile_ipv6_runtime_from_intent
+from mcd_agent.nginx_baseline import cloudflare_real_ip_state
 
 
 def _run(args: list[str], *, timeout_sec: int = 8) -> tuple[int, str]:
@@ -171,6 +172,7 @@ def collect_mautic_install_readiness() -> dict[str, Any]:
             "installed": bool(nginx_exists),
             "active": nginx_rc == 0 and nginx_state.strip() == "active",
             "version": nginx_version,
+            "cloudflare_real_ip": cloudflare_real_ip_state(),
         },
         "php": php,
         "composer": {

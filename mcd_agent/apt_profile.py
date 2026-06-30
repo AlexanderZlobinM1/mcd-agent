@@ -14,7 +14,13 @@ import tempfile
 from typing import Any
 from urllib import request as urlrequest
 
-from mcd_agent.nginx_baseline import ensure_nginx_baseline, nginx_baseline_satisfied
+from mcd_agent.nginx_baseline import (
+    cloudflare_real_ip_profile_present,
+    cloudflare_real_ip_state,
+    ensure_cloudflare_real_ip,
+    ensure_nginx_baseline,
+    nginx_baseline_satisfied,
+)
 
 
 def _run(cmd: list[str], *, timeout_sec: int = 120) -> subprocess.CompletedProcess[str]:
@@ -2418,6 +2424,7 @@ def collect_apt_state(
         "checked_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "zabbix_agent": zbx_agent_payload,
         "zabbix_mysql_monitor": zbx_payload,
+        "cloudflare_real_ip": cloudflare_real_ip_state(profile),
         "wazuh_agent": _collect_wazuh_agent_state_for_push(),
         "repo_profiles": collect_apt_repo_profiles_state(cfg=cfg),
         "unattended_upgrade": collect_unattended_upgrade_state(),
@@ -2452,6 +2459,7 @@ def apply_apt_profile(
                 "ensure_nodejs20",
                 "ensure_composer_global",
                 "ensure_var_www",
+                "cloudflare_real_ip",
                 "zabbix_agent_repo",
                 "zabbix_agent_config",
                 "zabbix_agent_firewall",
@@ -2645,6 +2653,20 @@ def apply_apt_profile(
             changed.append("/var/www")
     else:
         actions.append("var_www:disabled")
+
+    if cloudflare_real_ip_profile_present(profile):
+        cf_result = ensure_cloudflare_real_ip(profile, reload_service=True)
+        cf_status = str(cf_result.get("status", "") or "").strip().lower()
+        for act in list(cf_result.get("actions", []) or []):
+            actions.append(str(act))
+        for changed_file in list(cf_result.get("changed_files", []) or []):
+            changed.append(str(changed_file))
+        if cf_status in {"error"}:
+            errors.append(f"cloudflare_real_ip:{str(cf_result.get('reason', 'unknown_error'))}")
+        elif cf_status:
+            actions.append(f"cloudflare_real_ip:{cf_status}")
+    else:
+        actions.append("cloudflare_real_ip:unmanaged")
 
     if packages_absent:
         cmd = ["apt-get", "purge", "-y"] + packages_absent

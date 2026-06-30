@@ -24,6 +24,128 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertIn("fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;", snippet)
         self.assertIn("include fastcgi_params;", snippet)
 
+    def test_nginx_conf_baseline_includes_conf_d_and_sites_enabled(self) -> None:
+        src = "user nginx;\nhttp {\n    worker_connections 1024;\n}\n"
+
+        out, actions = nginx_baseline._desired_nginx_conf(src)
+
+        self.assertIn("user_www_data", actions)
+        self.assertIn("conf_d_include", actions)
+        self.assertIn("sites_enabled_include", actions)
+        self.assertIn("include /etc/nginx/conf.d/*.conf;", out)
+        self.assertIn("include /etc/nginx/sites-enabled/*.conf;", out)
+
+    def test_cloudflare_real_ip_template_uses_cf_connecting_ip(self) -> None:
+        content = nginx_baseline._desired_cloudflare_real_ip_config(
+            {
+                "cloudflare_real_ip_enabled": True,
+                "cloudflare_real_ip_cidrs": ["173.245.48.0/20", "173.245.48.0/20", "bad"],
+            }
+        )
+
+        self.assertIn("real_ip_header CF-Connecting-IP;", content)
+        self.assertIn("real_ip_recursive on;", content)
+        self.assertEqual(content.count("set_real_ip_from 173.245.48.0/20;"), 1)
+
+    def test_ensure_cloudflare_real_ip_writes_managed_conf(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            conf_d = root / "conf.d"
+            sites_available = root / "sites-available"
+            sites_enabled = root / "sites-enabled"
+            snippets = root / "snippets"
+            conf_d.mkdir()
+            sites_available.mkdir()
+            sites_enabled.mkdir()
+            snippets.mkdir()
+            nginx_conf = root / "nginx.conf"
+            nginx_conf.write_text("user www-data;\nhttp {\n    include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*.conf;\n}\n", encoding="utf-8")
+            target = conf_d / "10-mcd-cloudflare-real-ip.conf"
+
+            old_conf = nginx_baseline.NGINX_CONF
+            old_conf_d = nginx_baseline.CONF_D
+            old_available = nginx_baseline.SITES_AVAILABLE
+            old_enabled = nginx_baseline.SITES_ENABLED
+            old_snippets = nginx_baseline.SNIPPETS_DIR
+            old_hardening = nginx_baseline.HARDENING_SNIPPET
+            old_fastcgi = nginx_baseline.FASTCGI_PHP_SNIPPET
+            old_present = nginx_baseline._nginx_present
+            old_test = nginx_baseline._nginx_test
+            old_reload = nginx_baseline._reload_nginx
+            old_geteuid = nginx_baseline.os.geteuid
+            try:
+                nginx_baseline.NGINX_CONF = nginx_conf
+                nginx_baseline.CONF_D = conf_d
+                nginx_baseline.SITES_AVAILABLE = sites_available
+                nginx_baseline.SITES_ENABLED = sites_enabled
+                nginx_baseline.SNIPPETS_DIR = snippets
+                nginx_baseline.HARDENING_SNIPPET = snippets / "mcd-mautic-hardening.conf"
+                nginx_baseline.FASTCGI_PHP_SNIPPET = snippets / "fastcgi-php.conf"
+                nginx_baseline._nginx_present = lambda: True
+                nginx_baseline._nginx_test = lambda: (True, "nginx_test:ok")
+                nginx_baseline._reload_nginx = lambda: (True, "nginx_reload:ok")
+                nginx_baseline.os.geteuid = lambda: 0
+
+                result = nginx_baseline.ensure_cloudflare_real_ip(
+                    {
+                        "cloudflare_real_ip_enabled": True,
+                        "cloudflare_real_ip_target_file": str(target),
+                        "cloudflare_real_ip_cidrs": ["173.245.48.0/20"],
+                    }
+                )
+            finally:
+                nginx_baseline.NGINX_CONF = old_conf
+                nginx_baseline.CONF_D = old_conf_d
+                nginx_baseline.SITES_AVAILABLE = old_available
+                nginx_baseline.SITES_ENABLED = old_enabled
+                nginx_baseline.SNIPPETS_DIR = old_snippets
+                nginx_baseline.HARDENING_SNIPPET = old_hardening
+                nginx_baseline.FASTCGI_PHP_SNIPPET = old_fastcgi
+                nginx_baseline._nginx_present = old_present
+                nginx_baseline._nginx_test = old_test
+                nginx_baseline._reload_nginx = old_reload
+                nginx_baseline.os.geteuid = old_geteuid
+
+            self.assertEqual(result["status"], "applied")
+            text = target.read_text(encoding="utf-8")
+            self.assertIn(nginx_baseline.CLOUDFLARE_REAL_IP_MARKER, text)
+            self.assertIn("set_real_ip_from 173.245.48.0/20;", text)
+            self.assertIn("real_ip_header CF-Connecting-IP;", text)
+
+    def test_ensure_cloudflare_real_ip_removes_managed_conf_for_direct_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            conf_d = root / "conf.d"
+            conf_d.mkdir()
+            target = conf_d / "10-mcd-cloudflare-real-ip.conf"
+            target.write_text(nginx_baseline.CLOUDFLARE_REAL_IP_MARKER + "\nreal_ip_header CF-Connecting-IP;\n", encoding="utf-8")
+
+            old_conf_d = nginx_baseline.CONF_D
+            old_test = nginx_baseline._nginx_test
+            old_reload = nginx_baseline._reload_nginx
+            old_geteuid = nginx_baseline.os.geteuid
+            try:
+                nginx_baseline.CONF_D = conf_d
+                nginx_baseline._nginx_test = lambda: (True, "nginx_test:ok")
+                nginx_baseline._reload_nginx = lambda: (True, "nginx_reload:ok")
+                nginx_baseline.os.geteuid = lambda: 0
+
+                result = nginx_baseline.ensure_cloudflare_real_ip(
+                    {
+                        "cloudflare_real_ip_enabled": False,
+                        "cloudflare_real_ip_target_file": str(target),
+                        "cloudflare_real_ip_remove_when_disabled": True,
+                    }
+                )
+            finally:
+                nginx_baseline.CONF_D = old_conf_d
+                nginx_baseline._nginx_test = old_test
+                nginx_baseline._reload_nginx = old_reload
+                nginx_baseline.os.geteuid = old_geteuid
+
+            self.assertEqual(result["status"], "applied")
+            self.assertFalse(target.exists())
+
     def test_public_app_asset_locations_precede_private_app_deny(self) -> None:
         src = """server {
     server_name example.com;
