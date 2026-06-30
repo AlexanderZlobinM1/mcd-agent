@@ -1,3 +1,3 @@
 """MCD Agent package."""
 
-__version__ = "0.9.192"
+__version__ = "0.9.195"

@@ -70,6 +70,7 @@ from mcd_agent.mautic_version_cache import (
 )
 from mcd_agent.mode import (
     reconcile_empty_leads_cleanup_cron,
+    reconcile_managed_cron,
     reconcile_mautic_email_fetch_cron,
     reconcile_viber_stats_cron,
 )
@@ -5954,6 +5955,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_backup_storage_probe_at = 0.0
     next_zabbix_version_cache_guard_at = 0.0
     next_runtime_overrides_poll_at = 0.0
+    next_managed_cron_reconcile_at = 0.0
     next_viber_cron_reconcile_at = 0.0
     next_email_fetch_cron_reconcile_at = 0.0
     next_empty_leads_cleanup_cron_reconcile_at = 0.0
@@ -7466,6 +7468,21 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             except Exception as e:
                 logging.warning("profile guard check failed: %s", e)
             next_profile_guard_at = now + guard_interval
+
+        if now >= next_managed_cron_reconcile_at:
+            try:
+                mcron = reconcile_managed_cron(
+                    profile_name=(config.profile_name or ""),
+                    install_dir="/opt/mcd",
+                )
+                changed = [line for line in mcron.lines if "commented managed cron" in line]
+                if changed:
+                    logging.info("managed cron reconcile: %s", "; ".join(changed))
+                elif not mcron.ok:
+                    logging.warning("managed cron reconcile failed: %s", "; ".join(mcron.lines))
+            except Exception as e:
+                logging.warning("managed cron reconcile failed: %s", e)
+            next_managed_cron_reconcile_at = now + 60
 
         if now >= next_viber_cron_reconcile_at:
             try:

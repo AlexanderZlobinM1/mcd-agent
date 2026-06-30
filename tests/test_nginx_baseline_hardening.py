@@ -47,6 +47,39 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertIn("real_ip_recursive on;", content)
         self.assertEqual(content.count("set_real_ip_from 173.245.48.0/20;"), 1)
 
+    def test_default_deny_vhost_rejects_unknown_hosts(self) -> None:
+        content = nginx_baseline._desired_default_deny_config((Path("/cert/fullchain.pem"), Path("/cert/privkey.pem")))
+
+        self.assertIn(nginx_baseline.DEFAULT_DENY_MARKER, content)
+        self.assertIn("listen 80 default_server;", content)
+        self.assertIn("listen 443 ssl default_server;", content)
+        self.assertIn("server_name _;", content)
+        self.assertEqual(content.count("return 444;"), 2)
+
+    def test_ensure_default_deny_config_writes_managed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            conf_d = root / "conf.d"
+            conf_d.mkdir()
+            target = conf_d / "00-mcd-default-deny.conf"
+            backup = root / "backup"
+
+            old_file = nginx_baseline.DEFAULT_DENY_FILE
+            old_pair = nginx_baseline._default_deny_ssl_pair
+            try:
+                nginx_baseline.DEFAULT_DENY_FILE = target
+                nginx_baseline._default_deny_ssl_pair = lambda: (Path("/cert/fullchain.pem"), Path("/cert/privkey.pem"))
+                actions = nginx_baseline._ensure_default_deny_config(backup, {})
+                text = target.read_text(encoding="utf-8")
+            finally:
+                nginx_baseline.DEFAULT_DENY_FILE = old_file
+                nginx_baseline._default_deny_ssl_pair = old_pair
+
+        self.assertEqual(actions, ["default_deny_vhost"])
+        self.assertIn("listen 80 default_server;", text)
+        self.assertIn("listen 443 ssl default_server;", text)
+        self.assertIn("return 444;", text)
+
     def test_ensure_cloudflare_real_ip_writes_managed_conf(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -69,6 +102,8 @@ class NginxBaselineHardeningTests(unittest.TestCase):
             old_snippets = nginx_baseline.SNIPPETS_DIR
             old_hardening = nginx_baseline.HARDENING_SNIPPET
             old_fastcgi = nginx_baseline.FASTCGI_PHP_SNIPPET
+            old_default_deny = nginx_baseline.DEFAULT_DENY_FILE
+            old_default_pair = nginx_baseline._default_deny_ssl_pair
             old_present = nginx_baseline._nginx_present
             old_test = nginx_baseline._nginx_test
             old_reload = nginx_baseline._reload_nginx
@@ -81,6 +116,8 @@ class NginxBaselineHardeningTests(unittest.TestCase):
                 nginx_baseline.SNIPPETS_DIR = snippets
                 nginx_baseline.HARDENING_SNIPPET = snippets / "mcd-mautic-hardening.conf"
                 nginx_baseline.FASTCGI_PHP_SNIPPET = snippets / "fastcgi-php.conf"
+                nginx_baseline.DEFAULT_DENY_FILE = conf_d / "00-mcd-default-deny.conf"
+                nginx_baseline._default_deny_ssl_pair = lambda: (Path("/cert/fullchain.pem"), Path("/cert/privkey.pem"))
                 nginx_baseline._nginx_present = lambda: True
                 nginx_baseline._nginx_test = lambda: (True, "nginx_test:ok")
                 nginx_baseline._reload_nginx = lambda: (True, "nginx_reload:ok")
@@ -101,6 +138,8 @@ class NginxBaselineHardeningTests(unittest.TestCase):
                 nginx_baseline.SNIPPETS_DIR = old_snippets
                 nginx_baseline.HARDENING_SNIPPET = old_hardening
                 nginx_baseline.FASTCGI_PHP_SNIPPET = old_fastcgi
+                nginx_baseline.DEFAULT_DENY_FILE = old_default_deny
+                nginx_baseline._default_deny_ssl_pair = old_default_pair
                 nginx_baseline._nginx_present = old_present
                 nginx_baseline._nginx_test = old_test
                 nginx_baseline._reload_nginx = old_reload

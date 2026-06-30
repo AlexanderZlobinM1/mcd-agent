@@ -1,5 +1,23 @@
 # MCD Changelog
 
+## 0.9.195 - 2026-06-30
+
+- Changed: republished the default-deny nginx baseline and active-profile cron
+  wrapper reconciliation fixes under a fresh build number so self-update can
+  converge hosts that already report `0.9.194`.
+
+## 0.9.194 - 2026-06-30
+
+- Fixed: active profile cron reconciliation now disables small wrapper scripts
+  that invoke MCD-managed Mautic console jobs, such as legacy full
+  `mautic:segments:update` shell wrappers.
+
+## 0.9.193 - 2026-06-30
+
+- Fixed: nginx baseline now installs a managed default deny vhost for port 80
+  and 443 so stale DNS records or unknown Host headers cannot fall through to
+  the first live Mautic vhost and expose another instance's login page.
+
 ## 0.9.192 - 2026-06-30
 
 - Fixed: `mcd-cli instance-delete --delete-db` now falls back to the local MCD

@@ -32,6 +32,9 @@ MANAGED_KEYWORDS = (
     "viber:stats:update",
 )
 
+_MAX_CRON_WRAPPER_BYTES = 128 * 1024
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[A-Za-z0-9_@%+=:,./-]+)")
+
 
 @dataclass
 class ModeResult:
@@ -64,9 +67,37 @@ def _is_managed_job(line: str) -> bool:
     s = line.strip()
     if not s or s.startswith("#"):
         return False
-    if "bin/console" not in s:
+    if "bin/console" in s:
+        return any(k in s for k in MANAGED_KEYWORDS)
+    return _cron_wrapper_has_managed_job(s)
+
+
+def _cron_wrapper_has_managed_job(line: str) -> bool:
+    for match in _ABSOLUTE_PATH_RE.finditer(line):
+        token = match.group(1).rstrip(";|&)")
+        path = Path(token)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if not path.is_file() or st.st_size <= 0 or st.st_size > _MAX_CRON_WRAPPER_BYTES:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "bin/console" not in content:
+            continue
+        if any(k in content for k in MANAGED_KEYWORDS):
+            return True
+    return False
+
+
+def _is_direct_managed_job(line: str) -> bool:
+    s = line.strip()
+    if not s or s.startswith("#"):
         return False
-    return any(k in s for k in MANAGED_KEYWORDS)
+    return "bin/console" in s and any(k in s for k in MANAGED_KEYWORDS)
 
 
 def _is_viber_stats_job(line: str) -> bool:
@@ -280,6 +311,39 @@ def _restore_from_backup(install_dir: str, user: str) -> tuple[bool, str]:
     if rc != 0:
         return False, f"restore {user} failed: {out}"
     return True, f"restored {user} crontab from backup"
+
+
+def reconcile_managed_cron(*, profile_name: str, install_dir: str) -> ModeResult:
+    """
+    Idempotently keep active profiles from racing legacy Mautic cron jobs.
+
+    Profile commands do this on explicit transitions. The daemon also calls
+    this so hosts that were already active before an update converge without a
+    manual profile toggle.
+    """
+    if os.geteuid() != 0:
+        return ModeResult(ok=False, lines=["managed cron reconcile requires root"])
+    profile = (profile_name or "").strip().lower()
+    if profile == "passive":
+        return ModeResult(ok=True, lines=["passive profile, managed cron left unchanged"])
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    for user in ("root", "www-data"):
+        rc, cur = _read_crontab(None if user == "root" else user)
+        if rc != 0:
+            lines.append(f"{user}: crontab not readable, skip")
+            continue
+        _ensure_backup(install_dir, user, cur)
+        updated, changed = _comment_managed(cur, stamp)
+        if changed <= 0:
+            lines.append(f"{user}: no managed cron change")
+            continue
+        rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+        if rc2 != 0:
+            lines.append(f"{user}: failed to write crontab: {out2}")
+            return ModeResult(ok=False, lines=lines)
+        lines.append(f"{user}: commented managed cron lines={changed}")
+    return ModeResult(ok=True, lines=lines)
 
 
 def reconcile_viber_stats_cron(*, profile_name: str, install_dir: str) -> ModeResult:

@@ -26,6 +26,8 @@ SECURITY_HEADERS_END = "# mcd-security-headers-extra end"
 MAUTIC_PUBLIC_APP_ASSETS_COMMENT = "MCD public Mautic app assets"
 CLOUDFLARE_REAL_IP_FILE = CONF_D / "10-mcd-cloudflare-real-ip.conf"
 CLOUDFLARE_REAL_IP_MARKER = "# Managed by MCD host baseline: trust Cloudflare edge and pass client IP to PHP/Mautic."
+DEFAULT_DENY_FILE = CONF_D / "00-mcd-default-deny.conf"
+DEFAULT_DENY_MARKER = "# Managed by MCD host baseline: deny unknown/default virtual hosts."
 CLOUDFLARE_REAL_IP_CIDRS = [
     "173.245.48.0/20",
     "103.21.244.0/22",
@@ -146,6 +148,59 @@ def _sites_enabled_has_non_conf_entries() -> bool:
     return False
 
 
+def _default_deny_ssl_pair() -> tuple[Path, Path] | None:
+    letsencrypt = Path("/etc/letsencrypt/live")
+    if letsencrypt.exists():
+        try:
+            for fullchain in sorted(letsencrypt.glob("*/fullchain.pem")):
+                privkey = fullchain.parent / "privkey.pem"
+                if fullchain.exists() and privkey.exists():
+                    return fullchain, privkey
+        except Exception:
+            pass
+    snakeoil_cert = Path("/etc/ssl/certs/ssl-cert-snakeoil.pem")
+    snakeoil_key = Path("/etc/ssl/private/ssl-cert-snakeoil.key")
+    if snakeoil_cert.exists() and snakeoil_key.exists():
+        return snakeoil_cert, snakeoil_key
+    return None
+
+
+def _desired_default_deny_config(pair: tuple[Path, Path] | None = None) -> str:
+    ssl_pair = pair if pair is not None else _default_deny_ssl_pair()
+    lines = [
+        DEFAULT_DENY_MARKER,
+        "server {",
+        "    listen 80 default_server;",
+        "    server_name _;",
+        "    return 444;",
+        "}",
+        "",
+    ]
+    if ssl_pair is not None:
+        cert, key = ssl_pair
+        lines.extend(
+            [
+                "server {",
+                "    listen 443 ssl default_server;",
+                "    server_name _;",
+                f"    ssl_certificate {cert};",
+                f"    ssl_certificate_key {key};",
+                "    return 444;",
+                "}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _default_deny_satisfied() -> bool:
+    current = _read_text(DEFAULT_DENY_FILE)
+    if DEFAULT_DENY_MARKER not in current:
+        return False
+    desired = _desired_default_deny_config()
+    return current == desired
+
+
 def nginx_baseline_satisfied() -> bool:
     """Cheap read-only check for the SalesSnap nginx layout baseline."""
     if not _nginx_present():
@@ -169,6 +224,8 @@ def nginx_baseline_satisfied() -> bool:
     if _read_text(FASTCGI_PHP_SNIPPET) != _desired_fastcgi_php_snippet():
         return False
     if SECURITY_HEADERS_SNIPPET.exists() and SECURITY_HEADERS_START not in _read_text(SECURITY_HEADERS_SNIPPET):
+        return False
+    if not _default_deny_satisfied():
         return False
     modern_http2 = _nginx_supports_http2_directive()
     strip_ipv6_listens = _ipv6_listen_forbidden()
@@ -552,6 +609,17 @@ def _ensure_security_headers_snippet(backup_dir: Path, snapshots: dict[Path, _Sn
     return ["security_headers_snippet"]
 
 
+def _ensure_default_deny_config(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    desired = _desired_default_deny_config()
+    original = _read_text(DEFAULT_DENY_FILE)
+    if original == desired:
+        return []
+    _snapshot(DEFAULT_DENY_FILE, backup_dir, snapshots)
+    DEFAULT_DENY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_DENY_FILE.write_text(desired, encoding="utf-8")
+    return ["default_deny_vhost"]
+
+
 def _active_server_config_files() -> list[Path]:
     files: dict[Path, None] = {}
     if SITES_ENABLED.exists():
@@ -568,6 +636,8 @@ def _active_server_config_files() -> list[Path]:
         try:
             for path in sorted(CONF_D.glob("*.conf")):
                 if path.name.startswith("zz-mcd-"):
+                    continue
+                if path.resolve(strict=False) == DEFAULT_DENY_FILE.resolve(strict=False):
                     continue
                 if path.is_file():
                     files[path.resolve()] = None
@@ -1011,6 +1081,10 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
         header_actions = _ensure_security_headers_snippet(backup_dir, snapshots)
         if header_actions:
             actions.extend(header_actions)
+            changed = True
+        deny_actions = _ensure_default_deny_config(backup_dir, snapshots)
+        if deny_actions:
+            actions.extend(deny_actions)
             changed = True
         include_actions = _ensure_hardening_includes(backup_dir, snapshots)
         if include_actions:
