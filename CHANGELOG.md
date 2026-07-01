@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.208 - 2026-07-01
+
+- Fixed: full MCC state pushes now use a longer default HTTP timeout so image
+  installs and other inventory-changing operations do not leave MCC stale when
+  the control plane takes more than five seconds to process a larger host
+  payload. Lightweight monitor signals keep their short timeout.
+
+## 0.9.207 - 2026-07-01
+
+- Fixed: Mautic image installs now ignore archived `.mcd` runtime artifacts
+  such as `.mcd/php` symlinks that point at the source host's generated MCD
+  wrapper path. Other unsafe archive paths and links are still rejected.
+
 ## 0.9.206 - 2026-07-01
 
 - Changed: successful native page_hits segment rebuilds are now considered

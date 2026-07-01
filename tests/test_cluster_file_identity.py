@@ -8,7 +8,13 @@ from unittest.mock import patch
 from mcd_agent.backup import _cluster_node_slug
 from mcd_agent.cluster_routing import cluster_local_identity_values
 from mcd_agent.daemon import _cluster_local_full_done_for_date
-from mcd_agent.state_push import MCCStatePusher, monitor_signals_change_payload, stable_change_payload, _hash_payload
+from mcd_agent.state_push import (
+    MCCStatePusher,
+    _DEFAULT_STATE_PUSH_TIMEOUT_SEC,
+    _hash_payload,
+    monitor_signals_change_payload,
+    stable_change_payload,
+)
 
 
 def _cfg(**overrides: object) -> SimpleNamespace:
@@ -103,6 +109,39 @@ class ClusterFileIdentityTests(unittest.TestCase):
         self.assertFalse(pusher.should_push_monitor_signals(10.1, payload))
         self.assertFalse(pusher.should_push_monitor_signals(10.1, changed_payload))
         self.assertTrue(pusher.should_push_monitor_signals(10.6, changed_payload))
+
+    def test_full_state_push_uses_longer_default_timeout(self) -> None:
+        pusher = MCCStatePusher(
+            SimpleNamespace(
+                mcc_push_enabled=True,
+                mcc_url="https://mcc.example.test",
+                mcc_token="token",
+            )
+        )
+        calls: dict[str, int] = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"status":"ok"}'
+
+        def fake_urlopen(_req, timeout: int):
+            calls["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("mcd_agent.state_push.request.urlopen", side_effect=fake_urlopen):
+            with patch("mcd_agent.state_push.mark_state_snapshot_push_result_mysql"):
+                ok, _msg = pusher.send({"schema": "mcd-state-v1"})
+
+        self.assertTrue(ok)
+        self.assertEqual(calls["timeout"], _DEFAULT_STATE_PUSH_TIMEOUT_SEC)
 
     def test_cluster_full_done_accepts_recent_full_across_utc_date_boundary(self) -> None:
         cfg = _cfg()

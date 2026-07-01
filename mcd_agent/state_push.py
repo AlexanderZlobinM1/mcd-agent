@@ -57,6 +57,7 @@ _LOCAL_SOCKET_CANDIDATES: tuple[str, ...] = (
 _PROFILE_EVENT_EMPTY_UNTIL: dict[str, float] = {}
 _MYSQL_WARN_THROTTLE: dict[str, dict[str, Any]] = {}
 _MYSQL_WARN_THROTTLE_SEC = 300
+_DEFAULT_STATE_PUSH_TIMEOUT_SEC = 20
 
 
 def _galera_routing_eligibility(galera: dict[str, Any]) -> tuple[bool, str]:
@@ -1780,7 +1781,11 @@ class MCCStatePusher:
         self._store_state_snapshot(payload, now_ts)
         return payload
 
-    def send(self, payload: dict[str, Any], timeout_sec: int = 5) -> tuple[bool, str]:
+    def send(
+        self,
+        payload: dict[str, Any],
+        timeout_sec: int = _DEFAULT_STATE_PUSH_TIMEOUT_SEC,
+    ) -> tuple[bool, str]:
         if not self.enabled():
             return False, "push disabled"
         payload_hash = _hash_payload(payload)
