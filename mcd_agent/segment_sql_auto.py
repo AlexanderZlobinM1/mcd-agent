@@ -433,23 +433,17 @@ def _lead_where_sql(parts: list[str]) -> str:
 
 
 def _page_hit_candidates_sql(ph_parts: list[str]) -> str:
-    subqueries = [
-        (
-            "SELECT DISTINCT ph.lead_id AS lead_id "
-            "FROM {prefix}page_hits ph "
-            f"WHERE {part}"
-        )
-        for part in ph_parts
-        if part
-    ]
-    if not subqueries:
+    parts = [part for part in ph_parts if part]
+    if not parts:
         return ""
-    if len(subqueries) == 1:
-        return subqueries[0]
-    sql = f"({subqueries[0]}) ph0"
-    for idx, subquery in enumerate(subqueries[1:], start=1):
-        sql += f" INNER JOIN ({subquery}) ph{idx} ON ph{idx}.lead_id = ph0.lead_id"
-    return f"SELECT DISTINCT ph0.lead_id AS lead_id FROM {sql}"
+    # Native Mautic applies AND-ed page-hit behavior filters against the same
+    # hit row for this segment shape. Keeping one page_hits alias is both closer
+    # to native semantics and avoids expensive self-joins on large hit tables.
+    return (
+        "SELECT DISTINCT ph.lead_id AS lead_id "
+        "FROM {prefix}page_hits ph "
+        "WHERE " + " AND ".join(f"({part})" for part in parts)
+    )
 
 
 def _build_select_sql(groups: list[list[_CompiledClause]]) -> str | None:

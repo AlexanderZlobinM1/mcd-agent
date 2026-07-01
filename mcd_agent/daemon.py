@@ -3142,6 +3142,21 @@ def _fill_from_ring(
     return launched_count
 
 
+def _remove_ring_entities(ring: deque[int], entity_ids: set[int]) -> int:
+    if not ring or not entity_ids:
+        return 0
+    blocked = {int(entity_id) for entity_id in entity_ids if int(entity_id) > 0}
+    if not blocked:
+        return 0
+    before = len(ring)
+    keep = [entity_id for entity_id in ring if int(entity_id) not in blocked]
+    if len(keep) == before:
+        return 0
+    ring.clear()
+    ring.extend(keep)
+    return before - len(keep)
+
+
 def _compute_throttle_active(samples: deque[tuple[float, int]], threshold: int, window_min: int) -> bool:
     if not samples:
         return False
@@ -8098,6 +8113,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             seg_sql_rules = segment_sql_rules_by_root.setdefault(root, {})
             seg_sql_active = segment_sql_active_sets.setdefault(root, set())
             seg_sql_done = segment_sql_done_sets.setdefault(root, set())
+            sql_managed_segment_ids = set(seg_sql_active) | set(seg_sql_long_active)
             seg_prio_ring = segment_prio_rings.setdefault(root, deque())
             seg_reg_ring = segment_reg_rings.setdefault(root, deque())
             trg_prio_ring = campaign_trigger_prio_rings.setdefault(root, deque())
@@ -8216,6 +8232,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
             def _publish_monitor_cycle() -> None:
                 segment_resume_ring = segment_resume_rings.setdefault(root, deque())
+                _remove_ring_entities(segment_resume_ring, sql_managed_segment_ids)
                 segment_queued_ids: list[int] = []
                 campaign_trigger_queued_ids: list[int] = []
                 campaign_rebuild_queued_ids: list[int] = []
@@ -8594,6 +8611,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             eff_seg_reg_limit,
                         )
                 seg_resume_ring = segment_resume_rings.setdefault(root, deque())
+                _remove_ring_entities(seg_resume_ring, sql_managed_segment_ids)
 
                 if segment_throttled_active and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
                     for key, task in list(running.items()):
