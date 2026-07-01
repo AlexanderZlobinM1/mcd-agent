@@ -1338,10 +1338,19 @@ def _parse_sql_segment_rules(raw: object) -> dict[int, SQLSegmentRule]:
     return out
 
 
-def _toposort_sql_segment_ids(ids: list[int], rules: dict[int, SQLSegmentRule]) -> list[int]:
+def _toposort_sql_segment_ids(
+    ids: list[int],
+    rules: dict[int, SQLSegmentRule],
+    priority_order: dict[int, int] | None = None,
+) -> list[int]:
     uniq = list(dict.fromkeys([x for x in ids if x in rules]))
     if not uniq:
         return []
+    order = dict(priority_order or {})
+
+    def _order_key(sid: int) -> tuple[int, int]:
+        return (int(order.get(int(sid), len(order) + int(sid))), int(sid))
+
     active = set(uniq)
     indeg: dict[int, int] = {sid: 0 for sid in uniq}
     outgoing: dict[int, set[int]] = {sid: set() for sid in uniq}
@@ -1353,19 +1362,20 @@ def _toposort_sql_segment_ids(ids: list[int], rules: dict[int, SQLSegmentRule]) 
             if sid not in outgoing[dep]:
                 outgoing[dep].add(sid)
                 indeg[sid] += 1
-    queue = sorted([sid for sid in uniq if indeg[sid] == 0])
+    queue = sorted([sid for sid in uniq if indeg[sid] == 0], key=_order_key)
     ordered: list[int] = []
     while queue:
         current = queue.pop(0)
         ordered.append(current)
-        for nxt in sorted(outgoing.get(current, set())):
+        for nxt in sorted(outgoing.get(current, set()), key=_order_key):
             indeg[nxt] = max(0, indeg[nxt] - 1)
             if indeg[nxt] == 0 and nxt not in queue and nxt not in ordered:
                 queue.append(nxt)
+                queue.sort(key=_order_key)
     if len(ordered) == len(uniq):
         return ordered
     # Keep deterministic order on dependency cycles/malformed graphs.
-    tail = [sid for sid in sorted(uniq) if sid not in set(ordered)]
+    tail = [sid for sid in sorted(uniq, key=_order_key) if sid not in set(ordered)]
     return ordered + tail
 
 
@@ -1388,7 +1398,8 @@ def _plan_sql_segment_ring(due_ids: list[int], rules: dict[int, SQLSegmentRule])
             if dep not in planned:
                 planned.add(dep)
                 queue.append(dep)
-    ordered = _toposort_sql_segment_ids(list(planned), rules)
+    due_order = {sid: idx for idx, sid in enumerate(due_ids)}
+    ordered = _toposort_sql_segment_ids(list(planned), rules, priority_order=due_order)
     # Keep due IDs first where possible; dependencies not due are still kept.
     ordered_due = [sid for sid in ordered if sid in due_set]
     ordered_deps = [sid for sid in ordered if sid not in due_set]
@@ -1410,6 +1421,116 @@ def _segment_sql_rule_kind(rule: SQLSegmentRule) -> str:
     if re.search(r"\bpage_hits\b", sql, flags=re.IGNORECASE):
         return "page_hits"
     return "generic"
+
+
+_SEGMENT_SQL_WORKERS_LOCK = threading.Lock()
+_SEGMENT_SQL_WORKERS: dict[tuple[str, int], dict[str, object]] = {}
+
+
+def _segment_sql_worker_prune() -> None:
+    with _SEGMENT_SQL_WORKERS_LOCK:
+        for key, meta in list(_SEGMENT_SQL_WORKERS.items()):
+            thread = meta.get("thread")
+            if isinstance(thread, threading.Thread) and thread.is_alive():
+                continue
+            _SEGMENT_SQL_WORKERS.pop(key, None)
+
+
+def _segment_sql_worker_ids(root: str) -> set[int]:
+    _segment_sql_worker_prune()
+    root_s = str(root)
+    with _SEGMENT_SQL_WORKERS_LOCK:
+        return {int(sid) for (row_root, sid), _meta in _SEGMENT_SQL_WORKERS.items() if row_root == root_s}
+
+
+def _segment_sql_worker_running(root: str, segment_id: int | None = None) -> bool:
+    ids = _segment_sql_worker_ids(root)
+    if segment_id is None:
+        return bool(ids)
+    try:
+        sid = int(segment_id)
+    except Exception:
+        return False
+    return sid in ids
+
+
+def _segment_sql_worker_count(root: str) -> int:
+    return len(_segment_sql_worker_ids(root))
+
+
+def _segment_sql_running_state_ids(
+    *,
+    store: "TaskStore",
+    root: str,
+    config: AgentConfig,
+    now_ts: float,
+) -> set[int]:
+    """Return SQL segment locks that are still fresh across daemon restarts."""
+    orphan_after_sec = max(30, int(getattr(config, "segment_sql_orphan_after_sec", 900) or 900))
+    out: set[int] = set()
+    try:
+        rows = store.list_runtime_sync("segment_sql_state:")
+    except Exception:
+        rows = []
+    for _key, payload in rows:
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("root") or "") != str(root):
+            continue
+        if str(payload.get("status") or "").strip().lower() != "running":
+            continue
+        try:
+            sid = int(payload.get("segment_id") or 0)
+        except Exception:
+            sid = 0
+        if sid <= 0:
+            continue
+        heartbeat_at = float(payload.get("heartbeat_at") or payload.get("started_at") or 0.0)
+        lock_orphan_after = max(30, int(payload.get("orphan_after_sec") or orphan_after_sec))
+        if heartbeat_at > 0 and (float(now_ts) - heartbeat_at) <= float(lock_orphan_after):
+            out.add(sid)
+    return out
+
+
+def _segment_sql_running_state_count(
+    *,
+    store: "TaskStore" | None,
+    root: str,
+    config: AgentConfig | None,
+    now_ts: float | None = None,
+) -> int:
+    if store is None or config is None:
+        return 0
+    return len(
+        _segment_sql_running_state_ids(
+            store=store,
+            root=root,
+            config=config,
+            now_ts=float(now_ts if now_ts is not None else time.time()),
+        )
+    )
+
+
+def _segment_sql_active_db_rebuild_query_count(db: MauticDB | None) -> int:
+    if db is None:
+        return 0
+    try:
+        rows = db.fetch_processlist(limit=500)
+    except Exception:
+        return 0
+    count = 0
+    for row in rows:
+        info = str(row.get("Info") or row.get("info") or "").strip()
+        command = str(row.get("Command") or row.get("command") or "").strip().lower()
+        if command and command not in {"query", "execute"}:
+            continue
+        info_l = info.lower()
+        if "mcd_tmp_segment_leads" not in info_l:
+            continue
+        if "insert ignore into" not in info_l:
+            continue
+        count += 1
+    return count
 
 
 def _in_daily_quiet_window(now_local: datetime, quiet_hour: int, quiet_window_min: int) -> bool:
@@ -1641,13 +1762,28 @@ def _run_sql_segment_ring(
     sql_ctx: dict[str, str],
     now_ts: float,
     now_local: datetime,
+    max_per_tick: int | None = None,
+    ring_label: str = "segment_sql",
+    async_worker: bool = False,
+    sql_db_running_count: int | None = None,
     on_launch=None,
     dynamic_blocked=None,
 ) -> int:
     if not config.segment_sql_ring_enabled:
         return 0
-    limit = min(1, max(0, int(getattr(config, "segment_sql_ring_max_per_tick", 1) or 0)))
+    configured_limit = (
+        getattr(config, "segment_sql_ring_max_per_tick", 1)
+        if max_per_tick is None
+        else max_per_tick
+    )
+    limit = max(0, int(configured_limit or 0))
     if limit <= 0 or not ring or not rules:
+        return 0
+    if async_worker and max(
+        _segment_sql_worker_count(root),
+        _segment_sql_running_state_count(store=store, root=root, config=config, now_ts=now_ts),
+        max(0, int(sql_db_running_count or 0)),
+    ) >= limit:
         return 0
     launched = 0
     scans = len(ring)
@@ -1705,71 +1841,120 @@ def _run_sql_segment_ring(
             owner=owner,
             interval_sec=int(getattr(config, "segment_sql_lock_heartbeat_sec", 15) or 15),
         )
-        try:
-            res = db.rebuild_segment_membership(
-                segment_id=sid,
-                select_query_template=rule.select_sql,
-                context=sql_ctx,
-                statement_timeout_sec=int(getattr(config, "segment_sql_statement_timeout_sec", 1800) or 1800),
+
+        def _execute_rebuild() -> bool:
+            try:
+                res = db.rebuild_segment_membership(
+                    segment_id=sid,
+                    select_query_template=rule.select_sql,
+                    context=sql_ctx,
+                    statement_timeout_sec=int(getattr(config, "segment_sql_statement_timeout_sec", 1800) or 1800),
+                )
+                _refresh_mautic_segment_count_cache(
+                    root=root,
+                    segment_id=sid,
+                    count=int(res.get("inserted_count", res.get("selected_count", 0)) or 0),
+                    php_bin=str(getattr(config, "php_bin", "php") or "php"),
+                    run_as_user=getattr(config, "mautic_run_as_user", None),
+                )
+                _mark_segment_finished(root, sid, now_ts=time.time())
+                done_set.add(sid)
+                _segment_sql_finish(
+                    store=store,
+                    root=root,
+                    segment_id=sid,
+                    owner=owner,
+                    now_ts=time.time(),
+                    result="ok",
+                    note="rebuilt",
+                    extra={
+                        "ring": str(ring_label or "segment_sql"),
+                        "selected_count": int(res.get("selected_count", 0) or 0),
+                        "deleted_count": int(res.get("deleted_count", 0) or 0),
+                        "inserted_count": int(res.get("inserted_count", 0) or 0),
+                        "duration_sec": float(res.get("duration_sec", 0.0) or 0.0),
+                    },
+                )
+                logging.info(
+                    "[%s] %s rebuilt id=%s selected=%s inserted=%s deleted=%s duration=%.2fs",
+                    root,
+                    str(ring_label or "segment_sql"),
+                    sid,
+                    int(res.get("selected_count", 0) or 0),
+                    int(res.get("inserted_count", 0) or 0),
+                    int(res.get("deleted_count", 0) or 0),
+                    float(res.get("duration_sec", 0.0) or 0.0),
+                )
+                return True
+            except Exception as e:
+                _segment_sql_finish(
+                    store=store,
+                    root=root,
+                    segment_id=sid,
+                    owner=owner,
+                    now_ts=time.time(),
+                    result="error",
+                    note=str(e),
+                )
+                logging.warning("[%s] %s rebuild failed id=%s: %s", root, str(ring_label or "segment_sql"), sid, e)
+                return False
+            finally:
+                hb_stop.set()
+                hb_thread.join(timeout=2.0)
+
+        _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment_sql", sid)] = float(now_ts)
+        # Keep shared cooldown in sync with regular `segment` task type.
+        _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment", sid)] = float(now_ts)
+
+        if async_worker:
+            worker_key = (str(root), int(sid))
+
+            def _worker() -> None:
+                try:
+                    _execute_rebuild()
+                finally:
+                    with _SEGMENT_SQL_WORKERS_LOCK:
+                        _SEGMENT_SQL_WORKERS.pop(worker_key, None)
+
+            thread = threading.Thread(
+                target=_worker,
+                name=f"{str(ring_label or 'segment_sql')}-worker-{sid}",
+                daemon=True,
             )
-            _refresh_mautic_segment_count_cache(
-                root=root,
-                segment_id=sid,
-                count=int(res.get("inserted_count", res.get("selected_count", 0)) or 0),
-                php_bin=str(getattr(config, "php_bin", "php") or "php"),
-                run_as_user=getattr(config, "mautic_run_as_user", None),
-            )
-            _mark_segment_finished(root, sid, now_ts=now_ts)
-            done_set.add(sid)
+            with _SEGMENT_SQL_WORKERS_LOCK:
+                existing = _SEGMENT_SQL_WORKERS.get(worker_key)
+                existing_thread = existing.get("thread") if isinstance(existing, dict) else None
+                if isinstance(existing_thread, threading.Thread) and existing_thread.is_alive():
+                    hb_stop.set()
+                    hb_thread.join(timeout=2.0)
+                    ring.rotate(-1)
+                    continue
+                _SEGMENT_SQL_WORKERS[worker_key] = {
+                    "thread": thread,
+                    "started_at": float(now_ts),
+                    "ring": str(ring_label or "segment_sql"),
+                }
+            thread.start()
+            ring.rotate(-1)
+            launched += 1
             if on_launch is not None:
                 try:
                     on_launch(sid)
                 except Exception:
                     pass
-            _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment_sql", sid)] = float(now_ts)
-            # Keep shared cooldown in sync with regular `segment` task type.
-            _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, "segment", sid)] = float(now_ts)
-            _segment_sql_finish(
-                store=store,
-                root=root,
-                segment_id=sid,
-                owner=owner,
-                now_ts=time.time(),
-                result="ok",
-                note="rebuilt",
-                extra={
-                    "selected_count": int(res.get("selected_count", 0) or 0),
-                    "deleted_count": int(res.get("deleted_count", 0) or 0),
-                    "inserted_count": int(res.get("inserted_count", 0) or 0),
-                    "duration_sec": float(res.get("duration_sec", 0.0) or 0.0),
-                },
-            )
+            logging.info("[%s] %s worker started id=%s", root, str(ring_label or "segment_sql"), sid)
+            continue
+
+        if _execute_rebuild():
             ring.rotate(-1)
             launched += 1
-            logging.info(
-                "[%s] segment_sql rebuilt id=%s selected=%s inserted=%s deleted=%s duration=%.2fs",
-                root,
-                sid,
-                int(res.get("selected_count", 0) or 0),
-                int(res.get("inserted_count", 0) or 0),
-                int(res.get("deleted_count", 0) or 0),
-                float(res.get("duration_sec", 0.0) or 0.0),
-            )
-        except Exception as e:
+            if on_launch is not None:
+                try:
+                    on_launch(sid)
+                except Exception:
+                    pass
+        else:
             ring.rotate(-1)
-            _segment_sql_finish(
-                store=store,
-                root=root,
-                segment_id=sid,
-                owner=owner,
-                now_ts=time.time(),
-                result="error",
-                note=str(e),
-            )
-            logging.warning("[%s] segment_sql rebuild failed id=%s: %s", root, sid, e)
-        finally:
-            hb_stop.set()
-            hb_thread.join(timeout=2.0)
     return launched
 
 
@@ -3765,6 +3950,94 @@ class TaskStore:
                 out[eid] = cnt
         return out
 
+    def recent_task_duration_stats(
+        self,
+        *,
+        root: str,
+        task_type: str,
+        since_sec: int,
+        min_duration_sec: int = 0,
+    ) -> dict[int, dict[str, object]]:
+        cutoff = time.time() - float(max(60, int(since_sec)))
+        min_duration = max(0.0, float(min_duration_sec or 0))
+        if self._mysql_mode:
+            tasks_table = self._mysql_tables.get("tasks", "")
+            if tasks_table and self._mysql_available():
+                try:
+                    rows = self._mysql_query(
+                        f"""
+                        SELECT entity_id, started_at, finished_at
+                        FROM `{tasks_table}`
+                        WHERE host_name=%s
+                          AND root=%s
+                          AND task_type=%s
+                          AND entity_id IS NOT NULL
+                          AND state='done'
+                          AND COALESCE(rc, 0)=0
+                          AND started_at IS NOT NULL
+                          AND finished_at IS NOT NULL
+                          AND finished_at >= %s
+                        ORDER BY finished_at ASC
+                        """,
+                        (self._node_id, str(root), str(task_type), cutoff),
+                    )
+                    return self._aggregate_task_duration_rows(rows, min_duration=min_duration)
+                except Exception:
+                    pass
+
+        rows = self._sqlite_fetchall_dicts(
+            """
+            SELECT entity_id, started_at, finished_at
+            FROM tasks
+            WHERE root=?
+              AND task_type=?
+              AND entity_id IS NOT NULL
+              AND state='done'
+              AND COALESCE(rc, 0)=0
+              AND started_at IS NOT NULL
+              AND finished_at IS NOT NULL
+              AND finished_at >= ?
+            ORDER BY finished_at ASC
+            """,
+            (str(root), str(task_type), cutoff),
+        )
+        return self._aggregate_task_duration_rows(rows, min_duration=min_duration)
+
+    @staticmethod
+    def _aggregate_task_duration_rows(
+        rows: list[dict[str, object]],
+        *,
+        min_duration: float,
+    ) -> dict[int, dict[str, object]]:
+        out: dict[int, dict[str, object]] = {}
+        for row in rows:
+            try:
+                eid = int(row.get("entity_id") or 0)
+                started = float(row.get("started_at") or 0.0)
+                finished = float(row.get("finished_at") or 0.0)
+            except Exception:
+                continue
+            if eid <= 0 or started <= 0 or finished <= 0:
+                continue
+            duration = max(0.0, finished - started)
+            if duration < min_duration:
+                continue
+            stats = out.setdefault(
+                eid,
+                {
+                    "success_count": 0,
+                    "max_duration_sec": 0.0,
+                    "last_duration_sec": 0.0,
+                    "last_finished_at": 0.0,
+                },
+            )
+            stats["success_count"] = int(stats.get("success_count") or 0) + 1
+            stats["max_duration_sec"] = max(float(stats.get("max_duration_sec") or 0.0), duration)
+            if finished >= float(stats.get("last_finished_at") or 0.0):
+                stats["last_duration_sec"] = duration
+                stats["last_finished_at"] = finished
+        return out
+
     def get_weights(self, kind: str, root: str, max_age_sec: int) -> dict[int, float]:
         min_ts = time.time() - max(1, max_age_sec)
         out: dict[int, float] = {}
@@ -4103,6 +4376,58 @@ class TaskStore:
         except Exception:
             return None
         return payload if isinstance(payload, dict) else None
+
+    def list_runtime_sync(self, prefix: str = "") -> list[tuple[str, dict[str, object]]]:
+        key_prefix = str(prefix or "")
+        out: dict[str, dict[str, object]] = {}
+
+        def _add_rows(rows: list[dict[str, object]] | list[sqlite3.Row]) -> None:
+            for row in rows:
+                try:
+                    key = str(row["key"] or "")
+                    raw = str(row["payload_json"] or "").strip()
+                except Exception:
+                    continue
+                if not key or not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    out[key] = payload
+
+        if self._mysql_mode:
+            table = self._mysql_tables.get("runtime_sync", "")
+            if table and self._mysql_available():
+                try:
+                    if key_prefix:
+                        rows = self._mysql_query(
+                            f"SELECT `key`, payload_json FROM `{table}` WHERE host_name=%s AND `key` LIKE %s",
+                            (self._node_id, f"{key_prefix}%"),
+                        )
+                    else:
+                        rows = self._mysql_query(
+                            f"SELECT `key`, payload_json FROM `{table}` WHERE host_name=%s",
+                            (self._node_id,),
+                        )
+                    _add_rows(rows)
+                except Exception:
+                    pass
+
+        try:
+            if key_prefix:
+                rows = self.conn.execute(
+                    "SELECT key, payload_json FROM runtime_sync WHERE key LIKE ?",
+                    (f"{key_prefix}%",),
+                ).fetchall()
+            else:
+                rows = self.conn.execute("SELECT key, payload_json FROM runtime_sync").fetchall()
+            _add_rows(rows)
+        except Exception:
+            pass
+
+        return sorted(out.items())
 
     def enqueue_manual_request(
         self,
@@ -4980,16 +5305,49 @@ def _effective_segment_slot_limit(config: AgentConfig, throttled_active: bool) -
     )
 
 
-def _segment_shared_slots_used(running: dict[str, RunningTask], root: str) -> int:
-    return _running_count(running, root, "segment") + _running_count(running, root, "import")
+def _segment_shared_slots_used(
+    running: dict[str, RunningTask],
+    root: str,
+    *,
+    store: TaskStore | None = None,
+    config: AgentConfig | None = None,
+    now_ts: float | None = None,
+    sql_db_running_count: int | None = None,
+) -> int:
+    sql_running_count = max(
+        _segment_sql_worker_count(root),
+        _segment_sql_running_state_count(store=store, root=root, config=config, now_ts=now_ts),
+        max(0, int(sql_db_running_count or 0)),
+    )
+    return (
+        _running_count(running, root, "segment")
+        + sql_running_count
+        + _running_count(running, root, "import")
+    )
 
 
 def _segment_shared_slots_available(
     running: dict[str, RunningTask],
     root: str,
     segment_slot_limit: int,
+    *,
+    store: TaskStore | None = None,
+    config: AgentConfig | None = None,
+    now_ts: float | None = None,
+    sql_db_running_count: int | None = None,
 ) -> int:
-    return max(0, max(0, int(segment_slot_limit or 0)) - _segment_shared_slots_used(running, root))
+    return max(
+        0,
+        max(0, int(segment_slot_limit or 0))
+        - _segment_shared_slots_used(
+            running,
+            root,
+            store=store,
+            config=config,
+            now_ts=now_ts,
+            sql_db_running_count=sql_db_running_count,
+        ),
+    )
 
 
 def _segment_task_limit_after_import(
@@ -5011,6 +5369,7 @@ def _submit_import_if_segment_slot(
     import_pending_count: int,
     segment_slot_limit: int,
     now_ts: float,
+    sql_db_running_count: int | None = None,
 ) -> bool:
     if (
         not cluster_import_allowed
@@ -5020,7 +5379,15 @@ def _submit_import_if_segment_slot(
         or _running_count(running, root, "import") > 0
     ):
         return False
-    if _segment_shared_slots_available(running, root, segment_slot_limit) <= 0:
+    if _segment_shared_slots_available(
+        running,
+        root,
+        segment_slot_limit,
+        store=store,
+        config=config,
+        now_ts=now_ts,
+        sql_db_running_count=sql_db_running_count,
+    ) <= 0:
         return False
     args = render_mautic_command(
         php_bin=config.php_bin,
@@ -5052,6 +5419,9 @@ def _submit_import_if_segment_slot(
 
 
 def _is_running(running: dict[str, RunningTask], root: str, task_type: str, entity_id: int | None) -> bool:
+    if task_type in {"segment", "segment_sql"} and entity_id is not None:
+        if _segment_sql_worker_running(root, int(entity_id)):
+            return True
     for t in running.values():
         if t.root == root and t.task_type == task_type and t.entity_id == entity_id:
             return True
@@ -5589,6 +5959,8 @@ def _mark_external_entities_executed(
     trg_reg_ring: deque[int],
     reb_prio_ring: deque[int],
     reb_reg_ring: deque[int],
+    seg_sql_long_done: set[int] | None = None,
+    seg_sql_long_ring: deque[int] | None = None,
     monitor_cycle_done: dict[tuple[str, str], set[int]] | None = None,
 ) -> None:
     for task in running.values():
@@ -5600,6 +5972,10 @@ def _mark_external_entities_executed(
         if task.task_type == "segment":
             seg_sql_done.add(entity_id)
             _mark_ring_entity_executed(seg_sql_ring, entity_id)
+            if seg_sql_long_done is not None:
+                seg_sql_long_done.add(entity_id)
+            if seg_sql_long_ring is not None:
+                _mark_ring_entity_executed(seg_sql_long_ring, entity_id)
             _mark_ring_entity_executed(seg_prio_ring, entity_id)
             _mark_ring_entity_executed(seg_reg_ring, entity_id)
             if monitor_cycle_done is not None:
@@ -5871,6 +6247,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_sql_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
     segment_sql_active_sets: dict[str, set[int]] = {}
     segment_sql_done_sets: dict[str, set[int]] = {}
+    segment_sql_long_rings: dict[str, deque[int]] = {}
+    segment_sql_long_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
+    segment_sql_long_active_sets: dict[str, set[int]] = {}
+    segment_sql_long_done_sets: dict[str, set[int]] = {}
     segment_sql_auto_signatures: dict[str, tuple[int, ...]] = {}
     segment_dependencies_by_root: dict[str, dict[int, set[int]]] = {}
     segment_parents_by_root: dict[str, dict[int, set[int]]] = {}
@@ -6958,14 +7338,38 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         _log_segment_failure_cooldown(root, sid)
                     segment_failure_blocked_sets[root] = failure_blocked_ids
                     auto_sql_rules_for_root: dict[int, SQLSegmentRule] = {}
-                    if sql_ring_enabled_for_root and config.segment_sql_auto_enabled and standard_segment_ids:
+                    auto_sql_long_rules_for_root: dict[int, SQLSegmentRule] = {}
+                    auto_sql_long_scores_for_root: dict[int, tuple[int, float]] = {}
+                    if sql_ring_enabled_for_root and config.segment_sql_auto_enabled:
                         try:
                             recent_problem_counts = store.recent_task_problem_counts(
                                 root=root,
                                 task_type="segment",
                                 since_sec=max(6 * 3600, int(config.tasks_history_keep_days or 1) * 86400),
                             )
-                            segment_rows = segment_definition_rows or db.fetch_segment_definitions(standard_segment_ids)
+                            recent_long_duration_stats: dict[int, dict[str, object]] = {}
+                            if bool(getattr(config, "segment_sql_auto_long_native_enabled", True)):
+                                recent_long_duration_stats = store.recent_task_duration_stats(
+                                    root=root,
+                                    task_type="segment",
+                                    since_sec=max(
+                                        int(getattr(config, "segment_sql_auto_long_native_history_sec", 7 * 86400) or 0),
+                                        int(config.tasks_history_keep_days or 1) * 86400,
+                                    ),
+                                    min_duration_sec=int(
+                                        getattr(config, "segment_sql_auto_long_native_min_duration_sec", 1800) or 1800
+                                    ),
+                                )
+                            auto_candidate_ids = list(
+                                dict.fromkeys(
+                                    [
+                                        *[int(x) for x in standard_segment_ids if int(x) > 0],
+                                        *[int(x) for x in recent_problem_counts if int(x) > 0],
+                                        *[int(x) for x in recent_long_duration_stats if int(x) > 0],
+                                    ]
+                                )
+                            )
+                            segment_rows = db.fetch_segment_definitions(auto_candidate_ids) if auto_candidate_ids else []
                             for row in segment_rows:
                                 try:
                                     sid = int(row.get("id") or 0)
@@ -6983,7 +7387,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 max_clauses=config.segment_sql_auto_max_clauses,
                                 problem_threshold=config.segment_sql_auto_problem_threshold,
                                 lead_columns=lead_columns,
+                                long_native_stats=recent_long_duration_stats,
+                                long_native_min_duration_sec=int(
+                                    getattr(config, "segment_sql_auto_long_native_min_duration_sec", 1800) or 1800
+                                ),
+                                long_native_min_successes=int(
+                                    getattr(config, "segment_sql_auto_long_native_min_successes", 1) or 1
+                                ),
                             )
+                            auto_sql_long_rules_for_root = {
+                                sid: SQLSegmentRule(
+                                    segment_id=rule.segment_id,
+                                    select_sql=rule.select_sql,
+                                    depends_on=rule.depends_on,
+                                )
+                                for sid, rule in detected_rules.items()
+                                if float(rule.long_native_duration_sec or 0.0) > 0.0
+                            }
+                            auto_sql_long_scores_for_root = {
+                                sid: (int(rule.problem_count or 0), float(rule.long_native_duration_sec or 0.0))
+                                for sid, rule in detected_rules.items()
+                                if sid in auto_sql_long_rules_for_root
+                            }
                             auto_sql_rules_for_root = {
                                 sid: SQLSegmentRule(
                                     segment_id=rule.segment_id,
@@ -6991,8 +7416,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                     depends_on=rule.depends_on,
                                 )
                                 for sid, rule in detected_rules.items()
+                                if sid not in auto_sql_long_rules_for_root
                             }
-                            auto_sig = tuple(sorted(auto_sql_rules_for_root))
+                            auto_sig = tuple(sorted(detected_rules))
                             prev_auto_sig = segment_sql_auto_signatures.get(root, ())
                             if auto_sig != prev_auto_sig:
                                 if auto_sig:
@@ -7017,31 +7443,73 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             logging.warning("[%s] segment_sql auto-detect failed: %s", root, e)
 
                     if sql_ring_enabled_for_root:
+                        sql_long_rules_for_root = dict(auto_sql_long_rules_for_root)
                         sql_rules_for_root = dict(auto_sql_rules_for_root)
                         sql_rules_for_root.update(dict(sql_segment_rules_cfg))
+                        long_sql_ids = set(sql_long_rules_for_root)
+                        sql_rules_for_root = {
+                            sid: rule for sid, rule in sql_rules_for_root.items() if sid not in long_sql_ids
+                        }
+                        all_sql_rules_for_root = dict(sql_long_rules_for_root)
+                        all_sql_rules_for_root.update(dict(sql_rules_for_root))
                         if dependency_parents:
-                            for sid, rule in list(sql_rules_for_root.items()):
+                            for sid, rule in list(all_sql_rules_for_root.items()):
                                 deps = tuple(sorted(set(rule.depends_on) | set(dependency_parents.get(int(sid), set()))))
                                 if deps != rule.depends_on:
-                                    sql_rules_for_root[sid] = SQLSegmentRule(
+                                    all_sql_rules_for_root[sid] = SQLSegmentRule(
                                         segment_id=rule.segment_id,
                                         select_sql=rule.select_sql,
                                         depends_on=deps,
                                     )
-                    if sql_ring_enabled_for_root and sql_rules_for_root:
-                        sql_ring_plan = _plan_sql_segment_ring(standard_segment_ids, sql_rules_for_root)
-                        active_sql_set = set(sql_ring_plan)
+                            sql_long_rules_for_root = {
+                                sid: rule for sid, rule in all_sql_rules_for_root.items() if sid in long_sql_ids
+                            }
+                            sql_rules_for_root = {
+                                sid: rule for sid, rule in all_sql_rules_for_root.items() if sid not in long_sql_ids
+                            }
+                    if sql_ring_enabled_for_root and (sql_long_rules_for_root or sql_rules_for_root):
+                        sql_long_priority_ids = sorted(
+                            sql_long_rules_for_root,
+                            key=lambda sid: (
+                                -int(auto_sql_long_scores_for_root.get(sid, (0, 0.0))[0]),
+                                -float(auto_sql_long_scores_for_root.get(sid, (0, 0.0))[1]),
+                                int(sid),
+                            ),
+                        )
+                        sql_long_ring_plan = _plan_sql_segment_ring(
+                            list(dict.fromkeys([*sql_long_priority_ids, *standard_segment_ids])),
+                            sql_long_rules_for_root,
+                        )
+                        active_long_sql_set = set(sql_long_ring_plan)
+                        sql_ring_plan = _plan_sql_segment_ring(
+                            [sid for sid in standard_segment_ids if sid not in active_long_sql_set],
+                            sql_rules_for_root,
+                        )
+                        active_sql_set = active_long_sql_set | set(sql_ring_plan)
+                        # Long SQL auto-promotion is priority-based: segments
+                        # with recent scheduler failures must move ahead of an
+                        # older slow-only backlog. Rebuild this deque in plan
+                        # order instead of preserving historical ring order.
+                        segment_sql_long_rings[root] = deque(sql_long_ring_plan)
                         segment_sql_rings[root] = _reconcile_ring(
                             segment_sql_rings.get(root),
                             sql_ring_plan,
                             new_to_front=True,
                         )
+                        segment_sql_long_rules_by_root[root] = sql_long_rules_for_root
                         segment_sql_rules_by_root[root] = sql_rules_for_root
+                        segment_sql_long_active_sets[root] = active_long_sql_set
                         segment_sql_active_sets[root] = active_sql_set
+                        prev_long_done = set(segment_sql_long_done_sets.get(root, set()))
+                        segment_sql_long_done_sets[root] = {sid for sid in prev_long_done if sid in active_long_sql_set}
                         prev_done = set(segment_sql_done_sets.get(root, set()))
                         segment_sql_done_sets[root] = {sid for sid in prev_done if sid in active_sql_set}
                         standard_segment_ids = [sid for sid in standard_segment_ids if sid not in active_sql_set]
                     else:
+                        segment_sql_long_rings[root] = deque()
+                        segment_sql_long_rules_by_root[root] = {}
+                        segment_sql_long_active_sets[root] = set()
+                        segment_sql_long_done_sets[root] = set()
                         segment_sql_rings[root] = deque()
                         segment_sql_rules_by_root[root] = {}
                         segment_sql_active_sets[root] = set()
@@ -7622,6 +8090,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             now_utc = datetime.now(timezone.utc)
             sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
             inst_now = mautic_local_datetime(now_utc, inst.mautic_timezone)
+            seg_sql_long_ring = segment_sql_long_rings.setdefault(root, deque())
+            seg_sql_long_rules = segment_sql_long_rules_by_root.setdefault(root, {})
+            seg_sql_long_active = segment_sql_long_active_sets.setdefault(root, set())
+            seg_sql_long_done = segment_sql_long_done_sets.setdefault(root, set())
             seg_sql_ring = segment_sql_rings.setdefault(root, deque())
             seg_sql_rules = segment_sql_rules_by_root.setdefault(root, {})
             seg_sql_active = segment_sql_active_sets.setdefault(root, set())
@@ -7641,7 +8113,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             trigger_plan_started_at = campaign_trigger_plan_started_at_by_root.setdefault(root, {})
             segment_blocked_ids = segment_dependency_blocked_ids(
                 root=root,
-                candidate_ids=set(seg_prio_set) | set(seg_reg_set) | set(seg_sql_active),
+                candidate_ids=set(seg_prio_set) | set(seg_reg_set) | set(seg_sql_active) | set(seg_sql_long_active),
                 parents_by_child=segment_parents_by_root.get(root, {}),
                 running=running,
                 recently_finished=_recent_finished_segment_ids(root, now),
@@ -7677,6 +8149,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         )
                     except Exception:
                         running_related = {int(task.entity_id)}
+                    if candidate_related & running_related:
+                        return True
+                for running_sid in _segment_sql_worker_ids(root):
+                    try:
+                        running_related = segment_related_ids(
+                            int(running_sid),
+                            dependency_parents_for_root,
+                            dependency_children_for_root,
+                        )
+                    except Exception:
+                        running_related = {int(running_sid)}
                     if candidate_related & running_related:
                         return True
                 return False
@@ -7739,6 +8222,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if cluster_cron_allowed and config.segment_mode != "classic_loop":
                     segment_queued_ids = _unique_positive_ids(
                         _monitor_visible_queued_ids(
+                            ring=seg_sql_long_ring,
+                            root=root,
+                            task_type="segment_sql",
+                            running=running,
+                            config=config,
+                            now_ts=now,
+                            blocked_entities=segment_blocked_ids,
+                            dynamic_blocked=_segment_chain_running_conflict,
+                            running_task_types={"segment", "segment_sql"},
+                        )
+                        + _monitor_visible_queued_ids(
                             ring=seg_sql_ring,
                             root=root,
                             task_type="segment_sql",
@@ -7855,7 +8349,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     cycle_done=monitor_cycle_done,
                     running=running,
                     now_ts=now,
-                    seg_sql_ring=seg_sql_ring,
+                    seg_sql_ring=deque(list(seg_sql_long_ring) + list(seg_sql_ring)),
                     seg_resume_ring=segment_resume_ring,
                     seg_prio_ring=seg_prio_ring,
                     seg_reg_ring=seg_reg_ring,
@@ -7876,6 +8370,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 root=root,
                 seg_sql_done=seg_sql_done,
                 seg_sql_ring=seg_sql_ring,
+                seg_sql_long_done=seg_sql_long_done,
+                seg_sql_long_ring=seg_sql_long_ring,
                 seg_prio_ring=seg_prio_ring,
                 seg_reg_ring=seg_reg_ring,
                 trg_prio_ring=trg_prio_ring,
@@ -7935,6 +8431,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
             segment_slot_limit = _effective_segment_slot_limit(config, segment_throttled_active)
             import_segment_slot_limit = max(1, segment_slot_limit) if cluster_import_allowed else segment_slot_limit
+            segment_sql_db_running_count = _segment_sql_active_db_rebuild_query_count(db)
             segment_launched_this_tick = 0
             if _submit_import_if_segment_slot(
                 config=config,
@@ -7946,6 +8443,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 import_pending_count=max(0, int(import_pending_cache.get(root, 0) or 0)),
                 segment_slot_limit=import_segment_slot_limit,
                 now_ts=now,
+                sql_db_running_count=segment_sql_db_running_count,
             ):
                 last_import_activity_ts[root] = now
                 segment_launched_this_tick += 1
@@ -7954,7 +8452,52 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_launched_this_tick <= 0
                 and cluster_cron_allowed
                 and config.segment_mode != "classic_loop"
-                and _segment_shared_slots_available(running, root, segment_slot_limit) > 0
+                and _segment_shared_slots_available(
+                    running,
+                    root,
+                    segment_slot_limit,
+                    store=store,
+                    config=config,
+                    now_ts=now,
+                    sql_db_running_count=segment_sql_db_running_count,
+                )
+                > 0
+                and not (segment_throttled_active and config.segment_throttle_whitelist_only)
+            ):
+                segment_launched_this_tick += _run_sql_segment_ring(
+                    config=config,
+                    store=store,
+                    db=db,
+                    root=root,
+                    ring=seg_sql_long_ring,
+                    rules=seg_sql_long_rules,
+                    active_set=seg_sql_long_active,
+                    done_set=seg_sql_long_done,
+                    running=running,
+                    sql_ctx=sql_ctx,
+                    now_ts=now,
+                    now_local=inst_now,
+                    max_per_tick=int(getattr(config, "segment_sql_long_ring_max_per_tick", 1) or 0),
+                    ring_label="segment_sql_long",
+                    async_worker=True,
+                    sql_db_running_count=segment_sql_db_running_count,
+                    on_launch=_mark_segment_cycle,
+                    dynamic_blocked=_segment_chain_running_conflict,
+                )
+            if (
+                segment_launched_this_tick <= 0
+                and cluster_cron_allowed
+                and config.segment_mode != "classic_loop"
+                and _segment_shared_slots_available(
+                    running,
+                    root,
+                    segment_slot_limit,
+                    store=store,
+                    config=config,
+                    now_ts=now,
+                    sql_db_running_count=segment_sql_db_running_count,
+                )
+                > 0
                 and not (segment_throttled_active and config.segment_throttle_whitelist_only)
             ):
                 segment_launched_this_tick += _run_sql_segment_ring(
@@ -7970,6 +8513,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     sql_ctx=sql_ctx,
                     now_ts=now,
                     now_local=inst_now,
+                    sql_db_running_count=segment_sql_db_running_count,
                     on_launch=_mark_segment_cycle,
                     dynamic_blocked=_segment_chain_running_conflict,
                 )
@@ -8699,6 +9243,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     for task in running.values()
                     if task.root == root and task.entity_id is not None and task.task_type in {"segment", "segment_sql"}
                 }
+                skip_segment_ids.update(_segment_sql_worker_ids(root))
                 skip_campaign_ids = {
                     int(task.entity_id)
                     for task in running.values()

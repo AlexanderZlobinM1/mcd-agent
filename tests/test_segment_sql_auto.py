@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import phpserialize
+
 from mcd_agent.segment_sql_auto import detect_auto_sql_segment_rules
 
 
@@ -109,6 +111,8 @@ class SegmentSQLAutoTests(unittest.TestCase):
             max_clauses=24,
             problem_threshold=2,
             lead_columns={"email"},
+            long_native_stats={204: {"success_count": 1, "max_duration_sec": 1900.0}},
+            long_native_min_duration_sec=1800,
         )
 
         self.assertIn(204, rules)
@@ -116,6 +120,94 @@ class SegmentSQLAutoTests(unittest.TestCase):
         self.assertIn("ph.`url` LIKE '%dyson%'", sql)
         self.assertIn("ph.`url` = 'aparati-za-kosa'", sql)
         self.assertIn("ph.`url` = 'rachni-pravosmukalki'", sql)
+
+    def test_page_hit_without_problem_or_long_history_is_not_auto_managed(self) -> None:
+        filters = phpserialize.dumps(
+            [
+                {
+                    "object": "lead",
+                    "glue": "and",
+                    "field": "email",
+                    "type": "email",
+                    "operator": "!empty",
+                    "properties": {"filter": None, "display": None},
+                    "filter": None,
+                    "display": None,
+                },
+                {
+                    "object": "behaviors",
+                    "glue": "and",
+                    "field": "hit_url",
+                    "type": "text",
+                    "operator": "contains",
+                    "properties": {"filter": "klima"},
+                    "filter": "klima",
+                    "display": None,
+                },
+            ]
+        ).decode("utf-8")
+
+        rules = detect_auto_sql_segment_rules(
+            [{"id": 273, "filters": filters, "problem_count": 0}],
+            max_clauses=24,
+            problem_threshold=2,
+            lead_columns={"email"},
+        )
+
+        self.assertNotIn(273, rules)
+
+    def test_gigatron_hit_url_and_hit_url_date_promotes_after_long_native_rebuild(self) -> None:
+        filters = phpserialize.dumps(
+            [
+                {
+                    "object": "lead",
+                    "glue": "and",
+                    "field": "email",
+                    "type": "email",
+                    "operator": "!empty",
+                    "properties": {"filter": None, "display": None},
+                    "filter": None,
+                    "display": None,
+                },
+                {
+                    "object": "behaviors",
+                    "glue": "and",
+                    "field": "hit_url",
+                    "type": "text",
+                    "operator": "contains",
+                    "properties": {"filter": "klima"},
+                    "filter": "klima",
+                    "display": None,
+                },
+                {
+                    "object": "behaviors",
+                    "glue": "and",
+                    "field": "hit_url_date",
+                    "type": "datetime",
+                    "operator": "gte",
+                    "properties": {"filter": "2026-05-29 10:00"},
+                    "filter": "2026-05-29 10:00",
+                    "display": None,
+                },
+            ]
+        ).decode("utf-8")
+
+        rules = detect_auto_sql_segment_rules(
+            [{"id": 273, "filters": filters, "problem_count": 0}],
+            max_clauses=24,
+            problem_threshold=2,
+            lead_columns={"email"},
+            long_native_stats={273: {"success_count": 1, "max_duration_sec": 3122.2}},
+            long_native_min_duration_sec=1800,
+        )
+
+        self.assertIn(273, rules)
+        self.assertIn("long_native=3122s", rules[273].reason)
+        self.assertEqual(3122.2, rules[273].long_native_duration_sec)
+        sql = rules[273].select_sql
+        self.assertIn("ph.`url` LIKE '%klima%'", sql)
+        self.assertIn("ph.date_hit >= '2026-05-29 10:00:00'", sql)
+        self.assertIn("INNER JOIN", sql)
 
 
 if __name__ == "__main__":
