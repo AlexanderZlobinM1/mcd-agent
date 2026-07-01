@@ -78,7 +78,7 @@ segment_sql_orphan_policy = "reclaim_stale"
 # Consider SQL-ring lock stale after this many seconds without heartbeat.
 segment_sql_orphan_after_sec = 900
 # Allow page_hits-based SQL segments only in quiet window.
-segment_sql_page_hits_quiet_only = false
+segment_sql_page_hits_quiet_only = true
 # Quiet window start hour for page_hits-based SQL segments.
 segment_sql_page_hits_quiet_hour = 2
 # Quiet window length in minutes for page_hits-based SQL segments.

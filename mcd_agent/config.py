@@ -2687,7 +2687,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_statement_timeout_sec=max(60, int(runtime.get("segment_sql_statement_timeout_sec", 1800) or 1800)),
         segment_sql_orphan_policy=segment_sql_orphan_policy,
         segment_sql_orphan_after_sec=max(30, int(runtime.get("segment_sql_orphan_after_sec", 900) or 900)),
-        segment_sql_page_hits_quiet_only=bool(runtime.get("segment_sql_page_hits_quiet_only", False)),
+        segment_sql_page_hits_quiet_only=bool(runtime.get("segment_sql_page_hits_quiet_only", True)),
         segment_sql_page_hits_quiet_hour=max(0, min(23, int(runtime.get("segment_sql_page_hits_quiet_hour", 2) or 2))),
         segment_sql_page_hits_quiet_window_min=max(
             1,
