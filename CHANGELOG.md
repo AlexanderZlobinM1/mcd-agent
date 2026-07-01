@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.206 - 2026-07-01
+
+- Changed: successful native page_hits segment rebuilds are now considered
+  long enough for SQL auto-promotion after 600 seconds instead of 1800 seconds.
+  This keeps medium-long page-hit segments out of daytime native Mautic rebuild
+  loops before they can accumulate database load.
+
 ## 0.9.205 - 2026-07-01
 
 - Changed: page_hits-based SQL segment rebuilds now default to quiet-window-only

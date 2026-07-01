@@ -27,6 +27,7 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertTrue(cfg.segment_sql_page_hits_quiet_only)
         self.assertEqual(cfg.segment_sql_page_hits_quiet_hour, 2)
         self.assertEqual(cfg.segment_sql_page_hits_quiet_window_min, 180)
+        self.assertEqual(cfg.segment_sql_auto_long_native_min_duration_sec, 600)
 
     def test_page_hits_sql_quiet_window_can_be_explicitly_disabled(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
