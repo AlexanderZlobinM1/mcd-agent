@@ -18,6 +18,34 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertIn("{campaign_limit_arg}", cfg.cmd_campaign_trigger_template)
         self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 300)
 
+    def test_page_hits_sql_segments_default_to_quiet_window_only(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text("[runtime]\nprofile_name = \"midi\"\n", encoding="utf-8")
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertTrue(cfg.segment_sql_page_hits_quiet_only)
+        self.assertEqual(cfg.segment_sql_page_hits_quiet_hour, 2)
+        self.assertEqual(cfg.segment_sql_page_hits_quiet_window_min, 180)
+
+    def test_page_hits_sql_quiet_window_can_be_explicitly_disabled(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[runtime]",
+                    'profile_name = "midi"',
+                    "segment_sql_page_hits_quiet_only = false",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertFalse(cfg.segment_sql_page_hits_quiet_only)
+
     def test_legacy_campaign_trigger_template_is_migrated(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(

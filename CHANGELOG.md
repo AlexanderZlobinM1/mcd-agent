@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.205 - 2026-07-01
+
+- Changed: page_hits-based SQL segment rebuilds now default to quiet-window-only
+  execution. Auto-promoted page-hit segments still stay out of native Mautic
+  classic rings during the day, but the direct SQL scan waits for the configured
+  quiet window unless an operator explicitly disables the guard.
+
 ## 0.9.204 - 2026-07-01
 
 - Fixed: SQL auto-promotion now combines AND-ed page-hit behavior filters on a
