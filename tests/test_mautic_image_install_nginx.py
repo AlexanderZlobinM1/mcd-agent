@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import sys
+import tarfile
 import types
 import unittest
+from io import BytesIO
 from importlib import resources
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +18,7 @@ sys.modules.setdefault("mcd_agent.config", config_stub)
 sys.modules.setdefault("mcd_agent.inventory", inventory_stub)
 
 from mcd_agent import mautic_image_install as image_install
-from mcd_agent.mautic_image_install import _nginx_web_root
+from mcd_agent.mautic_image_install import _nginx_web_root, _safe_extract
 
 if sys.modules.get("mcd_agent.config") is config_stub:
     del sys.modules["mcd_agent.config"]
@@ -47,6 +49,47 @@ class MauticImageInstallNginxTests(unittest.TestCase):
 
         self.assertIn("listen 80;", template)
         self.assertNotIn("listen [::]", template)
+
+    def test_safe_extract_skips_mcd_runtime_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "image.tar.gz"
+            target = Path(td) / "out"
+            target.mkdir()
+            with tarfile.open(archive, "w:gz") as tf:
+                payload = b"<?php\n"
+                info = tarfile.TarInfo("./index.php")
+                info.size = len(payload)
+                tf.addfile(info, BytesIO(payload))
+
+                mcd_dir = tarfile.TarInfo("./.mcd")
+                mcd_dir.type = tarfile.DIRTYPE
+                tf.addfile(mcd_dir)
+
+                mcd_link = tarfile.TarInfo("./.mcd/php")
+                mcd_link.type = tarfile.SYMTYPE
+                mcd_link.linkname = "/opt/mcd/generated/instances/default7/php"
+                tf.addfile(mcd_link)
+
+            with tarfile.open(archive, "r:gz") as tf:
+                _safe_extract(tf, target)
+
+            self.assertTrue((target / "index.php").exists())
+            self.assertFalse((target / ".mcd").exists())
+
+    def test_safe_extract_still_rejects_non_mcd_unsafe_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "image.tar.gz"
+            target = Path(td) / "out"
+            target.mkdir()
+            with tarfile.open(archive, "w:gz") as tf:
+                bad_link = tarfile.TarInfo("./bad")
+                bad_link.type = tarfile.SYMTYPE
+                bad_link.linkname = "/etc/passwd"
+                tf.addfile(bad_link)
+
+            with tarfile.open(archive, "r:gz") as tf:
+                with self.assertRaisesRegex(RuntimeError, "unsafe link"):
+                    _safe_extract(tf, target)
 
 
 class MauticImageInstallMysqlCredentialTests(unittest.TestCase):

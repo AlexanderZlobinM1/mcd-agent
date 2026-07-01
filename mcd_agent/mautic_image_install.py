@@ -560,9 +560,19 @@ def _nginx_web_root(project_root: Path) -> Path:
     return root
 
 
+def _skip_image_archive_member(name: str) -> bool:
+    normalized = str(name or "").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized == ".mcd" or normalized.startswith(".mcd/")
+
+
 def _safe_extract(tar: tarfile.TarFile, dst: Path) -> None:
     root = dst.resolve()
+    members: list[tarfile.TarInfo] = []
     for member in tar.getmembers():
+        if _skip_image_archive_member(member.name):
+            continue
         target = (dst / member.name).resolve()
         if root != target and root not in target.parents:
             raise RuntimeError(f"unsafe path in image archive: {member.name}")
@@ -570,7 +580,8 @@ def _safe_extract(tar: tarfile.TarFile, dst: Path) -> None:
             link_target = (target.parent / member.linkname).resolve()
             if root != link_target and root not in link_target.parents:
                 raise RuntimeError(f"unsafe link in image archive: {member.name} -> {member.linkname}")
-    tar.extractall(dst)
+        members.append(member)
+    tar.extractall(dst, members=members)
 
 
 def install_from_image(
