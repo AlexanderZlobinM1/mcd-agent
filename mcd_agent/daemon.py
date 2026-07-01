@@ -7372,7 +7372,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                         int(config.tasks_history_keep_days or 1) * 86400,
                                     ),
                                     min_duration_sec=int(
-                                        getattr(config, "segment_sql_auto_long_native_min_duration_sec", 1800) or 1800
+                                        getattr(config, "segment_sql_auto_long_native_min_duration_sec", 600) or 600
                                     ),
                                 )
                             auto_candidate_ids = list(
@@ -7404,7 +7404,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 lead_columns=lead_columns,
                                 long_native_stats=recent_long_duration_stats,
                                 long_native_min_duration_sec=int(
-                                    getattr(config, "segment_sql_auto_long_native_min_duration_sec", 1800) or 1800
+                                    getattr(config, "segment_sql_auto_long_native_min_duration_sec", 600) or 600
                                 ),
                                 long_native_min_successes=int(
                                     getattr(config, "segment_sql_auto_long_native_min_successes", 1) or 1

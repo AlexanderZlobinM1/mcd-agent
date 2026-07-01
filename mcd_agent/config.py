@@ -2670,7 +2670,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_auto_long_native_enabled=bool(runtime.get("segment_sql_auto_long_native_enabled", True)),
         segment_sql_auto_long_native_min_duration_sec=max(
             60,
-            int(runtime.get("segment_sql_auto_long_native_min_duration_sec", 1800) or 1800),
+            int(runtime.get("segment_sql_auto_long_native_min_duration_sec", 600) or 600),
         ),
         segment_sql_auto_long_native_history_sec=max(
             3600,
