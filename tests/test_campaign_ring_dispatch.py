@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -30,9 +32,11 @@ from mcd_agent.daemon import (
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
+    _plan_sql_segment_ring,
     _published_segment_whitelist_ids,
     _recover_orphaned_imports_if_safe,
     _run_sql_segment_ring,
+    _segment_sql_active_db_rebuild_query_count,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
@@ -49,6 +53,8 @@ class CampaignRingDispatchTests(unittest.TestCase):
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
         _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.clear()
         _CAMPAIGN_REBUILD_FINISHED_AT.clear()
+        with daemon_mod._SEGMENT_SQL_WORKERS_LOCK:
+            daemon_mod._SEGMENT_SQL_WORKERS.clear()
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])
@@ -824,6 +830,198 @@ class CampaignRingDispatchTests(unittest.TestCase):
         finish.assert_called_once()
         fake_stop.set.assert_called_once()
         fake_thread.join.assert_called_once_with(timeout=2.0)
+
+    def test_sql_segment_long_ring_runs_async_worker_and_claims_slot(self) -> None:
+        root = "/var/www/site"
+        started = threading.Event()
+        release = threading.Event()
+
+        def rebuild_segment_membership(**_kwargs):
+            started.set()
+            release.wait(timeout=2.0)
+            return {"selected_count": 101, "inserted_count": 99, "deleted_count": 2, "duration_sec": 1.5}
+
+        db = SimpleNamespace(rebuild_segment_membership=Mock(side_effect=rebuild_segment_membership))
+        cfg = SimpleNamespace(
+            segment_sql_ring_enabled=True,
+            segment_sql_ring_max_per_tick=1,
+            segment_sql_statement_timeout_sec=1800,
+            segment_sql_page_hits_quiet_only=False,
+            segment_sql_min_repeat_sec=0,
+            segment_sql_lock_heartbeat_sec=15,
+            php_bin="/usr/bin/php",
+            mautic_run_as_user="www-data",
+        )
+        store = SimpleNamespace()
+        ring = deque([273])
+        done_set: set[int] = set()
+        fake_stop = SimpleNamespace(set=Mock())
+        fake_thread = SimpleNamespace(join=Mock())
+
+        with (
+            patch.object(daemon_mod, "_state_node_id", return_value="node-a"),
+            patch.object(daemon_mod, "_segment_sql_try_acquire", return_value=(True, {})),
+            patch.object(daemon_mod, "_segment_sql_start_heartbeat", return_value=(fake_stop, fake_thread)),
+            patch.object(daemon_mod, "_segment_sql_finish"),
+            patch.object(daemon_mod, "_refresh_mautic_segment_count_cache", return_value=True),
+        ):
+            started_at = time.monotonic()
+            launched = _run_sql_segment_ring(
+                config=cfg,
+                store=store,
+                db=db,
+                root=root,
+                ring=ring,
+                rules={273: SQLSegmentRule(segment_id=273, select_sql="SELECT 1 AS lead_id", depends_on=())},
+                active_set={273},
+                done_set=done_set,
+                running={},
+                sql_ctx={},
+                now_ts=100.0,
+                now_local=datetime.now(timezone.utc),
+                max_per_tick=1,
+                ring_label="segment_sql_long",
+                async_worker=True,
+            )
+            elapsed = time.monotonic() - started_at
+
+            self.assertEqual(launched, 1)
+            self.assertLess(elapsed, 0.5)
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertTrue(daemon_mod._segment_sql_worker_running(root, 273))
+            self.assertEqual(_segment_shared_slots_available({}, root, 1), 0)
+
+            release.set()
+            deadline = time.monotonic() + 2.0
+            while daemon_mod._segment_sql_worker_running(root, 273) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertFalse(daemon_mod._segment_sql_worker_running(root, 273))
+        self.assertIn(273, done_set)
+        fake_stop.set.assert_called_once()
+        fake_thread.join.assert_called_once_with(timeout=2.0)
+
+    def test_sql_segment_long_ring_respects_persisted_running_lock_after_restart(self) -> None:
+        root = "/var/www/site"
+        persisted_lock = {
+            "root": root,
+            "segment_id": 66,
+            "status": "running",
+            "heartbeat_at": 120.0,
+            "orphan_after_sec": 900,
+        }
+        store = SimpleNamespace(
+            list_runtime_sync=Mock(return_value=[("segment_sql_state:abc:66", persisted_lock)])
+        )
+        db = SimpleNamespace(rebuild_segment_membership=Mock(return_value={}))
+        cfg = SimpleNamespace(
+            segment_sql_ring_enabled=True,
+            segment_sql_ring_max_per_tick=1,
+            segment_sql_statement_timeout_sec=1800,
+            segment_sql_page_hits_quiet_only=False,
+            segment_sql_min_repeat_sec=0,
+            segment_sql_orphan_after_sec=900,
+            segment_sql_lock_heartbeat_sec=15,
+        )
+
+        self.assertEqual(
+            _segment_shared_slots_available({}, root, 1, store=store, config=cfg, now_ts=150.0),
+            0,
+        )
+
+        launched = _run_sql_segment_ring(
+            config=cfg,
+            store=store,
+            db=db,
+            root=root,
+            ring=deque([70]),
+            rules={70: SQLSegmentRule(segment_id=70, select_sql="SELECT 1 AS lead_id", depends_on=())},
+            active_set={70},
+            done_set=set(),
+            running={},
+            sql_ctx={},
+            now_ts=150.0,
+            now_local=datetime.now(timezone.utc),
+            max_per_tick=1,
+            ring_label="segment_sql_long",
+            async_worker=True,
+        )
+
+        self.assertEqual(launched, 0)
+        db.rebuild_segment_membership.assert_not_called()
+
+    def test_sql_segment_long_ring_respects_live_mysql_rebuild_query_after_timeout(self) -> None:
+        root = "/var/www/site"
+
+        class FakeDB:
+            rebuild_segment_membership = Mock(return_value={})
+
+            def fetch_processlist(self, *, limit=500):
+                return [
+                    {
+                        "Id": 123,
+                        "Command": "Query",
+                        "Info": "INSERT IGNORE INTO `mcd_tmp_segment_leads` (`lead_id`) SELECT ...",
+                    }
+                ]
+
+        db = FakeDB()
+        cfg = SimpleNamespace(
+            segment_sql_ring_enabled=True,
+            segment_sql_ring_max_per_tick=1,
+            segment_sql_statement_timeout_sec=1800,
+            segment_sql_page_hits_quiet_only=False,
+            segment_sql_min_repeat_sec=0,
+            segment_sql_orphan_after_sec=900,
+            segment_sql_lock_heartbeat_sec=15,
+        )
+        store = SimpleNamespace(list_runtime_sync=Mock(return_value=[]))
+        sql_db_running_count = _segment_sql_active_db_rebuild_query_count(db)
+
+        self.assertEqual(sql_db_running_count, 1)
+        self.assertEqual(
+            _segment_shared_slots_available(
+                {},
+                root,
+                1,
+                store=store,
+                config=cfg,
+                now_ts=150.0,
+                sql_db_running_count=sql_db_running_count,
+            ),
+            0,
+        )
+
+        launched = _run_sql_segment_ring(
+            config=cfg,
+            store=store,
+            db=db,
+            root=root,
+            ring=deque([76]),
+            rules={76: SQLSegmentRule(segment_id=76, select_sql="SELECT 1 AS lead_id", depends_on=())},
+            active_set={76},
+            done_set=set(),
+            running={},
+            sql_ctx={},
+            now_ts=150.0,
+            now_local=datetime.now(timezone.utc),
+            max_per_tick=1,
+            ring_label="segment_sql_long",
+            async_worker=True,
+            sql_db_running_count=sql_db_running_count,
+        )
+
+        self.assertEqual(launched, 0)
+        db.rebuild_segment_membership.assert_not_called()
+
+    def test_sql_segment_plan_preserves_priority_order_without_dependencies(self) -> None:
+        rules = {
+            66: SQLSegmentRule(segment_id=66, select_sql="SELECT 66 AS lead_id", depends_on=()),
+            77: SQLSegmentRule(segment_id=77, select_sql="SELECT 77 AS lead_id", depends_on=()),
+            273: SQLSegmentRule(segment_id=273, select_sql="SELECT 273 AS lead_id", depends_on=()),
+        }
+
+        self.assertEqual(_plan_sql_segment_ring([273, 77, 66], rules), [273, 77, 66])
 
     def test_campaign_pressure_ignores_short_single_campaign(self) -> None:
         root = "/var/www/site"

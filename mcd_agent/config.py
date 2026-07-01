@@ -482,6 +482,11 @@ class AgentConfig:
     segment_sql_auto_enabled: bool
     segment_sql_auto_problem_threshold: int
     segment_sql_auto_max_clauses: int
+    segment_sql_auto_long_native_enabled: bool
+    segment_sql_auto_long_native_min_duration_sec: int
+    segment_sql_auto_long_native_history_sec: int
+    segment_sql_auto_long_native_min_successes: int
+    segment_sql_long_ring_max_per_tick: int
     segment_sql_ring_max_per_tick: int
     segment_sql_min_repeat_sec: int
     segment_sql_lock_heartbeat_sec: int
@@ -1891,6 +1896,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_sql_auto_enabled": "segment_sql_auto_enabled",
     "segment_sql_auto_problem_threshold": "segment_sql_auto_problem_threshold",
     "segment_sql_auto_max_clauses": "segment_sql_auto_max_clauses",
+    "segment_sql_auto_long_native_enabled": "segment_sql_auto_long_native_enabled",
+    "segment_sql_auto_long_native_min_duration_sec": "segment_sql_auto_long_native_min_duration_sec",
+    "segment_sql_auto_long_native_history_sec": "segment_sql_auto_long_native_history_sec",
+    "segment_sql_auto_long_native_min_successes": "segment_sql_auto_long_native_min_successes",
+    "segment_sql_long_ring_max_per_tick": "segment_sql_long_ring_max_per_tick",
     "segment_sql_ring_max_per_tick": "segment_sql_ring_max_per_tick",
     "segment_sql_min_repeat_sec": "segment_sql_min_repeat_sec",
     "segment_sql_lock_heartbeat_sec": "segment_sql_lock_heartbeat_sec",
@@ -2657,6 +2667,20 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_auto_enabled=bool(runtime.get("segment_sql_auto_enabled", True)),
         segment_sql_auto_problem_threshold=max(1, int(runtime.get("segment_sql_auto_problem_threshold", 2) or 2)),
         segment_sql_auto_max_clauses=max(1, int(runtime.get("segment_sql_auto_max_clauses", 24) or 24)),
+        segment_sql_auto_long_native_enabled=bool(runtime.get("segment_sql_auto_long_native_enabled", True)),
+        segment_sql_auto_long_native_min_duration_sec=max(
+            60,
+            int(runtime.get("segment_sql_auto_long_native_min_duration_sec", 1800) or 1800),
+        ),
+        segment_sql_auto_long_native_history_sec=max(
+            3600,
+            int(runtime.get("segment_sql_auto_long_native_history_sec", 7 * 86400) or (7 * 86400)),
+        ),
+        segment_sql_auto_long_native_min_successes=max(
+            1,
+            int(runtime.get("segment_sql_auto_long_native_min_successes", 1) or 1),
+        ),
+        segment_sql_long_ring_max_per_tick=max(0, int(runtime.get("segment_sql_long_ring_max_per_tick", 1) or 0)),
         segment_sql_ring_max_per_tick=int(runtime.get("segment_sql_ring_max_per_tick", 1)),
         segment_sql_min_repeat_sec=max(0, int(runtime.get("segment_sql_min_repeat_sec", 3600) or 3600)),
         segment_sql_lock_heartbeat_sec=max(5, int(runtime.get("segment_sql_lock_heartbeat_sec", 15) or 15)),

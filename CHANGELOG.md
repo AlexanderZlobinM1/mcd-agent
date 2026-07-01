@@ -1,5 +1,69 @@
 # MCD Changelog
 
+## 0.9.203 - 2026-07-01
+
+- Fixed: SQL segment topological planning now preserves the incoming priority
+  order among ready nodes. High-priority long SQL segments are no longer
+  reordered behind smaller numeric segment IDs when there is no dependency
+  reason to do so.
+
+## 0.9.202 - 2026-07-01
+
+- Fixed: the long SQL segment ring now rebuilds its in-memory deque from the
+  priority plan each planner tick. Existing slow-only backlog order no longer
+  prevents higher-priority auto-promoted problem segments from running first.
+
+## 0.9.201 - 2026-07-01
+
+- Changed: auto-promoted long SQL segment ring ordering now prioritizes
+  segments with recent scheduler problems before purely slow historical
+  rebuilds. This puts failing business-critical page-hit segments ahead of the
+  long-only backlog.
+
+## 0.9.200 - 2026-07-01
+
+- Fixed: SQL segment slot accounting now also checks the live MySQL
+  processlist for active `mcd_tmp_segment_leads` rebuild queries. If a
+  client-side timeout or daemon restart leaves the server-side direct SQL
+  rebuild running, MCD blocks additional SQL segment workers until that query
+  is gone.
+
+## 0.9.199 - 2026-07-01
+
+- Fixed: long SQL segment slot accounting now treats fresh persisted
+  `segment_sql_state` locks as active work after daemon restart or self-update.
+  A restarted daemon no longer starts another heavy long SQL rebuild while a
+  previous worker's SQL query is still represented by a fresh running lock.
+
+## 0.9.198 - 2026-07-01
+
+- Fixed: the dedicated long SQL segment ring now runs direct SQL rebuilds in a
+  background worker. Heavy page-hit rebuilds no longer block the daemon's main
+  scheduler loop, while still claiming the shared segment slot and blocking the
+  same segment from native/classic launch until the SQL worker finishes.
+
+## 0.9.197 - 2026-07-01
+
+- Fixed: long native segment rebuild auto-promotion now considers segments from
+  recent task history even when the normal due-segment query does not list
+  them. This lets page-hit-driven segments stay in the dedicated SQL ring on
+  their own repeat interval instead of requiring a temporary whitelist.
+
+## 0.9.196 - 2026-07-01
+
+- Added: SQL-safe page-hit segments that finish a native
+  `mautic:segments:update -i <id>` but take longer than
+  `segment_sql_auto_long_native_min_duration_sec` are now auto-promoted into a
+  dedicated long SQL ring instead of requiring a manual whitelist.
+- Added: the long SQL ring runs before the regular SQL ring and is controlled
+  by `segment_sql_long_ring_max_per_tick`.
+- Fixed: automatic SQL segment detection now understands Mautic behavior
+  filters on `hit_url_date`, allowing URL contains plus page-hit date windows
+  to match native Mautic segment semantics.
+- Changed: page-hit filters alone are no longer enough to auto-promote a
+  segment; MCD now requires repeated scheduler problems, checked-out state, or
+  a recorded slow native rebuild.
+
 ## 0.9.195 - 2026-06-30
 
 - Changed: republished the default-deny nginx baseline and active-profile cron

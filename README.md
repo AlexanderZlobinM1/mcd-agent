@@ -118,6 +118,13 @@ Segment stale-priority rule (all non-passive profiles):
 - this rule is independent from normal weight threshold/top-N ranking;
 - if regular ring is empty, its slot is reused by priority ring automatically until regular items appear.
 
+SQL segment auto-promotion:
+- when `segment_sql_ring_enabled` and `segment_sql_auto_enabled` are true, MCD can rebuild SQL-safe segments directly in DB and remove them from native Mautic segment rings;
+- repeated recent native segment failures/timeouts still promote SQL-safe segments into the regular SQL ring;
+- SQL-safe page-hit segments are promoted into a dedicated long SQL ring after a successful native `mautic:segments:update -i <id>` takes at least `segment_sql_auto_long_native_min_duration_sec` seconds within `segment_sql_auto_long_native_history_sec`, even when the regular due-segment query would not select them;
+- the long SQL ring runs before the regular SQL ring and is limited by `segment_sql_long_ring_max_per_tick`;
+- direct SQL rebuilds update `lead_lists_leads`, `lead_lists.last_built_date`, build time metadata, and Mautic's segment count cache so the Mautic UI sees the segment as rebuilt.
+
 ## Split Config
 Recommended layout:
 - entrypoint: `/opt/mcd/etc/mcd.toml` (small, package-safe)

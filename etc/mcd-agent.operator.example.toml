@@ -57,6 +57,14 @@ segment_priority_parallel_throttled = 0
 segment_regular_parallel_throttled = 1
 # SQL ring for simple segments (direct DB rebuild; excluded from regular/priority rings).
 segment_sql_ring_enabled = false
+# Auto-promote SQL-safe segments after repeated scheduler errors or slow native rebuilds.
+segment_sql_auto_enabled = true
+# Native segment rebuild duration that promotes a SQL-safe page_hits segment into the long SQL ring.
+segment_sql_auto_long_native_min_duration_sec = 1800
+# Lookback window for slow native segment rebuild detection, sec.
+segment_sql_auto_long_native_history_sec = 604800
+# Max long SQL segment rebuilds per scheduler tick.
+segment_sql_long_ring_max_per_tick = 1
 # Max SQL segment rebuilds per scheduler tick.
 segment_sql_ring_max_per_tick = 1
 # Minimum time between starts of the same SQL-managed segment, sec.
