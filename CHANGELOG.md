@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.204 - 2026-07-01
+
+- Fixed: SQL auto-promotion now combines AND-ed page-hit behavior filters on a
+  single `{prefix}page_hits` alias instead of joining multiple page-hit
+  subqueries by lead ID. This matches the native Mautic shape for URL plus
+  hit-date segments and avoids expensive page_hits self-joins.
+- Fixed: SQL-managed segments are now pruned from the native segment resume
+  ring as well as the normal priority and regular rings, preventing a killed or
+  timed-out native rebuild from re-entering the classic scheduler cycle after
+  auto-promotion.
+
 ## 0.9.203 - 2026-07-01
 
 - Fixed: SQL segment topological planning now preserves the incoming priority

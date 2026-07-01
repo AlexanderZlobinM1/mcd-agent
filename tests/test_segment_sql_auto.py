@@ -207,7 +207,9 @@ class SegmentSQLAutoTests(unittest.TestCase):
         sql = rules[273].select_sql
         self.assertIn("ph.`url` LIKE '%klima%'", sql)
         self.assertIn("ph.date_hit >= '2026-05-29 10:00:00'", sql)
-        self.assertIn("INNER JOIN", sql)
+        self.assertNotIn("ph0", sql)
+        self.assertNotIn("ph1", sql)
+        self.assertEqual(1, sql.count("FROM {prefix}page_hits ph"))
 
 
 if __name__ == "__main__":

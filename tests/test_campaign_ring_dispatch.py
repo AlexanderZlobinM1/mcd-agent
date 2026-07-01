@@ -35,6 +35,7 @@ from mcd_agent.daemon import (
     _plan_sql_segment_ring,
     _published_segment_whitelist_ids,
     _recover_orphaned_imports_if_safe,
+    _remove_ring_entities,
     _run_sql_segment_ring,
     _segment_sql_active_db_rebuild_query_count,
     _segment_shared_slots_available,
@@ -1022,6 +1023,14 @@ class CampaignRingDispatchTests(unittest.TestCase):
         }
 
         self.assertEqual(_plan_sql_segment_ring([273, 77, 66], rules), [273, 77, 66])
+
+    def test_sql_managed_segment_is_removed_from_resume_ring(self) -> None:
+        ring = deque([101, 273, 204, 273, 305])
+
+        removed = _remove_ring_entities(ring, {273, 204})
+
+        self.assertEqual(removed, 3)
+        self.assertEqual(list(ring), [101, 305])
 
     def test_campaign_pressure_ignores_short_single_campaign(self) -> None:
         root = "/var/www/site"
