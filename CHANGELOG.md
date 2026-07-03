@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.213 - 2026-07-03
+
+- Added: guarded Composer Mautic 6 to 7 upgrade support behind explicit
+  `--allow-major`, including Composer/Node preflight, dynamic Mautic 7 target
+  application, existing Doctrine migration metadata reconciliation, and a
+  host-level PHP 8.4 system upgrade guard that blocks while other discovered
+  host instances are below Mautic 7.
+- Added: PHP 8.4 system upgrade handling for the 6 to 7 flow now migrates
+  custom PHP ini files, rewrites nginx PHP-FPM references, validates nginx,
+  restarts services, and purges PHP 8.3 only after the 8.4 switch succeeds.
+
 ## 0.9.212 - 2026-07-03
 
 - Fixed: per-campaign trigger due guards now apply the same `publish_down`

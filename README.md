@@ -501,6 +501,18 @@ Important:
   - `mautic-upgrade apply` supports `zip|composer|auto`
   - optional `--backup` creates archive backup before upgrade
   - optional `--with-system-upgrade` runs php/nginx package-level migration steps
+  - guarded Composer Mautic 6 to 7 upgrades require an explicit target and
+    `--allow-major`; MCC runs a Storage Box instance backup first and starts the
+    upgrade only after that backup succeeds
+  - the Mautic 6 to 7 Composer path prepares Composer and Node 20, updates
+    `composer.json` to the selected Mautic 7 target, runs Composer with
+    dependencies, clears cache, finishes the Mautic updater, and reconciles
+    known Doctrine migration metadata drift before the final migration check
+  - `--with-system-upgrade` on the 6 to 7 flow installs PHP 8.4 packages,
+    migrates custom PHP ini files such as `60-custom.ini` and
+    `90-redis-sessions.ini`, rewrites nginx PHP-FPM socket references from
+    8.3 to 8.4, validates nginx, restarts services, and purges PHP 8.3 only
+    after all other discovered host instances are Mautic 7-compatible
 - MCD self-version checks:
   - `runtime.mcd_update_notify = true` (default): show notice if MCC has newer MCD version
   - `runtime.mcd_auto_update_enabled = false` (default): auto-update disabled; notify-only
