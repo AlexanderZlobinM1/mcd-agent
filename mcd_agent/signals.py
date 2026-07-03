@@ -305,9 +305,15 @@ def _read_meminfo_kib() -> dict[str, int]:
 
 def _swap_signal() -> dict[str, Any]:
     mem = _read_meminfo_kib()
+    mem_total_kib = int(mem.get("MemTotal", 0) or 0)
+    mem_available_kib = int(mem.get("MemAvailable", 0) or 0)
     total_kib = int(mem.get("SwapTotal", 0) or 0)
     free_kib = int(mem.get("SwapFree", 0) or 0)
     used_kib = max(0, total_kib - free_kib)
+    mem_available_mb = int(mem_available_kib // 1024)
+    mem_available_pct = 0.0
+    if mem_total_kib > 0:
+        mem_available_pct = (float(mem_available_kib) / float(mem_total_kib)) * 100.0
     total_mb = int(total_kib // 1024)
     used_mb = int(used_kib // 1024)
     used_pct = 0.0
@@ -315,7 +321,13 @@ def _swap_signal() -> dict[str, Any]:
         used_pct = (float(used_kib) / float(total_kib)) * 100.0
     level = 0
     if total_mb > 0:
-        if used_pct >= 80.0 or used_mb >= 12_288:
+        low_available = (
+            mem_total_kib <= 0
+            or mem_available_kib <= 0
+            or mem_available_pct < 10.0
+            or mem_available_mb < 2048
+        )
+        if (used_pct >= 80.0 or used_mb >= 12_288) and low_available:
             level = 2
         elif used_pct >= 50.0 or used_mb >= 4_096:
             level = 1
@@ -324,6 +336,8 @@ def _swap_signal() -> dict[str, Any]:
         "used_mb": used_mb,
         "total_mb": total_mb,
         "used_pct": round(used_pct, 2),
+        "mem_available_mb": mem_available_mb,
+        "mem_available_pct": round(mem_available_pct, 2),
     }
 
 
