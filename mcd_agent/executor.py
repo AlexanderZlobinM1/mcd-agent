@@ -9,10 +9,11 @@ import subprocess
 from mcd_agent.fs_permissions import ensure_instance_permissions
 
 SUPPORTED_COMMANDS = {
-    "campaign:trigger": "mautic:campaign:trigger",
+    "campaign:trigger": "mautic:campaigns:trigger",
     "segments:update": "mautic:segments:update",
-    "campaign:rebuild": "mautic:campaign:rebuild",
+    "campaign:rebuild": "mautic:campaigns:rebuild",
     # Keep backward-compatible CLI alias: update == rebuild.
+    "campaigns:rebuild": "mautic:campaigns:rebuild",
     "campaigns:update": "mautic:campaigns:rebuild",
     "campaigns:trigger": "mautic:campaigns:trigger",
     "import": "mautic:import",
@@ -25,6 +26,7 @@ COMMAND_TASK_TYPES = {
     "campaigns:trigger": "campaign_trigger",
     "segments:update": "segment",
     "campaign:rebuild": "campaign_rebuild",
+    "campaigns:rebuild": "campaign_rebuild",
     "campaigns:update": "campaign_rebuild",
     "import": "import",
 }
@@ -136,7 +138,7 @@ def build_mautic_exec_args(
         raise ValueError(f"Unsupported command: {command}")
 
     template = SUPPORTED_COMMANDS[command]
-    if command in {"campaign:trigger", "segments:update", "campaign:rebuild", "campaigns:update", "campaigns:trigger", "import"} and instance_id is not None:
+    if command in {"campaign:trigger", "segments:update", "campaign:rebuild", "campaigns:rebuild", "campaigns:update", "campaigns:trigger", "import"} and instance_id is not None:
         template += f" -i {instance_id}"
     return render_mautic_command(
         php_bin=php_bin,

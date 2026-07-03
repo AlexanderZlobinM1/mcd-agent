@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.209 - 2026-07-03
+
+- Fixed: MCC/manual `mcd-cli exec` operations now run the requested Mautic
+  console command synchronously on the selected instance instead of marking the
+  operation successful after only queueing a local scheduler request. This makes
+  UI buttons behave like the native Mautic console command the operator chose.
+- Fixed: manual campaign aliases `campaign:rebuild` and `campaign:trigger` now
+  execute native plural Mautic commands (`mautic:campaigns:rebuild` and
+  `mautic:campaigns:trigger`). The explicit `campaigns:rebuild` alias is also
+  accepted.
+
 ## 0.9.208 - 2026-07-01
 
 - Fixed: full MCC state pushes now use a longer default HTTP timeout so image

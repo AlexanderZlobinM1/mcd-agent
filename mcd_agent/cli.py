@@ -599,6 +599,15 @@ def _run_manual_command_with_scheduler(
                 "cluster route requires mysql_hybrid state backend; "
                 f"route={route} targets={','.join(route_targets)}"
             )
+        if not remote_targets:
+            return execute_mautic_command(
+                php_bin=php_bin,
+                root=root,
+                command=command,
+                instance_id=instance_id,
+                timeout_sec=timeout_sec,
+                run_as_user=run_as_user,
+            )
 
         reqs: list[tuple[str, int]] = []
         command_payload = _MANUAL_CMD_SEP.join(cmd_args)
@@ -618,9 +627,9 @@ def _run_manual_command_with_scheduler(
         if not reqs:
             return 2, f"cluster route has no valid targets for route={route}"
 
-        wait_sec = max(1.0, min(8.0, float(cfg.dispatch_interval_sec) * 3.0))
+        wait_sec = max(1.0, float(timeout_sec or cfg.command_timeout_sec or 0) + 5.0)
         deadline = time.time() + wait_sec
-        terminal = {"launched", "done", "failed", "timeout", "lost", "skipped", "cancelled"}
+        terminal = {"done", "failed", "timeout", "lost", "skipped", "cancelled"}
         statuses: dict[tuple[str, int], str] = {}
         while time.time() < deadline:
             all_terminal = True
@@ -641,72 +650,24 @@ def _run_manual_command_with_scheduler(
         bad = [
             st
             for st in statuses.values()
-            if str(st).strip().lower() in {"failed", "timeout", "lost", "cancelled"}
+            if str(st).strip().lower() in {"failed", "timeout", "lost", "skipped", "cancelled"}
         ]
-        rc = 1 if bad else 0
+        unfinished = [
+            st
+            for st in statuses.values()
+            if str(st).strip().lower() not in terminal
+        ]
+        rc = 1 if bad or unfinished else 0
         return rc, f"cluster routed route={route} " + " ".join(parts)
 
-    if not task_type:
-        return execute_mautic_command(
-            php_bin=php_bin,
-            root=root,
-            command=command,
-            instance_id=instance_id,
-            timeout_sec=timeout_sec,
-            run_as_user=run_as_user,
-        )
-
-    profile = (cfg.profile_name or "").strip().lower()
-    if profile == "passive":
-        return execute_mautic_command(
-            php_bin=php_bin,
-            root=root,
-            command=command,
-            instance_id=instance_id,
-            timeout_sec=timeout_sec,
-            run_as_user=run_as_user,
-        )
-
-    try:
-        cmd_args = build_mautic_exec_args(
-            php_bin=php_bin,
-            root=root,
-            command=command,
-            instance_id=instance_id,
-            run_as_user=run_as_user,
-        )
-    except ValueError as e:
-        return 2, str(e)
-    except FileNotFoundError as e:
-        return 3, str(e)
-
-    store = TaskStore(cfg.state_db_path, cfg)
-    req_id = store.enqueue_manual_request(
+    return execute_mautic_command(
+        php_bin=php_bin,
         root=root,
-        task_type=task_type,
-        entity_id=instance_id,
-        command_str=_MANUAL_CMD_SEP.join(cmd_args),
+        command=command,
+        instance_id=instance_id,
         timeout_sec=timeout_sec,
+        run_as_user=run_as_user,
     )
-
-    wait_sec = max(1.0, min(8.0, float(cfg.dispatch_interval_sec) * 3.0))
-    deadline = time.time() + wait_sec
-    terminal = {"launched", "done", "failed", "timeout", "lost", "skipped", "cancelled"}
-    while time.time() < deadline:
-        st = store.get_manual_request_status(req_id)
-        if st is None:
-            break
-        st_norm = st.strip().lower()
-        if st_norm in terminal:
-            if st_norm == "launched":
-                return 0, f"queued request_id={req_id} status=launched"
-            if st_norm in {"failed", "timeout", "lost"}:
-                return 1, f"queued request_id={req_id} status={st_norm}"
-            return 0, f"queued request_id={req_id} status={st_norm}"
-        time.sleep(0.15)
-
-    st = store.get_manual_request_status(req_id) or "unknown"
-    return 0, f"queued request_id={req_id} status={st}"
 
 
 def _build_cache_hard_local_cli_args(cfg, root: str) -> list[str]:
@@ -1567,6 +1528,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "campaign:trigger",
             "segments:update",
             "campaign:rebuild",
+            "campaigns:rebuild",
             "campaigns:update",
             "campaigns:trigger",
             "import",
@@ -1596,6 +1558,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sh_cr = sub.add_parser("campaign:rebuild", help="Shorthand for exec --command campaign:rebuild")
     _add_shorthand_exec_args(sh_cr, with_instance_id=True)
+
+    sh_crs = sub.add_parser("campaigns:rebuild", help="Shorthand for exec --command campaigns:rebuild")
+    _add_shorthand_exec_args(sh_crs, with_instance_id=True)
 
     sh_cu = sub.add_parser("campaigns:update", help="Shorthand for exec --command campaigns:update")
     _add_shorthand_exec_args(sh_cu, with_instance_id=True)
@@ -2125,6 +2090,7 @@ def main() -> int:
         "segments:update",
         "campaign:trigger",
         "campaign:rebuild",
+        "campaigns:rebuild",
         "campaigns:update",
         "campaigns:trigger",
         "import",
