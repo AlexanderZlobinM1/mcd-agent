@@ -2477,6 +2477,7 @@ def _campaign_trigger_event_log_due_exists_sql(campaign_id: int) -> str:
         f"WHERE c.id = {cid} "
         "  AND c.is_published = 1 "
         "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+        "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
         "  AND EXISTS ("
         "    SELECT 1 "
         "    FROM {prefix}campaign_lead_event_log el "

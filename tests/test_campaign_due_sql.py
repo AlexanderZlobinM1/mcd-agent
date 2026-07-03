@@ -10,7 +10,10 @@ from mcd_agent.config import (
     _campaign_triggers_due_sql,
     _import_pending_count_sql,
 )
-from mcd_agent.daemon import _campaign_trigger_root_action_due_exists_sql
+from mcd_agent.daemon import (
+    _campaign_trigger_event_log_due_exists_sql,
+    _campaign_trigger_root_action_due_exists_sql,
+)
 
 
 class CampaignDueSqlTests(unittest.TestCase):
@@ -50,7 +53,7 @@ class CampaignDueSqlTests(unittest.TestCase):
             _DEFAULT_SQL_IMPORT_PENDING_COUNT,
         )
 
-    def test_trigger_due_catches_date_events_after_publish_down(self) -> None:
+    def test_trigger_due_respects_publish_down_for_date_events(self) -> None:
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
         self.assertIn("el.is_scheduled = 1", event_log_branch)
         self.assertIn("el.date_triggered IS NULL", event_log_branch)
@@ -59,8 +62,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertNotIn("el.trigger_date >= '{window_start_utc_7d}'", event_log_branch)
         self.assertNotIn("el.trigger_date <= '{now_local}'", event_log_branch)
         self.assertNotIn("el.trigger_date >= '{window_start_local_7d}'", event_log_branch)
-        self.assertNotIn("c.publish_down", event_log_branch)
-
+        self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", event_log_branch)
 
     def test_trigger_due_keeps_old_pending_event_logs_visible(self) -> None:
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
@@ -93,6 +95,18 @@ class CampaignDueSqlTests(unittest.TestCase):
         previous = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.replace(
             "el.trigger_date <= '{now_utc}' ",
             "el.trigger_date <= '{now_utc}' OR el.trigger_date <= '{now_local}' ",
+            1,
+        )
+
+        self.assertEqual(
+            _campaign_triggers_due_sql({"campaign_triggers_due": previous}),
+            _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+        )
+
+    def test_trigger_sql_without_event_log_publish_down_guard_is_migrated(self) -> None:
+        previous = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.replace(
+            "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') ",
+            "",
             1,
         )
 
@@ -147,6 +161,13 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("el0.rotation <=> cld.rotation", guard_sql)
         self.assertNotIn("el0.event_id = ce.id", guard_sql)
 
+    def test_trigger_due_event_log_guard_respects_publish_down(self) -> None:
+        guard_sql = _campaign_trigger_event_log_due_exists_sql(162)
+
+        self.assertIn("FROM {prefix}campaign_lead_event_log el", guard_sql)
+        self.assertIn("el.trigger_date <= '{now_utc}'", guard_sql)
+        self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", guard_sql)
+
     def test_trigger_due_is_strictly_event_log_driven(self) -> None:
         # Scheduled execution is event-log driven, but root actions also need a
         # bootstrap path: Mautic only creates the event log when the campaign is
@@ -157,7 +178,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("FROM {prefix}campaign_events ce", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
         self.assertIn("ce.trigger_mode IN ('immediate', 'interval')", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
 
-    def test_rebuild_due_has_publish_down_free_date_action_catchup(self) -> None:
+    def test_rebuild_due_date_action_catchup_respects_publish_down(self) -> None:
         date_action_branch = _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE.split("UNION", 2)[1]
 
         self.assertIn("ce.trigger_mode = 'date'", date_action_branch)
@@ -165,8 +186,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertNotIn("ce.trigger_date >= '{window_start_utc_7d}'", date_action_branch)
         self.assertIn("ce.trigger_date <= '{now_local}'", date_action_branch)
         self.assertNotIn("ce.trigger_date >= '{window_start_local_7d}'", date_action_branch)
-        self.assertNotIn("c.publish_down", date_action_branch)
-
+        self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", date_action_branch)
 
     def test_campaign_due_has_no_age_lower_bound_for_campaign_events(self) -> None:
         self.assertNotIn("ce.trigger_date >= '{window_start_utc_7d}'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
@@ -214,6 +234,20 @@ class CampaignDueSqlTests(unittest.TestCase):
             "ce.trigger_date <= '{now_utc}'         OR ce.trigger_date <= '{now_local}'",
             "(ce.trigger_date >= '{window_start_utc_7d}' AND ce.trigger_date <= '{now_utc}')         OR (ce.trigger_date >= '{window_start_local_7d}' AND ce.trigger_date <= '{now_local}')",
             1,
+        )
+
+        self.assertEqual(
+            _campaign_rebuilds_due_sql({"campaign_rebuilds_due": previous}),
+            _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE,
+        )
+
+    def test_rebuild_sql_without_date_action_publish_down_guard_is_migrated(self) -> None:
+        guard = "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+        first_pos = _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE.index(guard)
+        second_pos = _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE.index(guard, first_pos + len(guard))
+        previous = (
+            _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE[:second_pos]
+            + _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE[second_pos + len(guard) :]
         )
 
         self.assertEqual(

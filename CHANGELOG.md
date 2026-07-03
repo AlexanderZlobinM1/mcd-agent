@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.9.212 - 2026-07-03
+
+- Fixed: per-campaign trigger due guards now apply the same `publish_down`
+  active-window check as the scheduler ring SQL, so expired campaigns cannot be
+  treated as due after the ring planner has filtered them out.
+
+## 0.9.211 - 2026-07-03
+
+- Fixed: campaign trigger and rebuild due SQL now applies the active
+  `publish_down` window to every scheduler branch. Expired published campaigns
+  no longer stay in MCD trigger/rebuild rings after native Mautic would skip
+  them, preventing old campaigns from delaying fresh active campaigns.
+- Fixed: saved legacy campaign trigger/rebuild SQL overrides missing the
+  branch-level `publish_down` guard are migrated back to the packaged default.
+
 ## 0.9.210 - 2026-07-03
 
 - Fixed: host pressure scheduler pause no longer treats historically occupied

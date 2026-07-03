@@ -219,6 +219,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
     "  AND EXISTS ("
     "  SELECT 1 "
     "  FROM {prefix}campaign_lead_event_log el "
@@ -331,6 +332,7 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "  FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
     "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
     "  AND EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_leadlist_xref cx0 "
@@ -1143,6 +1145,14 @@ def _normalize_sql_signature(value: object) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
+def _sql_branch_missing_publish_down(normalized: str, signatures: tuple[str, ...]) -> bool:
+    for branch in normalized.split(" union "):
+        if all(sig in branch for sig in signatures):
+            if "c.publish_down is null or c.publish_down >= '{now_local}'" not in branch:
+                return True
+    return False
+
+
 def _is_legacy_campaigns_due_sql(value: object) -> bool:
     raw = str(value or "").strip()
     if raw in _LEGACY_CAMPAIGNS_DUE_SQLS:
@@ -1155,6 +1165,14 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
         # 4 installations do not have campaigns.deleted. Any persisted due SQL
         # referencing it is unsafe and must be regenerated from the packaged
         # compatibility-safe default.
+        return True
+    event_log_active_window_signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_lead_event_log el",
+        "el.is_scheduled = 1",
+        "el.trigger_date <= '{now_utc}'",
+    )
+    if _sql_branch_missing_publish_down(normalized, event_log_active_window_signatures):
         return True
     # MCC used to persist the generated campaign trigger SQL under the legacy
     # campaigns_due key. Match that shape structurally so hosts with old
@@ -1261,6 +1279,16 @@ def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
     if not normalized:
         return False
     if "{prefix}campaigns c" in normalized and "c.deleted is null" in normalized:
+        return True
+    date_action_active_window_signatures = (
+        "{prefix}campaigns c",
+        "{prefix}campaign_events ce",
+        "ce.parent_id is not null",
+        "ce.trigger_mode = 'date'",
+        "ce.trigger_date <= '{now_utc}'",
+        "el3.rotation <=> cld.rotation",
+    )
+    if _sql_branch_missing_publish_down(normalized, date_action_active_window_signatures):
         return True
     signatures = (
         "{prefix}campaigns c",
