@@ -12,6 +12,8 @@ from mcd_agent.mautic_upgrade import (
     _enter_upgrade_maintenance,
     _exit_upgrade_maintenance,
     _hard_clear_prod_cache,
+    _migrate_php_custom_ini,
+    _rewrite_nginx_php_fpm_references,
     _upgrade_target_relation,
 )
 
@@ -28,6 +30,11 @@ class MauticUpgradeTargetTests(unittest.TestCase):
     def test_major_and_multi_minor_are_blocked(self) -> None:
         self.assertEqual(_upgrade_target_relation("7.0.2", "8.0.0", allow_minor=True), "blocked_major")
         self.assertEqual(_upgrade_target_relation("7.0.2", "7.2.0", allow_minor=True), "blocked_minor")
+
+    def test_guarded_composer_six_to_seven_major_can_be_allowed(self) -> None:
+        self.assertEqual(_upgrade_target_relation("6.0.9", "7.1.2"), "blocked_major")
+        self.assertEqual(_upgrade_target_relation("6.0.9", "7.1.2", allow_major=True), "allowed")
+        self.assertEqual(_upgrade_target_relation("5.2.9", "7.1.2", allow_major=True), "blocked_major")
 
     def test_target_must_be_clean_semver(self) -> None:
         self.assertEqual(_clean_target_version("7.1.2"), "7.1.2")
@@ -136,6 +143,36 @@ class MauticUpgradeTargetTests(unittest.TestCase):
 
             hard_clear.assert_called_once_with("/tmp/app")
             run.assert_called_once_with(["php", "bin/console", "cache:clear"], cwd="/tmp/app", as_www_data=True)
+
+    def test_php_custom_ini_migration_copies_only_custom_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "8.3" / "cli" / "conf.d"
+            dst = root / "8.4" / "cli" / "conf.d"
+            src.mkdir(parents=True)
+            dst.mkdir(parents=True)
+            (src / "60-custom.ini").write_text("memory_limit=512M\n", encoding="utf-8")
+            (src / "20-curl.ini").write_text("extension=curl.so\n", encoding="utf-8")
+
+            moved = _migrate_php_custom_ini(php_etc_root=root)
+
+            self.assertTrue((dst / "60-custom.ini").exists())
+            self.assertTrue((src / "60-custom.ini").exists())
+            self.assertTrue((src / "20-curl.ini").exists())
+            self.assertIn(str(dst / "60-custom.ini"), moved[0])
+
+    def test_nginx_php_fpm_rewrite_updates_socket_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            site = root / "sites-enabled"
+            site.mkdir()
+            conf = site / "app.conf"
+            conf.write_text("fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n", encoding="utf-8")
+
+            changed = _rewrite_nginx_php_fpm_references(nginx_roots=(site,))
+
+            self.assertEqual(changed, [str(conf)])
+            self.assertIn("php8.4-fpm.sock", conf.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

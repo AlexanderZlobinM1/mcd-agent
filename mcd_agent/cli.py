@@ -1680,6 +1680,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--with-system-upgrade", action="store_true")
     up.add_argument("--target", help="Explicit target Mautic version")
     up.add_argument("--allow-minor", action="store_true", help="Allow one-step minor upgrade within the current major")
+    up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
     img.add_argument("--config", default=default_cfg)
@@ -2605,6 +2606,7 @@ def main() -> int:
             with_system_upgrade=bool(args.with_system_upgrade),
             target_override=str(args.target or "").strip() or None,
             allow_minor=bool(args.allow_minor),
+            allow_major=bool(args.allow_major),
         )
         if rc == 0:
             _push_state_after_change(cfg, "mautic-upgrade-apply")

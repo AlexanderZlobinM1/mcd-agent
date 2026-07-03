@@ -56,6 +56,30 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
 
 _VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
 
+PHP84_PACKAGE_SUFFIXES = [
+    "apcu",
+    "fpm",
+    "cli",
+    "curl",
+    "mysql",
+    "mailparse",
+    "gd",
+    "mbstring",
+    "imagick",
+    "bcmath",
+    "zip",
+    "tidy",
+    "soap",
+    "intl",
+    "xml",
+    "imap",
+    "redis",
+    "opcache",
+]
+
+PHP_CUSTOM_INI_NAMES = {"60-custom.ini", "90-redis-sessions.ini"}
+PHP_CUSTOM_INI_HINTS = ("custom", "mcd", "sales-snap", "redis-session", "redis_sessions")
+
 
 @dataclass(slots=True)
 class UpgradeProbeResult:
@@ -335,7 +359,19 @@ def _latest_same_branch(config: AgentConfig, version: str) -> str | None:
     return latest if _parse_semver(latest) > v else None
 
 
-def _upgrade_target_relation(current: str, target: str, *, allow_minor: bool = False) -> str:
+def _is_supported_major_upgrade(current: str, target: str) -> bool:
+    current_sv = _parse_semver(current)
+    target_sv = _parse_semver(target)
+    return current_sv[0] == 6 and target_sv[0] == 7 and target_sv > current_sv
+
+
+def _upgrade_target_relation(
+    current: str,
+    target: str,
+    *,
+    allow_minor: bool = False,
+    allow_major: bool = False,
+) -> str:
     current_sv = _parse_semver(current)
     target_sv = _parse_semver(target)
     if current_sv == (0, 0, 0) or target_sv == (0, 0, 0):
@@ -343,6 +379,8 @@ def _upgrade_target_relation(current: str, target: str, *, allow_minor: bool = F
     if target_sv <= current_sv:
         return "none"
     if target_sv[0] != current_sv[0]:
+        if allow_major and _is_supported_major_upgrade(current, target):
+            return "allowed"
         return "blocked_major"
     if target_sv[1] == current_sv[1]:
         return "allowed"
@@ -351,8 +389,14 @@ def _upgrade_target_relation(current: str, target: str, *, allow_minor: bool = F
     return "blocked_minor"
 
 
-def _ensure_upgrade_target_allowed(current: str, target: str, *, allow_minor: bool = False) -> bool:
-    relation = _upgrade_target_relation(current, target, allow_minor=allow_minor)
+def _ensure_upgrade_target_allowed(
+    current: str,
+    target: str,
+    *,
+    allow_minor: bool = False,
+    allow_major: bool = False,
+) -> bool:
+    relation = _upgrade_target_relation(current, target, allow_minor=allow_minor, allow_major=allow_major)
     if relation == "allowed":
         return True
     if relation == "none":
@@ -360,7 +404,8 @@ def _ensure_upgrade_target_allowed(current: str, target: str, *, allow_minor: bo
     if relation == "blocked_major":
         raise RuntimeError(
             f"Major upgrade is disabled in current flow: {current} -> {target}. "
-            "Only patch updates are allowed by default; one-step minor updates require --allow-minor."
+            "Only patch updates are allowed by default; one-step minor updates require --allow-minor, "
+            "and the Composer Mautic 6 -> 7 flow requires --allow-major."
         )
     if relation == "blocked_minor":
         raise RuntimeError(
@@ -494,7 +539,169 @@ def _prepare_plugins_for_major_jump(root: str, from_ver: str, to_ver: str) -> No
         shutil.rmtree(d)
 
 
-def _apply_system_upgrade(from_ver: str, to_ver: str) -> None:
+def _same_install_root(a: str, b: str) -> bool:
+    try:
+        return os.path.abspath(a) == os.path.abspath(b)
+    except Exception:
+        return str(a or "").rstrip("/") == str(b or "").rstrip("/")
+
+
+def _instance_label(inst: MauticInstall) -> str:
+    for value in (inst.primary_domain, inst.name, inst.instance_uid, inst.root):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "unknown instance"
+
+
+def _assert_php84_host_safe(config: AgentConfig, upgraded_root: str) -> None:
+    blockers: list[str] = []
+    installs = discover_mautic(
+        config.discovery_roots,
+        config.exclude_path_contains,
+        config.supported_mautic_majors,
+        config.custom_instances,
+    )
+    for inst in installs:
+        if _same_install_root(inst.root, upgraded_root):
+            continue
+        major = inst.mautic_major
+        if major is None:
+            try:
+                detected = _read_current_version(inst.root, inst.console_path, config.php_bin, config.mautic_run_as_user)
+                parsed = _parse_semver(detected)
+                if parsed != (0, 0, 0):
+                    major = parsed[0]
+            except Exception:
+                major = None
+        if major is None:
+            blockers.append(f"{_instance_label(inst)} (unknown Mautic version)")
+        elif int(major) < 7:
+            blockers.append(f"{_instance_label(inst)} (Mautic {major})")
+    if blockers:
+        raise RuntimeError(
+            "PHP 8.4 system upgrade is blocked because this host still has instance(s) "
+            "that may not support PHP 8.4: "
+            + "; ".join(blockers)
+        )
+
+
+def _php84_package_names() -> list[str]:
+    return [f"php8.4-{suffix}" for suffix in PHP84_PACKAGE_SUFFIXES]
+
+
+def _install_php84_packages() -> None:
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    subprocess.run(["apt-get", "update"], check=True, env=env)
+    subprocess.run(["apt-get", "install", "-y", *_php84_package_names()], check=True, env=env)
+
+
+def _is_custom_php_ini(path: Path) -> bool:
+    name = path.name
+    low = name.lower()
+    if name in PHP_CUSTOM_INI_NAMES:
+        return True
+    if not low.endswith(".ini"):
+        return False
+    return any(hint in low for hint in PHP_CUSTOM_INI_HINTS)
+
+
+def _migrate_php_custom_ini(
+    *,
+    from_version: str = "8.3",
+    to_version: str = "8.4",
+    php_etc_root: Path = Path("/etc/php"),
+) -> list[str]:
+    moved: list[str] = []
+    for sapi in ("cli", "fpm"):
+        src_dir = php_etc_root / from_version / sapi / "conf.d"
+        dst_dir = php_etc_root / to_version / sapi / "conf.d"
+        if not src_dir.exists() or not src_dir.is_dir():
+            continue
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for src in sorted(src_dir.iterdir(), key=lambda p: p.name):
+            if not _is_custom_php_ini(src):
+                continue
+            dst = dst_dir / src.name
+            if dst.exists() or dst.is_symlink():
+                moved.append(f"skip existing {dst}")
+                continue
+            shutil.copy2(str(src), str(dst), follow_symlinks=False)
+            moved.append(f"{src} -> {dst}")
+    return moved
+
+
+def _rewrite_nginx_php_fpm_references(
+    *,
+    from_version: str = "8.3",
+    to_version: str = "8.4",
+    nginx_roots: tuple[Path, ...] = (Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/sites-available")),
+) -> list[str]:
+    changed: list[str] = []
+    old = f"php{from_version}-fpm"
+    new = f"php{to_version}-fpm"
+    for root in nginx_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in sorted(root.iterdir(), key=lambda p: p.name):
+            if path.is_dir():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if old not in text:
+                continue
+            path.write_text(text.replace(old, new), encoding="utf-8")
+            changed.append(str(path))
+    return changed
+
+
+def _enable_php84_and_restart_nginx() -> None:
+    subprocess.run(["systemctl", "enable", "--now", "php8.4-fpm"], check=True)
+    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    if test.returncode != 0:
+        raise RuntimeError(f"nginx -t failed after PHP 8.4 switch: {(test.stderr or test.stdout or '').strip()}")
+    subprocess.run(["systemctl", "restart", "nginx"], check=True)
+    subprocess.run(["systemctl", "restart", "php8.4-fpm"], check=False)
+
+
+def _purge_php83_packages() -> None:
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    subprocess.run(["bash", "-lc", "apt-get purge -y 'php8.3*'"], check=True, env=env)
+
+
+def _apply_php84_system_upgrade(config: AgentConfig, upgraded_root: str) -> None:
+    _assert_php84_host_safe(config, upgraded_root)
+    print("PHP 8.4 preflight ok: all discovered host instances are Mautic 7-compatible")
+    _install_php84_packages()
+    moved = _migrate_php_custom_ini()
+    if moved:
+        print("PHP 8.4 custom ini migration:")
+        for item in moved:
+            print(f"  {item}")
+    changed = _rewrite_nginx_php_fpm_references()
+    if changed:
+        print("PHP 8.4 nginx references updated: " + ", ".join(changed))
+    _enable_php84_and_restart_nginx()
+    _purge_php83_packages()
+    print("PHP 8.4 system upgrade completed")
+
+
+def _apply_system_upgrade(
+    from_ver: str,
+    to_ver: str,
+    *,
+    config: AgentConfig | None = None,
+    upgraded_root: str | None = None,
+) -> None:
+    if _parse_semver(from_ver)[0] == 6 and _parse_semver(to_ver)[0] == 7:
+        if config is None or not upgraded_root:
+            raise RuntimeError("PHP 8.4 system upgrade requires config and upgraded root")
+        _apply_php84_system_upgrade(config, upgraded_root)
+        return
     if from_ver == "4.4.13" and to_ver == "5.1.1":
         subprocess.run(
             [
@@ -548,33 +755,6 @@ def _apply_system_upgrade(from_ver: str, to_ver: str) -> None:
                 "php8.3-imap",
                 "php8.3-redis",
                 "php8.3-opcache",
-                "-y",
-            ],
-            check=True,
-        )
-    if to_ver == "7.0.0":
-        subprocess.run(
-            [
-                "apt",
-                "install",
-                "php8.4-apcu",
-                "php8.4-fpm",
-                "php8.4-cli",
-                "php8.4-curl",
-                "php8.4-mysql",
-                "php8.4-mailparse",
-                "php8.4-gd",
-                "php8.4-mbstring",
-                "php8.4-imagick",
-                "php8.4-bcmath",
-                "php8.4-zip",
-                "php8.4-tidy",
-                "php8.4-soap",
-                "php8.4-intl",
-                "php8.4-xml",
-                "php8.4-imap",
-                "php8.4-redis",
-                "php8.4-opcache",
                 "-y",
             ],
             check=True,
@@ -1073,6 +1253,7 @@ def run_upgrade_apply(
     with_system_upgrade: bool,
     target_override: str | None = None,
     allow_minor: bool = False,
+    allow_major: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
     install_root, console = inst.root, inst.console_path
@@ -1081,11 +1262,20 @@ def run_upgrade_apply(
     if not target:
         print(f"No upgrade target for current version {current}")
         return 0
-    if not _ensure_upgrade_target_allowed(current, target, allow_minor=allow_minor):
+    if not _ensure_upgrade_target_allowed(current, target, allow_minor=allow_minor, allow_major=allow_major):
         print(f"No upgrade target for current version {current}")
         return 0
 
-    print(f"Upgrade plan: {current} -> {target} (mode={mode})")
+    chosen_mode = mode
+    if chosen_mode == "auto":
+        chosen_mode = detect_install_type(install_root)
+    if _parse_semver(current)[0] != _parse_semver(target)[0]:
+        if not (allow_major and _is_supported_major_upgrade(current, target) and chosen_mode == "composer"):
+            raise RuntimeError(
+                "Major upgrade is supported only for Composer Mautic 6 -> 7 with --allow-major"
+            )
+
+    print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
     if not yes:
         ans = input("Proceed? [y/N]: ").strip().lower()
         if ans not in {"y", "yes"}:
@@ -1101,10 +1291,6 @@ def run_upgrade_apply(
             b = _backup_install(install_root)
             print(f"Backup created: {b}")
 
-        chosen_mode = mode
-        if chosen_mode == "auto":
-            chosen_mode = detect_install_type(install_root)
-
         if chosen_mode == "zip":
             _apply_zip(config, install_root, console, config.php_bin, target)
         elif chosen_mode == "composer":
@@ -1113,7 +1299,7 @@ def run_upgrade_apply(
             raise RuntimeError(f"Unsupported mode: {mode}")
 
         if with_system_upgrade:
-            _apply_system_upgrade(current, target)
+            _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
 
         # Restore transport dependencies for API senders after upgrade
         # (especially relevant for zip installs where update flow may drop composer deps).
