@@ -5,10 +5,40 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcd_agent.signals import _shadow_running_tasks, collect_monitor_signals, collect_signals
+from mcd_agent.signals import _shadow_running_tasks, _swap_signal, collect_monitor_signals, collect_signals
 
 
 class SignalsSchedulerHistoryTests(unittest.TestCase):
+    def test_swap_signal_keeps_historic_swap_usage_below_pause_level_when_memory_is_available(self) -> None:
+        meminfo = {
+            "MemTotal": 64 * 1024 * 1024,
+            "MemAvailable": 21 * 1024 * 1024,
+            "SwapTotal": 32 * 1024 * 1024,
+            "SwapFree": 19 * 1024 * 1024,
+        }
+
+        with patch("mcd_agent.signals._read_meminfo_kib", return_value=meminfo):
+            payload = _swap_signal()
+
+        self.assertEqual(payload["used_mb"], 13 * 1024)
+        self.assertEqual(payload["mem_available_mb"], 21 * 1024)
+        self.assertEqual(payload["level"], 1)
+
+    def test_swap_signal_reaches_pause_level_when_swap_and_memory_are_both_under_pressure(self) -> None:
+        meminfo = {
+            "MemTotal": 64 * 1024 * 1024,
+            "MemAvailable": 1024 * 1024,
+            "SwapTotal": 32 * 1024 * 1024,
+            "SwapFree": 19 * 1024 * 1024,
+        }
+
+        with patch("mcd_agent.signals._read_meminfo_kib", return_value=meminfo):
+            payload = _swap_signal()
+
+        self.assertEqual(payload["used_mb"], 13 * 1024)
+        self.assertEqual(payload["mem_available_mb"], 1024)
+        self.assertEqual(payload["level"], 2)
+
     def test_shadow_includes_recent_finished_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "state.db"

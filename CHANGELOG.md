@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.210 - 2026-07-03
+
+- Fixed: host pressure scheduler pause no longer treats historically occupied
+  swap as critical by itself. Swap reaches the pause level only when high swap
+  usage is accompanied by low available memory, so active campaign/segment
+  scheduling is not stalled on large hosts that have reclaimed RAM but still
+  show old swap usage.
+
 ## 0.9.209 - 2026-07-03
 
 - Fixed: MCC/manual `mcd-cli exec` operations now run the requested Mautic
