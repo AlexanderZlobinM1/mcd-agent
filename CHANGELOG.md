@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.9.214 - 2026-07-04
+
+- Fixed: campaign trigger due detection now follows native Mautic scheduled
+  event-log semantics by selecting rows with `is_scheduled = 1` and due
+  `trigger_date` even when `date_triggered` is already filled by an earlier
+  scheduling/attempt pass. This keeps partially processed campaigns with due
+  event-log work visible to the MCD trigger ring instead of marking them stale.
+- Fixed: the per-campaign trigger due guard now uses the same scheduled-row
+  rule, so a campaign selected by the trigger ring is not skipped merely
+  because `date_triggered` is later than the original due timestamp.
+- Added: regression coverage for scheduled due campaign event-log rows whose
+  attempt timestamp is already populated.
+
 ## 0.9.213 - 2026-07-03
 
 - Added: guarded Composer Mautic 6 to 7 upgrade support behind explicit
