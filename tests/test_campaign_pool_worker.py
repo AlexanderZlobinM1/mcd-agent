@@ -1,18 +1,15 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
+import pytest
 
-SCRIPT_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "local-mcc"
-    / "mauticctl"
-    / "custom"
-    / "scripts"
-    / "campaign-pool-worker.py"
-)
+CONTROL_PLANE_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_PATH = CONTROL_PLANE_ROOT / "local-mcc" / "mauticctl" / "custom" / "scripts" / "campaign-pool-worker.py"
 
 
 def _load_module():
+    if not (CONTROL_PLANE_ROOT / "agent").exists() or not SCRIPT_PATH.exists():
+        pytest.skip("campaign pool worker tests require a full control-plane checkout")
     spec = spec_from_file_location("campaign_pool_worker", SCRIPT_PATH)
     module = module_from_spec(spec)
     assert spec.loader is not None
@@ -29,7 +26,8 @@ def test_trigger_backlog_sql_tracks_root_contacts_and_due_events():
     assert "campaign_events ev" in sql
     assert "ev.parent_id IS NULL" in sql
     assert "date_last_exited IS NULL" in sql
-    assert "date_triggered IS NULL" in sql
+    assert "el.is_scheduled = 1" in sql
+    assert "date_triggered IS NULL" not in sql
     assert "trigger_date <= NOW()" in sql
     assert "trigger_date <= UTC_TIMESTAMP()" in sql
 

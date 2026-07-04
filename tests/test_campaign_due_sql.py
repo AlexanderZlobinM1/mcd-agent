@@ -56,8 +56,7 @@ class CampaignDueSqlTests(unittest.TestCase):
     def test_trigger_due_respects_publish_down_for_date_events(self) -> None:
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
         self.assertIn("el.is_scheduled = 1", event_log_branch)
-        self.assertIn("el.date_triggered IS NULL", event_log_branch)
-        self.assertIn("el.date_triggered < el.trigger_date", event_log_branch)
+        self.assertNotIn("el.date_triggered", event_log_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
         self.assertNotIn("el.trigger_date >= '{window_start_utc_7d}'", event_log_branch)
         self.assertNotIn("el.trigger_date <= '{now_local}'", event_log_branch)
@@ -68,8 +67,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
 
         self.assertIn("el.is_scheduled = 1", event_log_branch)
-        self.assertIn("el.date_triggered IS NULL", event_log_branch)
-        self.assertIn("el.date_triggered < el.trigger_date", event_log_branch)
+        self.assertNotIn("el.date_triggered", event_log_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
         self.assertNotIn("el.trigger_date <= '{now_local}'", event_log_branch)
         self.assertNotIn("window_start_utc_7d", event_log_branch)
@@ -119,15 +117,22 @@ class CampaignDueSqlTests(unittest.TestCase):
         due_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("AND (", 1)[1]
         self.assertIn("el.trigger_date IS NOT NULL AND (", due_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", due_branch)
-        self.assertIn("OR (el.is_scheduled = 1 AND el.trigger_date IS NULL)", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("OR el.trigger_date IS NULL", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
 
     def test_trigger_due_catches_mautic_prescheduled_rows(self) -> None:
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
 
-        self.assertIn("el.date_triggered IS NULL", event_log_branch)
         self.assertIn("el.is_scheduled = 1", event_log_branch)
         self.assertIn("el.trigger_date IS NOT NULL", event_log_branch)
-        self.assertIn("el.date_triggered < el.trigger_date", event_log_branch)
+        self.assertNotIn("el.date_triggered", event_log_branch)
+
+    def test_trigger_due_keeps_scheduled_rows_due_after_attempt_timestamp(self) -> None:
+        event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[0]
+
+        self.assertIn("el.is_scheduled = 1", event_log_branch)
+        self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
+        self.assertNotIn("date_triggered IS NULL", event_log_branch)
+        self.assertNotIn("date_triggered < el.trigger_date", event_log_branch)
 
     def test_campaign_due_sql_avoids_deleted_column_for_mautic4(self) -> None:
         self.assertNotIn("c.deleted", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
@@ -199,8 +204,8 @@ class CampaignDueSqlTests(unittest.TestCase):
         event_log_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE
 
         self.assertIn("el.is_scheduled = 1", event_log_branch)
-        self.assertIn("el.date_triggered IS NULL", event_log_branch)
-        self.assertIn("el.date_triggered < el.trigger_date", event_log_branch)
+        self.assertNotIn("el.date_triggered IS NULL", event_log_branch)
+        self.assertNotIn("el.date_triggered < el.trigger_date", event_log_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
         self.assertNotIn("window_start_utc_7d", event_log_branch)
         self.assertNotIn("window_start_local_7d", event_log_branch)
