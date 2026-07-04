@@ -73,6 +73,15 @@ _CLUSTER_FILE_RSYNC_EXCLUDES = (
     "/var/lib/glusterd/***",
 )
 
+_BACKUP_TAR_RUNTIME_EXCLUDES = (
+    "--exclude=.mcd",
+    "--exclude=.mcd/*",
+    "--exclude=./.mcd",
+    "--exclude=./.mcd/*",
+    "--exclude=*/.mcd",
+    "--exclude=*/.mcd/*",
+)
+
 
 @dataclass(frozen=True)
 class BackupResult:
@@ -480,7 +489,7 @@ def _archive_files(cfg: AgentConfig, out_dir: Path) -> None:
     if not src:
         return
     target = out_dir / cfg.backup_archive_name
-    cmd = ["tar", "-czf", str(target)] + src
+    cmd = ["tar", *_BACKUP_TAR_RUNTIME_EXCLUDES, "-czf", str(target)] + src
     _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
 
 
@@ -491,6 +500,7 @@ def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path
     target = out_dir / "files.tar.gz"
     cmd = [
         "tar",
+        *_BACKUP_TAR_RUNTIME_EXCLUDES,
         "--exclude=var/cache",
         "--exclude=var/logs",
         "--exclude=app/cache",
