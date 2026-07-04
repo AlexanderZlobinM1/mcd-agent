@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.215 - 2026-07-04
+
+- Fixed: host and instance backup file archives now exclude MCD runtime
+  `.mcd` directories. Mutable runtime files such as cached version metadata no
+  longer make `tar` abort a valid backup with "file changed as we read it".
+
 ## 0.9.214 - 2026-07-04
 
 - Fixed: campaign trigger due detection now follows native Mautic scheduled
