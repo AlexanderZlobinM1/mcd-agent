@@ -2417,9 +2417,33 @@ def _cluster_prepared_mysql_processes(cfg: AgentConfig) -> list[dict[str, Any]]:
         datadir = _cluster_prepared_mysql_datadir_from_cmdline(cfg, cmdline)
         if datadir is None:
             continue
-        matches.append({"pid": int(pid_dir.name), "datadir": datadir, "cmdline": cmdline})
+        matches.append(
+            {
+                "pid": int(pid_dir.name),
+                "datadir": datadir,
+                "cmdline": cmdline,
+                "age_sec": _proc_age_sec(pid_dir),
+            }
+        )
     matches.sort(key=lambda x: int(x["pid"]))
     return matches
+
+
+def _proc_age_sec(pid_dir: Path) -> float | None:
+    try:
+        stat_text = (pid_dir / "stat").read_text(encoding="utf-8", errors="ignore")
+        after_comm = stat_text.rsplit(")", 1)[1].strip().split()
+        start_ticks = int(after_comm[19])
+        ticks_per_sec = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        uptime_sec = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+        return max(0.0, uptime_sec - (start_ticks / ticks_per_sec))
+    except Exception:
+        return None
+
+
+def _prepared_mysql_stale_age_limit_sec(cfg: AgentConfig) -> int:
+    dump_timeout = int(getattr(cfg, "backup_dump_timeout_sec", 0) or 0)
+    return max(3600, dump_timeout + 3600)
 
 
 def _pid_exists(pid: int) -> bool:
@@ -2457,10 +2481,13 @@ def _terminate_pid(pid: int, *, timeout_sec: int = 20) -> bool:
 
 def _cleanup_stale_prepared_mysql_processes(cfg: AgentConfig) -> list[int]:
     stopped: list[int] = []
+    stale_age_sec = _prepared_mysql_stale_age_limit_sec(cfg)
     for item in _cluster_prepared_mysql_processes(cfg):
         pid = int(item["pid"])
         datadir = item["datadir"]
-        if isinstance(datadir, Path) and datadir.exists():
+        age = item.get("age_sec")
+        too_old = isinstance(age, (int, float)) and age >= stale_age_sec
+        if isinstance(datadir, Path) and datadir.exists() and not too_old:
             continue
         if _terminate_pid(pid):
             stopped.append(pid)
@@ -3798,9 +3825,16 @@ def _cluster_offsite_state_from_marker(marker: dict[str, Any], backup_path: Path
     (local full, incremental, files assemble, offsite). Offsite file archive
     health must survive later local jobs, so it is stored under last_offsite_*.
     """
+    backup_dir = Path(backup_path)
     archive_path = str(marker.get("files_archive_path") or "").strip()
+    if archive_path:
+        archive_candidate = Path(archive_path)
+        if not archive_candidate.exists():
+            fallback = backup_dir / archive_candidate.name
+            if fallback.exists():
+                archive_path = str(fallback)
     out: dict[str, Any] = {
-        "last_offsite_backup_path": str(backup_path),
+        "last_offsite_backup_path": str(backup_dir),
         "last_offsite_backup_at": str(marker.get("ts_utc") or ""),
         "last_offsite_files_archive_path": archive_path,
         "last_offsite_files_bytes": int(marker.get("files_bytes") or 0),
@@ -3813,6 +3847,93 @@ def _cluster_offsite_state_from_marker(marker: dict[str, Any], backup_path: Path
     else:
         out["last_offsite_files_archive_ok"] = False
     return out
+
+
+def _parse_backup_iso_ts(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _cluster_latest_remote_offsite_marker(
+    cfg: AgentConfig,
+    mount_path: Path,
+) -> tuple[Path, dict[str, Any]] | None:
+    daily_parent = _cluster_remote_parent(cfg, mount_path) / "daily"
+    if not daily_parent.exists() or not daily_parent.is_dir():
+        return None
+    candidates: list[tuple[datetime, str, Path, dict[str, Any]]] = []
+    for item in daily_parent.iterdir():
+        if not item.is_dir() or not _DATE_RE.match(item.name):
+            continue
+        marker = _read_backup_marker(item)
+        if str(marker.get("status") or "").lower() != "ok":
+            continue
+        ts = _parse_backup_iso_ts(marker.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc)
+        candidates.append((ts, item.name, item, marker))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, _, path, marker = candidates[-1]
+    return path, marker
+
+
+def _cluster_recover_offsite_state_from_remote(
+    cfg: AgentConfig,
+    mount_path: Path,
+    state: dict[str, Any],
+    *,
+    offsite_mount_active: bool,
+) -> None:
+    if not offsite_mount_active:
+        return
+    try:
+        found = _cluster_latest_remote_offsite_marker(cfg, mount_path)
+    except Exception:
+        return
+    if found is None:
+        return
+    latest_path, marker = found
+    marker_ts = _parse_backup_iso_ts(marker.get("ts_utc"))
+    current_ts = _parse_backup_iso_ts(state.get("last_offsite_backup_at"))
+    if marker_ts is not None and current_ts is not None and marker_ts <= current_ts:
+        return
+    running_offsite = str(state.get("last_status") or "").lower() == "running" and str(state.get("job") or "") == "backup.cluster.offsite"
+    run_ts = _parse_backup_iso_ts(state.get("last_run_at"))
+    if running_offsite and marker_ts is not None and run_ts is not None and marker_ts < run_ts:
+        return
+
+    offsite_state = _cluster_offsite_state_from_marker(marker, latest_path)
+    updates: dict[str, Any] = {
+        "last_status": "ok",
+        "last_error": "",
+        "last_success_at": str(marker.get("ts_utc") or _utc_now_iso()),
+        "last_backup_path": str(latest_path),
+        "last_backup_kind": "cluster_offsite",
+        "last_bytes_written": int(marker.get("bytes_written") or 0),
+        **offsite_state,
+    }
+    if running_offsite and marker_ts is not None and run_ts is not None:
+        updates["last_duration_sec"] = max(0, int((marker_ts - run_ts).total_seconds()))
+    state.update(updates)
+    try:
+        _cluster_update_state(
+            cfg,
+            updates,
+            history_item={
+                "ts": _utc_now_iso(),
+                "status": "ok_recovered",
+                "job": "backup.cluster.offsite",
+                "backup_path": str(latest_path),
+                "bytes_written": int(marker.get("bytes_written") or 0),
+            },
+        )
+    except Exception:
+        pass
 
 
 def _cluster_backup_integrity_problem(state: dict[str, Any]) -> str:
@@ -4374,6 +4495,12 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             "files_snapshot_running": _lock_active(_cluster_lock_path(cfg, "files")),
             "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")) or bool(_cluster_offsite_processes(cfg)),
         }
+    )
+    _cluster_recover_offsite_state_from_remote(
+        cfg,
+        mount_path,
+        state,
+        offsite_mount_active=offsite_mount_active,
     )
     offsite_path_raw = str(state.get("last_offsite_backup_path") or "").strip()
     if not offsite_path_raw and str(state.get("last_backup_kind") or "") == "cluster_offsite":

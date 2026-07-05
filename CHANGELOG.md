@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.216 - 2026-07-05
+
+- Fixed: cluster offsite backup cleanup now treats temporary prepared MySQL
+  processes as stale when they outlive the configured backup dump timeout, even
+  if their prepared datadir still exists. This prevents abandoned
+  `mcd-offsite-mysql-*` processes from pinning reflinked xtrabackup data for
+  days and blocking future AnanasRS-style cluster offsite runs.
+- Fixed: cluster backup status now recovers a completed offsite backup from the
+  remote daily marker when an older agent finalized the directory but failed to
+  update local state. Recovery also corrects stale file archive paths left under
+  the temporary `.incomplete-*` directory name.
+
 ## 0.9.215 - 2026-07-04
 
 - Fixed: host and instance backup file archives now exclude MCD runtime

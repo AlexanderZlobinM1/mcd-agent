@@ -13,12 +13,13 @@ from mcd_agent.backup import (
     _cluster_file_source_path_forbidden,
     _cluster_file_source_paths,
     _cluster_prepared_mysql_datadir_from_cmdline,
+    _cleanup_stale_prepared_mysql_processes,
     cluster_backup_status,
 )
 
 
 def _cfg() -> SimpleNamespace:
-    return SimpleNamespace(backup_cluster_local_root_dir="/mnt/data/backup/local/ananasrs")
+    return SimpleNamespace(backup_cluster_local_root_dir="/mnt/data/backup/local/ananasrs", backup_dump_timeout_sec=43200)
 
 
 class PreparedOffsiteMysqlDetectionTest(unittest.TestCase):
@@ -50,6 +51,40 @@ class PreparedOffsiteMysqlDetectionTest(unittest.TestCase):
         )
 
         self.assertIsNone(_cluster_prepared_mysql_datadir_from_cmdline(_cfg(), cmdline))
+
+    def test_cleanup_keeps_fresh_existing_prepared_mysql(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            datadir = Path(td) / "prepared-20260705-010000"
+            datadir.mkdir()
+
+            with (
+                patch(
+                    "mcd_agent.backup._cluster_prepared_mysql_processes",
+                    return_value=[{"pid": 123, "datadir": datadir, "age_sec": 60}],
+                ),
+                patch("mcd_agent.backup._terminate_pid") as terminate,
+            ):
+                stopped = _cleanup_stale_prepared_mysql_processes(_cfg())
+
+        self.assertEqual(stopped, [])
+        terminate.assert_not_called()
+
+    def test_cleanup_stops_too_old_existing_prepared_mysql(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            datadir = Path(td) / "prepared-20260701-012026"
+            datadir.mkdir()
+
+            with (
+                patch(
+                    "mcd_agent.backup._cluster_prepared_mysql_processes",
+                    return_value=[{"pid": 1495368, "datadir": datadir, "age_sec": 4 * 24 * 3600}],
+                ),
+                patch("mcd_agent.backup._terminate_pid", return_value=True) as terminate,
+            ):
+                stopped = _cleanup_stale_prepared_mysql_processes(_cfg())
+
+        self.assertEqual(stopped, [1495368])
+        terminate.assert_called_once_with(1495368)
 
 
 class ClusterFileSourcePathsTest(unittest.TestCase):
@@ -164,6 +199,88 @@ class ClusterBackupIntegrityStatusTest(unittest.TestCase):
         self.assertEqual(state["last_error"], "")
         self.assertEqual(state["cluster_integrity_status"], "ok")
         self.assertTrue(state["last_offsite_files_archive_ok"])
+
+    def test_status_recovers_completed_offsite_marker_after_partial_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            state_dir = base / "state"
+            state_dir.mkdir()
+            local_root = base / "local"
+            local_root.mkdir()
+            mount_base = base / "mounts"
+            host_name = "ananas-cluster-replica-xtrabackup"
+            cluster_name = "ananasrs.sales-snap.com"
+            daily = mount_base / host_name / "backup" / cluster_name / "daily"
+            final_dir = daily / "2026-07-05"
+            final_dir.mkdir(parents=True)
+            archive = final_dir / "files-snapshot-20260705-213454.tar.gz"
+            archive.write_bytes(b"snapshot")
+            stale_archive = daily / ".incomplete-2026-07-05-20260705-214005" / archive.name
+            (final_dir / ".mcd-backup.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "ts_utc": "2026-07-05T23:32:37+00:00",
+                        "cluster_backup": True,
+                        "cluster_name": cluster_name,
+                        "host_name": host_name,
+                        "method": "mydumper",
+                        "path": str(final_dir),
+                        "files_archive_path": str(stale_archive),
+                        "bytes_written": 115360599358,
+                        "db_bytes": 115152079456,
+                        "files_bytes": len(b"snapshot"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_file = state_dir / f"host-{host_name}.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "last_status": "running",
+                        "last_error": "",
+                        "job": "backup.cluster.offsite",
+                        "last_run_at": "2026-07-05T21:34:57+00:00",
+                        "last_success_at": "2026-07-05T21:34:56+00:00",
+                        "last_offsite_backup_at": "2026-06-30T02:44:36+00:00",
+                        "last_offsite_backup_path": str(daily / "2026-06-30"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(
+                backup_host_name=host_name,
+                backup_state_dir=str(state_dir),
+                backup_mount_base_dir=str(mount_base),
+                backup_remote_root_dir="backup",
+                backup_cluster_enabled=True,
+                backup_cluster_local_root_dir=str(local_root),
+                backup_lock_dir=str(base / "locks"),
+                cluster_id="cluster-ananasrs-prod",
+                cluster_name=cluster_name,
+                cluster_node_role="replica",
+                cluster_node_index=6,
+                backup_cluster_authority_role="replica",
+                backup_cluster_authority_host="",
+                cluster_route_backup_host="",
+            )
+
+            with (
+                patch("mcd_agent.backup._effective_cfg", side_effect=lambda x: x),
+                patch("mcd_agent.backup._mounted", return_value=True),
+                patch("mcd_agent.backup._cluster_offsite_processes", return_value=[]),
+            ):
+                state = cluster_backup_status(cfg)
+
+            self.assertEqual(state["last_status"], "ok")
+            self.assertEqual(state["last_offsite_backup_at"], "2026-07-05T23:32:37+00:00")
+            self.assertEqual(state["last_offsite_backup_path"], str(final_dir))
+            self.assertEqual(state["last_offsite_files_archive_path"], str(archive))
+            self.assertTrue(state["last_offsite_files_archive_ok"])
+            persisted = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["last_status"], "ok")
+            self.assertEqual(persisted["last_backup_kind"], "cluster_offsite")
 
 
 if __name__ == "__main__":
