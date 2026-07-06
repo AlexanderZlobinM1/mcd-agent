@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.217 - 2026-07-06
+
+- Fixed: `tiny` profile now enables periodic full-scan segment planning with
+  the existing 60 second interval. Small Mautic 7 instances now pick up newly
+  matching contacts that are not yet present in `lead_lists_leads`, matching
+  native `mautic:segments:update` behavior instead of waiting for a manual
+  segment update or the 24 hour stale-window fallback.
+
 ## 0.9.216 - 2026-07-05
 
 - Fixed: cluster offsite backup cleanup now treats temporary prepared MySQL

@@ -106,7 +106,7 @@ Set in config:
 - `name = "custom|tiny|mini|midi|maxi|hiload"`
 
 Preset rules:
-- `tiny`: single ring, no throttle, no whitelists, segments `1`; campaigns use one worker with actual trigger-due campaigns first and rebuild-due campaigns second, newest-first published list.
+- `tiny`: single ring, no throttle, no whitelists, segments `1`, periodic full segment scan every `60s`; campaigns use one worker with actual trigger-due campaigns first and rebuild-due campaigns second, newest-first published list.
 - `mini`: single ring, no throttle, no whitelists, segments `4`, campaign trigger `2`, campaign rebuild `1`, shared campaign cap `1`.
 - `midi`: dual ring, no throttle, whitelists enabled, priority size `10`, parallel `3+1` for segments, updates, triggers.
 - `maxi`: dual ring, throttle `200/5m`, whitelists enabled, segments `5+1`, triggers `3+1`, rebuilds `2+1`; during throttle only whitelist segments run in `1` stream.

@@ -819,6 +819,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=1,
             segment_full_scan_interval_sec=60,
+            segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=1,
             campaign_priority_size=0,
@@ -1061,6 +1062,13 @@ def _enforce_campaign_rebuild_guard(cfg: AgentConfig) -> AgentConfig:
     if not updates:
         return cfg
     return replace(cfg, **updates)
+
+
+def _enforce_profile_guards(cfg: AgentConfig) -> AgentConfig:
+    profile = (cfg.profile_name or "").strip().lower()
+    if profile == "tiny" and not cfg.segment_periodic_full_scan_enabled:
+        return replace(cfg, segment_periodic_full_scan_enabled=True)
+    return cfg
 
 
 def _normalize_json_dict(value: object) -> dict[str, Any]:
@@ -3303,6 +3311,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     profiled = _apply_profile(cfg)
     merged = _reapply_manual_runtime_overrides(profiled, runtime)
     merged = _enforce_campaign_rebuild_guard(merged)
+    merged = _enforce_profile_guards(merged)
     if merged.disable_whitelist:
         merged = replace(merged, segment_whitelist=[], segment_whitelist_file=None, campaign_whitelist=[], campaign_whitelist_file=None)
     # Runtime customization flag is not "runtime section exists"; it is
