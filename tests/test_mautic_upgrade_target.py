@@ -7,6 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from mcd_agent.mautic_upgrade import (
+    _apply_mautic7_twig_include_hotfix,
+    _best_probe_domain,
     _clean_target_version,
     _clear_prod_cache_with_fallback,
     _enter_upgrade_maintenance,
@@ -173,6 +175,49 @@ class MauticUpgradeTargetTests(unittest.TestCase):
 
             self.assertEqual(changed, [str(conf)])
             self.assertIn("php8.4-fpm.sock", conf.read_text(encoding="utf-8"))
+
+    def test_mautic7_twig_include_hotfix_casts_markup_return(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            helper = (
+                root
+                / "docroot"
+                / "app"
+                / "bundles"
+                / "CoreBundle"
+                / "Twig"
+                / "Extension"
+                / "OverrideIncludeExtension.php"
+            )
+            helper.parent.mkdir(parents=True)
+            helper.write_text(
+                """<?php
+final class OverrideIncludeExtension
+{
+    public function includeWithEvent(): string
+    {
+        return CoreExtension::include($env, $context, $template);
+    }
+}
+""",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(_apply_mautic7_twig_include_hotfix(str(root), "7.1.2"))
+
+            updated = helper.read_text(encoding="utf-8")
+            self.assertIn("return (string) CoreExtension::include(", updated)
+            self.assertTrue(helper.with_name(helper.name + ".mcd-pre-twig-include-hotfix.bak").exists())
+
+    def test_probe_domain_falls_back_to_mautic_site_url(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = root / "config" / "local.php"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text("<?php return ['site_url' => 'https://sita.sales-snap.com'];\n", encoding="utf-8")
+            inst = SimpleNamespace(primary_domain="", domains=[], local_php_path="", root=str(root))
+
+            self.assertEqual(_best_probe_domain(inst), "sita.sales-snap.com")
 
 
 if __name__ == "__main__":
