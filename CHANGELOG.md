@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.231 - 2026-07-07
+
+- Fixed: service-profile APT upgrades now run the same post-upgrade service
+  recovery used by `mcd-cli apt-upgrade`. After a successful
+  `apt-get upgrade`/`dist-upgrade`, MCD verifies and starts `nginx`,
+  `mysql`/`mariadb`, `cron`, and detected `php-fpm` services, then validates
+  nginx config. This prevents host package updates from leaving migrated or
+  active instances offline after MariaDB/nginx package upgrades.
+
 ## 0.9.230 - 2026-07-07
 
 - Fixed: nginx baseline default-deny generation now skips managed listen blocks

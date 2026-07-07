@@ -178,6 +178,116 @@ def _enable_start_services(services: list[str], *, timeout_sec: int = 45) -> tup
     return actions, errors
 
 
+def _unit_exists(service: str, *, timeout_sec: int = 8) -> bool:
+    p = _run(["systemctl", "list-unit-files", f"{service}.service", "--no-legend"], timeout_sec=timeout_sec)
+    return p.returncode == 0 and f"{service}.service" in str(p.stdout or "")
+
+
+def _php_fpm_services(*, timeout_sec: int = 8) -> list[str]:
+    p = _run(
+        ["systemctl", "list-unit-files", "php*-fpm.service", "--type=service", "--no-legend"],
+        timeout_sec=timeout_sec,
+    )
+    if p.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in (p.stdout or "").splitlines():
+        name = raw.strip().split(None, 1)[0].strip()
+        if name.endswith(".service"):
+            out.append(name.removesuffix(".service"))
+    return sorted(set(out))
+
+
+def _service_enable_and_start(service: str, *, timeout_sec: int = 45) -> tuple[bool, list[str]]:
+    actions: list[str] = []
+    enabled = _run(["systemctl", "is-enabled", service], timeout_sec=timeout_sec)
+    enabled_state = (enabled.stdout or enabled.stderr or "").strip()
+    allowed_enabled_states = {"enabled", "enabled-runtime", "static", "alias", "indirect", "generated"}
+    if enabled.returncode != 0 or enabled_state not in allowed_enabled_states:
+        en = _run(["systemctl", "enable", service], timeout_sec=timeout_sec)
+        if en.returncode != 0:
+            msg = (en.stderr or en.stdout or "").strip()
+            return False, [f"service_postcheck_enable_failed:{service}:{msg or en.returncode}"]
+        actions.append(f"service_postcheck_enabled:{service}")
+
+    active = _run(["systemctl", "is-active", service], timeout_sec=timeout_sec)
+    active_state = (active.stdout or active.stderr or "").strip()
+    if active.returncode == 0 and active_state == "active":
+        actions.append(f"service_postcheck_active:{service}")
+        return True, actions
+
+    st = _run(["systemctl", "start", service], timeout_sec=timeout_sec)
+    if st.returncode != 0:
+        msg = (st.stderr or st.stdout or "").strip()
+        return False, [*actions, f"service_postcheck_start_failed:{service}:{msg or st.returncode}"]
+    active = _run(["systemctl", "is-active", service], timeout_sec=timeout_sec)
+    active_state = (active.stdout or active.stderr or "").strip()
+    if active.returncode != 0 or active_state != "active":
+        return False, [*actions, f"service_postcheck_not_active:{service}:{active_state or 'inactive'}"]
+    actions.append(f"service_postcheck_started:{service}")
+    return True, actions
+
+
+def _apt_upgrade_service_postcheck(*, timeout_sec: int = 90) -> tuple[list[str], list[str]]:
+    actions: list[str] = []
+    errors: list[str] = []
+
+    if _unit_exists("nginx", timeout_sec=timeout_sec):
+        ok, service_actions = _service_enable_and_start("nginx", timeout_sec=timeout_sec)
+        actions.extend(service_actions)
+        if not ok:
+            errors.extend(service_actions)
+        else:
+            baseline = ensure_nginx_baseline(reload_service=True)
+            baseline_actions = baseline.get("actions") if isinstance(baseline, dict) else []
+            if isinstance(baseline_actions, list):
+                actions.extend(f"nginx_baseline:{str(x)}" for x in baseline_actions)
+            if str(baseline.get("status", "") if isinstance(baseline, dict) else "").lower() == "error":
+                errors.append(f"nginx_baseline_failed:{baseline.get('error', 'unknown error')}")
+            test = _run(["nginx", "-t"], timeout_sec=timeout_sec)
+            if test.returncode == 0:
+                actions.append("nginx_config_test:ok")
+            else:
+                msg = (test.stderr or test.stdout or "").strip()
+                errors.append(f"nginx_config_test_failed:{msg or test.returncode}")
+    else:
+        actions.append("service_postcheck_missing:nginx")
+
+    db_service = "mariadb" if _unit_exists("mariadb", timeout_sec=timeout_sec) else ("mysql" if _unit_exists("mysql", timeout_sec=timeout_sec) else "")
+    if db_service:
+        ok, service_actions = _service_enable_and_start(db_service, timeout_sec=timeout_sec)
+        actions.extend(service_actions)
+        if not ok:
+            errors.extend(service_actions)
+    else:
+        actions.append("service_postcheck_missing:mysql")
+
+    if _unit_exists("cron", timeout_sec=timeout_sec):
+        ok, service_actions = _service_enable_and_start("cron", timeout_sec=timeout_sec)
+        actions.extend(service_actions)
+        if not ok:
+            errors.extend(service_actions)
+    else:
+        actions.append("service_postcheck_missing:cron")
+
+    php_services = _php_fpm_services(timeout_sec=timeout_sec)
+    if php_services:
+        php_ok = False
+        for service in php_services:
+            ok, service_actions = _service_enable_and_start(service, timeout_sec=timeout_sec)
+            actions.extend(service_actions)
+            if ok:
+                php_ok = True
+            else:
+                errors.extend(service_actions)
+        if not php_ok:
+            errors.append("php_fpm_postcheck_no_active_service")
+    else:
+        actions.append("service_postcheck_missing:php-fpm")
+
+    return actions, errors
+
+
 def _version_tuple(raw: str) -> tuple[int, int, int]:
     nums = [int(x) for x in re.findall(r"\d+", str(raw or ""))[:3]]
     while len(nums) < 3:
@@ -2680,12 +2790,24 @@ def apply_apt_profile(
         p = _run(["apt-get", "upgrade", "-y"], timeout_sec=refresh_timeout_sec)
         if p.returncode == 0:
             actions.append("upgrade:upgrade")
+            if ensure_package_services_started:
+                svc_actions, svc_errors = _apt_upgrade_service_postcheck(timeout_sec=max(45, min(int(refresh_timeout_sec), 180)))
+                actions.extend(svc_actions)
+                errors.extend(svc_errors)
+            else:
+                actions.append("upgrade_service_postcheck:disabled")
         else:
             errors.append((p.stderr or p.stdout or "apt upgrade failed").strip())
     elif upgrade_mode in {"full", "dist", "dist-upgrade"}:
         p = _run(["apt-get", "dist-upgrade", "-y"], timeout_sec=refresh_timeout_sec)
         if p.returncode == 0:
             actions.append("upgrade:dist-upgrade")
+            if ensure_package_services_started:
+                svc_actions, svc_errors = _apt_upgrade_service_postcheck(timeout_sec=max(45, min(int(refresh_timeout_sec), 180)))
+                actions.extend(svc_actions)
+                errors.extend(svc_errors)
+            else:
+                actions.append("upgrade_service_postcheck:disabled")
         else:
             errors.append((p.stderr or p.stdout or "apt dist-upgrade failed").strip())
 

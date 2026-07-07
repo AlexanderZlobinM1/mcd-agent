@@ -40,6 +40,105 @@ class AptProfileDbRepoTests(unittest.TestCase):
 
         self.assertEqual(services, ["nginx", "redis-server", "php8.3-fpm", "mariadb", "sendmail", "zabbix-agent2"])
 
+    def test_apt_upgrade_postcheck_recovers_core_services(self) -> None:
+        started: list[str] = []
+        old_run = apt_profile._run
+        old_baseline = apt_profile.ensure_nginx_baseline
+        try:
+            def fake_run(cmd, **_kwargs):
+                if cmd[:2] == ["systemctl", "list-unit-files"]:
+                    pattern = cmd[2]
+                    if pattern == "php*-fpm.service":
+                        return SimpleNamespace(returncode=0, stdout="php8.4-fpm.service enabled\n", stderr="")
+                    service = pattern.removesuffix(".service")
+                    if service in {"nginx", "mariadb", "cron"}:
+                        return SimpleNamespace(returncode=0, stdout=f"{service}.service enabled\n", stderr="")
+                    return SimpleNamespace(returncode=1, stdout="", stderr="")
+                if cmd[:2] == ["systemctl", "is-enabled"]:
+                    return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+                if cmd[:2] == ["systemctl", "is-active"]:
+                    service = cmd[2]
+                    if service == "cron" or service in started:
+                        return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+                    return SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
+                if cmd[:2] == ["systemctl", "start"]:
+                    started.append(cmd[2])
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["nginx", "-t"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+            apt_profile._run = fake_run
+            apt_profile.ensure_nginx_baseline = lambda **_kwargs: {"status": "ok", "actions": ["reload_ok"]}
+
+            actions, errors = apt_profile._apt_upgrade_service_postcheck()
+        finally:
+            apt_profile._run = old_run
+            apt_profile.ensure_nginx_baseline = old_baseline
+
+        self.assertEqual(errors, [])
+        self.assertIn("nginx", started)
+        self.assertIn("mariadb", started)
+        self.assertIn("php8.4-fpm", started)
+        self.assertIn("service_postcheck_active:cron", actions)
+        self.assertIn("nginx_config_test:ok", actions)
+
+    def test_dist_upgrade_profile_runs_service_postcheck(self) -> None:
+        called: list[str] = []
+        old_run = apt_profile._run
+        old_apply_repo_profiles = apt_profile._apply_repo_profiles
+        old_apply_unattended = apt_profile._apply_unattended_upgrades
+        old_hosts = apt_profile.ensure_local_fqdn_hosts_entry
+        old_zabbix_agent = apt_profile.ensure_zabbix_agent
+        old_zabbix_mysql = apt_profile.ensure_zabbix_mysql_monitor_user
+        old_collect = apt_profile.collect_apt_state
+        old_postcheck = apt_profile._apt_upgrade_service_postcheck
+        old_cf_present = apt_profile.cloudflare_real_ip_profile_present
+        try:
+            apt_profile._run = lambda cmd, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr="")
+            apt_profile._apply_repo_profiles = lambda *args, **kwargs: ([], [])
+            apt_profile._apply_unattended_upgrades = lambda *args, **kwargs: ([], [], [])
+            apt_profile.ensure_local_fqdn_hosts_entry = lambda **_kwargs: (False, "hosts_fqdn:skipped")
+            apt_profile.ensure_zabbix_agent = lambda *args, **kwargs: {"status": "disabled"}
+            apt_profile.ensure_zabbix_mysql_monitor_user = lambda *args, **kwargs: {"status": "disabled"}
+            apt_profile.collect_apt_state = lambda *args, **kwargs: {"status": "ok", "errors": []}
+            apt_profile.cloudflare_real_ip_profile_present = lambda _profile: False
+
+            def fake_postcheck(**_kwargs):
+                called.append("postcheck")
+                return ["service_postcheck_started:mariadb"], []
+
+            apt_profile._apt_upgrade_service_postcheck = fake_postcheck
+
+            result = apt_profile.apply_apt_profile(
+                profile={
+                    "refresh_cache": False,
+                    "remove_third_party_sources": False,
+                    "dedupe_list_sources": False,
+                    "ensure_local_fqdn_hosts": False,
+                    "ensure_package_services_started": True,
+                    "upgrade_mode": "dist-upgrade",
+                    "cloudflare_real_ip_enabled": False,
+                    "zabbix_agent_enabled": False,
+                    "zabbix_mysql_monitor_enabled": False,
+                },
+                cfg=None,
+            )
+        finally:
+            apt_profile._run = old_run
+            apt_profile._apply_repo_profiles = old_apply_repo_profiles
+            apt_profile._apply_unattended_upgrades = old_apply_unattended
+            apt_profile.ensure_local_fqdn_hosts_entry = old_hosts
+            apt_profile.ensure_zabbix_agent = old_zabbix_agent
+            apt_profile.ensure_zabbix_mysql_monitor_user = old_zabbix_mysql
+            apt_profile.collect_apt_state = old_collect
+            apt_profile._apt_upgrade_service_postcheck = old_postcheck
+            apt_profile.cloudflare_real_ip_profile_present = old_cf_present
+
+        self.assertEqual(called, ["postcheck"])
+        self.assertIn("upgrade:dist-upgrade", result["actions"])
+        self.assertIn("service_postcheck_started:mariadb", result["actions"])
+
     def test_zabbix_agent_state_ok_when_dropin_and_service_match(self) -> None:
         old_dpkg = apt_profile._dpkg_installed_versions
         old_read = apt_profile._read_key_value_file
