@@ -288,8 +288,12 @@ class InstanceMigrateProbeTests(unittest.TestCase):
             events.append("rsync")
             Path(kwargs["target_path"]).mkdir(parents=True, exist_ok=True)
 
-        def fake_remote_mcd(**_kwargs):
-            events.append("maintenance_on")
+        def fake_remote_mcd(**kwargs):
+            args = list(kwargs.get("args") or [])
+            if "off" in args:
+                events.append("maintenance_off")
+            else:
+                events.append("maintenance_on")
             return "{}"
 
         def fake_tunnel(**_kwargs):
@@ -341,9 +345,12 @@ class InstanceMigrateProbeTests(unittest.TestCase):
                 )
 
         self.assertTrue(result["ok"])
+        self.assertFalse(result["source_maintenance_active"])
+        self.assertTrue(result["source_maintenance_restored"])
         self.assertEqual([x for x in events if x.startswith("db_import:")], ["db_import:single"])
         self.assertLess(events.index("maintenance_on"), events.index("db_import:single"))
         self.assertLess(events.index("db_import:single"), events.index("patch_db"))
+        self.assertLess(events.index("patch_db"), events.index("maintenance_off"))
 
     def test_nginx_sites_layout_is_created_for_target_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as td:
