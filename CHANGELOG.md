@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.220 - 2026-07-07
+
+- Fixed: generated Mautic image nginx vhosts now fall back to the system
+  `/run/php/php-fpm.sock` alternative when the cached target PHP-FPM version is
+  stale or the exact versioned socket is not present on the host.
+
 ## 0.9.219 - 2026-07-07
 
 - Fixed: MCD-managed package installation now runs `apt-get update` with

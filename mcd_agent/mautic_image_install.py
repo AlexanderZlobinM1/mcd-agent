@@ -554,9 +554,10 @@ def _patch_local_php(path: Path, plan: ImageInstallPlan) -> None:
 
 
 def _mautic_nginx_locations(plan: ImageInstallPlan) -> str:
+    fastcgi_pass = _php_fpm_fastcgi_pass(plan.php_version)
     return f"""    location ~ \\.php$ {{
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php{plan.php_version}-fpm.sock;
+        fastcgi_pass {fastcgi_pass};
     }}
 
     location ~* ^/(?:config|vendor|node_modules|tests|var|\\.git)(?:/|$) {{
@@ -570,6 +571,16 @@ def _mautic_nginx_locations(plan: ImageInstallPlan) -> str:
     location ~* /\\.(?!well-known/) {{
         deny all;
     }}"""
+
+
+def _php_fpm_fastcgi_pass(php_version: str) -> str:
+    exact = Path(f"/run/php/php{str(php_version).strip()}-fpm.sock")
+    if exact.exists():
+        return f"unix:{exact};"
+    generic = Path("/run/php/php-fpm.sock")
+    if generic.exists():
+        return f"unix:{generic};"
+    return f"unix:{exact};"
 
 
 def _http_root_location(*, ssl_enabled: bool) -> str:
