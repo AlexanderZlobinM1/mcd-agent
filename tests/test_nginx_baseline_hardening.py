@@ -238,6 +238,25 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertNotIn("listen [::]:443 ssl;", out)
         self.assertIn("# listen [::]:8080;", out)
 
+    def test_duplicate_server_autoindex_is_removed_when_hardening_is_included(self) -> None:
+        src = f"""server {{
+    listen 80;
+    server_name example.com;
+    {nginx_baseline.HARDENING_INCLUDE}
+    autoindex off;
+
+    location /files/ {{
+        autoindex on;
+    }}
+}}
+"""
+
+        out = nginx_baseline.remove_duplicate_server_autoindex_directives(src)
+
+        self.assertIn(nginx_baseline.HARDENING_INCLUDE, out)
+        self.assertNotIn("\n    autoindex off;\n", out)
+        self.assertIn("        autoindex on;", out)
+
     def test_server_config_normalization_updates_active_vhost(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

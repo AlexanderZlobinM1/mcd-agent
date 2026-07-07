@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.226 - 2026-07-07
+
+- Fixed: nginx baseline normalization now removes legacy server-level
+  `autoindex` directives when the managed hardening snippet is included in the
+  same vhost, preventing package-update postchecks from rolling back with nginx
+  duplicate directive errors after IPv6 `listen [::]` cleanup.
+
 ## 0.9.225 - 2026-07-07
 
 - Fixed: Composer Mautic 6 to 7 upgrades now print Composer, Node.js, and npm
