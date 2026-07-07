@@ -3063,7 +3063,7 @@ def main() -> int:
                 return 1
         env = dict(os.environ)
         env["DEBIAN_FRONTEND"] = "noninteractive"
-        cmd_update = ["apt-get", "update"]
+        cmd_update = ["apt-get", "update", "--allow-releaseinfo-change"]
         cmd_upgrade = [
             "apt-get",
             "dist-upgrade",

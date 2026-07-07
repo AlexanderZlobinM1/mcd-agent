@@ -234,7 +234,7 @@ def _ensure_prerequisites(timeout_sec: int) -> None:
 
 
 def _apt_update(timeout_sec: int) -> None:
-    proc = _run(["apt-get", "update"], timeout_sec=timeout_sec)
+    proc = _run(["apt-get", "update", "--allow-releaseinfo-change"], timeout_sec=timeout_sec)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "apt-get update failed").strip())
 
