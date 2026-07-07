@@ -61,6 +61,7 @@ from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_script
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
 from mcd_agent.discovery import discover_mautic
+from mcd_agent.email_activity_report import collect_email_activity_report
 from mcd_agent.email_counters import audit_campaign_email_counters, repair_campaign_email_counters
 from mcd_agent.env import (
     build_policy_plan,
@@ -1639,6 +1640,19 @@ def _build_parser() -> argparse.ArgumentParser:
     email_counters.add_argument("op", choices=["audit", "repair"], nargs="?", default="audit")
     email_counters.add_argument("--json", action="store_true")
 
+    email_activity = sub.add_parser(
+        "report:email-activity",
+        help="Collect Mautic sent/read/click/unsubscribe activity report",
+    )
+    email_activity.add_argument("--config", default=default_cfg)
+    email_activity.add_argument("--root", help="Mautic root, instance uid, name, or domain")
+    email_activity.add_argument("--days", type=int, default=7)
+    email_activity.add_argument("--summary", action="store_true", help="Include daily totals")
+    email_activity.add_argument("--extended", action="store_true", help="Include per-email breakdown")
+    email_activity.add_argument("--contact-mode", choices=["all", "fresh", "old"], default="all")
+    email_activity.add_argument("--contact-age-days", type=int, default=30)
+    email_activity.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -2467,6 +2481,57 @@ def main() -> int:
                 )
         if str(args.op or "audit") == "repair" and int(payload.get("repaired", 0) or 0) > 0:
             _push_state_after_change(cfg, "email-counters-repair")
+        return 0
+
+    if args.cmd == "report:email-activity":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        try:
+            inst = _select_instance_for_ops(cfg, getattr(args, "root", None))
+            if not inst.db:
+                raise RuntimeError(f"Mautic install has no DB config: {inst.root}")
+            include_summary = bool(getattr(args, "summary", False))
+            include_extended = bool(getattr(args, "extended", False))
+            if not include_summary and not include_extended:
+                include_summary = True
+                include_extended = True
+            payload = collect_email_activity_report(
+                MauticDB(inst.db),
+                days=int(getattr(args, "days", 7) or 7),
+                include_summary=include_summary,
+                include_extended=include_extended,
+                contact_mode=str(getattr(args, "contact_mode", "all") or "all"),
+                contact_age_days=int(getattr(args, "contact_age_days", 30) or 30),
+            )
+            payload["root"] = inst.root
+            payload["instance_uid"] = inst.instance_uid
+            payload["name"] = inst.name
+            payload["primary_domain"] = inst.primary_domain
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"email activity report failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            totals = payload.get("summary_totals") if isinstance(payload.get("summary_totals"), dict) else {}
+            print(
+                "email-activity: root={root} days={days} summary_rows={summary_rows} "
+                "extended_rows={extended_rows} sent={sent} read={read} clicks={clicks} unsubscribed={unsubscribed}".format(
+                    root=str(payload.get("root") or ""),
+                    days=int(payload.get("days", 0) or 0),
+                    summary_rows=len(payload.get("summary_rows") or []),
+                    extended_rows=len(payload.get("extended_rows") or []),
+                    sent=int(totals.get("sent", 0) or 0),
+                    read=int(totals.get("read", 0) or 0),
+                    clicks=int(totals.get("clicks", 0) or 0),
+                    unsubscribed=int(totals.get("unsubscribed", 0) or 0),
+                )
+            )
         return 0
 
     if args.cmd == "exec":
