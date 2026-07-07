@@ -1,5 +1,19 @@
 # MCD Changelog
 
+## 0.9.228 - 2026-07-07
+
+- Released: unified agent build from one source tree containing the MySQL 8
+  generated-column migration import compatibility fix and the nginx baseline
+  duplicate `autoindex` normalization fix.
+
+## 0.9.227 - 2026-07-07
+
+- Fixed: instance migration database imports now rewrite MySQL 8 generated
+  `date_format()` bucket columns to MariaDB-compatible deterministic
+  expressions while streaming the gzipped dump into the target. This prevents
+  MySQL 8 -> MariaDB migrations from failing on Mautic campaign lead generated
+  date columns such as `generated_date_added_hour`.
+
 ## 0.9.226 - 2026-07-07
 
 - Fixed: nginx baseline normalization now removes legacy server-level

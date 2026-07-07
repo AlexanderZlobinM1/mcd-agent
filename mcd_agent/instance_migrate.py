@@ -37,6 +37,10 @@ from mcd_agent.nginx_templates import render_nginx_template
 _MIN_TARGET_HEADROOM_BYTES = 5 * 1024 * 1024 * 1024
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_$-]{1,64}$")
+_MYSQL_DATE_FORMAT_GENERATED_RE = re.compile(
+    r"GENERATED\s+ALWAYS\s+AS\s*\(\s*date_format\s*\(\s*`(?P<column>[^`]+)`\s*,\s*(?:_[A-Za-z0-9]+)?'(?P<fmt>[^']+)'\s*\)\s*\)",
+    re.IGNORECASE,
+)
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 
@@ -621,6 +625,40 @@ def stream_source_db(config: AgentConfig, *, selector: str | None, output: Any) 
         return rc
 
 
+def _mysql_generated_date_format_replacement(column: str, fmt: str) -> str | None:
+    col = "`" + str(column).replace("`", "``") + "`"
+    if fmt == "%Y-%m-%d %H:00":
+        expr = f"timestamp(date({col}), maketime(hour({col}),0,0))"
+    elif fmt == "%Y-%m-%d":
+        expr = f"date({col})"
+    elif fmt == "%Y %U":
+        expr = f"concat(year({col}),' ',lpad(week({col},0),2,'0'))"
+    elif fmt == "%Y-%m":
+        expr = f"concat(year({col}),'-',lpad(month({col}),2,'0'))"
+    elif fmt == "%Y":
+        expr = f"year({col})"
+    else:
+        return None
+    return f"GENERATED ALWAYS AS ({expr})"
+
+
+def _rewrite_mysql_generated_date_format_sql_line(line: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        replacement = _mysql_generated_date_format_replacement(match.group("column"), match.group("fmt"))
+        return replacement or match.group(0)
+
+    return _MYSQL_DATE_FORMAT_GENERATED_RE.sub(repl, line)
+
+
+def _iter_mysql_generated_date_format_compat_sql(lines: Any) -> Any:
+    for raw in lines:
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="surrogateescape")
+            yield _rewrite_mysql_generated_date_format_sql_line(text).encode("utf-8", errors="surrogateescape")
+        else:
+            yield _rewrite_mysql_generated_date_format_sql_line(str(raw)).encode("utf-8", errors="surrogateescape")
+
+
 def import_target_db_stream(*, target_db_name: str, target_db_user: str, target_db_password: str, input_stream: Any) -> dict[str, Any]:
     target_db = _target_db_from_direct_values(name=target_db_name, user=target_db_user, password=target_db_password)
     _prepare_target_db(target_db)
@@ -628,7 +666,8 @@ def import_target_db_stream(*, target_db_name: str, target_db_user: str, target_
     assert proc.stdin is not None
     try:
         with gzip.GzipFile(fileobj=input_stream, mode="rb") as gz:
-            shutil.copyfileobj(gz, proc.stdin)
+            for chunk in _iter_mysql_generated_date_format_compat_sql(gz):
+                proc.stdin.write(chunk)
         proc.stdin.close()
         proc.stdin = None
         out_b, err_b = proc.communicate()

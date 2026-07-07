@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 from pathlib import Path
 import tarfile
@@ -436,6 +437,70 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         self.assertIn("--routines", argv)
         self.assertIn("--triggers", argv)
         self.assertNotIn("--events", argv)
+
+    def test_target_db_stream_rewrites_mysql8_date_format_generated_columns(self) -> None:
+        sql = (
+            "CREATE TABLE `ss_campaign_leads` (\n"
+            "  `date_added` datetime DEFAULT NULL,\n"
+            "  `generated_date_added_hour` datetime GENERATED ALWAYS AS "
+            "(date_format(`date_added`,_utf8mb4'%Y-%m-%d %H:00')) STORED COMMENT '(DC2Type:generated)',\n"
+            "  `generated_date_added_day` date GENERATED ALWAYS AS "
+            "(date_format(`date_added`,_utf8mb4'%Y-%m-%d')) STORED COMMENT '(DC2Type:generated)',\n"
+            "  `generated_date_added_week` char(7) GENERATED ALWAYS AS "
+            "(date_format(`date_added`,_utf8mb4'%Y %U')) STORED COMMENT '(DC2Type:generated)',\n"
+            "  `generated_date_added_month` char(7) GENERATED ALWAYS AS "
+            "(date_format(`date_added`,_utf8mb4'%Y-%m')) STORED COMMENT '(DC2Type:generated)',\n"
+            "  `generated_date_added_year` year GENERATED ALWAYS AS "
+            "(date_format(`date_added`,_utf8mb4'%Y')) STORED COMMENT '(DC2Type:generated)'\n"
+            ") ENGINE=InnoDB;\n"
+        )
+        gzipped = io.BytesIO()
+        with gzip.GzipFile(fileobj=gzipped, mode="wb") as gz:
+            gz.write(sql.encode("utf-8"))
+        gzipped.seek(0)
+
+        class FakeStdin(io.BytesIO):
+            def close(self) -> None:
+                pass
+
+        fake_stdin = FakeStdin()
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdin = fake_stdin
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+                self.returncode = 0
+
+            def communicate(self):
+                self.returncode = 0
+                return b"", b""
+
+            def kill(self):
+                self.returncode = -9
+
+        proc = FakeProc()
+
+        with (
+            patch.object(instance_migrate, "_prepare_target_db", return_value=None),
+            patch.object(instance_migrate, "_mysql_admin_base", return_value=["mysql"]),
+            patch.object(instance_migrate.subprocess, "Popen", return_value=proc),
+        ):
+            result = instance_migrate.import_target_db_stream(
+                target_db_name="baza_target",
+                target_db_user="korisnik_target",
+                target_db_password="target_password",
+                input_stream=gzipped,
+            )
+
+        imported_sql = fake_stdin.getvalue().decode("utf-8")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("date_format(", imported_sql)
+        self.assertIn("timestamp(date(`date_added`), maketime(hour(`date_added`),0,0))", imported_sql)
+        self.assertIn("date(`date_added`)", imported_sql)
+        self.assertIn("concat(year(`date_added`),' ',lpad(week(`date_added`,0),2,'0'))", imported_sql)
+        self.assertIn("concat(year(`date_added`),'-',lpad(month(`date_added`),2,'0'))", imported_sql)
+        self.assertIn("year(`date_added`)", imported_sql)
 
 
 if __name__ == "__main__":
