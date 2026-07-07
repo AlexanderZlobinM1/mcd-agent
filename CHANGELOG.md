@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.230 - 2026-07-07
+
+- Fixed: nginx baseline default-deny generation now skips managed listen blocks
+  for ports already owned by a legacy default vhost, avoiding harmless but noisy
+  duplicate `server_name _` warnings while still preserving nginx syntax.
+
 ## 0.9.229 - 2026-07-07
 
 - Fixed: nginx baseline default-deny generation now avoids claiming

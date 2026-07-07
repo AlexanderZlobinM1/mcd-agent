@@ -202,31 +202,35 @@ def _desired_default_deny_config(
 ) -> str:
     ssl_pair = pair if pair is not None else _default_deny_ssl_pair()
     occupied_ports = _active_default_server_ports() if default_server_ports is None else default_server_ports
-    listen_80 = "listen 80;" if 80 in occupied_ports else "listen 80 default_server;"
     lines = [
         DEFAULT_DENY_MARKER,
-        "server {",
-        f"    {listen_80}",
-        "    server_name _;",
-        "    return 444;",
-        "}",
-        "",
     ]
-    if ssl_pair is not None:
-        cert, key = ssl_pair
-        listen_443 = "listen 443 ssl;" if 443 in occupied_ports else "listen 443 ssl default_server;"
+    if 80 not in occupied_ports:
         lines.extend(
             [
                 "server {",
-                f"    {listen_443}",
+                "    listen 80 default_server;",
                 "    server_name _;",
-                f"    ssl_certificate {cert};",
-                f"    ssl_certificate_key {key};",
                 "    return 444;",
                 "}",
                 "",
             ]
         )
+    if ssl_pair is not None:
+        cert, key = ssl_pair
+        if 443 not in occupied_ports:
+            lines.extend(
+                [
+                    "server {",
+                    "    listen 443 ssl default_server;",
+                    "    server_name _;",
+                    f"    ssl_certificate {cert};",
+                    f"    ssl_certificate_key {key};",
+                    "    return 444;",
+                    "}",
+                    "",
+                ]
+            )
     return "\n".join(lines)
 
 
