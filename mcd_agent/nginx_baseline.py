@@ -239,6 +239,8 @@ def nginx_baseline_satisfied() -> bool:
             return False
         if normalize_legacy_http2_listen(text, modern_http2=modern_http2) != text:
             return False
+        if remove_duplicate_server_autoindex_directives(text) != text:
+            return False
     return True
 
 
@@ -445,6 +447,37 @@ def ensure_mautic_public_app_asset_locations(text: str) -> str:
                 *lines[idx:],
             ]
         return lines
+
+    return _normalize_server_blocks(text, normalize_block)
+
+
+def remove_duplicate_server_autoindex_directives(text: str) -> str:
+    """Remove server-level autoindex directives duplicated by MCD hardening."""
+    if "autoindex" not in text:
+        return text
+
+    autoindex_re = re.compile(r"^\s*autoindex\s+\S+\s*;", re.IGNORECASE)
+
+    def normalize_block(lines: list[str]) -> list[str]:
+        has_hardening = any(HARDENING_INCLUDE in raw for raw in lines)
+        seen_autoindex = has_hardening
+        out: list[str] = []
+        depth = 0
+        for raw in lines:
+            stripped = raw.strip()
+            is_server_autoindex = (
+                depth == 1
+                and not stripped.startswith("#")
+                and autoindex_re.match(raw) is not None
+            )
+            if is_server_autoindex:
+                if seen_autoindex:
+                    depth += raw.count("{") - raw.count("}")
+                    continue
+                seen_autoindex = True
+            out.append(raw)
+            depth += raw.count("{") - raw.count("}")
+        return out
 
     return _normalize_server_blocks(text, normalize_block)
 
@@ -722,6 +755,9 @@ def _ensure_server_config_normalization(backup_dir: Path, snapshots: dict[Path, 
         after_http2 = normalize_legacy_http2_listen(desired, modern_http2=modern_http2)
         http2_changed = after_http2 != desired
         desired = after_http2
+        after_autoindex = remove_duplicate_server_autoindex_directives(desired)
+        autoindex_changed = after_autoindex != desired
+        desired = after_autoindex
         if desired == original:
             continue
         _snapshot(path, backup_dir, snapshots)
@@ -732,6 +768,8 @@ def _ensure_server_config_normalization(backup_dir: Path, snapshots: dict[Path, 
             actions.append(f"ipv6_listen_removed:{path.name}")
         if http2_changed:
             actions.append(f"http2_listen_modernized:{path.name}")
+        if autoindex_changed:
+            actions.append(f"duplicate_autoindex_removed:{path.name}")
     return actions
 
 
