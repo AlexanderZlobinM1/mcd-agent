@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.224 - 2026-07-07
+
+- Fixed: Composer Mautic 6 to 7 upgrades now normalize single-node Redis cache
+  DSNs that point at `127.0.0.1` or `localhost` before the first Mautic 7
+  `cache:clear`. This avoids the Mautic 7/Predis 3 loopback resolution bug
+  where a scalar local Redis DSN is converted into an aggregate endpoint array
+  and cache clear fails after Composer has already installed Mautic 7.
+
 ## 0.9.223 - 2026-07-07
 
 - Fixed: successful instance migrations now restore source-host MCD

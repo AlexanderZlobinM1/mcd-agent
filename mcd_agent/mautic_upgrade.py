@@ -12,7 +12,7 @@ import time
 from typing import Any
 from dataclasses import dataclass
 from urllib import error as urlerror
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 import urllib.request
 
 from mcd_agent.config import AgentConfig
@@ -509,6 +509,64 @@ def _clear_prod_cache_with_fallback(project_root: str, console_path: str, php_bi
         print(proc.stderr.strip())
     _hard_clear_prod_cache(project_root)
     _run([php_bin, console_path, "cache:clear"], cwd=project_root, as_www_data=True)
+
+
+def _safe_mautic7_loopback_redis_dsn(dsn: str) -> str:
+    raw = str(dsn or "").strip()
+    if not raw.lower().startswith("redis://"):
+        return raw
+    try:
+        parsed = urlsplit(raw)
+    except Exception:
+        return raw
+    host = str(parsed.hostname or "").strip().lower().rstrip(".")
+    if host not in {"127.0.0.1", "localhost"}:
+        return raw
+    netloc = parsed.netloc
+    idx = netloc.lower().rfind(host)
+    if idx < 0:
+        return raw
+    # Mautic 7's Redis helper resolves 127.0.0.1/localhost into an endpoint
+    # array, which Predis 3 treats as an aggregate connection and rejects. The
+    # hex loopback form still connects locally but remains a scalar DSN.
+    netloc = netloc[:idx] + "0x7f000001" + netloc[idx + len(host) :]
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _normalize_mautic7_loopback_redis_cache(project_root: str, target: str) -> bool:
+    if _parse_semver(target)[0] != 7:
+        return False
+    local_php = Path(project_root) / "config" / "local.php"
+    if not local_php.exists() or not local_php.is_file():
+        return False
+    text = local_php.read_text(encoding="utf-8", errors="ignore")
+    if "cache_adapter_redis" not in text or "mautic.cache.adapter.redis" not in text:
+        return False
+    changed = False
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal changed
+        dsn = match.group("dsn")
+        updated = _safe_mautic7_loopback_redis_dsn(dsn)
+        if updated == dsn:
+            return match.group(0)
+        changed = True
+        return f"{match.group('prefix')}{match.group('quote')}{updated}{match.group('quote')}"
+
+    updated = re.sub(
+        r"(?P<prefix>['\"]dsn['\"]\s*=>\s*)(?P<quote>['\"])(?P<dsn>redis://[^'\"]+)(?P=quote)",
+        repl,
+        text,
+        count=1,
+    )
+    if not changed or updated == text:
+        return False
+    backup = local_php.with_name(local_php.name + f".mcd-pre-m7-redis-dsn-{int(time.time())}.bak")
+    if not backup.exists():
+        shutil.copy2(local_php, backup)
+    local_php.write_text(updated, encoding="utf-8")
+    print("Mautic 7 Redis cache DSN normalized for Predis 3 loopback compatibility")
+    return True
 
 
 def _backup_install(root: str) -> Path:
@@ -1132,6 +1190,7 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
         cjson.write_text(updated, encoding="utf-8")
     _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
     patched = _apply_mautic7_twig_include_hotfix(project_root, target)
+    _normalize_mautic7_loopback_redis_cache(project_root, target)
     _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
     if patched:
         print("Mautic 7 Twig include hotfix cache refresh completed")
