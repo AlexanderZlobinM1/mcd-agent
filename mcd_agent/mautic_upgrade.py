@@ -593,7 +593,7 @@ def _php84_package_names() -> list[str]:
 def _install_php84_packages() -> None:
     env = dict(os.environ)
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    subprocess.run(["apt-get", "update"], check=True, env=env)
+    subprocess.run(["apt-get", "update", "--allow-releaseinfo-change"], check=True, env=env)
     subprocess.run(["apt-get", "install", "-y", *_php84_package_names()], check=True, env=env)
 
 

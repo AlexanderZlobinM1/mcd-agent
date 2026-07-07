@@ -2532,7 +2532,7 @@ def apply_apt_profile(
     def _run_update() -> list[str]:
         if not refresh_cache:
             return []
-        p = _run(["apt-get", "update"], timeout_sec=refresh_timeout_sec)
+        p = _run(["apt-get", "update", "--allow-releaseinfo-change"], timeout_sec=refresh_timeout_sec)
         merged = f"{p.stdout or ''}\n{p.stderr or ''}"
         errs = _apt_update_errors(merged)
         if p.returncode != 0 and not errs:

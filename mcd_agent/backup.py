@@ -1387,7 +1387,7 @@ def _apt_install_packages(packages: list[str]) -> None:
         raise RuntimeError(f"missing required backup packages and apt-get is unavailable: {', '.join(wanted)}")
     env = dict(os.environ)
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    _run(["apt-get", "update"], timeout_sec=900, env=env, check=True)
+    _run(["apt-get", "update", "--allow-releaseinfo-change"], timeout_sec=900, env=env, check=True)
     _run(["apt-get", "install", "-y", "--no-install-recommends"] + wanted, timeout_sec=1800, env=env, check=True)
 
 

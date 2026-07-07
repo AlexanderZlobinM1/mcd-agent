@@ -413,7 +413,7 @@ def _apt_install_packages(packages: list[str]) -> None:
     env = dict(os.environ)
     env["DEBIAN_FRONTEND"] = "noninteractive"
     for cmd, timeout in (
-        (["apt-get", "update"], 900),
+        (["apt-get", "update", "--allow-releaseinfo-change"], 900),
         (["apt-get", "install", "-y", "--no-install-recommends", *wanted], 1800),
     ):
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, check=False)

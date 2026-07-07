@@ -83,6 +83,25 @@ class MauticImageInstallNginxTests(unittest.TestCase):
         self.assertNotIn("agent-token", " ".join(calls[0]))
         write_vhost.assert_called_once_with(plan, ssl_enabled=True)
 
+    def test_package_install_accepts_apt_releaseinfo_changes(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **_: object) -> SimpleNamespace:
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(image_install.shutil, "which", return_value="/usr/bin/apt-get"),
+            patch.object(image_install.subprocess, "run", side_effect=fake_run),
+        ):
+            image_install._apt_install_packages(["python3-certbot-dns-cloudflare"])
+
+        self.assertEqual(calls[0], ["apt-get", "update", "--allow-releaseinfo-change"])
+        self.assertEqual(
+            calls[1],
+            ["apt-get", "install", "-y", "--no-install-recommends", "python3-certbot-dns-cloudflare"],
+        )
+
     def test_safe_extract_skips_mcd_runtime_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             archive = Path(td) / "image.tar.gz"

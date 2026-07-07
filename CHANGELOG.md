@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.219 - 2026-07-07
+
+- Fixed: MCD-managed package installation now runs `apt-get update` with
+  `--allow-releaseinfo-change`, so routine repository metadata label changes
+  do not block certbot DNS plugin installation, backup tooling preparation,
+  Wazuh profile application, Mautic upgrades, or host package updates.
+
 ## 0.9.218 - 2026-07-07
 
 - Fixed: Mautic image deploy can now issue certificates through Cloudflare
