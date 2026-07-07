@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.232 - 2026-07-07
+
+- Added: `mcd-cli report:email-activity` collects Mautic email activity
+  metrics locally from the instance database for MCC Reports, including daily
+  summary rows, per-email extended rows, clicks, failures, reads, unsubscribes,
+  and optional fresh/old contact filtering.
+
 ## 0.9.231 - 2026-07-07
 
 - Fixed: service-profile APT upgrades now run the same post-upgrade service
