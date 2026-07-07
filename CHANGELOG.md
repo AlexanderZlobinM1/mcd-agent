@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.229 - 2026-07-07
+
+- Fixed: nginx baseline default-deny generation now avoids claiming
+  `default_server` on ports already owned by an active legacy default vhost,
+  preventing package-update postchecks from rolling back with duplicate
+  default server errors after vhost normalization.
+
 ## 0.9.228 - 2026-07-07
 
 - Released: unified agent build from one source tree containing the MySQL 8
