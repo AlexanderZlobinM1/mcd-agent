@@ -102,6 +102,13 @@ class MauticImageInstallNginxTests(unittest.TestCase):
             ["apt-get", "install", "-y", "--no-install-recommends", "python3-certbot-dns-cloudflare"],
         )
 
+    def test_nginx_uses_generic_php_fpm_socket_when_requested_socket_is_missing(self) -> None:
+        def fake_exists(path: Path) -> bool:
+            return str(path) == "/run/php/php-fpm.sock"
+
+        with patch.object(Path, "exists", fake_exists):
+            self.assertEqual(image_install._php_fpm_fastcgi_pass("8.3"), "unix:/run/php/php-fpm.sock;")
+
     def test_safe_extract_skips_mcd_runtime_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             archive = Path(td) / "image.tar.gz"
