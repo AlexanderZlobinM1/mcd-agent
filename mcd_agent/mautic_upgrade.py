@@ -12,6 +12,7 @@ import time
 from typing import Any
 from dataclasses import dataclass
 from urllib import error as urlerror
+from urllib.parse import urlparse
 import urllib.request
 
 from mcd_agent.config import AgentConfig
@@ -1062,6 +1063,57 @@ def _verify_or_reconcile_doctrine_migrations(project_root: str, console_path: st
     raise RuntimeError("Post-migration up-to-date check failed\n" + output)
 
 
+def _mautic_core_file_candidates(root: str, relpath: Path) -> list[Path]:
+    base = Path(root)
+    candidates = [
+        base / relpath,
+        base / "docroot" / relpath,
+        base / "public" / relpath,
+    ]
+    if base.name.lower() in {"public", "docroot", "public_html"}:
+        candidates.append(base.parent / relpath)
+        candidates.append(base.parent / "docroot" / relpath)
+        candidates.append(base.parent / "public" / relpath)
+    out: list[Path] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _apply_mautic7_twig_include_hotfix(root: str, target: str) -> bool:
+    if _parse_semver(target)[0] != 7:
+        return False
+    rel = Path("app") / "bundles" / "CoreBundle" / "Twig" / "Extension" / "OverrideIncludeExtension.php"
+    changed_any = False
+    for path in _mautic_core_file_candidates(root, rel):
+        if not path.exists() or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "function includeWithEvent(" not in text or "CoreExtension::include(" not in text:
+            continue
+        updated, count = re.subn(
+            r"return\s+(?!\(string\)\s*)CoreExtension::include\(",
+            "return (string) CoreExtension::include(",
+            text,
+        )
+        if count <= 0 or updated == text:
+            if "(string) CoreExtension::include(" in text:
+                print(f"Mautic 7 Twig include hotfix already present: {path}")
+            continue
+        backup = path.with_name(path.name + ".mcd-pre-twig-include-hotfix.bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        path.write_text(updated, encoding="utf-8")
+        print(f"Mautic 7 Twig include hotfix applied: {path}")
+        changed_any = True
+    return changed_any
+
+
 def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str) -> None:
     project_root = _resolve_composer_project_root(root)
     cjson = Path(project_root) / "composer.json"
@@ -1079,7 +1131,10 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
     _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
+    patched = _apply_mautic7_twig_include_hotfix(project_root, target)
     _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
+    if patched:
+        print("Mautic 7 Twig include hotfix cache refresh completed")
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=project_root, as_www_data=True)
     migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
     _run_doctrine_migrate_with_reconcile(project_root, console_path, php_bin, migration_cmd)
@@ -1205,7 +1260,47 @@ def _best_probe_domain(inst: MauticInstall) -> str:
         domain = str(value or "").strip()
         if domain and domain not in candidates:
             candidates.append(domain)
+    fallback = _site_url_domain_from_install(inst)
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
     return candidates[0] if candidates else ""
+
+
+def _domain_from_site_url(site_url: str | None) -> str:
+    value = str(site_url or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+    except Exception:
+        return ""
+    host = str(parsed.hostname or "").strip().lower()
+    if not host or host in {"localhost", "_"} or "*" in host:
+        return ""
+    return host
+
+
+def _site_url_domain_from_install(inst: MauticInstall) -> str:
+    candidates: list[Path] = []
+    if str(inst.local_php_path or "").strip():
+        candidates.append(Path(str(inst.local_php_path)))
+    root = Path(str(inst.root or ""))
+    candidates.extend([root / "config" / "local.php", root / "app" / "config" / "local.php"])
+    if root.name.lower() in {"public", "docroot", "public_html"}:
+        candidates.extend([root.parent / "config" / "local.php", root.parent / "app" / "config" / "local.php"])
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen or not path.exists():
+            continue
+        seen.add(key)
+        try:
+            domain = _domain_from_site_url(parse_local_php(str(path)).get("site_url", ""))
+        except Exception:
+            domain = ""
+        if domain:
+            return domain
+    return ""
 
 
 def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:

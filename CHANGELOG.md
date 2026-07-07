@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.222 - 2026-07-07
+
+- Fixed: Composer Mautic 6 to 7 upgrades now apply the Mautic 7 Twig include
+  compatibility workaround before final cache verification, preventing login
+  pages from failing with `Twig\Markup` return type errors after upgrade.
+- Fixed: post-upgrade HTTP verification now falls back to the instance
+  `site_url` from `local.php` when discovery did not attach a vhost domain.
+
 ## 0.9.221 - 2026-07-07
 
 - Fixed: PHP-FPM socket fallback rendering no longer emits a duplicate
