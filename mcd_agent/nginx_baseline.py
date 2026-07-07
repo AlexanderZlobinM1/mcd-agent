@@ -165,12 +165,48 @@ def _default_deny_ssl_pair() -> tuple[Path, Path] | None:
     return None
 
 
-def _desired_default_deny_config(pair: tuple[Path, Path] | None = None) -> str:
+def _listen_default_server_ports(text: str) -> set[int]:
+    ports: set[int] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^listen\s+([^;#]+);", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        args = match.group(1).split()
+        if "default_server" not in {x.lower() for x in args}:
+            continue
+        address = args[0]
+        port_match = re.search(r":(\d+)$", address)
+        if port_match:
+            ports.add(int(port_match.group(1)))
+            continue
+        if address.isdigit():
+            ports.add(int(address))
+    return ports
+
+
+def _active_default_server_ports() -> set[int]:
+    ports: set[int] = set()
+    for path in _active_server_config_files():
+        if path.resolve(strict=False) == DEFAULT_DENY_FILE.resolve(strict=False):
+            continue
+        ports.update(_listen_default_server_ports(_read_text(path)))
+    return ports
+
+
+def _desired_default_deny_config(
+    pair: tuple[Path, Path] | None = None,
+    default_server_ports: set[int] | None = None,
+) -> str:
     ssl_pair = pair if pair is not None else _default_deny_ssl_pair()
+    occupied_ports = _active_default_server_ports() if default_server_ports is None else default_server_ports
+    listen_80 = "listen 80;" if 80 in occupied_ports else "listen 80 default_server;"
     lines = [
         DEFAULT_DENY_MARKER,
         "server {",
-        "    listen 80 default_server;",
+        f"    {listen_80}",
         "    server_name _;",
         "    return 444;",
         "}",
@@ -178,10 +214,11 @@ def _desired_default_deny_config(pair: tuple[Path, Path] | None = None) -> str:
     ]
     if ssl_pair is not None:
         cert, key = ssl_pair
+        listen_443 = "listen 443 ssl;" if 443 in occupied_ports else "listen 443 ssl default_server;"
         lines.extend(
             [
                 "server {",
-                "    listen 443 ssl default_server;",
+                f"    {listen_443}",
                 "    server_name _;",
                 f"    ssl_certificate {cert};",
                 f"    ssl_certificate_key {key};",

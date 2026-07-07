@@ -48,13 +48,37 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertEqual(content.count("set_real_ip_from 173.245.48.0/20;"), 1)
 
     def test_default_deny_vhost_rejects_unknown_hosts(self) -> None:
-        content = nginx_baseline._desired_default_deny_config((Path("/cert/fullchain.pem"), Path("/cert/privkey.pem")))
+        content = nginx_baseline._desired_default_deny_config(
+            (Path("/cert/fullchain.pem"), Path("/cert/privkey.pem")),
+            default_server_ports=set(),
+        )
 
         self.assertIn(nginx_baseline.DEFAULT_DENY_MARKER, content)
         self.assertIn("listen 80 default_server;", content)
         self.assertIn("listen 443 ssl default_server;", content)
         self.assertIn("server_name _;", content)
         self.assertEqual(content.count("return 444;"), 2)
+
+    def test_default_deny_vhost_avoids_occupied_default_server_ports(self) -> None:
+        content = nginx_baseline._desired_default_deny_config(
+            (Path("/cert/fullchain.pem"), Path("/cert/privkey.pem")),
+            default_server_ports={80},
+        )
+
+        self.assertIn("listen 80;", content)
+        self.assertNotIn("listen 80 default_server;", content)
+        self.assertIn("listen 443 ssl default_server;", content)
+
+    def test_listen_default_server_ports_detects_legacy_default_vhost(self) -> None:
+        src = """server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    listen 443 ssl default_server;
+    # listen 8443 ssl default_server;
+}
+"""
+
+        self.assertEqual(nginx_baseline._listen_default_server_ports(src), {80, 443})
 
     def test_ensure_default_deny_config_writes_managed_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -66,14 +90,17 @@ class NginxBaselineHardeningTests(unittest.TestCase):
 
             old_file = nginx_baseline.DEFAULT_DENY_FILE
             old_pair = nginx_baseline._default_deny_ssl_pair
+            old_ports = nginx_baseline._active_default_server_ports
             try:
                 nginx_baseline.DEFAULT_DENY_FILE = target
                 nginx_baseline._default_deny_ssl_pair = lambda: (Path("/cert/fullchain.pem"), Path("/cert/privkey.pem"))
+                nginx_baseline._active_default_server_ports = lambda: set()
                 actions = nginx_baseline._ensure_default_deny_config(backup, {})
                 text = target.read_text(encoding="utf-8")
             finally:
                 nginx_baseline.DEFAULT_DENY_FILE = old_file
                 nginx_baseline._default_deny_ssl_pair = old_pair
+                nginx_baseline._active_default_server_ports = old_ports
 
         self.assertEqual(actions, ["default_deny_vhost"])
         self.assertIn("listen 80 default_server;", text)
