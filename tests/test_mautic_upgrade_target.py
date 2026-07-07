@@ -15,7 +15,9 @@ from mcd_agent.mautic_upgrade import (
     _exit_upgrade_maintenance,
     _hard_clear_prod_cache,
     _migrate_php_custom_ini,
+    _normalize_mautic7_loopback_redis_cache,
     _rewrite_nginx_php_fpm_references,
+    _safe_mautic7_loopback_redis_dsn,
     _upgrade_target_relation,
 )
 
@@ -145,6 +147,65 @@ class MauticUpgradeTargetTests(unittest.TestCase):
 
             hard_clear.assert_called_once_with("/tmp/app")
             run.assert_called_once_with(["php", "bin/console", "cache:clear"], cwd="/tmp/app", as_www_data=True)
+
+    def test_mautic7_loopback_redis_dsn_uses_hex_loopback(self) -> None:
+        self.assertEqual(
+            _safe_mautic7_loopback_redis_dsn("redis://127.0.0.1:6379/0"),
+            "redis://0x7f000001:6379/0",
+        )
+        self.assertEqual(
+            _safe_mautic7_loopback_redis_dsn("redis://:secret@localhost:6380/2"),
+            "redis://:secret@0x7f000001:6380/2",
+        )
+        self.assertEqual(
+            _safe_mautic7_loopback_redis_dsn("redis://10.0.0.5:6379/0"),
+            "redis://10.0.0.5:6379/0",
+        )
+
+    def test_mautic7_loopback_redis_cache_normalizes_local_php(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = root / "config" / "local.php"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                """<?php
+$parameters = array(
+    'cache_adapter' => 'mautic.cache.adapter.redis',
+    'cache_adapter_redis' => array(
+        'dsn' => 'redis://127.0.0.1:6379/0',
+        'options' => array(),
+    ),
+);
+""",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(_normalize_mautic7_loopback_redis_cache(str(root), "7.1.2"))
+
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn("'dsn' => 'redis://0x7f000001:6379/0'", text)
+            self.assertTrue(list(cfg.parent.glob("local.php.mcd-pre-m7-redis-dsn-*.bak")))
+
+    def test_mautic7_loopback_redis_cache_ignores_non_mautic7_or_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = root / "config" / "local.php"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                """<?php
+$parameters = array(
+    'cache_adapter' => 'mautic.cache.adapter.redis',
+    'cache_adapter_redis' => array(
+        'dsn' => 'redis://10.0.0.5:6379/0',
+    ),
+);
+""",
+                encoding="utf-8",
+            )
+
+            self.assertFalse(_normalize_mautic7_loopback_redis_cache(str(root), "6.0.9"))
+            self.assertFalse(_normalize_mautic7_loopback_redis_cache(str(root), "7.1.2"))
+            self.assertIn("redis://10.0.0.5:6379/0", cfg.read_text(encoding="utf-8"))
 
     def test_php_custom_ini_migration_copies_only_custom_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
