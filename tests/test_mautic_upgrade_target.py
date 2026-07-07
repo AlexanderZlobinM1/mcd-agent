@@ -11,9 +11,11 @@ from mcd_agent.mautic_upgrade import (
     _best_probe_domain,
     _clean_target_version,
     _clear_prod_cache_with_fallback,
+    _composer_update_args,
     _enter_upgrade_maintenance,
     _exit_upgrade_maintenance,
     _hard_clear_prod_cache,
+    _normalize_mautic7_composer_constraints,
     _migrate_php_custom_ini,
     _normalize_mautic7_loopback_redis_cache,
     _rewrite_nginx_php_fpm_references,
@@ -206,6 +208,32 @@ $parameters = array(
             self.assertFalse(_normalize_mautic7_loopback_redis_cache(str(root), "6.0.9"))
             self.assertFalse(_normalize_mautic7_loopback_redis_cache(str(root), "7.1.2"))
             self.assertIn("redis://10.0.0.5:6379/0", cfg.read_text(encoding="utf-8"))
+
+    def test_mautic7_composer_constraints_upgrade_composer_installers(self) -> None:
+        text = """{
+  "require": {
+    "composer/installers": "^1.11",
+    "mautic/core-lib": "7.1.2"
+  }
+}
+"""
+
+        updated, changes = _normalize_mautic7_composer_constraints(text, "7.1.2")
+
+        self.assertEqual(changes, 1)
+        self.assertIn('"composer/installers": "^2.0"', updated)
+
+    def test_mautic7_composer_constraints_ignore_non_mautic7(self) -> None:
+        text = '{"require":{"composer/installers":"^1.11"}}'
+
+        updated, changes = _normalize_mautic7_composer_constraints(text, "6.0.9")
+
+        self.assertEqual(changes, 0)
+        self.assertEqual(updated, text)
+
+    def test_composer_update_uses_full_dependency_resolution_and_dry_run(self) -> None:
+        self.assertEqual(_composer_update_args(), ["update", "--with-all-dependencies"])
+        self.assertEqual(_composer_update_args(dry_run=True), ["update", "--with-all-dependencies", "--dry-run"])
 
     def test_php_custom_ini_migration_copies_only_custom_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:

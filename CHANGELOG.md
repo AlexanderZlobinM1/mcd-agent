@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.225 - 2026-07-07
+
+- Fixed: Composer Mautic 6 to 7 upgrades now print Composer, Node.js, and npm
+  preflight versions, normalize the Mautic 7 root `composer/installers`
+  constraint to `^2.0`, and run `composer update --with-all-dependencies
+  --dry-run` before the live dependency update. This catches package graph
+  conflicts such as `etailors/mautic-amazon-ses` requiring Composer installers
+  v2 before vendor code is changed.
+
 ## 0.9.224 - 2026-07-07
 
 - Fixed: Composer Mautic 6 to 7 upgrades now normalize single-node Redis cache
