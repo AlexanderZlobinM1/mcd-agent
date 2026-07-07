@@ -65,7 +65,7 @@ class NginxBaselineHardeningTests(unittest.TestCase):
             default_server_ports={80},
         )
 
-        self.assertIn("listen 80;", content)
+        self.assertNotIn("listen 80;", content)
         self.assertNotIn("listen 80 default_server;", content)
         self.assertIn("listen 443 ssl default_server;", content)
 
