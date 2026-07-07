@@ -8,6 +8,7 @@ import unittest
 from io import BytesIO
 from importlib import resources
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 config_stub = types.ModuleType("mcd_agent.config")
@@ -49,6 +50,38 @@ class MauticImageInstallNginxTests(unittest.TestCase):
 
         self.assertIn("listen 80;", template)
         self.assertNotIn("listen [::]", template)
+
+    def test_generated_nginx_vhost_exposes_acme_before_mautic_front_controller(self) -> None:
+        template = resources.files("mcd_agent.templates.nginx").joinpath("mautic_image_vhost.conf").read_text(encoding="utf-8")
+
+        self.assertLess(
+            template.index("location ^~ /.well-known/acme-challenge/"),
+            template.index("{{HTTP_ROOT_LOCATION}}"),
+        )
+        self.assertIn("try_files $uri =404;", template)
+
+    def test_cloudflare_dns01_certbot_does_not_put_token_on_command_line(self) -> None:
+        plan = image_install.build_plan(image_ref="default7", domain="example.sales-snap.com", php_version="8.4")
+        cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="agent-token")
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **_: object) -> tuple[int, str]:
+            calls.append(args)
+            return 0, "ok"
+
+        with (
+            patch.object(image_install, "_ensure_certbot_cloudflare_plugin"),
+            patch.object(image_install, "_certbot_cloudflare_credentials_path", return_value=Path("/etc/letsencrypt/mcd/cf.ini")),
+            patch.object(image_install, "_write_nginx_vhost") as write_vhost,
+            patch.object(image_install, "_run", side_effect=fake_run),
+        ):
+            image_install._run_certbot_cloudflare_dns01(cfg, plan, "mcc://dns/cloudflare/dns1")
+
+        self.assertEqual(calls[0][0:2], ["certbot", "certonly"])
+        self.assertIn("--dns-cloudflare", calls[0])
+        self.assertIn("/etc/letsencrypt/mcd/cf.ini", calls[0])
+        self.assertNotIn("agent-token", " ".join(calls[0]))
+        write_vhost.assert_called_once_with(plan, ssl_enabled=True)
 
     def test_safe_extract_skips_mcd_runtime_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as td:

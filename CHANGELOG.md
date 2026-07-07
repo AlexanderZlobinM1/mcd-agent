@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.218 - 2026-07-07
+
+- Fixed: Mautic image deploy can now issue certificates through Cloudflare
+  DNS-01 when MCC deploys a domain with a managed Cloudflare DNS credential.
+  This avoids Let’s Encrypt HTTP-01 timeouts on hosts whose Hetzner firewall
+  only permits web traffic from Cloudflare.
+- Fixed: generated image-deploy nginx vhosts now serve
+  `/.well-known/acme-challenge/` as static files before the Mautic front
+  controller for non-Cloudflare HTTP-01 hosts.
+
 ## 0.9.217 - 2026-07-06
 
 - Fixed: `tiny` profile now enables periodic full-scan segment planning with

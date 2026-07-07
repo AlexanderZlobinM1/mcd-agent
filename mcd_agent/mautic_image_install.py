@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 from typing import Any
 from urllib import request
+from urllib.parse import urlencode
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.nginx_templates import render_nginx_template
@@ -181,6 +182,15 @@ def _download(url: str, token: str, dst: Path) -> None:
     req = request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with request.urlopen(req, timeout=1800) as resp, dst.open("wb") as f:
         shutil.copyfileobj(resp, f)
+
+
+def _download_json(url: str, token: str, *, timeout_sec: int = 60) -> dict[str, Any]:
+    req = request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with request.urlopen(req, timeout=timeout_sec) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("MCC returned invalid JSON payload")
+    return payload
 
 
 _CREATE_TABLE_RE = re.compile(r"^CREATE TABLE `([^`]+)`")
@@ -500,6 +510,16 @@ def _artifact_url(cfg: AgentConfig, image_ref: str, kind: str) -> str:
     return f"{base}/api/v1/agent/mautic-images/{image_ref}/artifact/{kind}"
 
 
+def _agent_url(cfg: AgentConfig, path: str, query: dict[str, str] | None = None) -> str:
+    base = str(cfg.mcc_url or "").rstrip("/")
+    if not base:
+        raise RuntimeError("mcc.url is not configured")
+    suffix = "/" + str(path or "").lstrip("/")
+    if query:
+        suffix += "?" + urlencode(query)
+    return f"{base}{suffix}"
+
+
 def _patch_local_php(path: Path, plan: ImageInstallPlan) -> None:
     text = path.read_text(encoding="utf-8", errors="replace")
     text = text.replace("/var/www/ss/public_html", str(plan.webroot))
@@ -533,7 +553,57 @@ def _patch_local_php(path: Path, plan: ImageInstallPlan) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
+def _mautic_nginx_locations(plan: ImageInstallPlan) -> str:
+    return f"""    location ~ \\.php$ {{
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php{plan.php_version}-fpm.sock;
+    }}
+
+    location ~* ^/(?:config|vendor|node_modules|tests|var|\\.git)(?:/|$) {{
+        deny all;
+    }}
+
+    location ~* ^/(?:composer\\.(?:json|lock)|package(?:-lock)?\\.json|yarn\\.lock|pnpm-lock\\.yaml|symfony\\.lock|webpack\\.config\\.js|tsconfig\\.json|phpunit\\.xml(?:\\.dist)?|codeception\\.yml|SECURITY\\.md|README(?:\\..*)?|CHANGELOG(?:\\..*)?|\\.env(?:\\..*)?)$ {{
+        deny all;
+    }}
+
+    location ~* /\\.(?!well-known/) {{
+        deny all;
+    }}"""
+
+
+def _http_root_location(*, ssl_enabled: bool) -> str:
+    if ssl_enabled:
+        return """    location / {
+        return 301 https://$host$request_uri;
+    }"""
+    return """    location / {
+        try_files $uri /index.php$is_args$args;
+    }"""
+
+
+def _ssl_server_block(plan: ImageInstallPlan, web_root: Path) -> str:
+    cert_dir = Path("/etc/letsencrypt/live") / plan.domain
+    return f"""server {{
+    listen 443 ssl;
+    server_name {plan.domain};
+    root {web_root};
+    index index.php index.html;
+    client_max_body_size 128M;
+
+    ssl_certificate {cert_dir / "fullchain.pem"};
+    ssl_certificate_key {cert_dir / "privkey.pem"};
+
+    location / {{
+        try_files $uri /index.php$is_args$args;
+    }}
+
+{_mautic_nginx_locations(plan)}
+}}
+"""
+
+
+def _write_nginx_vhost(plan: ImageInstallPlan, *, ssl_enabled: bool = False) -> Path:
     site = Path("/etc/nginx/sites-available") / f"{plan.domain}.conf"
     site.parent.mkdir(parents=True, exist_ok=True)
     web_root = _nginx_web_root(plan.webroot)
@@ -541,12 +611,15 @@ def _write_nginx_vhost(plan: ImageInstallPlan) -> Path:
         "mautic_image_vhost.conf",
         DOMAIN=plan.domain,
         WEB_ROOT=web_root,
-        PHP_VERSION=plan.php_version,
+        HTTP_ROOT_LOCATION=_http_root_location(ssl_enabled=ssl_enabled),
+        MAUTIC_DENY_LOCATIONS=_mautic_nginx_locations(plan),
+        SSL_SERVER_BLOCK=_ssl_server_block(plan, web_root) if ssl_enabled else "",
     )
     site.write_text(content, encoding="utf-8")
     enabled = Path("/etc/nginx/sites-enabled") / site.name
     enabled.parent.mkdir(parents=True, exist_ok=True)
-    enabled.symlink_to(site)
+    if not enabled.exists() and not enabled.is_symlink():
+        enabled.symlink_to(site)
     return site
 
 
@@ -558,6 +631,89 @@ def _nginx_web_root(project_root: Path) -> Path:
         if (candidate / "index.php").exists():
             return candidate
     return root
+
+
+def _certbot_cloudflare_credentials_url(cfg: AgentConfig, plan: ImageInstallPlan, credential_ref: str) -> str:
+    return _agent_url(
+        cfg,
+        "/api/v1/agent/dns-credentials/certbot-cloudflare",
+        {"domain": plan.domain, "credential_ref": credential_ref},
+    )
+
+
+def _certbot_cloudflare_credentials_path(cfg: AgentConfig, plan: ImageInstallPlan, credential_ref: str) -> Path:
+    payload = _download_json(_certbot_cloudflare_credentials_url(cfg, plan, credential_ref), str(cfg.mcc_token), timeout_sec=60)
+    token = str(payload.get("api_token") or "").strip()
+    if not token:
+        raise RuntimeError("Cloudflare DNS credential has no API token")
+    safe_domain = re.sub(r"[^a-z0-9_.-]+", "_", plan.domain.lower()).strip("._-") or "domain"
+    cred_dir = Path("/etc/letsencrypt/mcd")
+    cred_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(cred_dir, 0o700)
+    path = cred_dir / f"dns-cloudflare-{safe_domain}.ini"
+    path.write_text("dns_cloudflare_api_token = " + token + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _ensure_certbot_cloudflare_plugin() -> None:
+    rc, out = _run(["certbot", "plugins"], timeout_sec=60)
+    if rc == 0 and "dns-cloudflare" in out:
+        return
+    _apt_install_packages(["python3-certbot-dns-cloudflare"])
+    rc, out = _run(["certbot", "plugins"], timeout_sec=60)
+    if rc != 0 or "dns-cloudflare" not in out:
+        raise RuntimeError("certbot dns-cloudflare plugin is not available: " + out)
+
+
+def _run_certbot_http01(plan: ImageInstallPlan) -> None:
+    rc, out = _run(
+        [
+            "certbot",
+            "--nginx",
+            "-d",
+            plan.domain,
+            "--non-interactive",
+            "--agree-tos",
+            "--redirect",
+            "--register-unsafely-without-email",
+        ],
+        timeout_sec=600,
+    )
+    if rc != 0:
+        raise RuntimeError("certbot failed: " + out)
+
+
+def _run_certbot_cloudflare_dns01(cfg: AgentConfig, plan: ImageInstallPlan, credential_ref: str) -> None:
+    _ensure_certbot_cloudflare_plugin()
+    credentials_path = _certbot_cloudflare_credentials_path(cfg, plan, credential_ref)
+    rc, out = _run(
+        [
+            "certbot",
+            "certonly",
+            "--dns-cloudflare",
+            "--dns-cloudflare-credentials",
+            str(credentials_path),
+            "--dns-cloudflare-propagation-seconds",
+            "60",
+            "--cert-name",
+            plan.domain,
+            "-d",
+            plan.domain,
+            "--non-interactive",
+            "--agree-tos",
+            "--keep-until-expiring",
+            "--register-unsafely-without-email",
+        ],
+        timeout_sec=900,
+    )
+    if rc != 0:
+        raise RuntimeError("certbot dns-cloudflare failed: " + out)
+    _write_nginx_vhost(plan, ssl_enabled=True)
+    rc, out = _run(["nginx", "-t"], timeout_sec=30)
+    if rc != 0:
+        raise RuntimeError("nginx -t failed after SSL vhost update: " + out)
+    _run(["systemctl", "reload", "nginx"], timeout_sec=30)
 
 
 def _skip_image_archive_member(name: str) -> bool:
@@ -592,6 +748,7 @@ def install_from_image(
     php_version: str,
     yes: bool = False,
     run_certbot: bool = True,
+    certbot_dns_credential_ref: str | None = None,
 ) -> dict[str, Any]:
     plan = build_plan(image_ref=image_ref, domain=domain, php_version=php_version)
     if not yes:
@@ -656,22 +813,13 @@ def install_from_image(
         _run(["systemctl", "reload", "nginx"], timeout_sec=30)
 
         if run_certbot:
-            print("Running certbot")
-            rc, out = _run(
-                [
-                    "certbot",
-                    "--nginx",
-                    "-d",
-                    plan.domain,
-                    "--non-interactive",
-                    "--agree-tos",
-                    "--redirect",
-                    "--register-unsafely-without-email",
-                ],
-                timeout_sec=600,
-            )
-            if rc != 0:
-                raise RuntimeError("certbot failed: " + out)
+            dns_ref = str(certbot_dns_credential_ref or "").strip()
+            if dns_ref:
+                print("Running certbot via Cloudflare DNS-01")
+                _run_certbot_cloudflare_dns01(cfg, plan, dns_ref)
+            else:
+                print("Running certbot via nginx HTTP-01")
+                _run_certbot_http01(plan)
 
     from mcd_agent.inventory import InstanceInventory
 

@@ -1688,6 +1688,7 @@ def _build_parser() -> argparse.ArgumentParser:
     img.add_argument("--image-ref", required=True)
     img.add_argument("--domain", required=True)
     img.add_argument("--php-version", required=True)
+    img.add_argument("--certbot-dns-credential-ref", default="")
     img.add_argument("--yes", action="store_true")
     img.add_argument("--no-certbot", action="store_true")
     img.add_argument("--json", action="store_true")
@@ -2688,6 +2689,7 @@ def main() -> int:
                     php_version=str(args.php_version),
                     yes=bool(args.yes),
                     run_certbot=not bool(args.no_certbot),
+                    certbot_dns_credential_ref=str(args.certbot_dns_credential_ref or "").strip() or None,
                 )
         else:
             result = install_from_image(
@@ -2697,6 +2699,7 @@ def main() -> int:
                 php_version=str(args.php_version),
                 yes=bool(args.yes),
                 run_certbot=not bool(args.no_certbot),
+                certbot_dns_credential_ref=str(args.certbot_dns_credential_ref or "").strip() or None,
             )
         if bool(args.json):
             print(json.dumps(result, ensure_ascii=True, indent=2))
