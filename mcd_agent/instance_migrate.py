@@ -987,12 +987,24 @@ def run_target_pull_migration(
         inv = InstanceInventory(config.state_db_path)
         instances = inv.rescan(config)
 
+        print("progress: 98 source maintenance off")
+        _remote_mcd(
+            source_ssh_user=source_ssh_user,
+            source_address=source_address,
+            source_ssh_port=source_ssh_port,
+            source_ssh_key_file=source_ssh_key_file,
+            args=["maintenance", "off", "--json"],
+            timeout_sec=120,
+        )
+        source_maintenance_on = False
+
         result.update(
             {
                 "ok": True,
                 "catchup_ok": True,
                 "completed_at_utc": _utc_now(),
-                "source_maintenance_active": source_maintenance_on,
+                "source_maintenance_active": False,
+                "source_maintenance_restored": True,
                 "nginx_vhost": site,
                 "letsencrypt_copied": copied_certs,
                 "healthcheck_tail": health,

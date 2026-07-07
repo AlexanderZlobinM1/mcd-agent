@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.223 - 2026-07-07
+
+- Fixed: successful instance migrations now restore source-host MCD
+  maintenance mode and cron before reporting completion, preventing migrated
+  source hosts from being left with scheduler paused after a clean run.
+
 ## 0.9.222 - 2026-07-07
 
 - Fixed: Composer Mautic 6 to 7 upgrades now apply the Mautic 7 Twig include
