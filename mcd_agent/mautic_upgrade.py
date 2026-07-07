@@ -569,6 +569,47 @@ def _normalize_mautic7_loopback_redis_cache(project_root: str, target: str) -> b
     return True
 
 
+def _normalize_mautic7_composer_constraints(text: str, target: str) -> tuple[str, int]:
+    if _parse_semver(target)[0] != 7:
+        return text, 0
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text, 0
+    if not isinstance(data, dict):
+        return text, 0
+    require = data.get("require")
+    if not isinstance(require, dict):
+        return text, 0
+
+    changes = 0
+    current = str(require.get("composer/installers", "") or "").strip()
+    if current and current != "^2.0":
+        require["composer/installers"] = "^2.0"
+        changes += 1
+    if changes <= 0:
+        return text, 0
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n", changes
+
+
+def _composer_update_args(*, dry_run: bool = False) -> list[str]:
+    args = ["update", "--with-all-dependencies"]
+    if dry_run:
+        args.append("--dry-run")
+    return args
+
+
+def _command_version_line(cmd: list[str], *, cwd: str, as_www_data: bool = False) -> str:
+    proc = _run_capture(cmd, cwd=cwd, as_www_data=as_www_data)
+    if proc.returncode != 0:
+        full = _command_with_user(cmd, as_www_data=as_www_data)
+        raise RuntimeError(
+            f"Version preflight failed ({proc.returncode}): {' '.join(full)}\n{proc.stdout}\n{proc.stderr}"
+        )
+    out = (proc.stdout or proc.stderr or "").strip()
+    return out.splitlines()[0].strip() if out else "ok"
+
+
 def _backup_install(root: str) -> Path:
     backups = Path("/opt/mcd/backups")
     backups.mkdir(parents=True, exist_ok=True)
@@ -1180,15 +1221,25 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     composer_bin = _resolve_composer_bin()
     _ensure_node20()
     _ensure_www_data_composer_cache()
-    print(f"Composer preflight ok: {composer_bin}")
-    node_version = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=20, check=False)
-    if node_version.returncode == 0 and (node_version.stdout or "").strip():
-        print(f"Node.js preflight ok: {(node_version.stdout or '').strip()}")
+    composer_version = _command_version_line(
+        [composer_bin, "-V", "--no-interaction", "--no-ansi"],
+        cwd=project_root,
+        as_www_data=True,
+    )
+    node_version = _command_version_line(["node", "-v"], cwd=project_root)
+    npm_version = _command_version_line(["npm", "-v"], cwd=project_root)
+    print(f"Composer preflight ok: {composer_version} ({composer_bin})")
+    print(f"Node.js preflight ok: {node_version}")
+    print(f"npm preflight ok: {npm_version}")
     text = cjson.read_text(encoding="utf-8")
     updated, changes = _replace_version_tokens(text, current, target)
+    updated, constraint_changes = _normalize_mautic7_composer_constraints(updated, target)
+    changes += constraint_changes
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
-    _run([composer_bin, "update", "--with-dependencies"], cwd=project_root, as_www_data=True)
+    _run([composer_bin, *_composer_update_args(dry_run=True)], cwd=project_root, as_www_data=True)
+    print("Composer dependency dry-run ok")
+    _run([composer_bin, *_composer_update_args()], cwd=project_root, as_www_data=True)
     patched = _apply_mautic7_twig_include_hotfix(project_root, target)
     _normalize_mautic7_loopback_redis_cache(project_root, target)
     _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
