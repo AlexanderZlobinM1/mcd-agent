@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.9.221 - 2026-07-07
+
+- Fixed: PHP-FPM socket fallback rendering no longer emits a duplicate
+  semicolon in generated nginx `fastcgi_pass` directives.
+
 ## 0.9.220 - 2026-07-07
 
 - Fixed: generated Mautic image nginx vhosts now fall back to the system

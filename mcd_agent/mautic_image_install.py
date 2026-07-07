@@ -576,11 +576,11 @@ def _mautic_nginx_locations(plan: ImageInstallPlan) -> str:
 def _php_fpm_fastcgi_pass(php_version: str) -> str:
     exact = Path(f"/run/php/php{str(php_version).strip()}-fpm.sock")
     if exact.exists():
-        return f"unix:{exact};"
+        return f"unix:{exact}"
     generic = Path("/run/php/php-fpm.sock")
     if generic.exists():
-        return f"unix:{generic};"
-    return f"unix:{exact};"
+        return f"unix:{generic}"
+    return f"unix:{exact}"
 
 
 def _http_root_location(*, ssl_enabled: bool) -> str:
