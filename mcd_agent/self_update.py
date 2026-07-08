@@ -322,6 +322,7 @@ def _install_requirements_for_staged_source(install_dir: Path, staged_src_dir: P
     venv_python = install_dir / "venv" / "bin" / "python"
     if not venv_python.exists():
         raise RuntimeError(f"venv python not found: {venv_python}")
+    _ensure_venv_pip(venv_python)
     cmd = [
         str(venv_python),
         "-m",
@@ -345,6 +346,7 @@ def _install_agent_package_for_source(install_dir: Path, source_dir: Path) -> No
     venv_python = install_dir / "venv" / "bin" / "python"
     if not venv_python.exists():
         raise RuntimeError(f"venv python not found: {venv_python}")
+    _ensure_venv_pip(venv_python)
     site_proc = subprocess.run(
         [
             str(venv_python),
@@ -375,6 +377,21 @@ def _install_agent_package_for_source(install_dir: Path, source_dir: Path) -> No
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "pip install agent package failed").strip()
         raise RuntimeError(f"agent package install failed: {detail}")
+
+
+def _ensure_venv_pip(venv_python: Path) -> None:
+    probe = subprocess.run([str(venv_python), "-m", "pip", "--version"], cwd="/", capture_output=True, text=True)
+    if probe.returncode == 0:
+        return
+    proc = subprocess.run(
+        [str(venv_python), "-m", "ensurepip", "--upgrade"],
+        cwd="/",
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "ensurepip failed").strip()
+        raise RuntimeError(f"pip bootstrap failed: {detail}")
 
 
 def _agent_package_sync_needed(source_ver: str | None = None) -> bool:
