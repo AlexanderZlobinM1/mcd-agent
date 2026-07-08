@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.234 - 2026-07-08
+
+- Fixed: `composer-move` now keeps ZIP vhost backups outside
+  `/etc/nginx/sites-enabled`. When the active vhost is a legacy regular file
+  in `sites-enabled`, MCD writes the switched Composer vhost to
+  `sites-available`, replaces the enabled file with a symlink, and preserves
+  old configs as inactive backups only.
+- Fixed: daemon bootstrap and self-update dependency installation now run
+  `ensurepip` when the agent venv lost `pip` after a system Python minor
+  upgrade, allowing MCD to reinstall requirements instead of crashing on
+  missing modules such as `cryptography`.
+
 ## 0.9.233 - 2026-07-08
 
 - Fixed: local Mautic DB connections now try the unix socket before TCP

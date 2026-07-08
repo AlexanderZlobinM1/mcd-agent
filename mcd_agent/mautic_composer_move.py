@@ -20,6 +20,8 @@ from mcd_agent.nginx_baseline import (
 )
 
 RETIRED_INSTANCE_MARKER = ".mcd-retired-after-composer-move"
+NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 
 
 @dataclass
@@ -78,7 +80,7 @@ def _target_root(domain: str) -> Path:
 
 def _find_site(domain: str, source_root: Path) -> tuple[Path, Path | None]:
     candidates: list[Path] = []
-    for root in (Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/sites-available")):
+    for root in (NGINX_SITES_ENABLED, NGINX_SITES_AVAILABLE):
         if not root.exists():
             continue
         for path in sorted(root.iterdir()):
@@ -94,7 +96,7 @@ def _find_site(domain: str, source_root: Path) -> tuple[Path, Path | None]:
     if not candidates:
         raise RuntimeError(f"nginx vhost for {domain} was not found")
     site_available = candidates[0]
-    enabled = Path("/etc/nginx/sites-enabled") / site_available.name
+    enabled = NGINX_SITES_ENABLED / site_available.name
     return site_available, enabled if enabled.exists() or enabled.is_symlink() else None
 
 
@@ -213,9 +215,26 @@ def _ensure_runtime_dirs(target_root: Path) -> list[str]:
 
 def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    backup = plan.site_available.with_name(f"zip-backup-{ts}-{plan.site_available.name}")
-    shutil.copy2(plan.site_available, backup)
-    text = plan.site_available.read_text(encoding="utf-8", errors="replace")
+    source_site = plan.site_available
+    target_site = plan.site_available
+    enabled_site = plan.site_enabled
+    source_parent = source_site.parent.resolve(strict=False)
+    enabled_dir = NGINX_SITES_ENABLED.resolve(strict=False)
+    available_dir = NGINX_SITES_AVAILABLE.resolve(strict=False)
+    managed_nginx_site = source_parent in {enabled_dir, available_dir}
+    if source_parent == enabled_dir:
+        target_site = NGINX_SITES_AVAILABLE / source_site.name
+        enabled_site = source_site
+
+    backup_dir = NGINX_SITES_AVAILABLE if managed_nginx_site else target_site.parent
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"zip-backup-{ts}-{target_site.name}"
+    shutil.copy2(source_site, backup)
+    if target_site.exists() and target_site.resolve(strict=False) != source_site.resolve(strict=False):
+        existing_backup = backup_dir / f"pre-composer-{ts}-{target_site.name}"
+        shutil.copy2(target_site, existing_backup)
+
+    text = source_site.read_text(encoding="utf-8", errors="replace")
     old = str(plan.source_root)
     new = str(plan.nginx_root)
     if old not in text:
@@ -233,10 +252,17 @@ def _write_switched_vhost(plan: ComposerMovePlan) -> dict[str, str]:
     )
     text = ensure_mautic_public_app_asset_locations(text)
     text = normalize_legacy_http2_listen(text, modern_http2=_nginx_supports_http2_directive())
-    plan.site_available.write_text(text, encoding="utf-8")
-    if plan.site_enabled is not None and not plan.site_enabled.exists() and not plan.site_enabled.is_symlink():
-        plan.site_enabled.symlink_to(plan.site_available)
-    return {"active": str(plan.site_available), "backup": str(backup)}
+    target_site.parent.mkdir(parents=True, exist_ok=True)
+    target_site.write_text(text, encoding="utf-8")
+    if enabled_site is not None:
+        enabled_site.parent.mkdir(parents=True, exist_ok=True)
+        if enabled_site.exists() or enabled_site.is_symlink():
+            same_target = enabled_site.is_symlink() and enabled_site.resolve(strict=False) == target_site.resolve(strict=False)
+            if not same_target:
+                enabled_site.unlink()
+        if not enabled_site.exists() and not enabled_site.is_symlink():
+            enabled_site.symlink_to(os.path.relpath(target_site, enabled_site.parent))
+    return {"active": str(target_site), "backup": str(backup)}
 
 
 def _mark_source_root_retired(plan: ComposerMovePlan) -> str:
