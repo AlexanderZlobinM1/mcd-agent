@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.235 - 2026-07-09
+
+- Fixed: `mautic-upgrade apply` now uses the full maintenance guard for every
+  upgrade path. Before Mautic update commands run, MCD pauses the scheduler,
+  stops cron, terminates tracked/external Mautic console work including orphan
+  console processes with a grace window, and aborts the upgrade if any running
+  task cannot be stopped. Cleanup still restores only the cron/pause state that
+  the upgrade guard owned.
+
 ## 0.9.234 - 2026-07-08
 
 - Fixed: `composer-move` now keeps ZIP vhost backups outside

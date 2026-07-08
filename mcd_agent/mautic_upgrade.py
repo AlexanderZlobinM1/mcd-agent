@@ -18,7 +18,12 @@ import urllib.request
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
-from mcd_agent.maintenance_mode import cron_marker_path, restore_cron_service_if_needed, stop_cron_service
+from mcd_agent.maintenance_mode import (
+    cron_marker_path,
+    restore_cron_service_if_needed,
+    stop_cron_service,
+    stop_running_tasks_for_maintenance,
+)
 from mcd_agent.models import MauticInstall
 from mcd_agent.amazon_mailer_dep import (
     ensure_amazon_mailer_for_bundles,
@@ -94,6 +99,8 @@ class UpgradeMaintenanceGuard:
     pause_flag: Path
     owned_pause_flag: bool
     owned_cron_stop: bool
+    stopped_tasks: int = 0
+    stop_failed: int = 0
 
 
 def _pick_install_record(config: AgentConfig, root: str | None) -> MauticInstall:
@@ -189,10 +196,34 @@ def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
         was_active = str(bool(cron_stop.get("was_active", False))).lower()
         print(f"Maintenance guard: cron stopped unit={unit} was_active={was_active}")
 
+    stop_result = stop_running_tasks_for_maintenance(config, grace_sec=30, kill_orphans=True)
+    stopped_tasks = int(stop_result.get("stopped") or 0)
+    stop_failed = int(stop_result.get("stop_failed") or 0)
+    print(
+        "Maintenance guard: running tasks stopped={stopped} failed={failed} "
+        "managed_remaining={managed} console_remaining={consoles}".format(
+            stopped=stopped_tasks,
+            failed=stop_failed,
+            managed=int(stop_result.get("managed_running") or 0),
+            consoles=int(stop_result.get("mautic_console_total") or 0),
+        )
+    )
+    if stop_failed > 0:
+        if owned_cron_stop:
+            try:
+                restore_cron_service_if_needed(config)
+            except Exception:
+                pass
+        if owned_pause_flag and pause_flag.exists():
+            pause_flag.unlink()
+        raise RuntimeError("Maintenance guard failed: unable to stop all running Mautic tasks")
+
     return UpgradeMaintenanceGuard(
         pause_flag=pause_flag,
         owned_pause_flag=owned_pause_flag,
         owned_cron_stop=owned_cron_stop,
+        stopped_tasks=stopped_tasks,
+        stop_failed=stop_failed,
     )
 
 

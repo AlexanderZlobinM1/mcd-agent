@@ -60,12 +60,24 @@ class MauticUpgradeTargetTests(unittest.TestCase):
                     "mcd_agent.mautic_upgrade.restore_cron_service_if_needed",
                     return_value={"ok": True, "unit": "cron", "started": True},
                 ) as restore_cron,
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_running_tasks_for_maintenance",
+                    return_value={
+                        "ok": True,
+                        "stopped": 2,
+                        "stop_failed": 0,
+                        "managed_running": 0,
+                        "mautic_console_total": 0,
+                    },
+                ) as stop_tasks,
             ):
                 guard = _enter_upgrade_maintenance(cfg)
                 self.assertTrue(pause_flag.exists())
                 self.assertTrue(guard.owned_pause_flag)
                 self.assertTrue(guard.owned_cron_stop)
+                self.assertEqual(guard.stopped_tasks, 2)
                 stop_cron.assert_called_once_with(cfg)
+                stop_tasks.assert_called_once_with(cfg, grace_sec=30, kill_orphans=True)
 
                 _exit_upgrade_maintenance(cfg, guard)
                 self.assertFalse(pause_flag.exists())
@@ -81,15 +93,55 @@ class MauticUpgradeTargetTests(unittest.TestCase):
             with (
                 patch("mcd_agent.mautic_upgrade.stop_cron_service") as stop_cron,
                 patch("mcd_agent.mautic_upgrade.restore_cron_service_if_needed") as restore_cron,
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_running_tasks_for_maintenance",
+                    return_value={
+                        "ok": True,
+                        "stopped": 0,
+                        "stop_failed": 0,
+                        "managed_running": 0,
+                        "mautic_console_total": 0,
+                    },
+                ) as stop_tasks,
             ):
                 guard = _enter_upgrade_maintenance(cfg)
                 self.assertFalse(guard.owned_pause_flag)
                 self.assertFalse(guard.owned_cron_stop)
                 stop_cron.assert_not_called()
+                stop_tasks.assert_called_once_with(cfg, grace_sec=30, kill_orphans=True)
 
                 _exit_upgrade_maintenance(cfg, guard)
                 self.assertTrue(pause_flag.exists())
                 restore_cron.assert_not_called()
+
+    def test_upgrade_maintenance_guard_aborts_when_tasks_do_not_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            pause_flag = Path(td) / "scheduler.pause"
+            cfg = SimpleNamespace(scheduler_pause_flag_path=str(pause_flag))
+            with (
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_cron_service",
+                    return_value={"ok": True, "unit": "cron", "was_active": True},
+                ),
+                patch(
+                    "mcd_agent.mautic_upgrade.restore_cron_service_if_needed",
+                    return_value={"ok": True, "unit": "cron", "started": True},
+                ) as restore_cron,
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_running_tasks_for_maintenance",
+                    return_value={
+                        "ok": False,
+                        "stopped": 0,
+                        "stop_failed": 1,
+                        "managed_running": 1,
+                        "mautic_console_total": 1,
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unable to stop all running Mautic tasks"):
+                    _enter_upgrade_maintenance(cfg)
+                self.assertFalse(pause_flag.exists())
+                restore_cron.assert_called_once_with(cfg)
 
     def test_hard_clear_prod_cache_recreates_prod(self) -> None:
         with tempfile.TemporaryDirectory() as td:
