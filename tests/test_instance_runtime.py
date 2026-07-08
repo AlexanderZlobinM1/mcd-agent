@@ -120,6 +120,51 @@ server {{
             self.assertIn("fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
             self.assertTrue((inst_root / ".mcd" / "php").is_symlink())
 
+    def test_rewrites_generic_php_fpm_socket_to_single_active_shared_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            php_etc = base / "etc" / "php"
+            generated = base / "opt" / "mcd" / "generated"
+            backups = base / "backups"
+            sites_available = base / "etc" / "nginx" / "sites-available"
+            sites_enabled = base / "etc" / "nginx" / "sites-enabled"
+            sites_available.mkdir(parents=True)
+            sites_enabled.mkdir(parents=True)
+            inst_root = base / "var" / "www" / "merkurosiguranje" / "public_html"
+            inst = self._install(inst_root)
+            vhost = sites_available / "merkurosiguranje.sales-snap.com.conf"
+            vhost.write_text(
+                f"""
+server {{
+    server_name merkurosiguranje.sales-snap.com;
+    root {inst_root / "docroot"};
+    location ~ \\.php$ {{
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+    }}
+}}
+""",
+                encoding="utf-8",
+            )
+            (sites_enabled / vhost.name).symlink_to(vhost)
+
+            with (
+                patch.object(instance_runtime, "PHP_ETC_ROOT", php_etc),
+                patch.object(instance_runtime, "GENERATED_ROOT", generated),
+                patch.object(instance_runtime, "BACKUP_ROOT", backups),
+                patch.object(instance_runtime, "NGINX_SITES_AVAILABLE", sites_available),
+                patch.object(instance_runtime, "NGINX_SITES_ENABLED", sites_enabled),
+                patch.object(instance_runtime, "_single_active_shared_php_version", return_value="8.4"),
+                patch.object(instance_runtime, "_run", self._fake_run),
+            ):
+                payload = instance_runtime.apply_instance_runtime([inst], reload_services=False)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["changed"])
+            self.assertEqual(payload["instances"][0]["php_versions"], ["8.4"])
+            self.assertIn("nginx_shared:", " ".join(payload["actions"]))
+            self.assertIn("fastcgi_pass unix:/run/php/php8.4-fpm.sock;", vhost.read_text(encoding="utf-8"))
+            self.assertTrue((inst_root / ".mcd" / "php").is_symlink())
+
     def test_ignores_inactive_backup_nginx_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

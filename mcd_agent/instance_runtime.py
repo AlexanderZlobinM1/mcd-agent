@@ -20,6 +20,7 @@ BACKUP_ROOT = Path("/var/backups/mcd-instance-runtime")
 
 _FASTCGI_SHARED_RE = re.compile(r"fastcgi_pass\s+unix:/(?:var/)?run/php/php(?P<version>\d+\.\d+)-fpm\.sock;")
 _FASTCGI_MCD_RE = re.compile(r"fastcgi_pass\s+unix:/run/php/php(?P<version>\d+\.\d+)-fpm-mcd-[^;]+\.sock;")
+_FASTCGI_GENERIC_RE = re.compile(r"fastcgi_pass\s+unix:/(?:var/)?run/php/php-fpm\.sock;")
 _SERVER_NAME_RE = re.compile(r"^\s*server_name\s+([^;]+);", flags=re.MULTILINE)
 _ROOT_RE = re.compile(r"^\s*root\s+([^;]+);", flags=re.MULTILINE)
 _SAFE_SLUG_RE = re.compile(r"[^a-z0-9_.-]+")
@@ -139,6 +140,24 @@ def _php_versions_for_file(text: str) -> set[str]:
     out = {m.group("version") for m in _FASTCGI_SHARED_RE.finditer(text)}
     out.update(m.group("version") for m in _FASTCGI_MCD_RE.finditer(text))
     return {x for x in out if x}
+
+
+def _has_generic_fastcgi_socket(text: str) -> bool:
+    return bool(_FASTCGI_GENERIC_RE.search(text))
+
+
+def _single_active_shared_php_version() -> str | None:
+    versions: set[str] = set()
+    run_php = Path("/run/php")
+    if not run_php.is_dir():
+        return None
+    for path in run_php.glob("php*-fpm.sock"):
+        m = re.fullmatch(r"php(\d+\.\d+)-fpm\.sock", path.name)
+        if m and path.is_socket():
+            versions.add(m.group(1))
+    if len(versions) == 1:
+        return next(iter(versions))
+    return None
 
 
 def _wrapper_script(version: str, inst: MauticInstall, slug: str) -> str:
@@ -284,6 +303,7 @@ def _rewrite_nginx_file_to_shared(path: Path, version: str) -> bool:
         ),
         text,
     )
+    new = _FASTCGI_GENERIC_RE.sub(f"fastcgi_pass unix:/run/php/php{version}-fpm.sock;", new)
     if new == text:
         return False
     path.write_text(new, encoding="utf-8")
@@ -323,9 +343,15 @@ def apply_instance_runtime(
             slug = _pool_slug(inst)
             matched = [p for p in _active_nginx_files() if _nginx_file_matches_instance(p, inst)]
             inst_versions: set[str] = set()
+            has_generic_fastcgi = False
             for path in matched:
                 text = path.read_text(encoding="utf-8", errors="ignore")
                 inst_versions.update(_php_versions_for_file(text))
+                has_generic_fastcgi = has_generic_fastcgi or _has_generic_fastcgi_socket(text)
+            if not inst_versions and has_generic_fastcgi:
+                inferred = _single_active_shared_php_version()
+                if inferred:
+                    inst_versions.add(inferred)
             row: dict[str, Any] = {
                 "root": inst.root,
                 "name": inst.name,

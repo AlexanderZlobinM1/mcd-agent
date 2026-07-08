@@ -68,14 +68,20 @@ class MauticDB:
             seen.add(key)
             out.append(kwargs)
 
-        _add({**base, "host": host_raw or "localhost", "port": port})
         if self._is_local_host(host_raw):
-            # Prefer unix socket on local DBs because many hosts have grants
-            # only for user@localhost and reject user@127.0.0.1.
+            explicit_tcp = host_raw.lower() in {"127.0.0.1", "::1"}
+            if explicit_tcp:
+                _add({**base, "host": host_raw, "port": port})
+            # Prefer unix socket on implicit local DBs because many hosts have
+            # grants only for user@localhost and reject TCP loopback users.
             for sock in self._socket_candidates():
                 _add({**base, "unix_socket": sock})
+            if not explicit_tcp:
+                _add({**base, "host": host_raw or "localhost", "port": port})
             _add({**base, "host": "localhost", "port": port})
             _add({**base, "host": "127.0.0.1", "port": port})
+        else:
+            _add({**base, "host": host_raw, "port": port})
         return out
 
     def _connect(self) -> pymysql.connections.Connection:

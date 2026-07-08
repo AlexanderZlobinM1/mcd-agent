@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.233 - 2026-07-08
+
+- Fixed: local Mautic DB connections now try the unix socket before TCP
+  `localhost` when the instance config uses an implicit local database,
+  avoiding repeated MariaDB `Access denied` noise on hosts that only grant
+  `user@localhost`.
+- Fixed: instance runtime normalization now rewrites legacy generic nginx
+  `fastcgi_pass unix:/run/php/php-fpm.sock` entries to the active versioned
+  PHP-FPM socket for the instance, preventing reboot/package updates from
+  leaving vhosts pointed at a missing generic socket.
+
 ## 0.9.232 - 2026-07-07
 
 - Added: `mcd-cli report:email-activity` collects Mautic email activity
