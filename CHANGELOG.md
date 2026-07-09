@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.238 - 2026-07-09
+
+- Added: MCD now maintains an hourly per-instance contact/DNC cache and includes
+  the cached values in every standard MCC state push. MCC reports can render
+  total contacts and do-not-contact counts instantly from the control-plane
+  cache without launching host-side collection.
+
 ## 0.9.235 - 2026-07-09
 
 - Fixed: `mautic-upgrade apply` now uses the full maintenance guard for every

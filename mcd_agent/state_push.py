@@ -30,6 +30,7 @@ from mcd_agent.apt_profile import collect_apt_state
 from mcd_agent.backup import backup_profile_for_push, backup_state_for_push
 from mcd_agent.cluster_assets import collect_cluster_assets_status
 from mcd_agent.config import AgentConfig
+from mcd_agent.contact_stats import collect_contact_stats
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.instance_size import collect_instance_sizes
@@ -1770,6 +1771,11 @@ class MCCStatePusher:
             "cluster_assets": self._cluster_assets_payload(now_ts, installs),
             "instances": instances,
             "instance_sizes": collect_instance_sizes(installs),
+            "contact_stats": collect_contact_stats(
+                installs,
+                state_dir=Path(self.cfg.state_db_path).parent,
+                refresh_interval_sec=3600,
+            ),
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         payload.update(agent_version_payload())
