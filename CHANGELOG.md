@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.239 - 2026-07-09
+
+- Added: MySQL service profiles can now manage SQL mode through profile data.
+  Profiles may remove modes such as `ONLY_FULL_GROUP_BY` while preserving the
+  host's other current modes; MCD writes the computed value to the managed
+  MySQL drop-in and applies it immediately with `SET GLOBAL`.
+- Added: MySQL service profiles now accept generic `mysqld_options` and
+  `mysql_dynamic_variables` maps for future profile-driven MySQL parameters,
+  reducing the need for code changes for simple managed options.
+
 ## 0.9.238 - 2026-07-09
 
 - Added: MCD now maintains an hourly per-instance contact/DNC cache and includes
