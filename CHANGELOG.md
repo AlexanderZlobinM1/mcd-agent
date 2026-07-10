@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.240 - 2026-07-10
+
+- Fixed: campaign trigger due detection now includes decision `no` branches
+  whose child action is already due but whose event-log rows have not yet been
+  created by native Mautic. This prevents MCD from marking campaigns stale and
+  skipping `mautic:campaigns:trigger -i <id>` for scheduled follow-up emails
+  such as Apetit campaign 161.
+
 ## 0.9.235 - 2026-07-09
 
 - Fixed: `mautic-upgrade apply` now uses the full maintenance guard for every

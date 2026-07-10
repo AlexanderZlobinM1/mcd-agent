@@ -110,6 +110,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         snapshot = CampaignTriggerProgressSnapshot(
             due_event_logs=0,
             due_root_actions=0,
+            due_no_action_branches=0,
             pending_event_logs=0,
             triggered_event_logs=4439,
             max_triggered_at="2026-06-12 08:25:59",
@@ -172,6 +173,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         snapshot = CampaignTriggerProgressSnapshot(
             due_event_logs=1,
             due_root_actions=0,
+            due_no_action_branches=0,
             pending_event_logs=1,
             triggered_event_logs=2219,
             max_triggered_at="2026-06-12 06:04:16",
@@ -247,6 +249,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         snapshot = CampaignTriggerProgressSnapshot(
             due_event_logs=0,
             due_root_actions=0,
+            due_no_action_branches=0,
             pending_event_logs=0,
             triggered_event_logs=169709,
             max_triggered_at="2026-06-30 08:27:02",
