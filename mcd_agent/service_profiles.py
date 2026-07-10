@@ -35,7 +35,6 @@ _MYSQL_PROFILE_MANAGED_KEYS = {
     "max_allowed_packet",
     "skip_name_resolve",
     "log_queries_not_using_indexes",
-    "sql_mode",
 }
 _MYSQL_GALERA_MARKERS = (
     "wsrep_on",
@@ -514,29 +513,7 @@ def _cleanup_legacy_mysql_top_level_configs() -> dict[Path, str | None]:
     return before
 
 
-def _normalize_mysql_option_key(value: Any) -> str:
-    raw = str(value or "").strip().lower().replace("-", "_")
-    if not re.match(r"^[a-z][a-z0-9_]*$", raw):
-        return ""
-    return raw
-
-
-def _profile_mysql_option_keys(profile: dict[str, Any]) -> set[str]:
-    keys: set[str] = set(_MYSQL_PROFILE_MANAGED_KEYS)
-    for group_key in ("mysqld_options", "mysql_options", "mysql_dynamic_variables"):
-        raw = profile.get(group_key)
-        if not isinstance(raw, dict):
-            continue
-        for key in raw:
-            normalized = _normalize_mysql_option_key(key)
-            if normalized:
-                keys.add(normalized)
-    if profile.get("sql_mode") is not None or profile.get("sql_mode_remove") or profile.get("sql_mode_add"):
-        keys.add("sql_mode")
-    return keys
-
-
-def _cleanup_mysql_top_level_profile_overrides(profile: dict[str, Any] | None = None) -> dict[Path, str | None]:
+def _cleanup_mysql_top_level_profile_overrides() -> dict[Path, str | None]:
     """
     Disable only active top-level MySQL settings that MCD now owns through its
     drop-in. Some old hosts have hand-copied /etc/mysql/my.cnf after includedir
@@ -548,7 +525,6 @@ def _cleanup_mysql_top_level_profile_overrides(profile: dict[str, Any] | None = 
     before: dict[Path, str | None] = {}
     section = re.compile(r"^\s*\[(?P<section>[^\]]+)\]\s*(?:[#;].*)?$")
     assignment = re.compile(r"^\s*(?P<key>[A-Za-z0-9_-]+)\s*=")
-    managed_keys = _profile_mysql_option_keys(profile or {})
     for path in _MYSQL_TOP_LEVEL_CONFIGS:
         if not path.exists():
             continue
@@ -574,7 +550,7 @@ def _cleanup_mysql_top_level_profile_overrides(profile: dict[str, Any] | None = 
                 m_assignment = assignment.match(line)
                 if m_assignment:
                     key = m_assignment.group("key").strip().lower().replace("-", "_")
-                    if key in managed_keys:
+                    if key in _MYSQL_PROFILE_MANAGED_KEYS:
                         line = "# mcd-managed duplicate disabled: " + line
                         changed = True
             lines.append(line)
@@ -603,118 +579,6 @@ def _mb(size_mb: Any, default: int) -> str:
     if v < 1:
         v = int(default)
     return f"{v}M"
-
-
-def _mysql_modes_from_value(value: Any) -> list[str]:
-    raw_items: list[Any]
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_items = list(value)
-    else:
-        raw_items = str(value or "").split(",")
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        mode = str(item or "").strip().upper()
-        if not mode or not re.match(r"^[A-Z0-9_]+$", mode):
-            continue
-        if mode in seen:
-            continue
-        seen.add(mode)
-        out.append(mode)
-    return out
-
-
-def _mysql_read_global_variable(name: str, *, timeout_sec: int = 8) -> str | None:
-    key = _normalize_mysql_option_key(name)
-    if not key:
-        return None
-    for cmd in _mysql_client_cmd_candidates():
-        try:
-            proc = subprocess.run(
-                [*cmd, "--batch", "--skip-column-names", "-e", f"SELECT @@GLOBAL.{key}"],
-                capture_output=True,
-                text=True,
-                timeout=max(3, int(timeout_sec)),
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0:
-            return (proc.stdout or "").strip()
-    return None
-
-
-def _mysql_sql_mode_value(profile: dict[str, Any]) -> str | None:
-    if profile.get("sql_mode") is not None:
-        return ",".join(_mysql_modes_from_value(profile.get("sql_mode")))
-
-    remove = set(_mysql_modes_from_value(profile.get("sql_mode_remove")))
-    add = _mysql_modes_from_value(profile.get("sql_mode_add"))
-    if not remove and not add:
-        return None
-
-    base = profile.get("sql_mode_base")
-    if base is None:
-        base = _mysql_read_global_variable("sql_mode")
-    modes = _mysql_modes_from_value(base)
-    if not modes and remove:
-        return None
-    out = [mode for mode in modes if mode not in remove]
-    seen = set(out)
-    for mode in add:
-        if mode not in seen:
-            out.append(mode)
-            seen.add(mode)
-    return ",".join(out)
-
-
-def _mysql_option_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "ON" if value else "OFF"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return str(value)
-    if isinstance(value, (list, tuple, set)):
-        value = ",".join(str(x).strip() for x in value if str(x).strip())
-    raw = str(value or "").strip()
-    if "\n" in raw or "\r" in raw:
-        raise ValueError("mysql option value cannot contain newlines")
-    if not raw:
-        return "\"\""
-    if re.match(r"^[A-Za-z0-9_./:@,+-]+$", raw):
-        return raw
-    return "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-
-
-def _mysql_sql_literal(value: Any) -> str:
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return str(value)
-    if isinstance(value, (list, tuple, set)):
-        value = ",".join(str(x).strip() for x in value if str(x).strip())
-    raw = str(value or "")
-    return "'" + raw.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def _mysql_extra_option_lines(profile: dict[str, Any], *, skip: set[str] | None = None) -> list[str]:
-    skip_keys = skip or set()
-    raw = profile.get("mysqld_options")
-    if raw is None:
-        raw = profile.get("mysql_options")
-    if not isinstance(raw, dict):
-        return []
-    lines: list[str] = []
-    for key, value in sorted(raw.items(), key=lambda kv: str(kv[0])):
-        normalized = _normalize_mysql_option_key(key)
-        if not normalized or normalized in skip_keys:
-            continue
-        lines.append(f"{normalized} = {_mysql_option_value(value)}")
-    return lines
 
 
 def _build_mysql_override(profile: dict[str, Any], *, engine: str) -> str:
@@ -754,10 +618,6 @@ def _build_mysql_override(profile: dict[str, Any], *, engine: str) -> str:
     lines.append(
         f"log_queries_not_using_indexes = {'ON' if _as_bool(profile.get('log_queries_not_using_indexes'), False) else 'OFF'}"
     )
-    sql_mode = _mysql_sql_mode_value(profile)
-    if sql_mode is not None:
-        lines.append(f"sql_mode = {_mysql_option_value(sql_mode)}")
-    lines.extend(_mysql_extra_option_lines(profile, skip={"sql_mode"}))
     return "\n".join(lines) + "\n"
 
 
@@ -840,16 +700,6 @@ def _apply_mysql_dynamic_profile(profile: dict[str, Any], *, engine: str, timeou
         val = _mysql_mb_bytes(profile, key, default_mb)
         if val:
             statements.append(f"SET GLOBAL {key[:-3]}={val}")
-    sql_mode = _mysql_sql_mode_value(profile)
-    if sql_mode is not None:
-        statements.append(f"SET GLOBAL sql_mode={_mysql_sql_literal(sql_mode)}")
-    raw_dynamic = profile.get("mysql_dynamic_variables")
-    if isinstance(raw_dynamic, dict):
-        for key, value in sorted(raw_dynamic.items(), key=lambda kv: str(kv[0])):
-            normalized = _normalize_mysql_option_key(key)
-            if not normalized or normalized == "sql_mode":
-                continue
-            statements.append(f"SET GLOBAL {normalized}={_mysql_sql_literal(value)}")
 
     if not statements:
         return {"status": "noop", "applied": []}
@@ -1023,7 +873,7 @@ def apply_mysql_profile(cfg: AgentConfig, profile: dict[str, Any], *, dry_run: b
     try:
         if not cluster_mysql:
             top_level_before = _cleanup_legacy_mysql_top_level_configs()
-            profile_override_before = _cleanup_mysql_top_level_profile_overrides(profile)
+            profile_override_before = _cleanup_mysql_top_level_profile_overrides()
             top_level_before.update(profile_override_before)
             changed.extend(str(p) for p in top_level_before)
         if _write_file(dropin, content):

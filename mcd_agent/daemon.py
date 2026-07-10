@@ -182,18 +182,24 @@ _SQL_IMPORT_MONITOR_ROWS = (
 class CampaignTriggerProgressSnapshot:
     due_event_logs: int
     due_root_actions: int
+    due_no_action_branches: int
     pending_event_logs: int
     triggered_event_logs: int
     max_triggered_at: str
 
     @property
     def due_total(self) -> int:
-        return max(0, int(self.due_event_logs or 0)) + max(0, int(self.due_root_actions or 0))
+        return (
+            max(0, int(self.due_event_logs or 0))
+            + max(0, int(self.due_root_actions or 0))
+            + max(0, int(self.due_no_action_branches or 0))
+        )
 
-    def progress_key(self) -> tuple[int, int, int, int, str]:
+    def progress_key(self) -> tuple[int, int, int, int, int, str]:
         return (
             self.due_total,
             max(0, int(self.due_event_logs or 0)),
+            max(0, int(self.due_no_action_branches or 0)),
             max(0, int(self.pending_event_logs or 0)),
             max(0, int(self.triggered_event_logs or 0)),
             str(self.max_triggered_at or ""),
@@ -2540,6 +2546,76 @@ def _campaign_trigger_root_action_due_exists_sql(campaign_id: int) -> str:
     )
 
 
+def _campaign_trigger_no_action_due_exists_sql(campaign_id: int) -> str:
+    cid = int(campaign_id)
+    interval_due_expr = (
+        "CASE LOWER(COALESCE(ce.trigger_interval_unit, 'd')) "
+        "WHEN 'i' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MINUTE) "
+        "WHEN 'h' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) HOUR) "
+        "WHEN 'd' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
+        "WHEN 'm' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MONTH) "
+        "WHEN 'y' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) YEAR) "
+        "ELSE DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
+        "END"
+    )
+    return (
+        "SELECT COUNT(*) AS cnt FROM ("
+        "SELECT 1 "
+        "FROM {prefix}campaigns c "
+        f"WHERE c.id = {cid} "
+        "  AND c.is_published = 1 "
+        "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
+        "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+        "  AND EXISTS ("
+        "    SELECT 1 "
+        "    FROM {prefix}campaign_events d "
+        "    INNER JOIN {prefix}campaign_events ce "
+        "      ON ce.parent_id = d.id "
+        "     AND ce.decision_path = 'no' "
+        "     AND ce.event_type IN ('action', 'condition') "
+        "    INNER JOIN {prefix}campaign_lead_event_log parent_log "
+        "      ON parent_log.campaign_id = c.id "
+        "     AND parent_log.event_id = d.parent_id "
+        "     AND parent_log.date_triggered IS NOT NULL "
+        "    INNER JOIN {prefix}campaign_leads cld "
+        "      ON cld.campaign_id = parent_log.campaign_id "
+        "     AND cld.lead_id = parent_log.lead_id "
+        "     AND cld.rotation <=> parent_log.rotation "
+        "     AND cld.manually_removed = 0 "
+        "     AND cld.date_last_exited IS NULL "
+        "    WHERE d.campaign_id = c.id "
+        "      AND d.event_type = 'decision' "
+        "      AND d.parent_id IS NOT NULL "
+        "      AND ("
+        "        ce.trigger_mode = 'immediate' "
+        "        OR ce.trigger_mode IS NULL "
+        "        OR ("
+        "          ce.trigger_mode = 'date' "
+        "          AND ce.trigger_date IS NOT NULL "
+        "          AND (ce.trigger_date <= '{now_utc}' OR ce.trigger_date <= '{now_local}')"
+        "        ) "
+        "        OR ("
+        "          ce.trigger_mode = 'interval' "
+        "          AND parent_log.date_triggered IS NOT NULL "
+        f"          AND ({interval_due_expr}) <= '{{now_utc}}'"
+        "        )"
+        "      ) "
+        "      AND NOT EXISTS ("
+        "        SELECT 1 "
+        "        FROM {prefix}campaign_lead_event_log dlog "
+        "        WHERE dlog.campaign_id = parent_log.campaign_id "
+        "          AND dlog.event_id = d.id "
+        "          AND dlog.lead_id = parent_log.lead_id "
+        "          AND dlog.rotation <=> parent_log.rotation "
+        "        LIMIT 1"
+        "      ) "
+        "    LIMIT 1"
+        "  ) "
+        "LIMIT 1"
+        ") q"
+    )
+
+
 def _campaign_trigger_event_log_progress_sql(campaign_id: int) -> str:
     cid = int(campaign_id)
     return (
@@ -2616,11 +2692,13 @@ def _campaign_trigger_progress_snapshot(
     cid = int(campaign_id)
     due_event_logs = db.fetch_count(_campaign_trigger_event_log_due_exists_sql(cid), context=sql_ctx)
     due_root_actions = db.fetch_count(_campaign_trigger_root_action_due_exists_sql(cid), context=sql_ctx)
+    due_no_action_branches = db.fetch_count(_campaign_trigger_no_action_due_exists_sql(cid), context=sql_ctx)
     rows = db.fetch_rows(_campaign_trigger_event_log_progress_sql(cid), limit=1, context=sql_ctx)
     row = rows[0] if rows else {}
     return CampaignTriggerProgressSnapshot(
         due_event_logs=max(0, int(due_event_logs or 0)),
         due_root_actions=max(0, int(due_root_actions or 0)),
+        due_no_action_branches=max(0, int(due_no_action_branches or 0)),
         pending_event_logs=_row_int(row, "pending_event_logs"),
         triggered_event_logs=_row_int(row, "triggered_event_logs"),
         max_triggered_at=str(row.get("max_triggered_at") or ""),

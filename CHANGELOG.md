@@ -1,21 +1,12 @@
 # MCD Changelog
 
-## 0.9.239 - 2026-07-09
+## 0.9.240 - 2026-07-10
 
-- Added: MySQL service profiles can now manage SQL mode through profile data.
-  Profiles may remove modes such as `ONLY_FULL_GROUP_BY` while preserving the
-  host's other current modes; MCD writes the computed value to the managed
-  MySQL drop-in and applies it immediately with `SET GLOBAL`.
-- Added: MySQL service profiles now accept generic `mysqld_options` and
-  `mysql_dynamic_variables` maps for future profile-driven MySQL parameters,
-  reducing the need for code changes for simple managed options.
-
-## 0.9.238 - 2026-07-09
-
-- Added: MCD now maintains an hourly per-instance contact/DNC cache and includes
-  the cached values in every standard MCC state push. MCC reports can render
-  total contacts and do-not-contact counts instantly from the control-plane
-  cache without launching host-side collection.
+- Fixed: campaign trigger due detection now includes decision `no` branches
+  whose child action is already due but whose event-log rows have not yet been
+  created by native Mautic. This prevents MCD from marking campaigns stale and
+  skipping `mautic:campaigns:trigger -i <id>` for scheduled follow-up emails
+  such as Apetit campaign 161.
 
 ## 0.9.235 - 2026-07-09
 

@@ -12,6 +12,7 @@ from mcd_agent.config import (
 )
 from mcd_agent.daemon import (
     _campaign_trigger_event_log_due_exists_sql,
+    _campaign_trigger_no_action_due_exists_sql,
     _campaign_trigger_root_action_due_exists_sql,
 )
 
@@ -165,6 +166,26 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("INNER JOIN {prefix}campaign_leads cld", guard_sql)
         self.assertIn("el0.rotation <=> cld.rotation", guard_sql)
         self.assertNotIn("el0.event_id = ce.id", guard_sql)
+
+    def test_trigger_due_catches_decision_no_path_without_event_log(self) -> None:
+        self.assertIn("d.event_type = 'decision'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("ce.decision_path = 'no'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("parent_log.event_id = d.parent_id", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("dlog.event_id = d.id", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("ce.trigger_mode = 'date'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("ce.trigger_date <= '{now_utc}' OR ce.trigger_date <= '{now_local}'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("ce.trigger_mode = 'interval'", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+        self.assertIn("DATE_ADD(parent_log.date_triggered", _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE)
+
+    def test_trigger_due_guard_catches_decision_no_path_without_event_log(self) -> None:
+        guard_sql = _campaign_trigger_no_action_due_exists_sql(162)
+
+        self.assertIn("d.event_type = 'decision'", guard_sql)
+        self.assertIn("ce.decision_path = 'no'", guard_sql)
+        self.assertIn("parent_log.event_id = d.parent_id", guard_sql)
+        self.assertIn("dlog.event_id = d.id", guard_sql)
+        self.assertIn("dlog.rotation <=> parent_log.rotation", guard_sql)
+        self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", guard_sql)
 
     def test_trigger_due_event_log_guard_respects_publish_down(self) -> None:
         guard_sql = _campaign_trigger_event_log_due_exists_sql(162)

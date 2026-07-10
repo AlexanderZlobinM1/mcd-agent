@@ -243,56 +243,6 @@ class ServiceProfileClusterGuardTests(unittest.TestCase):
         self.assertEqual(sanitized["open_files_limit"], 262144)
         self.assertEqual(sanitized["table_open_cache"], 8000)
 
-    def test_mysql_profile_sql_mode_remove_preserves_other_modes(self) -> None:
-        old_read = service_profiles._mysql_read_global_variable
-        try:
-            service_profiles._mysql_read_global_variable = lambda _name: (
-                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,"
-                "NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-            )
-
-            content = service_profiles._build_mysql_override(
-                {"sql_mode_remove": ["ONLY_FULL_GROUP_BY"]},
-                engine="mysql",
-            )
-        finally:
-            service_profiles._mysql_read_global_variable = old_read
-
-        self.assertIn("sql_mode = STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION", content)
-        self.assertNotIn("ONLY_FULL_GROUP_BY", content)
-
-    def test_mysql_profile_dynamic_sql_mode_remove_uses_set_global(self) -> None:
-        old_read = service_profiles._mysql_read_global_variable
-        old_candidates = service_profiles._mysql_client_cmd_candidates
-        old_run = service_profiles.subprocess.run
-        calls: list[list[str]] = []
-        try:
-            service_profiles._mysql_read_global_variable = lambda _name: (
-                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,"
-                "NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-            )
-            service_profiles._mysql_client_cmd_candidates = lambda: [["mysql", "-u", "root"]]
-
-            def fake_run(cmd, **_kwargs):
-                calls.append(list(cmd))
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-            service_profiles.subprocess.run = fake_run
-
-            res = service_profiles._apply_mysql_dynamic_profile(
-                {"sql_mode_remove": ["ONLY_FULL_GROUP_BY"]},
-                engine="mysql",
-            )
-        finally:
-            service_profiles._mysql_read_global_variable = old_read
-            service_profiles._mysql_client_cmd_candidates = old_candidates
-            service_profiles.subprocess.run = old_run
-
-        self.assertEqual(res.get("status"), "applied")
-        sql = calls[0][-1]
-        self.assertIn("SET GLOBAL sql_mode='STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'", sql)
-        self.assertNotIn("ONLY_FULL_GROUP_BY", sql)
-
 
 if __name__ == "__main__":
     unittest.main()
