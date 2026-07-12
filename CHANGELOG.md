@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.241 - 2026-07-13
+
+- Fixed: campaign scheduled-event due detection now accepts both UTC and the
+  instance-local Mautic clock before launching native campaign processing.
+  This prevents non-UTC installations from delaying scheduled event-log work
+  by the timezone offset while leaving final execution-window enforcement to
+  native Mautic.
+- Fixed: the per-campaign due guard and decision `no` interval catch-up use the
+  same dual-clock semantics, so scheduler planning and launch revalidation
+  cannot disagree about locally stored campaign timestamps.
+
 ## 0.9.240 - 2026-07-10
 
 - Fixed: campaign trigger due detection now includes decision `no` branches

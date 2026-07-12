@@ -227,7 +227,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "    AND el.is_scheduled = 1 "
     "    AND ("
     "      (el.trigger_date IS NOT NULL AND ("
-    "        el.trigger_date <= '{now_utc}' "
+    "        (el.trigger_date <= '{now_utc}' OR el.trigger_date <= '{now_local}') "
     "      )) "
     "      OR el.trigger_date IS NULL"
     "    ) "
@@ -277,7 +277,15 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "          WHEN 'm' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MONTH) "
     "          WHEN 'y' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) YEAR) "
     "          ELSE DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
-    "        END) <= '{now_utc}'"
+    "        END) <= '{now_utc}' OR "
+    "        (CASE LOWER(COALESCE(ce.trigger_interval_unit, 'd')) "
+    "          WHEN 'i' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MINUTE) "
+    "          WHEN 'h' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) HOUR) "
+    "          WHEN 'd' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
+    "          WHEN 'm' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MONTH) "
+    "          WHEN 'y' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) YEAR) "
+    "          ELSE DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
+    "        END) <= '{now_local}'"
     "      )"
     "    ) "
     "    AND NOT EXISTS ("
@@ -1263,12 +1271,11 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
     )
     if all(sig in normalized for sig in old_event_log_lower_bound):
         return True
-    old_event_log_local_time_semantics = (
+    old_event_log_utc_only_semantics = (
         "{prefix}campaign_lead_event_log el",
         "el.trigger_date <= '{now_utc}'",
-        "el.trigger_date <= '{now_local}'",
     )
-    if all(sig in normalized for sig in old_event_log_local_time_semantics):
+    if all(sig in normalized for sig in old_event_log_utc_only_semantics) and "el.trigger_date <= '{now_local}'" not in normalized:
         return True
     old_campaign_event_lower_bound = (
         "{prefix}campaign_events ce",
