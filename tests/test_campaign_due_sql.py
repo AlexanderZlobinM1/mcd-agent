@@ -59,8 +59,8 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("el.is_scheduled = 1", event_log_branch)
         self.assertNotIn("el.date_triggered", event_log_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
+        self.assertIn("el.trigger_date <= '{now_local}'", event_log_branch)
         self.assertNotIn("el.trigger_date >= '{window_start_utc_7d}'", event_log_branch)
-        self.assertNotIn("el.trigger_date <= '{now_local}'", event_log_branch)
         self.assertNotIn("el.trigger_date >= '{window_start_local_7d}'", event_log_branch)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", event_log_branch)
 
@@ -70,7 +70,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("el.is_scheduled = 1", event_log_branch)
         self.assertNotIn("el.date_triggered", event_log_branch)
         self.assertIn("el.trigger_date <= '{now_utc}'", event_log_branch)
-        self.assertNotIn("el.trigger_date <= '{now_local}'", event_log_branch)
+        self.assertIn("el.trigger_date <= '{now_local}'", event_log_branch)
         self.assertNotIn("window_start_utc_7d", event_log_branch)
         self.assertNotIn("window_start_local_7d", event_log_branch)
 
@@ -90,10 +90,10 @@ class CampaignDueSqlTests(unittest.TestCase):
             _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
         )
 
-    def test_trigger_sql_with_event_log_local_time_semantics_is_migrated(self) -> None:
+    def test_trigger_sql_with_event_log_utc_only_semantics_is_migrated(self) -> None:
         previous = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.replace(
+            "(el.trigger_date <= '{now_utc}' OR el.trigger_date <= '{now_local}') ",
             "el.trigger_date <= '{now_utc}' ",
-            "el.trigger_date <= '{now_utc}' OR el.trigger_date <= '{now_local}' ",
             1,
         )
 
@@ -185,6 +185,8 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("parent_log.event_id = d.parent_id", guard_sql)
         self.assertIn("dlog.event_id = d.id", guard_sql)
         self.assertIn("dlog.rotation <=> parent_log.rotation", guard_sql)
+        self.assertIn("<= '{now_utc}'", guard_sql)
+        self.assertIn("<= '{now_local}'", guard_sql)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", guard_sql)
 
     def test_trigger_due_event_log_guard_respects_publish_down(self) -> None:
@@ -192,6 +194,7 @@ class CampaignDueSqlTests(unittest.TestCase):
 
         self.assertIn("FROM {prefix}campaign_lead_event_log el", guard_sql)
         self.assertIn("el.trigger_date <= '{now_utc}'", guard_sql)
+        self.assertIn("el.trigger_date <= '{now_local}'", guard_sql)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_local}'", guard_sql)
 
     def test_trigger_due_is_strictly_event_log_driven(self) -> None:
