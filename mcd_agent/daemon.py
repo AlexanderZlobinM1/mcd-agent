@@ -62,6 +62,7 @@ from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.grapesjs_ckeditor_patch import ensure_grapesjs_ckeditor_gpl_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
 from mcd_agent.mautic_version_cache import (
@@ -7058,6 +7059,20 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             installs = inventory.list_instances()
             _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
             _apply_instance_runtime_guard(installs, reason="plan-refresh")
+            for inst in installs:
+                try:
+                    patch_res = ensure_grapesjs_ckeditor_gpl_patch(inst)
+                    patch_status = str(patch_res.get("status", "")).strip().lower()
+                    if patch_status == "patched":
+                        logging.info("[%s] Mautic 7 GrapesJS CKEditor GPL patch applied", inst.root)
+                    elif patch_status == "error":
+                        logging.warning(
+                            "[%s] Mautic 7 GrapesJS CKEditor GPL patch error: %s",
+                            inst.root,
+                            patch_res.get("files", []),
+                        )
+                except Exception as e:
+                    logging.warning("[%s] Mautic 7 GrapesJS CKEditor GPL patch check failed: %s", inst.root, e)
             logging.info("Instance inventory count: %d", len(installs))
             if (config.profile_name or "").strip().lower() == "passive":
                 for inst in installs:
