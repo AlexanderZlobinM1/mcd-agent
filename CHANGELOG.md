@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.242 - 2026-07-17
+
+- Fixed: Mautic 7 GrapesJS rich-text editing now supplies CKEditor's `GPL`
+  license fallback when the plugin bridge omits a license key. MCD patches both
+  plugin source and the published `builder.js` artifact idempotently, preserving
+  backups and refusing unexpected signatures.
+
 ## 0.9.241 - 2026-07-13
 
 - Fixed: campaign scheduled-event due detection now accepts both UTC and the
