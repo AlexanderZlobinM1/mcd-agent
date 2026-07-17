@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.243 - 2026-07-17
+
+- Fixed: the Mautic 7 HTML-email builder now receives `licenseKey: 'GPL'` at
+  plugin initialization, matching the already-correct page and MJML builders.
+- Fixed: the patched GrapesJS JavaScript uses a scoped cache-busting URL so
+  browsers with the old builder cached immediately load the corrected asset.
+
 ## 0.9.242 - 2026-07-17
 
 - Fixed: Mautic 7 GrapesJS rich-text editing now supplies CKEditor's `GPL`

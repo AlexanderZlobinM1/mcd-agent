@@ -515,7 +515,8 @@ Important:
     after all other discovered host instances are Mautic 7-compatible
   - MCD repairs the Mautic 7 GrapesJS CKEditor GPL-license fallback on every
     inventory cycle, including passive hosts, and reapplies it after plugin or
-    Mautic updates overwrite either the source or published builder artifact
+    Mautic updates overwrite either the source or published builder artifact;
+    the scoped builder URL revision also invalidates previously cached broken JS
 - MCD self-version checks:
   - `runtime.mcd_update_notify = true` (default): show notice if MCC has newer MCD version
   - `runtime.mcd_auto_update_enabled = false` (default): auto-update disabled; notify-only

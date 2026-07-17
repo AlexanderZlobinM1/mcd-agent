@@ -13,11 +13,26 @@ _PLUGIN_REL_PATHS = (
     "public/plugins/GrapesJsBuilderBundle",
 )
 _SOURCE_REL_PATH = "Assets/library/js/plugins/grapesjs-ckeditor/editorLifecycle.js"
+_BUILDER_SERVICE_REL_PATH = "Assets/library/js/builder.service.js"
 _DIST_REL_PATH = "Assets/library/js/dist/builder.js"
+_ASSETS_SUBSCRIBER_REL_PATH = "EventSubscriber/AssetsSubscriber.php"
 _SOURCE_VULNERABLE = "licenseKey: this.licenseKey,"
 _SOURCE_PATCHED = "licenseKey: this.licenseKey || 'GPL',"
 _DIST_VULNERABLE = "licenseKey:this.licenseKey"
 _DIST_PATCHED = 'licenseKey:this.licenseKey||"GPL"'
+_EMAIL_HTML_SOURCE_VULNERABLE = """grapesjsmautic: BuilderService.getMauticConf('email-html'),
+        [grapesjsckeditor]: {
+          ckeditor_module: ckeditorModuleUrl,
+          inlineMode: true,"""
+_EMAIL_HTML_SOURCE_PATCHED = """grapesjsmautic: BuilderService.getMauticConf('email-html'),
+        [grapesjsckeditor]: {
+          ckeditor_module: ckeditorModuleUrl,
+          licenseKey: 'GPL',
+          inlineMode: true,"""
+_EMAIL_HTML_DIST_VULNERABLE = 'grapesjsmautic:gl.getMauticConf("email-html"),[mT]:{ckeditor_module:r,inlineMode:!0'
+_EMAIL_HTML_DIST_PATCHED = 'grapesjsmautic:gl.getMauticConf("email-html"),[mT]:{ckeditor_module:r,licenseKey:"GPL",inlineMode:!0'
+_ASSET_URL_VULNERABLE = "$assetsEvent->addScript('plugins/GrapesJsBuilderBundle/Assets/library/js/dist/builder.js');"
+_ASSET_URL_PATCHED = "$assetsEvent->addScript('plugins/GrapesJsBuilderBundle/Assets/library/js/dist/builder.js?mcd-ckeditor-gpl');"
 
 
 def _plugin_root(root: str) -> Path | None:
@@ -84,7 +99,14 @@ def ensure_grapesjs_ckeditor_gpl_patch(install: MauticInstall) -> dict[str, Any]
 
     files = [
         _patch_file(plugin_root / _SOURCE_REL_PATH, _SOURCE_VULNERABLE, _SOURCE_PATCHED),
+        _patch_file(
+            plugin_root / _BUILDER_SERVICE_REL_PATH,
+            _EMAIL_HTML_SOURCE_VULNERABLE,
+            _EMAIL_HTML_SOURCE_PATCHED,
+        ),
         _patch_file(plugin_root / _DIST_REL_PATH, _DIST_VULNERABLE, _DIST_PATCHED),
+        _patch_file(plugin_root / _DIST_REL_PATH, _EMAIL_HTML_DIST_VULNERABLE, _EMAIL_HTML_DIST_PATCHED),
+        _patch_file(plugin_root / _ASSETS_SUBSCRIBER_REL_PATH, _ASSET_URL_VULNERABLE, _ASSET_URL_PATCHED),
     ]
     if any(item["status"] == "error" for item in files):
         status = "error"
