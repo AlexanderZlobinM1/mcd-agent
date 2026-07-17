@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.244 - 2026-07-17
+
+- Fixed: native Mautic forms embedded on external domains can receive their
+  hidden-iframe submission response. The nginx baseline now omits
+  `X-Frame-Options` only for `/form/submit`, while retaining `SAMEORIGIN` on
+  every other route.
+
 ## 0.9.243 - 2026-07-17
 
 - Fixed: the Mautic 7 HTML-email builder now receives `licenseKey: 'GPL'` at

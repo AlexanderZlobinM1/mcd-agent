@@ -19,6 +19,7 @@ SNIPPETS_DIR = Path("/etc/nginx/snippets")
 HARDENING_SNIPPET = SNIPPETS_DIR / "mcd-mautic-hardening.conf"
 FASTCGI_PHP_SNIPPET = SNIPPETS_DIR / "fastcgi-php.conf"
 SECURITY_HEADERS_SNIPPET = SNIPPETS_DIR / "security-headers.conf"
+MAUTIC_FORM_HEADERS_NAME = "20-mcd-mautic-form-headers.conf"
 HARDENING_INCLUDE = "include /etc/nginx/snippets/mcd-mautic-hardening.conf;"
 BACKUP_ROOT = Path("/var/backups/mcd-nginx-baseline")
 SECURITY_HEADERS_START = "# mcd-security-headers-extra start"
@@ -28,6 +29,7 @@ CLOUDFLARE_REAL_IP_FILE = CONF_D / "10-mcd-cloudflare-real-ip.conf"
 CLOUDFLARE_REAL_IP_MARKER = "# Managed by MCD host baseline: trust Cloudflare edge and pass client IP to PHP/Mautic."
 DEFAULT_DENY_FILE = CONF_D / "00-mcd-default-deny.conf"
 DEFAULT_DENY_MARKER = "# Managed by MCD host baseline: deny unknown/default virtual hosts."
+MAUTIC_FORM_HEADERS_MARKER = "# Managed by MCD: allow native cross-domain Mautic form responses."
 CLOUDFLARE_REAL_IP_CIDRS = [
     "173.245.48.0/20",
     "103.21.244.0/22",
@@ -262,6 +264,8 @@ def nginx_baseline_satisfied() -> bool:
         return False
     if _read_text(HARDENING_SNIPPET) != _desired_hardening_snippet():
         return False
+    if _read_text(_mautic_form_headers_file()) != _desired_mautic_form_headers_config():
+        return False
     if _read_text(FASTCGI_PHP_SNIPPET) != _desired_fastcgi_php_snippet():
         return False
     if SECURITY_HEADERS_SNIPPET.exists() and SECURITY_HEADERS_START not in _read_text(SECURITY_HEADERS_SNIPPET):
@@ -398,12 +402,25 @@ location ~* /\\.(?!well-known/) {
     return 403;
 }
 
-add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Frame-Options $mcd_x_frame_options always;
 add_header X-Content-Type-Options "nosniff" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 add_header Strict-Transport-Security "max-age=31536000" always;
 """
+
+
+def _desired_mautic_form_headers_config() -> str:
+    return f"""{MAUTIC_FORM_HEADERS_MARKER}
+map $request_uri $mcd_x_frame_options {{
+    default "SAMEORIGIN";
+    ~^/form/submit(?:\\?|$) "";
+}}
+"""
+
+
+def _mautic_form_headers_file() -> Path:
+    return CONF_D / MAUTIC_FORM_HEADERS_NAME
 
 
 def _mautic_public_app_asset_locations(indent: str) -> list[str]:
@@ -626,6 +643,18 @@ def _write_hardening_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot])
     return ["mautic_hardening_snippet"]
 
 
+def _ensure_mautic_form_headers_config(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
+    target = _mautic_form_headers_file()
+    desired = _desired_mautic_form_headers_config()
+    current = _read_text(target)
+    if current == desired:
+        return []
+    _snapshot(target, backup_dir, snapshots)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(desired, encoding="utf-8")
+    return ["mautic_form_headers"]
+
+
 def _write_fastcgi_php_snippet(backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> list[str]:
     desired = _desired_fastcgi_php_snippet()
     current = _read_text(FASTCGI_PHP_SNIPPET)
@@ -660,7 +689,7 @@ def _desired_security_headers_snippet(text: str) -> str:
     base = _strip_managed_security_header_block(text)
     additions: list[str] = []
     if not _active_add_header_present(base, "X-Frame-Options"):
-        additions.append('add_header X-Frame-Options "SAMEORIGIN" always;')
+        additions.append("add_header X-Frame-Options $mcd_x_frame_options always;")
     if not _active_add_header_present(base, "Strict-Transport-Security"):
         additions.append('add_header Strict-Transport-Security "max-age=31536000" always;')
     if not _active_add_header_present(base, "Permissions-Policy"):
@@ -1152,6 +1181,10 @@ def ensure_nginx_baseline(*, reload_service: bool = True) -> dict[str, Any]:
         hardening_actions = _write_hardening_snippet(backup_dir, snapshots)
         if hardening_actions:
             actions.extend(hardening_actions)
+            changed = True
+        form_header_actions = _ensure_mautic_form_headers_config(backup_dir, snapshots)
+        if form_header_actions:
+            actions.extend(form_header_actions)
             changed = True
         fastcgi_actions = _write_fastcgi_php_snippet(backup_dir, snapshots)
         if fastcgi_actions:

@@ -15,7 +15,14 @@ class NginxBaselineHardeningTests(unittest.TestCase):
         self.assertIn("composer\\.(?:json|lock)", snippet)
         self.assertIn("package(?:-lock)?\\.json", snippet)
         self.assertIn("Strict-Transport-Security", snippet)
-        self.assertIn("X-Frame-Options", snippet)
+        self.assertIn("add_header X-Frame-Options $mcd_x_frame_options always;", snippet)
+
+    def test_form_submit_response_can_load_in_cross_domain_messenger_iframe(self) -> None:
+        config = nginx_baseline._desired_mautic_form_headers_config()
+
+        self.assertIn("map $request_uri $mcd_x_frame_options", config)
+        self.assertIn('default "SAMEORIGIN";', config)
+        self.assertIn('~^/form/submit(?:\\?|$) "";', config)
 
     def test_fastcgi_php_snippet_supports_official_nginx_packages(self) -> None:
         snippet = nginx_baseline._desired_fastcgi_php_snippet()
@@ -444,7 +451,7 @@ add_header "Referrer-Policy" "strict-origin-when-cross-origin";
         out = nginx_baseline._desired_security_headers_snippet(src)
 
         self.assertIn(nginx_baseline.SECURITY_HEADERS_START, out)
-        self.assertIn('add_header X-Frame-Options "SAMEORIGIN" always;', out)
+        self.assertIn("add_header X-Frame-Options $mcd_x_frame_options always;", out)
         self.assertIn('add_header Strict-Transport-Security "max-age=31536000" always;', out)
         self.assertIn('add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;', out)
 
