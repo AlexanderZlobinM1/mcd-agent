@@ -17,6 +17,8 @@ NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 GENERATED_ROOT = Path("/opt/mcd/generated")
 BACKUP_ROOT = Path("/var/backups/mcd-instance-runtime")
+BACKUP_KEEP = 20
+BACKUP_PRUNE_LIMIT = 200
 
 _FASTCGI_SHARED_RE = re.compile(r"fastcgi_pass\s+unix:/(?:var/)?run/php/php(?P<version>\d+\.\d+)-fpm\.sock;")
 _FASTCGI_MCD_RE = re.compile(r"fastcgi_pass\s+unix:/run/php/php(?P<version>\d+\.\d+)-fpm-mcd-[^;]+\.sock;")
@@ -25,6 +27,7 @@ _SERVER_NAME_RE = re.compile(r"^\s*server_name\s+([^;]+);", flags=re.MULTILINE)
 _ROOT_RE = re.compile(r"^\s*root\s+([^;]+);", flags=re.MULTILINE)
 _SAFE_SLUG_RE = re.compile(r"[^a-z0-9_.-]+")
 _NGINX_BACKUP_NAME_RE = re.compile(r"(?:^|[._-])(bak|backup|disabled|old|orig|save|tmp)(?:[._-]|$)", re.I)
+_BACKUP_DIR_RE = re.compile(r"^\d{8}T\d{6}Z$")
 
 
 @dataclass(slots=True)
@@ -177,7 +180,12 @@ exec {php} \\
 """
 
 
-def _write_if_changed(path: Path, text: str) -> bool:
+def _write_if_changed(
+    path: Path,
+    text: str,
+    backup_dir: Path,
+    snapshots: dict[Path, _Snapshot],
+) -> bool:
     old = None
     if path.exists() and not path.is_symlink():
         try:
@@ -186,11 +194,37 @@ def _write_if_changed(path: Path, text: str) -> bool:
             old = None
     if old == text:
         return False
+    _snapshot(path, backup_dir, snapshots)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     return True
+
+
+def _prune_backup_dirs(*, keep: int = BACKUP_KEEP, max_remove: int = BACKUP_PRUNE_LIMIT) -> list[str]:
+    if not BACKUP_ROOT.is_dir():
+        return []
+    candidates = sorted(
+        (
+            path
+            for path in BACKUP_ROOT.iterdir()
+            if _BACKUP_DIR_RE.fullmatch(path.name) and path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.name,
+    )
+    keep_count = max(0, int(keep))
+    stale = candidates[:-keep_count] if keep_count else candidates
+    remove_limit = max(0, int(max_remove))
+    if remove_limit:
+        stale = stale[:remove_limit]
+    elif stale:
+        return []
+    removed: list[str] = []
+    for path in stale:
+        shutil.rmtree(path)
+        removed.append(path.name)
+    return removed
 
 
 def _snapshot(path: Path, backup_dir: Path, snapshots: dict[Path, _Snapshot]) -> None:
@@ -293,7 +327,12 @@ def _cleanup_instance_pool(version: str, slug: str, backup_dir: Path, snapshots:
     return _remove_file_if_exists(pool_path, backup_dir, snapshots)
 
 
-def _rewrite_nginx_file_to_shared(path: Path, version: str) -> bool:
+def _rewrite_nginx_file_to_shared(
+    path: Path,
+    version: str,
+    backup_dir: Path,
+    snapshots: dict[Path, _Snapshot],
+) -> bool:
     text = path.read_text(encoding="utf-8", errors="ignore")
     new = _FASTCGI_MCD_RE.sub(
         lambda m: (
@@ -306,6 +345,7 @@ def _rewrite_nginx_file_to_shared(path: Path, version: str) -> bool:
     new = _FASTCGI_GENERIC_RE.sub(f"fastcgi_pass unix:/run/php/php{version}-fpm.sock;", new)
     if new == text:
         return False
+    _snapshot(path, backup_dir, snapshots)
     path.write_text(new, encoding="utf-8")
     return True
 
@@ -338,6 +378,13 @@ def apply_instance_runtime(
     fpm_versions: set[str] = set()
     fpm_config_changed_versions: set[str] = set()
     results: list[dict[str, Any]] = []
+    pruned_backups: list[str] = []
+    backup_prune_error = ""
+    if not dry_run:
+        try:
+            pruned_backups = _prune_backup_dirs()
+        except OSError as e:
+            backup_prune_error = str(e)
     try:
         for inst in selected:
             slug = _pool_slug(inst)
@@ -373,27 +420,31 @@ def apply_instance_runtime(
                     actions.append(f"pool_removed:{slug}:{version}")
                 wrapper_dir = GENERATED_ROOT / "instances" / slug
                 wrapper_path = wrapper_dir / "php"
-                _snapshot(wrapper_path, backup_dir, snapshots)
-                if _write_if_changed(wrapper_path, _wrapper_script(version, inst, slug)):
+                if _write_if_changed(
+                    wrapper_path,
+                    _wrapper_script(version, inst, slug),
+                    backup_dir,
+                    snapshots,
+                ):
                     wrapper_path.chmod(0o755)
                     changed = True
                     actions.append(f"wrapper:{slug}:{version}")
                 instance_wrapper = Path(inst.root) / ".mcd" / "php"
-                _snapshot(instance_wrapper, backup_dir, snapshots)
                 instance_wrapper.parent.mkdir(parents=True, exist_ok=True)
                 if instance_wrapper.exists() or instance_wrapper.is_symlink():
                     if not instance_wrapper.is_symlink() or os.readlink(instance_wrapper) != str(wrapper_path):
+                        _snapshot(instance_wrapper, backup_dir, snapshots)
                         instance_wrapper.unlink()
                         instance_wrapper.symlink_to(wrapper_path)
                         changed = True
                         actions.append(f"instance_wrapper:{slug}:{version}")
                 else:
+                    _snapshot(instance_wrapper, backup_dir, snapshots)
                     instance_wrapper.symlink_to(wrapper_path)
                     changed = True
                     actions.append(f"instance_wrapper:{slug}:{version}")
                 for path in matched:
-                    _snapshot(path, backup_dir, snapshots)
-                    if _rewrite_nginx_file_to_shared(path, version):
+                    if _rewrite_nginx_file_to_shared(path, version, backup_dir, snapshots):
                         changed = True
                         actions.append(f"nginx_shared:{path}:{version}")
                 include_actions = _cleanup_fpm_include_if_unused(version, backup_dir, snapshots)
@@ -428,7 +479,10 @@ def apply_instance_runtime(
             "instances": results,
             "actions": actions,
             "reload": reload_actions,
-            "backup_dir": str(backup_dir),
+            "backup_dir": str(backup_dir) if snapshots and backup_dir.exists() else "",
+            "backup_pruned": len(pruned_backups),
+            "backup_pruned_names": pruned_backups,
+            "backup_prune_error": backup_prune_error,
         }
     except Exception as e:
         if snapshots:
@@ -439,5 +493,8 @@ def apply_instance_runtime(
             "reason": str(e),
             "instances": results,
             "actions": actions,
-            "backup_dir": str(backup_dir),
+            "backup_dir": str(backup_dir) if snapshots and backup_dir.exists() else "",
+            "backup_pruned": len(pruned_backups),
+            "backup_pruned_names": pruned_backups,
+            "backup_prune_error": backup_prune_error,
         }
