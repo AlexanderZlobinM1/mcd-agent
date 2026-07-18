@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.246 - 2026-07-18
+
+- Changed: cluster offsite `mydumper` now uses the completed local physical
+  full directly through a temporary read-only MySQL process. MCD no longer
+  creates a second local `offsite-mysql` physical staging copy, preventing
+  backup jobs from consuming another full-database worth of disk space.
+
 ## 0.9.245 - 2026-07-18
 
 - Safety: cluster physical full backups now estimate the database size and
