@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.9.248 - 2026-07-18
+
+- Keep managed database-index sessions attached for long online DDL operations instead of timing out after 30 seconds while MariaDB continues the ALTER in the background.
+
 ## 0.9.247 - 2026-07-18
 
 - Fixed: orphan page-hits cleanup now holds a cross-process MariaDB advisory

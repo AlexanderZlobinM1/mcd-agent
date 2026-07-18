@@ -87,7 +87,10 @@ def _connect(db: DBConfig) -> pymysql.connections.Connection:
         "autocommit": True,
         "cursorclass": DictCursor,
         "connect_timeout": 5,
-        "read_timeout": 30,
+        # Online index builds on large Mautic tables can legitimately run for
+        # hours. Keep the client attached so completion is reported correctly
+        # instead of abandoning a still-running server-side ALTER.
+        "read_timeout": 7200,
         "write_timeout": 30,
     }
     if host.lower() in {"", "localhost", "127.0.0.1", "::1"}:
