@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.245 - 2026-07-18
+
+- Safety: cluster physical full backups now estimate the database size and
+  refuse to start unless the local target has enough free space to finish.
+  The decision is recorded in backup state instead of producing another
+  incomplete full after hours of writes.
+
 ## 0.9.244 - 2026-07-17
 
 - Fixed: native Mautic forms embedded on external domains can receive their
@@ -39,6 +46,19 @@
   created by native Mautic. This prevents MCD from marking campaigns stale and
   skipping `mautic:campaigns:trigger -i <id>` for scheduled follow-up emails
   such as Apetit campaign 161.
+
+## 0.9.237 - 2026-07-09
+
+- Safety: retention deletion on storage mounts now enforces a hard boundary check
+  and refuses to remove any candidate path that resolves outside the current
+  cluster remote retention root.
+
+## 0.9.236 - 2026-07-09
+
+- Fixed: cluster offsite retention now treats date-prefixed `.superseded-*` wrappers
+  as normal date-scoped candidates for pruning (unless explicitly marked as
+  manually protected), preventing temporary retention artifacts from accumulating
+  indefinitely when long-term local policy is tightened.
 
 ## 0.9.235 - 2026-07-09
 
