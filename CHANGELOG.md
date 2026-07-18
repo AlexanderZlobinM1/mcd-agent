@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.249 - 2026-07-18
+
+- Fixed: idempotent instance-runtime reconciliation no longer snapshots every
+  unchanged CLI wrapper and nginx vhost on each plan refresh. This prevents
+  no-op runtime checks from exhausting host inodes.
+- Fixed: instance-runtime reconciliation prunes bounded batches of old,
+  timestamped rollback snapshots while retaining the newest 20 and leaving
+  manual or nonconforming entries untouched.
+
 ## 0.9.248 - 2026-07-18
 
 - Keep managed database-index sessions attached for long online DDL operations instead of timing out after 30 seconds while MariaDB continues the ALTER in the background.

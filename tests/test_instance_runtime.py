@@ -120,6 +120,86 @@ server {{
             self.assertIn("fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
             self.assertTrue((inst_root / ".mcd" / "php").is_symlink())
 
+    def test_idempotent_apply_does_not_create_another_backup_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            php_etc = base / "etc" / "php"
+            generated = base / "opt" / "mcd" / "generated"
+            backups = base / "backups"
+            sites_available = base / "etc" / "nginx" / "sites-available"
+            sites_enabled = base / "etc" / "nginx" / "sites-enabled"
+            sites_available.mkdir(parents=True)
+            sites_enabled.mkdir(parents=True)
+            inst_root = base / "var" / "www" / "merkurosiguranje" / "public_html"
+            inst = self._install(inst_root)
+            vhost = sites_available / "merkurosiguranje.sales-snap.com.conf"
+            vhost.write_text(
+                f"""
+server {{
+    server_name merkurosiguranje.sales-snap.com;
+    root {inst_root / "docroot"};
+    location ~ \\.php$ {{
+        fastcgi_pass unix:/run/php/php8.3-fpm-mcd-merkurosiguranje.sock;
+    }}
+}}
+""",
+                encoding="utf-8",
+            )
+            (sites_enabled / vhost.name).symlink_to(vhost)
+
+            with (
+                patch.object(instance_runtime, "PHP_ETC_ROOT", php_etc),
+                patch.object(instance_runtime, "GENERATED_ROOT", generated),
+                patch.object(instance_runtime, "BACKUP_ROOT", backups),
+                patch.object(instance_runtime, "NGINX_SITES_AVAILABLE", sites_available),
+                patch.object(instance_runtime, "NGINX_SITES_ENABLED", sites_enabled),
+                patch.object(instance_runtime, "_run", self._fake_run),
+            ):
+                first = instance_runtime.apply_instance_runtime([inst], reload_services=False)
+                snapshots_after_first = sorted(path.name for path in backups.iterdir())
+                second = instance_runtime.apply_instance_runtime([inst], reload_services=False)
+                snapshots_after_second = sorted(path.name for path in backups.iterdir())
+
+            self.assertEqual(first["status"], "ok")
+            self.assertTrue(first["changed"])
+            self.assertEqual(len(snapshots_after_first), 1)
+            self.assertEqual(second["status"], "ok")
+            self.assertFalse(second["changed"])
+            self.assertEqual(second["backup_dir"], "")
+            self.assertEqual(snapshots_after_second, snapshots_after_first)
+
+    def test_prunes_only_timestamped_runtime_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            backups = base / "backups"
+            backups.mkdir()
+            for index in range(25):
+                snapshot = backups / f"20260718T{index:06d}Z"
+                snapshot.mkdir()
+                (snapshot / "nginx.conf").write_text("snapshot\n", encoding="utf-8")
+            manual = backups / "manual-keep"
+            manual.mkdir()
+            external = base / "external"
+            external.mkdir()
+            symlink = backups / "20260719T000000Z"
+            symlink.symlink_to(external, target_is_directory=True)
+
+            with patch.object(instance_runtime, "BACKUP_ROOT", backups):
+                payload = instance_runtime.apply_instance_runtime([], reload_services=False)
+
+            remaining = sorted(
+                path.name
+                for path in backups.iterdir()
+                if path.is_dir() and not path.is_symlink() and path.name.startswith("2026")
+            )
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["backup_pruned"], 5)
+            self.assertEqual(len(remaining), 20)
+            self.assertEqual(remaining[0], "20260718T000005Z")
+            self.assertTrue(manual.is_dir())
+            self.assertTrue(symlink.is_symlink())
+            self.assertTrue(external.is_dir())
+
     def test_rewrites_generic_php_fpm_socket_to_single_active_shared_socket(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
