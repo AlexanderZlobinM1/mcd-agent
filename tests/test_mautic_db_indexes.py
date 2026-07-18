@@ -34,6 +34,10 @@ class MauticDbIndexesTests(unittest.TestCase):
             by_name["idx_mcd_clel_scheduled_trigger_id"].columns,
             ("is_scheduled", "trigger_date", "id"),
         )
+        self.assertEqual(
+            by_name["idx_mcd_ph_lead_date"].columns,
+            ("lead_id", "date_hit", "id"),
+        )
 
     def test_fax_indexes_are_prunable_when_mysql_index_limit_is_hit(self) -> None:
         indexes = {
