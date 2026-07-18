@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.247 - 2026-07-18
+
+- Fixed: orphan page-hits cleanup now holds a cross-process MariaDB advisory
+  lock for the complete preview/delete cycle. A restarted daemon cannot launch
+  another cleanup while an older SQL operation is still active.
+- Fixed: the global managed-index profile now creates
+  `idx_mcd_ph_lead_date (lead_id, date_hit, id)` online. Orphan page-hits
+  batches no longer require a full table sort when the host lacked this index.
+
 ## 0.9.246 - 2026-07-18
 
 - Changed: cluster offsite `mydumper` now uses the completed local physical

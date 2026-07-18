@@ -99,6 +99,29 @@ class MauticDB:
             raise last_error
         raise RuntimeError("mysql_connection_failed")
 
+    def try_acquire_orphan_page_hits_cleanup_lock(self) -> pymysql.connections.Connection | None:
+        conn = self._connect()
+        lock_name = f"mcd:page_hits_orphan:{self.cfg.name}"[:64]
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT GET_LOCK(%s, 0) AS acquired", (lock_name,))
+                row = cur.fetchone()
+            if isinstance(row, dict) and int(row.get("acquired") or 0) == 1:
+                return conn
+        except Exception:
+            conn.close()
+            raise
+        conn.close()
+        return None
+
+    @staticmethod
+    def release_orphan_page_hits_cleanup_lock(conn: pymysql.connections.Connection | None) -> None:
+        if conn is None:
+            return
+        # MariaDB releases every named lock owned by a connection when that
+        # connection closes. Closing also avoids a separate RELEASE_LOCK race.
+        conn.close()
+
     @staticmethod
     def _safe_column(name: str) -> str:
         raw = str(name or "").strip()

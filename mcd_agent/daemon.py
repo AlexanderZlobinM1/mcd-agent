@@ -9621,6 +9621,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.warning("[%s] housekeeping plugin schedule failed: %s", root, e)
 
             if selected_service_cleanup == "page_hits_orphan_cleanup":
+                page_hits_cleanup_lock = db.try_acquire_orphan_page_hits_cleanup_lock()
+                if page_hits_cleanup_lock is None:
+                    logging.info("[%s] page_hits_orphan_cleanup skipped: cleanup lock is already held", root)
+                    selected_service_cleanup = ""
+
+            if selected_service_cleanup == "page_hits_orphan_cleanup":
                 try:
                     preview = db.preview_orphan_page_hits_batch(
                         cutoff_utc=page_hits_cleanup_cutoff_utc,
@@ -9687,6 +9693,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 except Exception as e:
                     page_hits_orphan_cleanup_active[root] = False
                     logging.warning("[%s] page_hits_orphan_cleanup failed: %s", root, e)
+                finally:
+                    db.release_orphan_page_hits_cleanup_lock(page_hits_cleanup_lock)
                 last_page_hits_orphan_cleanup_ts[root] = now
                 if page_hits_cleanup_window_key:
                     page_hits_orphan_cleanup_window_counts[root] = page_hits_orphan_cleanup_window_counts.get(root, 0) + 1

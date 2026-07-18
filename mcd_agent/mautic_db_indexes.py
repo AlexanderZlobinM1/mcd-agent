@@ -64,6 +64,11 @@ MANAGED_INDEXES: tuple[ManagedIndex, ...] = (
         name="idx_mcd_clel_scheduled_trigger_id",
         columns=("is_scheduled", "trigger_date", "id"),
     ),
+    ManagedIndex(
+        table="page_hits",
+        name="idx_mcd_ph_lead_date",
+        columns=("lead_id", "date_hit", "id"),
+    ),
 )
 
 
