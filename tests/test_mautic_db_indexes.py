@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from mcd_agent.mautic_db_indexes import (
     MANAGED_INDEXES,
@@ -17,6 +18,14 @@ from mcd_agent.models import DBConfig, MauticInstall
 
 
 class MauticDbIndexesTests(unittest.TestCase):
+    def test_index_connection_allows_long_online_ddl(self) -> None:
+        db = DBConfig(host="localhost", port=3306, name="demo", user="u", password="p", table_prefix="ss_")
+
+        with patch("mcd_agent.mautic_db_indexes.pymysql.connect") as connect:
+            _connect(db)
+
+        self.assertEqual(connect.call_args.kwargs["read_timeout"], 7200)
+
     def test_managed_index_sql_uses_prefix_and_online_ddl(self) -> None:
         sql = _add_index_sql("ss_", MANAGED_INDEXES[0])
 
