@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 
 from mcd_agent.backup import (
+    _cluster_remote_retention_plan_for_parent,
+    _is_within_parent,
     _backup_retention_candidate_dirs,
     _instance_backup_retention_enabled,
     _prune_by_copies,
@@ -26,6 +28,97 @@ class BackupRetentionPruneTests(unittest.TestCase):
             names = [p.name for p in _backup_retention_candidate_dirs(parent)]
 
         self.assertEqual(names, ["20260620-010203", "2026-06-19"])
+
+    def test_cluster_remote_retention_plan_handles_superseded_date_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            daily = parent / "daily"
+            daily.mkdir()
+            for name in ("2026-06-20", "2026-06-21", ".superseded-live-2026-06-19"):
+                (daily / name).mkdir()
+            (parent / ".superseded-live-2026-06-18").mkdir()
+
+            for name in ("2026-06-14",):
+                (daily / name).mkdir()
+
+            plan = _cluster_remote_retention_plan_for_parent(
+                parent,
+                keep_daily=2,
+                keep_weekly=0,
+                apply=False,
+            )
+
+            self.assertEqual(plan["problems"], [])
+            self.assertCountEqual(
+                [entry["path"] for entry in plan["kept"]],
+                ["daily/2026-06-21", "daily/2026-06-20"],
+            )
+            self.assertCountEqual(
+                [entry["path"] for entry in plan["delete_candidates"]],
+                [".superseded-live-2026-06-18", "daily/.superseded-live-2026-06-19", "daily/2026-06-14"],
+            )
+
+    def test_cluster_remote_retention_plan_reports_non_date_dirs_as_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            daily = parent / "daily"
+            daily.mkdir()
+            for name in ("2026-06-14", "legacy-no-date"):
+                (daily / name).mkdir()
+
+            plan = _cluster_remote_retention_plan_for_parent(
+                parent,
+                keep_daily=1,
+                keep_weekly=0,
+                apply=False,
+            )
+
+            self.assertEqual(len(plan["problems"]), 1)
+            self.assertIn("legacy-no-date", plan["problems"][0]["path"])
+
+    def test_cluster_remote_retention_plan_ignores_superseded_do_not_prune_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            superseded = parent / "daily"
+            superseded.mkdir()
+            for name in ("2026-06-30", ".superseded-live-2026-06-20"):
+                (superseded / name).mkdir()
+
+            (superseded / ".superseded-live-2026-06-20" / ".mcd-backup.json").write_text(
+                json.dumps({"status": "ok", "do_not_prune": True}),
+                encoding="utf-8",
+            )
+
+            plan = _cluster_remote_retention_plan_for_parent(
+                parent,
+                keep_daily=1,
+                keep_weekly=0,
+                apply=False,
+            )
+
+            self.assertCountEqual(
+                [entry["path"] for entry in plan["delete_candidates"]],
+                ["daily/.superseded-live-2026-06-20"],
+            )
+            self.assertFalse(plan["protected"])
+
+    def test_is_within_parent_guard_refuses_outside_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            (parent / "daily").mkdir()
+
+            self.assertTrue(
+                _is_within_parent(parent, parent / "daily"),
+                "_is_within_parent should allow child paths inside parent",
+            )
+            self.assertFalse(
+                _is_within_parent(parent, Path("/")),
+                "_is_within_parent should reject filesystem root",
+            )
+            self.assertFalse(
+                _is_within_parent(parent, Path("/tmp")),
+                "_is_within_parent should reject external absolute paths",
+            )
 
     def test_deleted_instances_instance_backups_are_manual_delete_only(self) -> None:
         cfg = SimpleNamespace(backup_remote_root_dir="backup")

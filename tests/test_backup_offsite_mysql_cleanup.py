@@ -10,12 +10,14 @@ from unittest.mock import patch
 from mcd_agent.backup import (
     _apply_cluster_backup_integrity_status,
     _cluster_backup_integrity_problem,
+    _cluster_full_required_free_bytes,
     _cluster_file_source_path_forbidden,
     _cluster_file_source_paths,
     _cluster_prepared_mysql_datadir_from_cmdline,
     _cleanup_stale_prepared_mysql_processes,
     cluster_backup_status,
 )
+from mcd_agent.models import DBConfig
 
 
 def _cfg() -> SimpleNamespace:
@@ -23,6 +25,24 @@ def _cfg() -> SimpleNamespace:
 
 
 class PreparedOffsiteMysqlDetectionTest(unittest.TestCase):
+    def test_full_space_requirement_uses_database_size_and_headroom(self) -> None:
+        cfg = SimpleNamespace(backup_cluster_incremental_min_free_bytes=300)
+        db = DBConfig(host="localhost", port=3306, name="baza_ananas", user="backup", password="x", table_prefix="")
+
+        with patch("mcd_agent.backup._mysql_capture", return_value="1000"):
+            required = _cluster_full_required_free_bytes(cfg, db)
+
+        self.assertEqual(required, 1250)
+
+    def test_full_space_requirement_keeps_configured_headroom(self) -> None:
+        cfg = SimpleNamespace(backup_cluster_incremental_min_free_bytes=2000)
+        db = DBConfig(host="localhost", port=3306, name="baza_ananas", user="backup", password="x", table_prefix="")
+
+        with patch("mcd_agent.backup._mysql_capture", return_value="1000"):
+            required = _cluster_full_required_free_bytes(cfg, db)
+
+        self.assertEqual(required, 2000)
+
     def test_detects_mcd_prepared_offsite_mysql(self) -> None:
         cmdline = (
             "/usr/sbin/mysqld --no-defaults "

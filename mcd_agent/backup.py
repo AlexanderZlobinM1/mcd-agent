@@ -640,6 +640,21 @@ def _dir_date(path: Path) -> datetime | None:
         return None
 
 
+def _cluster_retention_dir_date(path: Path) -> datetime | None:
+    dt = _dir_date(path)
+    if dt is not None:
+        return dt
+    # Some legacy/automation temp names (for example .superseded-live-YYYY-MM-DD...)
+    # are operationally date-scoped and should still participate in retention.
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def _xtrabackup_db_dir(backup_dir: Path) -> Path:
     return backup_dir / "databases" / "physical-xtrabackup"
 
@@ -2898,6 +2913,33 @@ def _cluster_prune_local_before_full(cfg: AgentConfig) -> list[str]:
     return removed
 
 
+def _cluster_full_required_free_bytes(cfg: AgentConfig, db: DBConfig) -> int:
+    """Return a conservative free-space requirement for a physical full.
+
+    The full backup is written beside the live database backups.  A generic
+    mount preflight only proves that the target is writable; it does not prove
+    that a physical copy can finish.  Size the guard from MySQL's logical data
+    plus a safety margin and retain the configured operational headroom.
+    """
+    schema = str(db.name or "").replace("'", "''")
+    raw = _mysql_capture(
+        cfg,
+        db,
+        "SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) "
+        "FROM information_schema.TABLES "
+        f"WHERE TABLE_SCHEMA = '{schema}'",
+    )
+    try:
+        logical_bytes = max(0, int((raw or "0").splitlines()[0].strip()))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise RuntimeError("unable to estimate database size for cluster full backup") from exc
+    # XtraBackup copies physical pages and metadata; 25% headroom avoids
+    # starting a job that can only fail after hours of disk writes.
+    estimated = int(logical_bytes * 1.25)
+    configured_headroom = int(getattr(cfg, "backup_cluster_incremental_min_free_bytes", 0) or 0)
+    return max(estimated, configured_headroom)
+
+
 def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
     cfg = _effective_cfg(config)
     state_path = _cluster_state_path(cfg)
@@ -2959,6 +3001,21 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
         prepruned = _cluster_prune_local_before_full(cfg)
         if prepruned:
             _cluster_update_state(cfg, {"last_local_prepruned": prepruned})
+        usage = _storage_usage(db_root)
+        free_bytes = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
+        required_free_bytes = _cluster_full_required_free_bytes(cfg, db)
+        if free_bytes < required_free_bytes:
+            raise RuntimeError(
+                "cluster local full skipped: insufficient free space "
+                f"({free_bytes} bytes free, need at least {required_free_bytes})"
+            )
+        _cluster_update_state(
+            cfg,
+            {
+                "last_full_free_bytes": free_bytes,
+                "last_full_required_free_bytes": required_free_bytes,
+            },
+        )
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         _run_xtrabackup(replace(cfg, backup_method="xtrabackup"), db, db_dir)
@@ -3964,6 +4021,12 @@ def _cluster_is_protected_archive(path: Path) -> tuple[bool, str]:
     if any(tok in lname for tok in manual_tokens):
         return True, "protected_by_name"
     marker = _read_backup_marker(path)
+    if lname.startswith(".superseded-") and not (
+        marker.get("manual") or marker.get("manual_archive") or marker.get("protected")
+    ):
+        # Superseded backup wrappers are temporary artifacts and should be governed
+        # by retention unless explicitly marked as a manually protected backup.
+        marker = {}
     for key in ("manual", "manual_archive", "do_not_prune", "dont_touch", "protected"):
         if bool(marker.get(key)):
             return True, f"protected_by_marker:{key}"
@@ -3971,6 +4034,16 @@ def _cluster_is_protected_archive(path: Path) -> tuple[bool, str]:
     if kind in {"manual", "manual_archive"}:
         return True, "protected_by_marker_kind"
     return False, ""
+
+
+def _is_within_parent(parent: Path, candidate: Path) -> bool:
+    try:
+        parent_abs = parent.resolve()
+        candidate_abs = candidate.resolve()
+    except Exception:
+        parent_abs = parent.absolute()
+        candidate_abs = candidate.absolute()
+    return os.path.commonpath([str(candidate_abs), str(parent_abs)]) == str(parent_abs)
 
 
 def _cluster_remote_retention_plan_for_parent(
@@ -4016,7 +4089,7 @@ def _cluster_remote_retention_plan_for_parent(
             if protected:
                 plan["protected"].append({"path": rel(child), "reason": reason})
                 continue
-            dt = _dir_date(child)
+            dt = _cluster_retention_dir_date(child)
             if dt is None:
                 plan["problems"].append(
                     {
@@ -4038,7 +4111,7 @@ def _cluster_remote_retention_plan_for_parent(
             if protected:
                 plan["protected"].append({"path": rel(child), "reason": reason})
                 continue
-            dt = _dir_date(child)
+            dt = _cluster_retention_dir_date(child)
             if dt is not None:
                 candidates.append({"path": child, "rel": rel(child), "date": dt, "scope": "legacy"})
             else:
@@ -4067,6 +4140,14 @@ def _cluster_remote_retention_plan_for_parent(
     if apply and not plan["problems"]:
         for item in plan["delete_candidates"]:
             path = parent / str(item["path"])
+            if not _is_within_parent(parent, path):
+                plan["problems"].append(
+                    {
+                        "path": str(item["path"]),
+                        "reason": f"unsafe retention delete candidate outside parent ({parent})",
+                    }
+                )
+                continue
             try:
                 shutil.rmtree(path)
                 plan["removed"].append(dict(item))
