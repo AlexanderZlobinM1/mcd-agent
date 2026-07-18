@@ -15,6 +15,7 @@ from mcd_agent.backup import (
     _cluster_file_source_paths,
     _cluster_prepared_mysql_datadir_from_cmdline,
     _cleanup_stale_prepared_mysql_processes,
+    _run_mydumper_from_xtrabackup_full,
     cluster_backup_status,
 )
 from mcd_agent.models import DBConfig
@@ -71,6 +72,47 @@ class PreparedOffsiteMysqlDetectionTest(unittest.TestCase):
         )
 
         self.assertIsNone(_cluster_prepared_mysql_datadir_from_cmdline(_cfg(), cmdline))
+
+    def test_detects_local_full_read_only_offsite_mysql(self) -> None:
+        cmdline = (
+            "/usr/sbin/mysqld --no-defaults "
+            "--datadir=/mnt/data/backup/local/ananasrs/db/full-20260718-092355/physical-xtrabackup "
+            "--socket=/tmp/mcd-offsite-mysql-r6uxlec_/mysql.sock "
+            "--skip-networking --skip-log-bin --skip-grant-tables --read-only=ON --super-read-only=ON"
+        )
+
+        datadir = _cluster_prepared_mysql_datadir_from_cmdline(_cfg(), cmdline)
+
+        self.assertEqual(
+            datadir,
+            Path("/mnt/data/backup/local/ananasrs/db/full-20260718-092355/physical-xtrabackup"),
+        )
+
+    def test_mydumper_uses_local_full_without_offsite_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            full_dir = Path(td) / "full-20260718-092355"
+            source = full_dir / "physical-xtrabackup"
+            source.mkdir(parents=True)
+            (source / "xtrabackup_checkpoints").write_text("backup_type = full-prepared\n", encoding="utf-8")
+            (source / "ibdata1").write_bytes(b"data")
+            output_dir = Path(td) / "dump"
+            cfg = SimpleNamespace(backup_dump_timeout_sec=30, backup_mount_timeout_sec=30)
+            db = DBConfig(host="localhost", port=3306, name="baza_ananas", user="backup", password="x", table_prefix="")
+            runtime = SimpleNamespace(socket_path=Path("/tmp/mcd-offsite-test.sock"))
+
+            with (
+                patch("mcd_agent.backup._prepare_xtrabackup_full_for_mysql", return_value=source) as prepare,
+                patch("mcd_agent.backup._start_prepared_xtrabackup_mysql", return_value=runtime),
+                patch("mcd_agent.backup._stop_prepared_xtrabackup_mysql"),
+                patch("mcd_agent.backup.replace", side_effect=lambda obj, **changes: obj),
+                patch("mcd_agent.backup._run_mydumper") as dump,
+            ):
+                meta = _run_mydumper_from_xtrabackup_full(cfg, db, full_dir, output_dir)
+
+            prepare.assert_called_once_with(cfg, full_dir)
+            dump.assert_called_once()
+            self.assertEqual(meta["offsite_temp_mysql"], "local_full_read_only")
+            self.assertFalse((Path(td) / "offsite-mysql").exists())
 
     def test_cleanup_keeps_fresh_existing_prepared_mysql(self) -> None:
         with tempfile.TemporaryDirectory() as td:

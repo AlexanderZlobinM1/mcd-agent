@@ -1938,55 +1938,33 @@ def _cluster_offsite_mysql_root(cfg: AgentConfig) -> Path:
     return _cluster_db_root(cfg) / "offsite-mysql"
 
 
-def _clone_xtrabackup_for_offsite_prepare(cfg: AgentConfig, full_dir: Path) -> Path:
+def _xtrabackup_full_source_dir(full_dir: Path) -> Path:
     src = full_dir / "physical-xtrabackup"
     ok, msg, _ = _verify_xtrabackup_dir(src)
     if not ok:
         raise RuntimeError(f"local full xtrabackup is not usable for offsite source: {msg}")
-    root = _cluster_offsite_mysql_root(cfg)
-    root.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_prepared_mysql_processes(cfg)
-    active_prepared = {
-        item["datadir"].resolve(strict=False): int(item["pid"])
-        for item in _cluster_prepared_mysql_processes(cfg)
-        if isinstance(item.get("datadir"), Path)
-    }
-    for old in root.iterdir():
-        if old.is_dir() and old.name.startswith("prepared-"):
-            pid = active_prepared.get(old.resolve(strict=False))
-            if pid:
-                raise RuntimeError(f"refusing to remove prepared offsite mysql datadir still used by pid {pid}: {old}")
-            shutil.rmtree(old, ignore_errors=True)
-    clone_dir = root / f"prepared-{_fmt_local_ts()}"
-    if clone_dir.exists():
-        shutil.rmtree(clone_dir)
-    clone_dir.mkdir(parents=True, exist_ok=False)
-    try:
-        # This must be a reflink clone, not a full local copy: the cluster
-        # replica intentionally has no spare 1.4T cache area for another DB copy.
-        _run(
-            ["cp", "-a", "--reflink=always", f"{src}/.", str(clone_dir)],
-            timeout_sec=cfg.backup_dump_timeout_sec,
-            check=True,
-        )
-    except Exception as e:
-        shutil.rmtree(clone_dir, ignore_errors=True)
-        raise RuntimeError(f"failed to create reflink clone of local xtrabackup source: {e}") from e
-    return clone_dir
+    return src
 
 
-def _prepare_xtrabackup_clone_for_mysql(cfg: AgentConfig, clone_dir: Path) -> None:
-    checkpoint = _xtrabackup_checkpoint_text(clone_dir).lower()
+def _prepare_xtrabackup_full_for_mysql(cfg: AgentConfig, full_dir: Path) -> Path:
+    """Prepare the completed local full in place for the offsite read-only dump.
+
+    The local full is already the authoritative physical backup. Preparing it
+    in place is safe and avoids creating a second 1.7 TB staging datadir.
+    """
+    full_source = _xtrabackup_full_source_dir(full_dir)
+    checkpoint = _xtrabackup_checkpoint_text(full_source).lower()
     if "full-prepared" not in checkpoint:
         _run(
-            [cfg.backup_xtrabackup_bin, "--prepare", f"--target-dir={clone_dir}"],
+            [cfg.backup_xtrabackup_bin, "--prepare", f"--target-dir={full_source}"],
             timeout_sec=cfg.backup_dump_timeout_sec,
             check=True,
         )
     if shutil.which("chown"):
-        # MySQL refuses to run as root. Chowning the reflink clone changes
-        # metadata only and keeps the source xtrabackup snapshot untouched.
-        _run(["chown", "-R", "mysql:mysql", str(clone_dir)], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+        # MySQL refuses to run as root; the local full is no longer being
+        # written, so changing ownership is safe for the restore source.
+        _run(["chown", "-R", "mysql:mysql", str(full_source)], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    return full_source
 
 
 def _mysqladmin_ping(socket_path: Path) -> bool:
@@ -2075,12 +2053,10 @@ def _run_mydumper_from_xtrabackup_full(
     full_dir: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
-    clone_dir: Path | None = None
     runtime: _PreparedMysqlRuntime | None = None
     try:
-        clone_dir = _clone_xtrabackup_for_offsite_prepare(cfg, full_dir)
-        _prepare_xtrabackup_clone_for_mysql(cfg, clone_dir)
-        runtime = _start_prepared_xtrabackup_mysql(cfg, clone_dir)
+        full_source = _prepare_xtrabackup_full_for_mysql(cfg, full_dir)
+        runtime = _start_prepared_xtrabackup_mysql(cfg, full_source)
         temp_db = DBConfig(
             host="localhost",
             port=0,
@@ -2093,13 +2069,11 @@ def _run_mydumper_from_xtrabackup_full(
         return {
             "offsite_db_source": "xtrabackup",
             "offsite_xtrabackup_full_path": str(full_dir),
-            "offsite_temp_mysql": "prepared_reflink_clone",
+            "offsite_temp_mysql": "local_full_read_only",
         }
     finally:
         if runtime is not None:
             _stop_prepared_xtrabackup_mysql(runtime)
-        if clone_dir is not None:
-            shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _run_mysql_sql(cfg: AgentConfig, db: DBConfig, sql: str) -> None:
@@ -2408,14 +2382,24 @@ def _cluster_prepared_mysql_datadir_from_cmdline(cfg: AgentConfig, cmdline: str)
     datadir = Path(match.group(1))
     if not datadir.is_absolute():
         return None
-    root = _cluster_offsite_mysql_root(cfg)
+    legacy_root = _cluster_offsite_mysql_root(cfg)
     try:
-        rel = datadir.resolve(strict=False).relative_to(root.resolve(strict=False))
+        rel = datadir.resolve(strict=False).relative_to(legacy_root.resolve(strict=False))
+    except ValueError:
+        rel = None
+    if rel is not None and rel.parts and rel.parts[0].startswith("prepared-"):
+        return datadir
+
+    # New offsite runs use the completed local full directly. Keep detecting
+    # this process shape so a daemon restart cannot start a duplicate dump.
+    local_db_root = _cluster_db_root(cfg)
+    try:
+        rel = datadir.resolve(strict=False).relative_to(local_db_root.resolve(strict=False))
     except ValueError:
         return None
-    if not rel.parts or not rel.parts[0].startswith("prepared-"):
-        return None
-    return datadir
+    if len(rel.parts) == 2 and rel.parts[0].startswith("full-") and rel.parts[1] == "physical-xtrabackup":
+        return datadir
+    return None
 
 
 def _cluster_prepared_mysql_processes(cfg: AgentConfig) -> list[dict[str, Any]]:
