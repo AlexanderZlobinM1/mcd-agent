@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.250 - 2026-07-20
+
+- Added: dedicated hardware profiles now install and maintain the canonical
+  five-level SMART/NVMe/md-RAID Zabbix monitor, including its packages,
+  UserParameter, restricted sudo policy, and health script.
+
 ## 0.9.249 - 2026-07-18
 
 - Fixed: idempotent instance-runtime reconciliation no longer snapshots every

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import sys
 import types
@@ -184,6 +186,38 @@ class AptProfileDbRepoTests(unittest.TestCase):
         sources = apt_profile._normalize_ip_networks(["65.109.226.152", "bad.host", "10.0.0.0/24", "65.109.226.152"])
 
         self.assertEqual(sources, ["65.109.226.152/32", "10.0.0.0/24"])
+
+    def test_zabbix_disk_health_profile_writes_canonical_monitor_files(self) -> None:
+        old_script = apt_profile._ZABBIX_DISK_HEALTH_SCRIPT
+        old_dropin = apt_profile._ZABBIX_DISK_HEALTH_DROPIN
+        old_sudoers = apt_profile._ZABBIX_DISK_HEALTH_SUDOERS
+        old_dpkg = apt_profile._dpkg_installed_versions
+        old_which = apt_profile.shutil.which
+        old_run = apt_profile._run
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                apt_profile._ZABBIX_DISK_HEALTH_SCRIPT = root / "usr/local/bin/zbx_smart_health_worst.sh"
+                apt_profile._ZABBIX_DISK_HEALTH_DROPIN = root / "etc/zabbix/zabbix_agent2.d/disk_health.conf"
+                apt_profile._ZABBIX_DISK_HEALTH_SUDOERS = root / "etc/sudoers.d/zabbix-smart"
+                apt_profile._dpkg_installed_versions = lambda **_kwargs: {"smartmontools": "7.4", "nvme-cli": "2.8"}
+                apt_profile.shutil.which = lambda name: "/usr/sbin/visudo" if name == "visudo" else None
+                apt_profile._run = lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                result = apt_profile.ensure_zabbix_disk_health({"zabbix_disk_health_enabled": True})
+
+                self.assertEqual(result["status"], "applied")
+                self.assertIn("smart.health.worst", apt_profile._ZABBIX_DISK_HEALTH_DROPIN.read_text())
+                self.assertIn("score_mdraid", apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.read_text())
+                self.assertEqual(apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(apt_profile._ZABBIX_DISK_HEALTH_SUDOERS.stat().st_mode & 0o777, 0o440)
+        finally:
+            apt_profile._ZABBIX_DISK_HEALTH_SCRIPT = old_script
+            apt_profile._ZABBIX_DISK_HEALTH_DROPIN = old_dropin
+            apt_profile._ZABBIX_DISK_HEALTH_SUDOERS = old_sudoers
+            apt_profile._dpkg_installed_versions = old_dpkg
+            apt_profile.shutil.which = old_which
+            apt_profile._run = old_run
 
     def test_nodejs20_satisfied_requires_node20_and_npm(self) -> None:
         old_which = apt_profile.shutil.which
