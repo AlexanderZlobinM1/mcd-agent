@@ -772,6 +772,104 @@ _NGINX_OFFICIAL_SOURCE = Path("/etc/apt/sources.list.d/nginx.list")
 _NGINX_OFFICIAL_FINGERPRINT = "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
 _ZABBIX_AGENT_DROPIN = Path("/etc/zabbix/zabbix_agent2.d/99-mcd-server.conf")
 _ZABBIX_AGENT_BASE_CONF = Path("/etc/zabbix/zabbix_agent2.conf")
+_ZABBIX_DISK_HEALTH_SCRIPT = Path("/usr/local/bin/zbx_smart_health_worst.sh")
+_ZABBIX_DISK_HEALTH_DROPIN = Path("/etc/zabbix/zabbix_agent2.d/disk_health.conf")
+_ZABBIX_DISK_HEALTH_SUDOERS = Path("/etc/sudoers.d/zabbix-smart")
+_ZABBIX_DISK_HEALTH_SCRIPT_TEXT = r'''#!/usr/bin/env bash
+# Output: one integer, 1..5, for the worst physical disk or md array.
+# 5=GOOD, 4=OK, 3=ATTENTION, 2=BAD, 1=ALARM.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+score_min=5
+score_min_func() {
+  local cur="$1"
+  if [ "$cur" -lt "$score_min" ]; then score_min="$cur"; fi
+}
+
+score_mdraid() {
+  local s=5
+  if [ -r /proc/mdstat ]; then
+    if awk '
+      /\[[0-9]+\/[0-9]+\]/ {
+        match($0, /\[([0-9]+)\/([0-9]+)\]/, a);
+        if (a[1] != a[2]) { print "DEG"; exit }
+      }
+      /\[[U_]+\]/ { if ($0 ~ /_/) { print "DEG"; exit } }
+    ' /proc/mdstat | grep -q DEG; then
+      s=1
+    fi
+  fi
+  echo "$s"
+}
+
+score_nvme() {
+  local dev="$1" s=5 out
+  if ! out=$(sudo nvme smart-log "$dev" 2>/dev/null); then echo; return; fi
+  local cw me pu t
+  cw=$(echo "$out" | awk -F: '/critical_warning/{gsub(/ /,"",$2); print $2; exit}' || echo 0)
+  [ -z "$cw" ] && cw=0
+  if [ "$cw" != "0" ]; then s=1; fi
+  me=$(echo "$out" | awk -F: '/media_errors/{gsub(/ /,"",$2); print $2; exit}' || echo 0)
+  [ -z "$me" ] && me=0
+  if [ "$me" -gt 0 ] && [ "$s" -gt 2 ]; then s=2; fi
+  pu=$(echo "$out" | awk -F: '/percentage_used/{gsub(/ /,"",$2); print $2; exit}' || true)
+  if [[ "${pu:-}" =~ ^[0-9]+$ ]]; then
+    if [ "$pu" -ge 95 ] && [ "$s" -gt 2 ]; then s=2
+    elif [ "$pu" -ge 80 ] && [ "$s" -gt 3 ]; then s=3
+    elif [ "$pu" -ge 60 ] && [ "$s" -gt 4 ]; then s=4; fi
+  fi
+  t=$(echo "$out" | awk -F'[ :]' '/^temperature/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/){print $i; exit}}' || echo '')
+  if [[ "$t" =~ ^[0-9]+$ ]]; then
+    if [ "$t" -ge 80 ]; then s=1
+    elif [ "$t" -ge 70 ] && [ "$s" -gt 2 ]; then s=2
+    elif [ "$t" -ge 60 ] && [ "$s" -gt 3 ]; then s=3
+    elif [ "$t" -ge 50 ] && [ "$s" -gt 4 ]; then s=4; fi
+  fi
+  echo "$s"
+}
+
+score_sata() {
+  local dev="$1" s=5 H A
+  H=$(sudo smartctl -H "$dev" 2>/dev/null || true)
+  A=$(sudo smartctl -A "$dev" 2>/dev/null || true)
+  echo "$H" | grep -qi 'SMART overall-health self-assessment test result: PASSED' || s=1
+  get_raw() { echo "$A" | awk -v id="$1" '$1==id {print $10; exit}'; }
+  local realloc pending uncor crc temp
+  realloc=$(get_raw 5); realloc=${realloc:-0}
+  pending=$(get_raw 197); pending=${pending:-0}
+  uncor=$(get_raw 198); uncor=${uncor:-0}
+  crc=$(get_raw 199); crc=${crc:-0}
+  if [ "$pending" -gt 0 ] || [ "$uncor" -gt 0 ]; then s=1; fi
+  if [ "$realloc" -gt 0 ] && [ "$s" -gt 2 ]; then s=2; fi
+  if [ "$crc" -gt 0 ] && [ "$s" -gt 3 ]; then s=3; fi
+  temp=$(get_raw 194)
+  if [[ "$temp" =~ ^[0-9]+$ ]]; then
+    if [ "$temp" -ge 80 ]; then s=1
+    elif [ "$temp" -ge 70 ] && [ "$s" -gt 2 ]; then s=2
+    elif [ "$temp" -ge 60 ] && [ "$s" -gt 3 ]; then s=3
+    elif [ "$temp" -ge 50 ] && [ "$s" -gt 4 ]; then s=4; fi
+  fi
+  echo "$s"
+}
+
+md_sc=$(score_mdraid || echo 5)
+[[ "$md_sc" =~ ^[1-5]$ ]] && score_min_func "$md_sc"
+for d in $(ls /dev/nvme*n1 2>/dev/null || true); do
+  sc=$(score_nvme "$d" || echo 5)
+  [[ "$sc" =~ ^[1-5]$ ]] && score_min_func "$sc"
+done
+for d in $(ls /dev/sd[a-z] 2>/dev/null || true); do
+  sc=$(score_sata "$d" || echo 5)
+  [[ "$sc" =~ ^[1-5]$ ]] && score_min_func "$sc"
+done
+echo "${score_min:-5}"
+'''
+_ZABBIX_DISK_HEALTH_DROPIN_TEXT = "UserParameter=smart.health.worst,/usr/local/bin/zbx_smart_health_worst.sh\n"
+_ZABBIX_DISK_HEALTH_SUDOERS_TEXT = """Defaults:zabbix !requiretty
+Cmnd_Alias ZBX_SMART = /usr/sbin/smartctl *, /usr/sbin/nvme *, /usr/bin/nvme *
+zabbix ALL=(root) NOPASSWD: ZBX_SMART
+"""
 
 
 def _ubuntu_codename() -> str:
@@ -2424,6 +2522,43 @@ def collect_zabbix_agent_state(profile: dict[str, Any] | None = None) -> dict[st
     }
 
 
+def ensure_zabbix_disk_health(profile: dict[str, Any]) -> dict[str, Any]:
+    if not _bool(profile.get("zabbix_disk_health_enabled"), False):
+        return {"status": "disabled", "reason": "zabbix_disk_health_disabled", "actions": []}
+    installed = _dpkg_installed_versions(timeout_sec=12)
+    missing = [name for name in ("smartmontools", "nvme-cli") if not installed.get(name)]
+    if missing:
+        return {"status": "error", "reason": f"missing packages: {', '.join(missing)}", "actions": []}
+
+    actions: list[str] = []
+    errors: list[str] = []
+    try:
+        if _write_if_changed(_ZABBIX_DISK_HEALTH_SCRIPT, _ZABBIX_DISK_HEALTH_SCRIPT_TEXT):
+            actions.append(f"zabbix_disk_health_script:written:{_ZABBIX_DISK_HEALTH_SCRIPT}")
+        _ZABBIX_DISK_HEALTH_SCRIPT.chmod(0o755)
+        if _write_if_changed(_ZABBIX_DISK_HEALTH_DROPIN, _ZABBIX_DISK_HEALTH_DROPIN_TEXT):
+            actions.append(f"zabbix_disk_health_dropin:written:{_ZABBIX_DISK_HEALTH_DROPIN}")
+        _ZABBIX_DISK_HEALTH_DROPIN.chmod(0o644)
+        if _write_if_changed(_ZABBIX_DISK_HEALTH_SUDOERS, _ZABBIX_DISK_HEALTH_SUDOERS_TEXT):
+            actions.append(f"zabbix_disk_health_sudoers:written:{_ZABBIX_DISK_HEALTH_SUDOERS}")
+        _ZABBIX_DISK_HEALTH_SUDOERS.chmod(0o440)
+    except Exception as exc:
+        errors.append(f"write_failed:{exc}")
+
+    if not errors:
+        visudo = shutil.which("visudo")
+        if not visudo:
+            errors.append("visudo_not_found")
+        else:
+            checked = _run([visudo, "-cf", str(_ZABBIX_DISK_HEALTH_SUDOERS)], timeout_sec=15)
+            if checked.returncode != 0:
+                errors.append(f"sudoers_invalid:{(checked.stderr or checked.stdout or checked.returncode)}")
+
+    if errors:
+        return {"status": "error", "reason": "; ".join(errors[:5]), "actions": actions}
+    return {"status": "applied", "actions": actions}
+
+
 def ensure_zabbix_agent(profile: dict[str, Any], *, timeout_sec: int = 90) -> dict[str, Any]:
     if not _bool(profile.get("zabbix_agent_enabled"), False):
         return {"status": "disabled", "reason": "zabbix_agent_disabled"}
@@ -2434,6 +2569,13 @@ def ensure_zabbix_agent(profile: dict[str, Any], *, timeout_sec: int = 90) -> di
         return {"status": "error", "reason": "zabbix-agent2 package missing after package install"}
     actions: list[str] = []
     errors: list[str] = []
+    disk_health = ensure_zabbix_disk_health(profile)
+    disk_status = str(disk_health.get("status") or "").strip().lower()
+    actions.extend([str(x) for x in list(disk_health.get("actions") or [])])
+    if disk_status == "error":
+        errors.append(f"zabbix_disk_health:{disk_health.get('reason') or 'unknown_error'}")
+    else:
+        actions.append(f"zabbix_disk_health:{disk_status or 'unknown'}")
     _, cfg_actions, cfg_errors = _write_zabbix_agent_dropin(profile)
     actions.extend(cfg_actions)
     errors.extend(cfg_errors)
