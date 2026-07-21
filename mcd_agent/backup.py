@@ -4609,30 +4609,37 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             "offsite_running": offsite_lock_active or bool(live_offsite_pids),
         }
     )
-    _cluster_recover_offsite_state_from_remote(
-        cfg,
-        mount_path,
-        state,
-        offsite_mount_active=offsite_mount_active,
-    )
-    offsite_path_raw = str(state.get("last_offsite_backup_path") or "").strip()
-    if not offsite_path_raw and str(state.get("last_backup_kind") or "") == "cluster_offsite":
-        offsite_path_raw = str(state.get("last_backup_path") or "").strip()
-    if offsite_path_raw:
-        offsite_path = Path(offsite_path_raw)
-        offsite_under_mount = _path_is_under(offsite_path, mount_path)
-        if offsite_mount_active or not offsite_under_mount:
-            marker = _read_backup_marker(offsite_path)
-            if marker:
-                offsite_state = _cluster_offsite_state_from_marker(marker, offsite_path)
-                archive_path = str(offsite_state.get("last_offsite_files_archive_path") or "").strip()
-                state.update(offsite_state)
-                state["last_files_archive_path"] = archive_path
-                state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
-            else:
+    offsite_active = offsite_lock_active or bool(live_offsite_pids)
+    if offsite_active:
+        # Do not walk or read the sshfs offsite tree while mydumper is writing
+        # it. The live process/lock is authoritative and this status call must
+        # stay non-invasive and quick during an active backup.
+        state["offsite_status_probe"] = "skipped_active_backup"
+    else:
+        _cluster_recover_offsite_state_from_remote(
+            cfg,
+            mount_path,
+            state,
+            offsite_mount_active=offsite_mount_active,
+        )
+        offsite_path_raw = str(state.get("last_offsite_backup_path") or "").strip()
+        if not offsite_path_raw and str(state.get("last_backup_kind") or "") == "cluster_offsite":
+            offsite_path_raw = str(state.get("last_backup_path") or "").strip()
+        if offsite_path_raw:
+            offsite_path = Path(offsite_path_raw)
+            offsite_under_mount = _path_is_under(offsite_path, mount_path)
+            if offsite_mount_active or not offsite_under_mount:
+                marker = _read_backup_marker(offsite_path)
+                if marker:
+                    offsite_state = _cluster_offsite_state_from_marker(marker, offsite_path)
+                    archive_path = str(offsite_state.get("last_offsite_files_archive_path") or "").strip()
+                    state.update(offsite_state)
+                    state["last_files_archive_path"] = archive_path
+                    state["last_files_bytes"] = int(offsite_state.get("last_offsite_files_bytes") or 0)
+                else:
+                    state["last_offsite_files_archive_ok"] = False
+            elif state.get("last_offsite_files_archive_ok") is None:
                 state["last_offsite_files_archive_ok"] = False
-        elif state.get("last_offsite_files_archive_ok") is None:
-            state["last_offsite_files_archive_ok"] = False
     if (
         str(state.get("last_status") or "").lower() == "running"
         and str(state.get("job") or "") == "backup.cluster.offsite"

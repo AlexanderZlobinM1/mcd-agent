@@ -150,6 +150,38 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         self.assertEqual(releases[0]["new_version"], "9.9.9")
         self.assertEqual(state["last_status"], "version_mismatch_restart")
 
+    def test_apply_update_defers_manual_restart_while_backup_lock_is_active(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg.backup_enabled = True
+            restarts: list[bool] = []
+            old_installed = self_update.installed_agent_version
+            old_lock = self_update.backup_lock_active
+            old_restart = self_update._restart_service_async
+            try:
+                self_update.installed_agent_version = lambda: "0.9.252"
+                self_update.backup_lock_active = lambda _cfg: True
+                self_update._restart_service_async = lambda: restarts.append(True)
+                ok, msg = self_update.apply_update(
+                    cfg,
+                    {
+                        "status": "update",
+                        "target": "0.9.253",
+                        "package_url": "https://mcc.invalid/mcd-agent-0.9.253.tar.gz",
+                    },
+                )
+            finally:
+                self_update.installed_agent_version = old_installed
+                self_update.backup_lock_active = old_lock
+                self_update._restart_service_async = old_restart
+
+            state = json.loads((Path(tmp) / "mcd-self-update.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(ok)
+        self.assertEqual(msg, "MCD update deferred: backup lock is active")
+        self.assertEqual(state["last_status"], "deferred_backup_lock")
+        self.assertEqual(restarts, [])
+
     def test_apply_update_refreshes_cluster_result_message(self) -> None:
         with TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)

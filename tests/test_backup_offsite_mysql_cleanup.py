@@ -387,6 +387,59 @@ class ClusterBackupIntegrityStatusTest(unittest.TestCase):
             self.assertEqual(persisted["last_status"], "ok")
             self.assertEqual(persisted["last_backup_kind"], "cluster_offsite")
 
+    def test_status_does_not_probe_remote_tree_while_offsite_backup_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            state_dir = base / "state"
+            state_dir.mkdir()
+            local_root = base / "local"
+            local_root.mkdir()
+            mount_base = base / "mounts"
+            host_name = "ananas-cluster-replica-xtrabackup"
+            state_file = state_dir / f"host-{host_name}.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "last_status": "running",
+                        "last_error": "",
+                        "job": "backup.cluster.offsite",
+                        "last_run_at": "2026-07-21T00:05:09+00:00",
+                        "last_offsite_backup_path": str(mount_base / host_name / "backup" / "ananasrs.sales-snap.com" / "daily" / "2026-07-20"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(
+                backup_host_name=host_name,
+                backup_state_dir=str(state_dir),
+                backup_mount_base_dir=str(mount_base),
+                backup_cluster_enabled=True,
+                backup_cluster_local_root_dir=str(local_root),
+                backup_lock_dir=str(base / "locks"),
+                cluster_id="cluster-ananasrs-prod",
+                cluster_name="ananasrs.sales-snap.com",
+                cluster_node_role="replica",
+                cluster_node_index=6,
+                backup_cluster_authority_role="replica",
+                backup_cluster_authority_host="",
+                cluster_route_backup_host="",
+            )
+
+            with (
+                patch("mcd_agent.backup._effective_cfg", side_effect=lambda x: x),
+                patch("mcd_agent.backup._mounted", return_value=True),
+                patch("mcd_agent.backup._cluster_offsite_processes", return_value=[4321]),
+                patch("mcd_agent.backup._cluster_recover_offsite_state_from_remote") as recover,
+                patch("mcd_agent.backup._read_backup_marker") as marker,
+            ):
+                state = cluster_backup_status(cfg)
+
+        self.assertTrue(state["offsite_running"])
+        self.assertEqual(state["active_offsite_pids"], [4321])
+        self.assertEqual(state["offsite_status_probe"], "skipped_active_backup")
+        recover.assert_not_called()
+        marker.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

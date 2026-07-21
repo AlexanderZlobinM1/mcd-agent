@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.9.253 - 2026-07-21
+- Safety: every self-update path, including explicit CLI apply and version-mismatch restarts, now defers while a backup lock is active instead of restarting MCD during a cluster dump.
+- Safety: active offsite backup status reports live process state without walking the remote sshfs tree, avoiding a competing/blocking probe while mydumper is writing.
+- Expanded cluster incident regression coverage for every passive user-task command, manual update during active backup, and active-offsite status probing.
+
 ## 0.9.252 - 2026-07-21
 - Safety: backup cleanup now distinguishes an idle orphaned temporary mysqld from an active long-running mydumper client and removes only the orphan after a grace period.
 - Safety: cluster backup status no longer remains `running` after its lock and processes are gone; stale interrupted runs are recorded as failed for the next supervised retry.
