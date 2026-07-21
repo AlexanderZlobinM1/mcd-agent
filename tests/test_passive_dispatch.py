@@ -59,17 +59,26 @@ def test_passive_dispatch_rejects_manual_user_task() -> None:
     assert store.finished == [(17, "skipped", "passive_profile_user_dispatch_disabled")]
 
 
-def test_passive_cli_rejects_segment_command() -> None:
+def test_passive_cli_rejects_every_user_task_command() -> None:
     config = SimpleNamespace(profile_name="passive", command_timeout_sec=1800)
-    rc, output = _run_manual_command_with_scheduler(
-        cfg=config,
-        root="/var/www/mautic",
-        command="segments:update",
-        instance_id=2071,
-        php_bin="php",
-        timeout_sec=1800,
-        run_as_user="www-data",
-    )
+    for command in (
+        "segments:update",
+        "campaign:trigger",
+        "campaign:rebuild",
+        "campaigns:rebuild",
+        "campaigns:update",
+        "campaigns:trigger",
+        "import",
+    ):
+        rc, output = _run_manual_command_with_scheduler(
+            cfg=config,
+            root="/var/www/mautic",
+            command=command,
+            instance_id=2071,
+            php_bin="php",
+            timeout_sec=1800,
+            run_as_user="www-data",
+        )
 
-    assert rc == 2
-    assert "passive profile rejects MCD user-task execution" in output
+        assert rc == 2, command
+        assert "passive profile rejects MCD user-task execution" in output

@@ -728,6 +728,54 @@ def _cluster_local_update_blockers(cfg: AgentConfig) -> list[dict[str, Any]]:
     return blockers
 
 
+def _defer_update_for_backup_lock(
+    cfg: AgentConfig,
+    state: dict[str, Any],
+    *,
+    target: str,
+    session_id: str,
+    now_s: int,
+) -> str | None:
+    """Fail closed before an update can restart MCD during a backup.
+
+    The automatic updater already checks this lock, but explicit CLI apply used
+    to bypass that check and could restart the service while a cluster offsite
+    dump still owned a prepared read-only mysqld. Keep the same safety rule for
+    every update path, including source/package mismatch restarts.
+    """
+    if not bool(getattr(cfg, "backup_enabled", False)):
+        return None
+    try:
+        locked = backup_lock_active(cfg)
+    except Exception as e:
+        msg = f"MCD update deferred: backup state cannot be verified ({str(e)[:300]})"
+        status = "deferred_backup_probe"
+    else:
+        if not locked:
+            return None
+        msg = "MCD update deferred: backup lock is active"
+        status = "deferred_backup_lock"
+    state.update(
+        {
+            "last_status": status,
+            "last_result": msg,
+            "last_target": target,
+            "last_attempt_ts": now_s,
+            "last_session_id": session_id,
+        }
+    )
+    _write_state(cfg, state)
+    if session_id:
+        release_session(
+            cfg,
+            session_id,
+            result_status="deferred",
+            result_message=msg,
+            new_version=installed_agent_version(),
+        )
+    return msg
+
+
 def _cluster_payload_plan(payload: dict[str, Any]) -> dict[str, Any] | None:
     plan = payload.get("plan")
     if not isinstance(plan, dict):
@@ -1169,6 +1217,15 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     state = _read_state(cfg)
     session_id = str(plan.get("session_id", "")).strip()
     now_s = int(time.time())
+    backup_defer = _defer_update_for_backup_lock(
+        cfg,
+        state,
+        target=target,
+        session_id=session_id,
+        now_s=now_s,
+    )
+    if backup_defer is not None:
+        return False, backup_defer
     install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
     src_dir = install_dir / "src"
     current_installed = installed_agent_version()
