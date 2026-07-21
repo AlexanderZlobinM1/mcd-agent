@@ -2969,7 +2969,53 @@ def _cluster_full_required_free_bytes(cfg: AgentConfig, db: DBConfig) -> int:
     return max(estimated, configured_headroom)
 
 
+def _cluster_storage_mode(cfg: AgentConfig) -> str:
+    mode = str(getattr(cfg, "backup_cluster_storage_mode", "local") or "local").strip().lower()
+    if mode not in {"local", "sshfs"}:
+        raise RuntimeError("backup.cluster.storage_mode must be 'local' or 'sshfs'")
+    return mode
+
+
+def _cluster_direct_storage_cfg(cfg: AgentConfig) -> tuple[AgentConfig, Path | None]:
+    """Mount StorageBox for cluster physical backups when direct mode is enabled."""
+    if _cluster_storage_mode(cfg) != "sshfs":
+        return cfg, None
+    _validate_cluster_cfg(cfg, remote=True)
+    _ensure_cluster_backup_authority(cfg)
+    _ensure_cluster_tools(cfg, {"sshfs"})
+    mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    try:
+        _mount(cfg, mount_path)
+        remote_root = _cluster_remote_parent(cfg, mount_path) / "local"
+        remote_root.mkdir(parents=True, exist_ok=True)
+        return replace(cfg, backup_cluster_local_root_dir=str(remote_root)), mount_path
+    except Exception:
+        if _mounted(mount_path):
+            try:
+                _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+            except Exception:
+                pass
+        raise
+
+
+def _cluster_release_direct_storage(cfg: AgentConfig, mount_path: Path | None) -> None:
+    if mount_path is None:
+        return
+    try:
+        _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+    except Exception:
+        pass
+
+
 def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
+    cfg, mount_path = _cluster_direct_storage_cfg(_effective_cfg(config))
+    try:
+        return _cluster_backup_local_full_impl(cfg)
+    finally:
+        _cluster_release_direct_storage(cfg, mount_path)
+
+
+def _cluster_backup_local_full_impl(config: AgentConfig) -> BackupResult:
     cfg = _effective_cfg(config)
     state_path = _cluster_state_path(cfg)
     started_ts = _utc_now_iso()
@@ -3142,6 +3188,14 @@ def cluster_backup_local_full(config: AgentConfig) -> BackupResult:
 
 
 def cluster_backup_local_incremental(config: AgentConfig) -> BackupResult:
+    cfg, mount_path = _cluster_direct_storage_cfg(_effective_cfg(config))
+    try:
+        return _cluster_backup_local_incremental_impl(cfg)
+    finally:
+        _cluster_release_direct_storage(cfg, mount_path)
+
+
+def _cluster_backup_local_incremental_impl(config: AgentConfig) -> BackupResult:
     cfg = _effective_cfg(config)
     state_path = _cluster_state_path(cfg)
     started_ts = _utc_now_iso()
@@ -4244,10 +4298,11 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
         db_instances = _cluster_db_instances(cfg)
         db = _backup_db_from_config_or_instances(cfg, db_instances)
+        offsite_source = str(getattr(cfg, "backup_cluster_offsite_source", "xtrabackup") or "xtrabackup").strip().lower()
         full_dir = _cluster_current_full_dir(cfg)
-        if full_dir is None:
+        if full_dir is None and offsite_source not in {"live", "live_replica", "replica"}:
             raise RuntimeError("offsite backup requires a completed local full backup")
-        full_marker = _read_backup_marker(full_dir)
+        full_marker = _read_backup_marker(full_dir) if full_dir is not None else {}
         files_snapshot = (
             _cluster_latest_files_snapshot(cfg)
             if bool(getattr(cfg, "backup_cluster_files_snapshot_enabled", True))
@@ -4362,7 +4417,6 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
         db_dir = tmp_dir / "databases" / f"cluster__{db.name or 'all'}"
         db_dir.mkdir(parents=True, exist_ok=False)
         dump_cfg = _cluster_offsite_mydumper_cfg(cfg)
-        offsite_source = str(getattr(cfg, "backup_cluster_offsite_source", "xtrabackup") or "xtrabackup").strip().lower()
         if offsite_source in {"live", "live_replica", "replica"}:
             db_source_meta = {"offsite_db_source": "live_replica"}
             _run_mydumper(dump_cfg, db, db_dir)
@@ -4387,8 +4441,8 @@ def cluster_backup_offsite(config: AgentConfig) -> BackupResult:
             "bytes_written": bytes_written,
             "db_bytes": db_bytes,
             "files_bytes": files_bytes,
-            "local_full_path": str(full_dir),
-            "local_full_chain_id": str(full_marker.get("chain_id") or full_dir.name),
+            "local_full_path": str(full_dir) if full_dir is not None else "",
+            "local_full_chain_id": str(full_marker.get("chain_id") or (full_dir.name if full_dir is not None else "")),
             "files_snapshot_path": str(files_snapshot) if files_snapshot is not None else "",
             "files_archive_path": files_archive_path,
             "server_snapshot": _mysql_server_snapshot(cfg, db),
@@ -4530,9 +4584,9 @@ def cluster_backup_offsite_dry_run(config: AgentConfig) -> dict[str, Any]:
         result["mydumper_threads"] = dump_cfg.backup_mydumper_threads
         result["mydumper_extra_args"] = dump_cfg.backup_mydumper_extra_args
         full_dir = _cluster_current_full_dir(cfg)
-        if full_dir is None:
+        if full_dir is None and str(result["offsite_db_source"]) not in {"live", "live_replica", "replica"}:
             raise RuntimeError("offsite dry-run requires a completed local full backup")
-        result["local_full_path"] = str(full_dir)
+        result["local_full_path"] = str(full_dir) if full_dir is not None else ""
         if str(result["offsite_db_source"]) not in {"live", "live_replica", "replica"}:
             result["would_prepare_xtrabackup_mysql"] = True
         files_snapshot = None

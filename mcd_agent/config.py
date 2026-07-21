@@ -779,6 +779,8 @@ class AgentConfig:
     backup_xtrabackup_retention_full_copies: int
     backup_xtrabackup_retention_incremental_days: int
     backup_cluster_enabled: bool
+    backup_cluster_storage_mode: str
+    backup_cluster_local_xtrabackup_enabled: bool
     backup_cluster_local_root_dir: str
     backup_cluster_full_hour: int
     backup_cluster_full_minute: int
@@ -3235,6 +3237,12 @@ def _load_config_inner(path: str) -> AgentConfig:
             int(backup_xtrabackup.get("retention_incremental_days", 7)),
         ),
         backup_cluster_enabled=bool(backup_cluster.get("enabled", False)),
+        backup_cluster_storage_mode=(
+            str(backup_cluster.get("storage_mode", "local")).strip().lower() or "local"
+        ),
+        backup_cluster_local_xtrabackup_enabled=bool(
+            backup_cluster.get("local_xtrabackup_enabled", True)
+        ),
         backup_cluster_local_root_dir=str(
             backup_cluster.get("local_root_dir", "/mnt/data/backup/local/ananasrs")
         ).strip()
