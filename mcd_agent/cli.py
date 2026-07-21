@@ -558,6 +558,14 @@ def _run_manual_command_with_scheduler(
     run_as_user: str | None,
 ) -> tuple[int, str]:
     task_type = command_task_type(command)
+    if (
+        str(getattr(cfg, "profile_name", "") or "").strip().lower() == "passive"
+        and task_type is not None
+    ):
+        return 2, (
+            "passive profile rejects MCD user-task execution; "
+            "cron remains external and maintenance must be explicit"
+        )
     route = cluster_route_for_command(command)
     route_targets = cluster_route_targets(cfg, route)
     if route_targets:

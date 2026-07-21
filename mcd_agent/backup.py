@@ -2369,6 +2369,8 @@ def _cluster_offsite_processes(cfg: AgentConfig) -> list[int]:
 
 
 _MYSQL_DATADIR_ARG_RE = re.compile(r"(?:^|\s)--datadir=([^\s]+)")
+_MYSQL_SOCKET_ARG_RE = re.compile(r"(?:^|\s)--socket=([^\s]+)")
+_PREPARED_MYSQL_IDLE_GRACE_SEC = 300
 
 
 def _cluster_prepared_mysql_datadir_from_cmdline(cfg: AgentConfig, cmdline: str) -> Path | None:
@@ -2426,6 +2428,43 @@ def _cluster_prepared_mysql_processes(cfg: AgentConfig) -> list[dict[str, Any]]:
         )
     matches.sort(key=lambda x: int(x["pid"]))
     return matches
+
+
+def _prepared_mysql_has_active_clients(item: dict[str, Any]) -> bool | None:
+    """Return whether a temporary offsite mysqld still has a dump client.
+
+    A prepared mysqld can survive the mydumper child after an MCD restart or
+    abrupt child exit. Do not infer liveness from mysqld age alone: a large
+    legitimate dump can run for many hours. The socket process list gives us
+    the safe distinction between an active dump and an orphaned server.
+    """
+    cmdline = str(item.get("cmdline") or "")
+    match = _MYSQL_SOCKET_ARG_RE.search(cmdline)
+    if not match:
+        return None
+    socket_path = match.group(1)
+    try:
+        proc = _run(
+            [
+                "mysql",
+                f"--socket={socket_path}",
+                "--protocol=socket",
+                "--user=root",
+                "--skip-password",
+                "-NBe",
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE ID <> CONNECTION_ID()",
+            ],
+            timeout_sec=10,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int((proc.stdout or "").strip().splitlines()[-1]) > 0
+    except (IndexError, TypeError, ValueError):
+        return None
 
 
 def _proc_age_sec(pid_dir: Path) -> float | None:
@@ -2487,7 +2526,13 @@ def _cleanup_stale_prepared_mysql_processes(cfg: AgentConfig) -> list[int]:
         age = item.get("age_sec")
         too_old = isinstance(age, (int, float)) and age >= stale_age_sec
         if isinstance(datadir, Path) and datadir.exists() and not too_old:
-            continue
+            # A just-started prepared server may not have its mydumper client
+            # connected yet. After the grace period, an idle socket means the
+            # dump child is gone and this server is safe to terminate.
+            if isinstance(age, (int, float)) and age < _PREPARED_MYSQL_IDLE_GRACE_SEC:
+                continue
+            if _prepared_mysql_has_active_clients(item) is not False:
+                continue
         if _terminate_pid(pid):
             stopped.append(pid)
     return stopped
@@ -4541,6 +4586,8 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
         chain_id = str(marker.get("chain_id") or current_full.name)
         latest_incr = _cluster_latest_incremental_dir(cfg, chain_id)
     latest_files = _cluster_latest_files_snapshot(cfg)
+    live_offsite_pids = _cluster_offsite_processes(cfg)
+    offsite_lock_active = _lock_active(_cluster_lock_path(cfg, "offsite"))
     state.update(
         {
             "cluster_enabled": bool(getattr(cfg, "backup_cluster_enabled", False)),
@@ -4558,7 +4605,8 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
             "local_full_running": _lock_active(_cluster_lock_path(cfg, "local-full")),
             "local_incremental_running": _lock_active(_cluster_lock_path(cfg, "local-incremental")),
             "files_snapshot_running": _lock_active(_cluster_lock_path(cfg, "files")),
-            "offsite_running": _lock_active(_cluster_lock_path(cfg, "offsite")) or bool(_cluster_offsite_processes(cfg)),
+            "active_offsite_pids": live_offsite_pids,
+            "offsite_running": offsite_lock_active or bool(live_offsite_pids),
         }
     )
     _cluster_recover_offsite_state_from_remote(
@@ -4585,6 +4633,30 @@ def cluster_backup_status(config: AgentConfig) -> dict[str, Any]:
                 state["last_offsite_files_archive_ok"] = False
         elif state.get("last_offsite_files_archive_ok") is None:
             state["last_offsite_files_archive_ok"] = False
+    if (
+        str(state.get("last_status") or "").lower() == "running"
+        and str(state.get("job") or "") == "backup.cluster.offsite"
+        and not offsite_lock_active
+        and not live_offsite_pids
+    ):
+        run_ts = _parse_backup_iso_ts(state.get("last_run_at"))
+        run_age = (datetime.now(timezone.utc) - run_ts).total_seconds() if run_ts is not None else None
+        if run_age is None or run_age >= 120:
+            stale_error = "cluster offsite backup state was stale: no active lock or process"
+            state.update({"last_status": "failed", "last_error": stale_error, "active_offsite_pids": []})
+            try:
+                _cluster_update_state(
+                    cfg,
+                    {"last_status": "failed", "last_error": stale_error, "active_offsite_pids": []},
+                    history_item={
+                        "ts": _utc_now_iso(),
+                        "status": "failed_stale",
+                        "job": "backup.cluster.offsite",
+                        "error": stale_error,
+                    },
+                )
+            except Exception:
+                pass
     _apply_cluster_backup_integrity_status(state)
     return state
 
