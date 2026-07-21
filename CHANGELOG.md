@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.254 - 2026-07-21
+- Fixed: cluster physical full and incremental backups can use direct SSHFS
+  StorageBox storage instead of checking or consuming the replica's local
+  `/mnt/data` backup filesystem.
+- Added: `backup.cluster.storage_mode=sshfs` keeps the StorageBox mounted only
+  for the backup operation and releases it after completion.
+- Added: replica-operated clusters can disable redundant local cluster
+  xtrabackup jobs and run the nightly live-replica mydumper directly to
+  StorageBox over SSHFS.
+
 ## 0.9.253 - 2026-07-21
 - Safety: every self-update path, including explicit CLI apply and version-mismatch restarts, now defers while a backup lock is active instead of restarting MCD during a cluster dump.
 - Safety: active offsite backup status reports live process state without walking the remote sshfs tree, avoiding a competing/blocking probe while mydumper is writing.

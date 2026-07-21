@@ -249,6 +249,8 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_xtrabackup_retention_full_copies",
     "backup_xtrabackup_retention_incremental_days",
     "backup_cluster_enabled",
+    "backup_cluster_storage_mode",
+    "backup_cluster_local_xtrabackup_enabled",
     "backup_cluster_local_root_dir",
     "backup_cluster_full_hour",
     "backup_cluster_full_minute",
@@ -6903,7 +6905,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if not cluster_busy:
                     cluster_job = ""
                     if (
-                        run_day != last_cluster_full_day
+                        bool(getattr(config, "backup_cluster_local_xtrabackup_enabled", True))
+                        and run_day != last_cluster_full_day
                         and now >= next_cluster_full_retry_at
                         and _local_time_reached(
                             dt_local,
@@ -6917,12 +6920,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         run_day != last_cluster_offsite_day
                         and now >= next_cluster_offsite_retry_at
                         and bool(getattr(config, "backup_cluster_remote_enabled", True))
-                        and _cluster_local_full_ready_for_offsite(config, dt_local)
+                        and (
+                            not bool(getattr(config, "backup_cluster_local_xtrabackup_enabled", True))
+                            or _cluster_local_full_ready_for_offsite(config, dt_local)
+                        )
                         and not _cluster_offsite_done_for_date(config, dt_local)
                     ):
                         cluster_job = "offsite"
                     elif (
-                        _cluster_local_full_done_for_date(config, dt_local)
+                        bool(getattr(config, "backup_cluster_local_xtrabackup_enabled", True))
+                        and _cluster_local_full_done_for_date(config, dt_local)
                         and _local_hour_in_closed_window(
                             dt_local,
                             int(getattr(config, "backup_cluster_incremental_start_hour", 8) or 8),
