@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.9.252 - 2026-07-21
+- Safety: backup cleanup now distinguishes an idle orphaned temporary mysqld from an active long-running mydumper client and removes only the orphan after a grace period.
+- Safety: cluster backup status no longer remains `running` after its lock and processes are gone; stale interrupted runs are recorded as failed for the next supervised retry.
+- Added regression coverage for idle orphan cleanup and active dump preservation.
+
+## 0.9.251 - 2026-07-21
+
+- Safety: passive cluster agents now reject MCD manual segment, campaign, and
+  import dispatch instead of executing user tasks while legacy cron remains
+  external and unchanged.
+- Safety: direct `mcd-cli exec` user-task commands are rejected in passive
+  profile, preventing a second MCD workload queue from racing the cluster's
+  fallback cron.
+- Added regression coverage for passive manual-dispatch rejection.
+
 ## 0.9.250 - 2026-07-20
 
 - Added: dedicated hardware profiles now install and maintain the canonical

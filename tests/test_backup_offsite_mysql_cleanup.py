@@ -15,6 +15,7 @@ from mcd_agent.backup import (
     _cluster_file_source_paths,
     _cluster_prepared_mysql_datadir_from_cmdline,
     _cleanup_stale_prepared_mysql_processes,
+    _prepared_mysql_has_active_clients,
     _run_mydumper_from_xtrabackup_full,
     cluster_backup_status,
 )
@@ -147,6 +148,48 @@ class PreparedOffsiteMysqlDetectionTest(unittest.TestCase):
 
         self.assertEqual(stopped, [1495368])
         terminate.assert_called_once_with(1495368)
+
+    def test_cleanup_stops_idle_prepared_mysql_after_grace_period(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            datadir = Path(td) / "full-20260720-213347" / "physical-xtrabackup"
+            datadir.mkdir(parents=True)
+            item = {
+                "pid": 3940850,
+                "datadir": datadir,
+                "age_sec": 2 * 3600,
+                "cmdline": "mysqld --socket=/tmp/mcd-offsite-mysql-test/mysql.sock",
+            }
+
+            with (
+                patch("mcd_agent.backup._cluster_prepared_mysql_processes", return_value=[item]),
+                patch("mcd_agent.backup._prepared_mysql_has_active_clients", return_value=False),
+                patch("mcd_agent.backup._terminate_pid", return_value=True) as terminate,
+            ):
+                stopped = _cleanup_stale_prepared_mysql_processes(_cfg())
+
+        self.assertEqual(stopped, [3940850])
+        terminate.assert_called_once_with(3940850)
+
+    def test_cleanup_keeps_prepared_mysql_with_active_dump_client(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            datadir = Path(td) / "full-20260720-213347" / "physical-xtrabackup"
+            datadir.mkdir(parents=True)
+            item = {
+                "pid": 3940851,
+                "datadir": datadir,
+                "age_sec": 2 * 3600,
+                "cmdline": "mysqld --socket=/tmp/mcd-offsite-mysql-test/mysql.sock",
+            }
+
+            with (
+                patch("mcd_agent.backup._cluster_prepared_mysql_processes", return_value=[item]),
+                patch("mcd_agent.backup._prepared_mysql_has_active_clients", return_value=True),
+                patch("mcd_agent.backup._terminate_pid") as terminate,
+            ):
+                stopped = _cleanup_stale_prepared_mysql_processes(_cfg())
+
+        self.assertEqual(stopped, [])
+        terminate.assert_not_called()
 
 
 class ClusterFileSourcePathsTest(unittest.TestCase):

@@ -6120,6 +6120,21 @@ def _dispatch_manual_requests_for_root(
     pending = store.pending_manual_requests(root, limit=64)
     if not pending:
         return
+    if (str(getattr(config, "profile_name", "") or "").strip().lower() == "passive"):
+        rejected = 0
+        for row in pending:
+            try:
+                req_id = int(row["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            store.finish_manual_request(req_id, "skipped", "passive_profile_user_dispatch_disabled")
+            rejected += 1
+        logging.warning(
+            "[%s] passive profile rejected manual user-task dispatch requests=%s; cron remains external",
+            root,
+            rejected,
+        )
+        return
     for row in pending:
         req_id = int(row["id"])
         task_type = str(row["task_type"] or "").strip()
@@ -7095,7 +7110,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         monitor_cycle_done=monitor_cycle_done,
                     )
                 if now >= next_passive_notice_at:
-                    logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                    logging.info(
+                        "Passive profile active: automatic/user-task planning disabled; "
+                        "manual user requests rejected; cron remains external"
+                    )
                     next_passive_notice_at = now + 60
                 # Do not let a low poll_interval spin the passive branch every
                 # loop: MCC state push, config guard and self-update live after
@@ -8131,7 +8149,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     monitor_cycle_done=monitor_cycle_done,
                 )
             if now >= next_passive_notice_at:
-                logging.info("Passive profile active: automatic planning disabled; manual requests still accepted")
+                logging.info(
+                    "Passive profile active: automatic/user-task planning disabled; "
+                    "manual user requests rejected; cron remains external"
+                )
                 next_passive_notice_at = now + 60
             if single_cycle:
                 return
