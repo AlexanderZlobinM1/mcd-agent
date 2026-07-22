@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.256 - 2026-07-22
+- Fixed: a `midi` host carrying the exact legacy single-ring runtime snapshot
+  now restores the canonical dual-ring `3+1` segment and campaign topology.
+  This prevents stale generated overrides from disabling priority segments and
+  per-instance whitelists after a profile change.
+
 ## 0.9.255 - 2026-07-22
 - Fixed: per-instance segment whitelists saved by MCC with a host-qualified
   instance UID are now resolved by the local scheduler and placed in the

@@ -1142,6 +1142,20 @@ def _enforce_campaign_rebuild_guard(cfg: AgentConfig) -> AgentConfig:
 
 def _enforce_profile_guards(cfg: AgentConfig) -> AgentConfig:
     profile = (cfg.profile_name or "").strip().lower()
+    if (
+        profile == "midi"
+        and cfg.ring_mode == "single"
+        and cfg.disable_whitelist
+        and cfg.segment_priority_size == 0
+        and cfg.segment_priority_parallel_idle == 0
+        and cfg.segment_regular_parallel_idle == 1
+        and cfg.segment_priority_parallel_throttled == 0
+        and cfg.segment_regular_parallel_throttled == 1
+    ):
+        # Early multi-instance installs persisted the old single-ring defaults
+        # into runtime overrides. Do not let that exact legacy snapshot replace
+        # the selected midi profile's dual 3+1 scheduler topology.
+        return _apply_profile(cfg)
     if profile == "tiny" and not cfg.segment_periodic_full_scan_enabled:
         return replace(cfg, segment_periodic_full_scan_enabled=True)
     return cfg
