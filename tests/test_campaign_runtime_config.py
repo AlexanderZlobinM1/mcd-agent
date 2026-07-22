@@ -131,6 +131,42 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertTrue(cfg.segment_periodic_full_scan_enabled)
         self.assertEqual(cfg.segment_full_scan_interval_sec, 60)
 
+    def test_midi_profile_migrates_legacy_single_ring_snapshot(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "midi"',
+                    "[runtime]",
+                    'ring_mode = "single"',
+                    "disable_whitelist = true",
+                    "segment_priority_size = 0",
+                    "segment_priority_parallel_idle = 0",
+                    "segment_regular_parallel_idle = 1",
+                    "segment_priority_parallel_throttled = 0",
+                    "segment_regular_parallel_throttled = 1",
+                    "campaign_total_parallel = 1",
+                    "campaign_trigger_priority_parallel = 0",
+                    "campaign_trigger_regular_parallel = 1",
+                    "campaign_rebuild_priority_parallel = 0",
+                    "campaign_rebuild_regular_parallel = 1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.ring_mode, "dual")
+        self.assertFalse(cfg.disable_whitelist)
+        self.assertEqual(cfg.segment_priority_size, 10)
+        self.assertEqual(cfg.segment_priority_parallel_idle, 3)
+        self.assertEqual(cfg.segment_regular_parallel_idle, 1)
+        self.assertEqual(cfg.campaign_trigger_priority_parallel, 3)
+        self.assertEqual(cfg.campaign_rebuild_priority_parallel, 3)
+
     def test_passive_profile_keeps_campaign_rebuild_disabled(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(
