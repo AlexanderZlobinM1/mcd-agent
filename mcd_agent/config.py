@@ -185,6 +185,14 @@ _DEFAULT_SQL_SEGMENTS_DUE = (
     "  )"
     "  OR EXISTS ("
     "    SELECT 1 "
+    "    FROM {prefix}leads changed_lead "
+    "    WHERE ll.last_built_date IS NULL "
+    "      OR changed_lead.date_added > ll.last_built_date "
+    "      OR changed_lead.date_modified > ll.last_built_date "
+    "    LIMIT 1"
+    "  )"
+    "  OR EXISTS ("
+    "    SELECT 1 "
     "    FROM {prefix}lead_lists_leads lll "
     "    WHERE lll.leadlist_id = ll.id "
     "      AND (ll.last_built_date IS NULL OR lll.date_added > ll.last_built_date) "
@@ -1336,6 +1344,10 @@ def _is_legacy_segments_due_sql(value: object) -> bool:
         # lead_donotcontact, not only leads/lead_lists_leads. Old generated
         # defaults can mark those segments built while fresh unsubscribe rows
         # remain invisible until the next 24h full scan.
+        return True
+    if all(sig in normalized for sig in default_shape) and "{prefix}leads changed_lead" not in normalized:
+        # Looking only at contacts already present in a segment misses newly
+        # created or modified contacts that have just started matching it.
         return True
     return False
 

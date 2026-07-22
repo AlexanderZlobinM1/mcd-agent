@@ -630,7 +630,16 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
     if not isinstance(settings, dict):
         return global_segment_ids()
 
-    for key in _viber_stats_setting_keys(inst) + ["default"]:
+    instance_keys = _viber_stats_setting_keys(inst)
+    qualified_keys: list[str] = []
+    instance_key_set = set(instance_keys)
+    for raw_key in settings:
+        key = str(raw_key or "").strip()
+        base_key, separator, _host_name = key.partition("@")
+        if separator and base_key in instance_key_set and key not in instance_key_set:
+            qualified_keys.append(key)
+
+    for key in instance_keys + qualified_keys + ["default"]:
         if key not in settings:
             continue
         raw = settings.get(key)
@@ -8739,7 +8748,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         if task.entity_id not in seg_resume_ring:
                             seg_resume_ring.appendleft(task.entity_id)
 
-                if not segment_throttled_active and seg_resume_ring and segment_launched_this_tick <= 0:
+                if not segment_throttled_active and seg_resume_ring:
                     segment_launched_this_tick += _fill_from_ring(
                         ring=seg_resume_ring,
                         ring_limit=seg_total_limit,
@@ -8762,6 +8771,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         blocked_entities=segment_blocked_ids,
                         dynamic_blocked=_segment_chain_running_conflict,
                         on_launch=_mark_segment_cycle,
+                        max_launches=seg_total_limit,
                     )
 
                 if segment_throttled_active and config.segment_throttle_whitelist_only:
@@ -8771,30 +8781,30 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         )
                     )
                     seg_wl_ring = deque(wl_ids)
-                    if segment_launched_this_tick <= 0:
-                        segment_launched_this_tick += _fill_from_ring(
-                            ring=seg_wl_ring,
-                            ring_limit=seg_prio_limit,
-                            total_limit=seg_total_limit,
+                    segment_launched_this_tick += _fill_from_ring(
+                        ring=seg_wl_ring,
+                        ring_limit=seg_prio_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=segment_whitelist_for_inst,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
                             root=root,
-                            task_type="segment",
-                            running=running,
-                            ring_entities=segment_whitelist_for_inst,
-                            config=config,
-                            store=store,
-                            popens=popens,
-                            build_args=lambda sid: render_mautic_command(
-                                php_bin=config.php_bin,
-                                run_as_user=config.mautic_run_as_user,
-                                root=root,
-                                template=config.cmd_segment_update_template,
-                                id=sid,
-                                batch_limit=config.segment_batch_limit,
-                            ),
-                            blocked_entities=segment_blocked_ids,
-                            dynamic_blocked=_segment_chain_running_conflict,
-                            on_launch=_mark_segment_cycle,
-                        )
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                        blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
+                        max_launches=seg_prio_limit,
+                    )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
                         pass
@@ -8802,56 +8812,56 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         # No non-whitelist launches while throttle is active.
                         pass
                 else:
-                    if segment_launched_this_tick <= 0:
-                        segment_launched_this_tick += _fill_from_ring(
-                            ring=seg_prio_ring,
-                            ring_limit=eff_seg_prio_limit,
-                            total_limit=seg_total_limit,
+                    segment_launched_this_tick += _fill_from_ring(
+                        ring=seg_prio_ring,
+                        ring_limit=eff_seg_prio_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=seg_prio_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
                             root=root,
-                            task_type="segment",
-                            running=running,
-                            ring_entities=seg_prio_set,
-                            config=config,
-                            store=store,
-                            popens=popens,
-                            build_args=lambda sid: render_mautic_command(
-                                php_bin=config.php_bin,
-                                run_as_user=config.mautic_run_as_user,
-                                root=root,
-                                template=config.cmd_segment_update_template,
-                                id=sid,
-                                batch_limit=config.segment_batch_limit,
-                            ),
-                            blocked_entities=segment_blocked_ids,
-                            dynamic_blocked=_segment_chain_running_conflict,
-                            on_launch=_mark_segment_cycle,
-                        )
-                    if segment_launched_this_tick <= 0:
-                        segment_launched_this_tick += _fill_from_ring(
-                            ring=seg_reg_ring,
-                            ring_limit=eff_seg_reg_limit,
-                            total_limit=seg_total_limit,
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                        blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
+                        max_launches=eff_seg_prio_limit,
+                    )
+                    segment_launched_this_tick += _fill_from_ring(
+                        ring=seg_reg_ring,
+                        ring_limit=eff_seg_reg_limit,
+                        total_limit=seg_total_limit,
+                        root=root,
+                        task_type="segment",
+                        running=running,
+                        ring_entities=seg_reg_set,
+                        config=config,
+                        store=store,
+                        popens=popens,
+                        build_args=lambda sid: render_mautic_command(
+                            php_bin=config.php_bin,
+                            run_as_user=config.mautic_run_as_user,
                             root=root,
-                            task_type="segment",
-                            running=running,
-                            ring_entities=seg_reg_set,
-                            config=config,
-                            store=store,
-                            popens=popens,
-                            build_args=lambda sid: render_mautic_command(
-                                php_bin=config.php_bin,
-                                run_as_user=config.mautic_run_as_user,
-                                root=root,
-                                template=config.cmd_segment_update_template,
-                                id=sid,
-                                batch_limit=config.segment_batch_limit,
-                            ),
-                            blocked_entities=segment_blocked_ids,
-                            dynamic_blocked=_segment_chain_running_conflict,
-                            on_launch=_mark_segment_cycle,
-                        )
+                            template=config.cmd_segment_update_template,
+                            id=sid,
+                            batch_limit=config.segment_batch_limit,
+                        ),
+                        blocked_entities=segment_blocked_ids,
+                        dynamic_blocked=_segment_chain_running_conflict,
+                        on_launch=_mark_segment_cycle,
+                        max_launches=eff_seg_reg_limit,
+                    )
                     seg_cur_total = _running_count(running, root, "segment")
-                    if segment_launched_this_tick <= 0 and seg_cur_total < seg_total_limit:
+                    if seg_cur_total < seg_total_limit:
                         spill = seg_total_limit - seg_cur_total
                         if prefer_priority_spill and seg_prio_ring and spill > 0:
                             segment_launched_this_tick += _fill_from_ring(
@@ -8876,6 +8886,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
                                 on_launch=_mark_segment_cycle,
+                                max_launches=spill,
                             )
                         elif seg_reg_ring:
                             segment_launched_this_tick += _fill_from_ring(
@@ -8900,6 +8911,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
                                 on_launch=_mark_segment_cycle,
+                                max_launches=spill,
                             )
                         elif seg_prio_ring and spill > 0:
                             # If regular ring is empty, keep total segment concurrency at target
@@ -8926,6 +8938,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 blocked_entities=segment_blocked_ids,
                                 dynamic_blocked=_segment_chain_running_conflict,
                                 on_launch=_mark_segment_cycle,
+                                max_launches=spill,
                             )
 
             _publish_monitor_cycle()

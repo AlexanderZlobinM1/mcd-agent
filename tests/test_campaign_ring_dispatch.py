@@ -727,6 +727,31 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(submit.call_args.kwargs["entity_id"], 11)
         self.assertEqual(list(ring), [22, 33, 11])
 
+    def test_fill_from_ring_can_fill_midi_priority_lane_in_one_pass(self) -> None:
+        root = "/var/www/site"
+        ring = deque([11, 22, 33, 44])
+        cfg = SimpleNamespace(command_timeout_sec=3600, segment_full_scan_interval_sec=0)
+
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True) as submit:
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=3,
+                total_limit=4,
+                root=root,
+                task_type="segment",
+                running={},
+                ring_entities={11, 22, 33, 44},
+                config=cfg,
+                store=SimpleNamespace(),
+                popens={},
+                build_args=lambda sid: ["php", "bin/console", "mautic:segments:update", "-i", str(sid)],
+                max_launches=3,
+            )
+
+        self.assertEqual(launched, 3)
+        self.assertEqual([call.kwargs["entity_id"] for call in submit.call_args_list], [11, 22, 33])
+        self.assertEqual(list(ring), [44, 11, 22, 33])
+
     def test_fill_from_ring_skips_blocked_dependency_chain_and_launches_independent_segment(self) -> None:
         root = "/var/www/site"
         ring = deque([11, 22, 33])
@@ -1214,6 +1239,25 @@ class CampaignRingDispatchTests(unittest.TestCase):
         )
 
         self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
+
+    def test_segment_whitelist_accepts_mcc_host_qualified_instance_uid(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={
+                "site-a.example.com@MauticFarm-02": {"segment_whitelist": [23]},
+            },
+        )
+        inst = SimpleNamespace(
+            instance_uid="site-a.example.com",
+            root="/var/www/site-a/public_html",
+            name="site-a.example.com",
+            primary_domain="site-a.example.com",
+            domains=["site-a.example.com"],
+        )
+
+        self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {23})
 
     def test_segment_whitelist_falls_back_to_default_per_instance(self) -> None:
         cfg = SimpleNamespace(

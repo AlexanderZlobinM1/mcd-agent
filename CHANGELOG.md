@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.255 - 2026-07-22
+- Fixed: per-instance segment whitelists saved by MCC with a host-qualified
+  instance UID are now resolved by the local scheduler and placed in the
+  priority segment ring.
+- Fixed: dual-ring segment dispatch now fills the configured priority and
+  regular concurrency lanes (`3+1` on `midi`) instead of launching only one
+  segment and starving the regular ring.
+- Fixed: segment due detection now treats newly created or modified contacts
+  as candidates for every published segment, including contacts that were not
+  already members at the previous build.
+
 ## 0.9.254 - 2026-07-21
 - Fixed: cluster physical full and incremental backups can use direct SSHFS
   StorageBox storage instead of checking or consuming the replica's local
