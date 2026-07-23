@@ -18,6 +18,17 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertIn("{campaign_limit_arg}", cfg.cmd_campaign_trigger_template)
         self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 300)
 
+    def test_host_scheduler_parallel_limit_is_runtime_configurable(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            '[runtime]\nprofile_name = "midi"\nscheduler_host_max_parallel = 6\n',
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.scheduler_host_max_parallel, 6)
+
     def test_page_hits_sql_segments_default_to_quiet_window_only(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text("[runtime]\nprofile_name = \"midi\"\n", encoding="utf-8")
