@@ -530,6 +530,7 @@ class AgentConfig:
     worker_stuck_policy: str
     worker_stuck_restart_limit: int
     jobs_max_workers: int
+    scheduler_host_max_parallel: int
     segment_whitelist: list[int]
     segment_whitelist_file: str | None
     segment_whitelist_instance_settings: dict[str, Any]
@@ -1997,6 +1998,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "worker_stuck_policy": "worker_stuck_policy",
     "worker_stuck_restart_limit": "worker_stuck_restart_limit",
     "jobs_max_workers": "jobs_max_workers",
+    "scheduler_host_max_parallel": "scheduler_host_max_parallel",
     "segment_whitelist": "segment_whitelist",
     "segment_whitelist_file": "segment_whitelist_file",
     "segment_whitelist_instance_settings": "segment_whitelist_instance_settings",
@@ -2764,6 +2766,7 @@ def _load_config_inner(path: str) -> AgentConfig:
         worker_stuck_policy=str(runtime.get("worker_stuck_policy", "skip")),
         worker_stuck_restart_limit=int(runtime.get("worker_stuck_restart_limit", 1)),
         jobs_max_workers=int(runtime.get("jobs_max_workers", 2)),
+        scheduler_host_max_parallel=max(0, int(runtime.get("scheduler_host_max_parallel", 0))),
         segment_whitelist=_normalize_int_list(runtime.get("segment_whitelist", [])),
         segment_whitelist_file=str(runtime.get("segment_whitelist_file")).strip() if runtime.get("segment_whitelist_file") else None,
         segment_whitelist_instance_settings=(

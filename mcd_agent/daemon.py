@@ -1476,6 +1476,26 @@ def _segment_sql_worker_count(root: str) -> int:
     return len(_segment_sql_worker_ids(root))
 
 
+def _segment_sql_worker_total_count() -> int:
+    _segment_sql_worker_prune()
+    with _SEGMENT_SQL_WORKERS_LOCK:
+        return len(_SEGMENT_SQL_WORKERS)
+
+
+def _scheduler_host_running_count(running: dict[str, "RunningTask"]) -> int:
+    return len(running) + _segment_sql_worker_total_count()
+
+
+def _scheduler_host_slots_available(
+    config: AgentConfig,
+    running: dict[str, "RunningTask"],
+) -> int | None:
+    limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
+    if limit <= 0:
+        return None
+    return max(0, limit - _scheduler_host_running_count(running))
+
+
 def _segment_sql_running_state_ids(
     *,
     store: "TaskStore",
@@ -1797,6 +1817,9 @@ def _run_sql_segment_ring(
     limit = max(0, int(configured_limit or 0))
     if limit <= 0 or not ring or not rules:
         return 0
+    host_slots = _scheduler_host_slots_available(config, running)
+    if host_slots is not None and host_slots <= 0:
+        return 0
     if async_worker and max(
         _segment_sql_worker_count(root),
         _segment_sql_running_state_count(store=store, root=root, config=config, now_ts=now_ts),
@@ -1806,6 +1829,9 @@ def _run_sql_segment_ring(
     launched = 0
     scans = len(ring)
     while scans > 0 and launched < limit:
+        host_slots = _scheduler_host_slots_available(config, running)
+        if host_slots is not None and host_slots <= 0:
+            break
         sid = int(ring[0])
         scans -= 1
         rule = rules.get(sid)
@@ -5338,6 +5364,13 @@ def _running_campaign_total(running: dict[str, RunningTask], root: str) -> int:
     )
 
 
+def _rotated_dispatch_installs(installs: list[object], cursor: int) -> list[object]:
+    if not installs:
+        return []
+    start = max(0, int(cursor or 0)) % len(installs)
+    return list(installs[start:]) + list(installs[:start])
+
+
 def _campaign_pressure_active(
     config: AgentConfig,
     running: dict[str, RunningTask],
@@ -5588,6 +5621,9 @@ def _submit_if_slot(
             prev = store.last_task_started_at(key)
             if prev > 0 and time.time() - float(prev) < float(min_repeat):
                 return False
+    host_slots = _scheduler_host_slots_available(config, running)
+    if host_slots is not None and host_slots <= 0:
+        return False
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
         return False
 
@@ -6464,6 +6500,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_runtime_overrides_error = ""
     last_monitor_signals_push_error = ""
     last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
+    dispatch_instance_cursor = 0
     pusher = MCCStatePusher(config)
 
     while True:
@@ -8216,7 +8253,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         cluster_import_allowed = cluster_route_allows(config, "import")
         cluster_cache_allowed = cluster_route_allows(config, "cache")
 
-        for inst in installs:
+        dispatch_installs = _rotated_dispatch_installs(installs, dispatch_instance_cursor)
+        if dispatch_installs:
+            dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
+        for inst in dispatch_installs:
             if not inst.db:
                 logging.warning("[%s] skip install without db config", inst.root)
                 continue

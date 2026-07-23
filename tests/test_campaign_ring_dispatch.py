@@ -36,7 +36,9 @@ from mcd_agent.daemon import (
     _published_segment_whitelist_ids,
     _recover_orphaned_imports_if_safe,
     _remove_ring_entities,
+    _rotated_dispatch_installs,
     _run_sql_segment_ring,
+    _scheduler_host_slots_available,
     _segment_sql_active_db_rebuild_query_count,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
@@ -63,6 +65,22 @@ class CampaignRingDispatchTests(unittest.TestCase):
         advance_ring_after_launch(ring, 3, remove_on_launch=True)
 
         self.assertEqual(list(ring), [4, 5])
+
+    def test_host_scheduler_limit_counts_tasks_across_instance_roots(self) -> None:
+        running = {
+            "a": SimpleNamespace(root="/var/www/a", task_type="segment"),
+            "b": SimpleNamespace(root="/var/www/b", task_type="campaign_trigger"),
+        }
+        cfg = SimpleNamespace(scheduler_host_max_parallel=2)
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running), 0)
+
+    def test_dispatch_rotation_changes_first_instance_each_tick(self) -> None:
+        installs = ["a", "b", "c"]
+
+        self.assertEqual(_rotated_dispatch_installs(installs, 0), ["a", "b", "c"])
+        self.assertEqual(_rotated_dispatch_installs(installs, 1), ["b", "c", "a"])
+        self.assertEqual(_rotated_dispatch_installs(installs, 4), ["b", "c", "a"])
 
     def test_fill_from_ring_skips_stale_campaign_without_launching(self) -> None:
         ring = deque([136])

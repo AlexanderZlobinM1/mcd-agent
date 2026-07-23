@@ -116,6 +116,9 @@ host_pressure_php_stuck_pause_threshold = 8
 host_pressure_swap_level_pause_threshold = 2
 # Max concurrent generic jobs (from [[jobs]]).
 jobs_max_workers = 2
+# Global MCD command cap across every instance root on this host.
+# 0 keeps the legacy unlimited fallback; MCC hardware profiles set this value.
+scheduler_host_max_parallel = 0
 
 # Segment ids forced to priority ring.
 segment_whitelist = []

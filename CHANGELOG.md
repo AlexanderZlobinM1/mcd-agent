@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.258 - 2026-07-23
+- Added: MCC hardware profiles now provide a host-wide scheduler concurrency
+  budget derived from vCPU and RAM, while explicit per-host runtime overrides
+  remain authoritative.
+- Fixed: scheduler task limits are enforced across all Mautic instances on a
+  host instead of being multiplied by the number of instance roots.
+- Changed: multi-instance dispatch rotates the first instance on every tick so
+  available host slots are distributed fairly instead of consistently
+  favoring the first inventory entries.
+
 ## 0.9.257 - 2026-07-23
 - Fixed: command execution now ignores an instance `.mcd/php` wrapper when it
   is missing or is not safely executable by the managed instance user, and
