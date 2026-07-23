@@ -420,15 +420,22 @@ def apply_instance_runtime(
                     actions.append(f"pool_removed:{slug}:{version}")
                 wrapper_dir = GENERATED_ROOT / "instances" / slug
                 wrapper_path = wrapper_dir / "php"
-                if _write_if_changed(
+                wrapper_written = _write_if_changed(
                     wrapper_path,
                     _wrapper_script(version, inst, slug),
                     backup_dir,
                     snapshots,
-                ):
+                )
+                wrapper_mode_repaired = False
+                if wrapper_path.is_file() and (wrapper_path.stat().st_mode & 0o777) != 0o755:
                     wrapper_path.chmod(0o755)
+                    wrapper_mode_repaired = True
+                if wrapper_written:
                     changed = True
                     actions.append(f"wrapper:{slug}:{version}")
+                elif wrapper_mode_repaired:
+                    changed = True
+                    actions.append(f"wrapper_mode:{slug}:{version}")
                 instance_wrapper = Path(inst.root) / ".mcd" / "php"
                 instance_wrapper.parent.mkdir(parents=True, exist_ok=True)
                 if instance_wrapper.exists() or instance_wrapper.is_symlink():

@@ -114,7 +114,13 @@ def render_mautic_command(
 
 def _resolve_instance_php_bin(*, root: str, php_bin: str) -> str:
     wrapper = Path(root) / ".mcd" / "php"
-    if not wrapper.exists():
+    try:
+        wrapper_usable = (
+            wrapper.is_file() and (wrapper.stat().st_mode & 0o005) == 0o005
+        )
+    except OSError:
+        wrapper_usable = False
+    if not wrapper_usable:
         return php_bin
     requested = Path(str(php_bin or "")).name
     if requested and not requested.startswith("php"):
