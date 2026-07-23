@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.257 - 2026-07-23
+- Fixed: command execution now ignores an instance `.mcd/php` wrapper when it
+  is missing or is not safely executable by the managed instance user, and
+  falls back to the configured PHP binary instead of failing every Mautic
+  scheduler command.
+- Fixed: `instance-runtime apply` restores generated PHP CLI wrappers to
+  `0755` even when their contents are already current, repairing permission
+  drift without rewriting the wrapper or creating an unnecessary snapshot.
+
 ## 0.9.256 - 2026-07-22
 - Fixed: a `midi` host carrying the exact legacy single-ring runtime snapshot
   now restores the canonical dual-ring `3+1` segment and campaign topology.

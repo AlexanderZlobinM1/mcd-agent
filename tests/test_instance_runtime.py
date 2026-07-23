@@ -159,6 +159,9 @@ server {{
                 snapshots_after_first = sorted(path.name for path in backups.iterdir())
                 second = instance_runtime.apply_instance_runtime([inst], reload_services=False)
                 snapshots_after_second = sorted(path.name for path in backups.iterdir())
+                wrapper = generated / "instances" / "merkurosiguranje" / "php"
+                wrapper.chmod(0o600)
+                repaired = instance_runtime.apply_instance_runtime([inst], reload_services=False)
 
             self.assertEqual(first["status"], "ok")
             self.assertTrue(first["changed"])
@@ -167,6 +170,9 @@ server {{
             self.assertFalse(second["changed"])
             self.assertEqual(second["backup_dir"], "")
             self.assertEqual(snapshots_after_second, snapshots_after_first)
+            self.assertTrue(repaired["changed"])
+            self.assertEqual(wrapper.stat().st_mode & 0o777, 0o755)
+            self.assertIn("wrapper_mode:merkurosiguranje:8.3", repaired["actions"])
 
     def test_prunes_only_timestamped_runtime_backups(self) -> None:
         with tempfile.TemporaryDirectory() as td:

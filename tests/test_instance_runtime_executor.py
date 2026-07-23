@@ -31,6 +31,26 @@ class InstanceRuntimeExecutorTest(unittest.TestCase):
 
         self.assertEqual(cmd[0], str(wrapper))
 
+    def test_falls_back_when_instance_php_wrapper_is_not_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "bin").mkdir()
+            (root / "bin" / "console").write_text("#!/usr/bin/env php\n", encoding="utf-8")
+            wrapper = root / ".mcd" / "php"
+            wrapper.parent.mkdir()
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+
+            cmd = build_mautic_exec_args(
+                php_bin="/usr/bin/php",
+                root=str(root),
+                command="cache:clear",
+                instance_id=None,
+                run_as_user=None,
+            )
+
+        self.assertEqual(cmd[0], "/usr/bin/php")
+
     def test_campaign_shorthand_uses_native_plural_mautic_commands(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
