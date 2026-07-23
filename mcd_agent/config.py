@@ -1746,6 +1746,44 @@ def _auto_migrate_legacy_sql_defaults(config_path: str) -> int:
     return changed
 
 
+def _canonicalize_config_text_for_drift_check(text: str) -> str:
+    """
+    Apply the same nonsemantic config migrations used during load_config.
+
+    MCC desired config can lag behind an agent release. A newer agent may
+    rewrite old defaults on disk during load_config, after which raw SHA
+    comparison would otherwise trigger an endless recover/rewrite loop.
+    """
+    out, _removed = _remove_section_keys_text(text, "runtime", set(LEGACY_RUNTIME_KEYS))
+    out, _changed = _replace_section_string_defaults_text(
+        out,
+        "sql",
+        {
+            "segments_due": (
+                _is_legacy_segments_due_sql,
+                _DEFAULT_SQL_SEGMENTS_DUE,
+            ),
+            "campaigns_due": (
+                _is_legacy_campaigns_due_sql,
+                _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+            ),
+            "campaign_triggers_due": (
+                _is_legacy_campaigns_due_sql,
+                _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+            ),
+            "campaign_rebuilds_due": (
+                _is_legacy_campaign_rebuilds_due_sql,
+                _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE,
+            ),
+            "import_pending_count": (
+                _is_legacy_import_pending_count_sql,
+                _DEFAULT_SQL_IMPORT_PENDING_COUNT,
+            ),
+        },
+    )
+    return out
+
+
 def _strip_legacy_runtime_keys(runtime: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     out = dict(runtime)
     removed: list[str] = []
@@ -1909,10 +1947,21 @@ def check_profile_drift_with_mcc(
     }
     if current_cfg_sha:
         out["current_config_sha256"] = current_cfg_sha or None
-    if desired_profile and current_profile_n and desired_profile != current_profile_n:
+    profile_mismatch = bool(desired_profile and current_profile_n and desired_profile != current_profile_n)
+    config_sha_mismatch = bool(desired_cfg_sha and current_cfg_sha and desired_cfg_sha != current_cfg_sha)
+    if profile_mismatch:
         out["status"] = "drift"
         out["reason"] = "profile_mismatch"
-    if desired_cfg_sha and current_cfg_sha and desired_cfg_sha != current_cfg_sha:
+
+    if config_sha_mismatch and desired_cfg_text:
+        canonical_desired_cfg = _canonicalize_config_text_for_drift_check(desired_cfg_text)
+        canonical_desired_sha = hashlib.sha256(canonical_desired_cfg.encode("utf-8")).hexdigest()
+        out["canonical_desired_config_sha256"] = canonical_desired_sha
+        if canonical_desired_sha == current_cfg_sha:
+            out["config_sha_mismatch_ignored"] = "local_auto_migration"
+            return out
+
+    if config_sha_mismatch:
         out["status"] = "drift"
         out["reason"] = "config_sha_mismatch"
     return out

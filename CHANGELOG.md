@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.259 - 2026-07-23
+- Fixed: MCC profile guard now treats local automatic config migrations of
+  legacy SQL/runtime defaults as non-drift. This prevents a stale desired
+  config from causing repeated recoveries and daemon restarts when the selected
+  profile is already correct.
+
 ## 0.9.258 - 2026-07-23
 - Added: MCC hardware profiles now provide a host-wide scheduler concurrency
   budget derived from vCPU and RAM, while explicit per-host runtime overrides
