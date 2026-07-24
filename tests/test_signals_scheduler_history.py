@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcd_agent.signals import _shadow_running_tasks, _swap_signal, collect_monitor_signals, collect_signals
+from mcd_agent.signals import _ps_console_processes, _shadow_running_tasks, _swap_signal, collect_monitor_signals, collect_signals
 
 
 class SignalsSchedulerHistoryTests(unittest.TestCase):
@@ -260,6 +260,50 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
         self.assertEqual(scheduler["planned"][0]["running"], [51])
         self.assertEqual(scheduler["planned"][0]["item_variants"], {"sql": [73]})
         self.assertEqual(payload["details"]["php_console_recent"], [])
+
+    def test_monitor_snapshot_filters_stale_running_state_against_live_php(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE tasks (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  root TEXT NOT NULL, task_key TEXT NOT NULL, task_type TEXT NOT NULL,
+                  entity_id INTEGER, command_str TEXT NOT NULL, pid INTEGER NOT NULL,
+                  timeout_sec INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 1,
+                  state TEXT NOT NULL, note TEXT, started_at REAL NOT NULL,
+                  finished_at REAL, rc INTEGER, manual_request_id INTEGER
+                )
+                """
+            )
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO tasks(root, task_key, task_type, entity_id, command_str, pid, timeout_sec, state, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("/var/www/mautic", "root|segment|61", "segment", 61, "sudo php console", 1001, 0, "running", now - 5),
+            )
+            conn.commit()
+            conn.close()
+            cfg = type("Cfg", (), {"state_db_path": str(db_path)})()
+            live = [{"pid": 2001, "elapsed_sec": 5, "args": "/usr/bin/php /var/www/mautic/bin/console mautic:segments:update -i 61"}]
+            payload = _shadow_running_tasks(cfg, live_console_rows=live)
+
+        self.assertEqual(payload["tracked_total"], 1)
+        self.assertEqual(payload["sample"][0]["pid"], 2001)
+
+    def test_php_console_snapshot_excludes_sudo_launcher(self) -> None:
+        ps_output = """\
+100 5 sudo -u www-data /usr/bin/php /var/www/mautic/bin/console mautic:segments:update -i 61
+101 5 /usr/bin/php /var/www/mautic/bin/console mautic:segments:update -i 61
+"""
+        completed = type("Completed", (), {"returncode": 0, "stdout": ps_output})()
+        with patch("mcd_agent.signals.subprocess.run", return_value=completed):
+            rows = _ps_console_processes()
+
+        self.assertEqual([row["pid"] for row in rows], [101])
 
 
 if __name__ == "__main__":

@@ -120,6 +120,11 @@ def _ps_console_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
             continue
         args = str(parts[2] or "").strip()
         lower = args.lower()
+        # MCD launches Mautic under sudo. `ps` exposes both the launcher and
+        # the PHP child; only the child is a console worker.
+        executable = Path(args.split(None, 1)[0]).name.lower() if args else ""
+        if executable == "sudo":
+            continue
         if "php" not in lower or "console" not in lower:
             continue
         if "mautic:" not in lower and "messenger:" not in lower and "pagehit:" not in lower:
@@ -129,7 +134,52 @@ def _ps_console_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
     return out
 
 
-def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
+def _scheduler_task_identity(root: object, task_type: object, entity_id: object) -> tuple[str, str, int | None]:
+    normalized_root = str(root or "").strip()
+    raw_type = str(task_type or "").strip().lower()
+    if raw_type in {"segment", "segment_update", "segment_sql"}:
+        normalized_type = "segment"
+    elif raw_type in {"campaign_rebuild", "campaigns_rebuild", "campaign_rebuild_sql"}:
+        normalized_type = "campaign_rebuild"
+    elif raw_type in {"campaign_trigger", "campaigns_trigger"}:
+        normalized_type = "campaign_trigger"
+    elif raw_type in {"import", "import_run"}:
+        normalized_type = "import"
+    else:
+        normalized_type = raw_type
+    try:
+        normalized_entity = int(entity_id) if entity_id is not None else None
+    except Exception:
+        normalized_entity = None
+    return normalized_root, normalized_type, normalized_entity
+
+
+def _console_task_identity(args: object) -> tuple[str, str, int | None] | None:
+    command = str(args or "").strip()
+    root_match = re.search(r"(?P<root>[^\s]+)/(?:(?:bin)|(?:app))/console\b", command)
+    if not root_match:
+        return None
+    lower = command.lower()
+    if "mautic:segments:update" in lower:
+        task_type = "segment"
+    elif "mautic:campaigns:rebuild" in lower:
+        task_type = "campaign_rebuild"
+    elif "mautic:campaigns:trigger" in lower:
+        task_type = "campaign_trigger"
+    elif "mautic:import" in lower:
+        task_type = "import"
+    else:
+        return None
+    entity_match = re.search(r"(?:\s-i\s+|\s--id=)(\d+)\b", command)
+    entity_id = int(entity_match.group(1)) if entity_match else None
+    return _scheduler_task_identity(root_match.group("root"), task_type, entity_id)
+
+
+def _shadow_running_tasks(
+    cfg: AgentConfig | None,
+    *,
+    live_console_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if cfg is None:
         return _empty_scheduler_shadow()
     db_path = str(getattr(cfg, "state_db_path", "") or "").strip()
@@ -183,11 +233,25 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
             conn.close()
         except Exception:
             pass
+    live_by_identity: dict[tuple[str, str, int | None], dict[str, Any]] = {}
+    if live_console_rows is not None:
+        for console_row in live_console_rows:
+            identity = _console_task_identity(console_row.get("args"))
+            if identity is not None:
+                live_by_identity[identity] = console_row
+
     by_type: dict[str, int] = {}
     key_counts: dict[str, int] = {}
     sample: list[dict[str, Any]] = []
     for row in rows:
         task_type = str(row["task_type"] or "").strip() or "unknown"
+        live_row: dict[str, Any] | None = None
+        if live_console_rows is not None:
+            live_row = live_by_identity.get(_scheduler_task_identity(row["root"], task_type, row["entity_id"]))
+            if live_row is None:
+                # State DB rows may survive until the daemon's next loop. A
+                # live process snapshot is authoritative for monitoring.
+                continue
         by_type[task_type] = int(by_type.get(task_type, 0) or 0) + 1
         task_key = str(row["task_key"] or "").strip()
         if task_key:
@@ -199,7 +263,7 @@ def _shadow_running_tasks(cfg: AgentConfig | None) -> dict[str, Any]:
                     "root": str(row["root"] or "").strip(),
                     "task_type": task_type,
                     "entity_id": int(row["entity_id"]) if row["entity_id"] is not None else None,
-                    "pid": int(row["pid"] or 0),
+                    "pid": int((live_row or row)["pid"] or 0),
                     "started_at": float(row["started_at"] or 0.0),
                 }
             )
@@ -466,7 +530,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
     console_rows = _ps_console_processes()
     php_stuck_sec = max(60, int(getattr(cfg, "php_console_stuck_sec", 1800) or 1800))
     console_stuck = [row for row in console_rows if int(row.get("elapsed_sec", 0) or 0) >= php_stuck_sec]
-    scheduler_shadow = _shadow_running_tasks(cfg)
+    scheduler_shadow = _shadow_running_tasks(cfg, live_console_rows=console_rows)
     tracked_total = int(scheduler_shadow.get("tracked_total", 0) or 0)
     duplicate_task_keys = int(scheduler_shadow.get("duplicate_task_keys", 0) or 0)
     live_console_total = len(console_rows)
@@ -592,7 +656,8 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
 
 
 def collect_monitor_signals(cfg: AgentConfig | None = None) -> dict[str, object]:
-    scheduler_shadow = _shadow_running_tasks(cfg)
+    console_rows = _ps_console_processes()
+    scheduler_shadow = _shadow_running_tasks(cfg, live_console_rows=console_rows)
     return {
         "monitor_only": True,
         "collected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -605,7 +670,7 @@ def collect_monitor_signals(cfg: AgentConfig | None = None) -> dict[str, object]
                 "recent": scheduler_shadow.get("recent", []),
                 "planned": scheduler_shadow.get("planned", []),
             },
-            "php_console_recent": _ps_console_processes()[:20],
+            "php_console_recent": console_rows[:20],
         },
     }
 

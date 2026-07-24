@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.264 - 2026-07-24
+- Fixed: scheduler monitoring now treats a task as processing only when its
+  matching Mautic PHP console process is live. Stale state-db and plan entries
+  no longer appear as active work.
+- Fixed: monitoring excludes the `sudo` launcher parent, so a Mautic command
+  is counted once instead of as both `sudo` and PHP.
+
 ## 0.9.263 - 2026-07-24
 - Fixed: cleanup now finds and removes known MCD-only `.mcd` directories under
   `/var/www` even when their legacy root is no longer present in MCD inventory.
