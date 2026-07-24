@@ -17,6 +17,7 @@ NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 GENERATED_ROOT = Path("/opt/mcd/generated")
 BACKUP_ROOT = Path("/var/backups/mcd-instance-runtime")
+LEGACY_INSTANCE_SEARCH_ROOTS = (Path("/var/www"),)
 BACKUP_KEEP = 20
 BACKUP_PRUNE_LIMIT = 200
 
@@ -292,6 +293,29 @@ def _cleanup_legacy_instance_mcd_dir(
     return actions
 
 
+def _cleanup_all_legacy_instance_mcd_dirs(
+    installs: list[MauticInstall],
+    backup_dir: Path,
+    snapshots: dict[Path, _Snapshot],
+) -> list[str]:
+    candidates = {Path(inst.root) / ".mcd" for inst in installs if str(inst.root or "").strip()}
+    for search_root in LEGACY_INSTANCE_SEARCH_ROOTS:
+        if not search_root.is_dir():
+            continue
+        try:
+            candidates.update(path for path in search_root.rglob(".mcd") if path.is_dir() and not path.is_symlink())
+        except OSError:
+            continue
+    actions: list[str] = []
+    for legacy_dir in sorted(candidates, key=str):
+        root = legacy_dir.parent
+        inst = next((item for item in installs if Path(item.root) == root), None)
+        if inst is None:
+            inst = MauticInstall(instance_uid=str(root), name=root.name, root=str(root), console_path="")
+        actions.extend(_cleanup_legacy_instance_mcd_dir(inst, backup_dir, snapshots))
+    return actions
+
+
 def _cleanup_legacy_generated_wrappers(
     backup_dir: Path,
     snapshots: dict[Path, _Snapshot],
@@ -426,6 +450,11 @@ def apply_instance_runtime(
             if wrapper_actions:
                 changed = True
                 actions.extend(wrapper_actions)
+        if not dry_run:
+            legacy_actions = _cleanup_all_legacy_instance_mcd_dirs(selected, backup_dir, snapshots)
+            if legacy_actions:
+                changed = True
+                actions.extend(legacy_actions)
         for inst in selected:
             slug = _pool_slug(inst)
             matched = [p for p in _active_nginx_files() if _nginx_file_matches_instance(p, inst)]
@@ -452,10 +481,6 @@ def apply_instance_runtime(
             results.append(row)
             if dry_run:
                 continue
-            legacy_actions = _cleanup_legacy_instance_mcd_dir(inst, backup_dir, snapshots)
-            if legacy_actions:
-                changed = True
-                actions.extend(legacy_actions)
             for version in sorted(inst_versions):
                 fpm_versions.add(version)
                 if _cleanup_instance_pool(version, slug, backup_dir, snapshots):

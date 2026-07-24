@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.9.263 - 2026-07-24
+- Fixed: cleanup now finds and removes known MCD-only `.mcd` directories under
+  `/var/www` even when their legacy root is no longer present in MCD inventory.
+
 ## 0.9.262 - 2026-07-24
 - Fixed: migration away from the retired per-instance Zabbix Mautic-version
   probe also removes its old inactive `mautic.conf.mcd-bak` file.

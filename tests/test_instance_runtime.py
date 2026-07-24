@@ -119,6 +119,26 @@ server {{
             self.assertIn("fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
             self.assertFalse((inst_root / ".mcd").exists())
 
+    def test_removes_orphan_mcd_dir_under_managed_web_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            web_root = base / "var" / "www"
+            orphan = web_root / "retired-site" / "public_html" / ".mcd"
+            orphan.mkdir(parents=True)
+            (orphan / "php").write_text("#!/bin/sh\n", encoding="utf-8")
+            backups = base / "backups"
+
+            with (
+                patch.object(instance_runtime, "BACKUP_ROOT", backups),
+                patch.object(instance_runtime, "LEGACY_INSTANCE_SEARCH_ROOTS", (web_root,)),
+                patch.object(instance_runtime, "_run", self._fake_run),
+            ):
+                payload = instance_runtime.apply_instance_runtime([], reload_services=False)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["changed"])
+            self.assertFalse(orphan.exists())
+
     def test_idempotent_apply_does_not_create_another_backup_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
