@@ -22,10 +22,10 @@ def mautic_local_datetime(now_utc: datetime, mautic_timezone: str | None) -> dat
 def campaign_sql_time_context(now_utc: datetime, mautic_timezone: str | None) -> dict[str, str]:
     """Build SQL placeholders without hard-coded timezone offsets.
 
-    Mautic campaign DATETIME columns are stored without timezone metadata and
-    installations differ between UTC and instance-local storage depending on
-    Mautic/DB/PHP runtime history. Expose both clocks so SQL can be tolerant
-    without hard-coded hour offsets.
+    Mautic's Doctrine ``datetime`` mapping persists campaign timestamps in UTC,
+    including campaign windows, event trigger dates, and event-log timestamps.
+    ``now_local`` remains available for explicitly local custom templates, but
+    native campaign due SQL must compare those UTC columns with ``now_utc``.
     """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)

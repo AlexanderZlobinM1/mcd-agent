@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.260 - 2026-07-24
+- Fixed: campaign scheduling now compares Mautic's UTC campaign windows,
+  event trigger dates, and event-log timestamps only with UTC. This prevents
+  a non-UTC host from treating a scheduled campaign as due by its local clock
+  and launching native Mautic processing early.
+- Fixed: persisted dual-clock campaign SQL templates migrate to the UTC-only
+  defaults, including per-campaign trigger guards.
+
 ## 0.9.259 - 2026-07-23
 - Fixed: MCC profile guard now treats local automatic config migrations of
   legacy SQL/runtime defaults as non-drift. This prevents a stale desired
