@@ -226,17 +226,15 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "SELECT c.id "
     "FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "  AND EXISTS ("
     "  SELECT 1 "
     "  FROM {prefix}campaign_lead_event_log el "
     "  WHERE el.campaign_id = c.id "
     "    AND el.is_scheduled = 1 "
     "    AND ("
-    "      (el.trigger_date IS NOT NULL AND ("
-    "        (el.trigger_date <= '{now_utc}' OR el.trigger_date <= '{now_local}') "
-    "      )) "
+    "      (el.trigger_date IS NOT NULL AND el.trigger_date <= '{now_utc}') "
     "      OR el.trigger_date IS NULL"
     "    ) "
     "  LIMIT 1"
@@ -245,8 +243,8 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "SELECT c.id "
     "FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "  AND EXISTS ("
     "  SELECT 1 "
     "  FROM {prefix}campaign_events d "
@@ -273,7 +271,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "      OR ("
     "        ce.trigger_mode = 'date' "
     "        AND ce.trigger_date IS NOT NULL "
-    "        AND (ce.trigger_date <= '{now_utc}' OR ce.trigger_date <= '{now_local}')"
+    "        AND ce.trigger_date <= '{now_utc}'"
     "      ) "
     "      OR ("
     "        ce.trigger_mode = 'interval' "
@@ -285,15 +283,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "          WHEN 'm' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MONTH) "
     "          WHEN 'y' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) YEAR) "
     "          ELSE DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
-    "        END) <= '{now_utc}' OR "
-    "        (CASE LOWER(COALESCE(ce.trigger_interval_unit, 'd')) "
-    "          WHEN 'i' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MINUTE) "
-    "          WHEN 'h' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) HOUR) "
-    "          WHEN 'd' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
-    "          WHEN 'm' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) MONTH) "
-    "          WHEN 'y' THEN DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) YEAR) "
-    "          ELSE DATE_ADD(parent_log.date_triggered, INTERVAL COALESCE(ce.trigger_interval, 0) DAY) "
-    "        END) <= '{now_local}'"
+    "        END) <= '{now_utc}'"
     "      )"
     "    ) "
     "    AND NOT EXISTS ("
@@ -311,8 +301,8 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "SELECT c.id "
     "FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "  AND EXISTS ("
     "  SELECT 1 "
     "  FROM {prefix}campaign_events ce "
@@ -329,7 +319,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "      OR ("
     "        ce.trigger_mode = 'date' "
     "        AND ce.trigger_date IS NOT NULL "
-    "        AND (ce.trigger_date <= '{now_utc}' OR ce.trigger_date <= '{now_local}')"
+    "        AND ce.trigger_date <= '{now_utc}'"
     "      )"
     "    ) "
     "    AND NOT EXISTS ("
@@ -351,8 +341,8 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "  SELECT c.id "
     "  FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "  AND EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_leadlist_xref cx0 "
@@ -396,8 +386,8 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "  SELECT c.id "
     "  FROM {prefix}campaigns c "
     "  WHERE c.is_published = 1 "
-    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "  AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "  AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "  AND EXISTS ("
     "    SELECT 1 "
     "    FROM {prefix}campaign_leadlist_xref cx0 "
@@ -416,10 +406,7 @@ _DEFAULT_SQL_CAMPAIGN_REBUILDS_DUE = (
     "      AND ce.parent_id IS NOT NULL "
     "      AND ce.trigger_mode = 'date' "
     "      AND ce.trigger_date IS NOT NULL "
-    "      AND ("
-    "        ce.trigger_date <= '{now_utc}' "
-    "        OR ce.trigger_date <= '{now_local}'"
-    "      ) "
+    "      AND ce.trigger_date <= '{now_utc}' "
     "      AND NOT EXISTS ("
     "        SELECT 1 "
     "        FROM {prefix}campaign_lead_event_log el3 "
@@ -1238,7 +1225,7 @@ def _normalize_sql_signature(value: object) -> str:
 def _sql_branch_missing_publish_down(normalized: str, signatures: tuple[str, ...]) -> bool:
     for branch in normalized.split(" union "):
         if all(sig in branch for sig in signatures):
-            if "c.publish_down is null or c.publish_down >= '{now_local}'" not in branch:
+            if "c.publish_down is null or c.publish_down >= '{now_utc}'" not in branch:
                 return True
     return False
 
@@ -1296,11 +1283,12 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
     )
     if all(sig in normalized for sig in old_event_log_lower_bound):
         return True
-    old_event_log_utc_only_semantics = (
+    dual_clock_event_log_semantics = (
         "{prefix}campaign_lead_event_log el",
         "el.trigger_date <= '{now_utc}'",
+        "el.trigger_date <= '{now_local}'",
     )
-    if all(sig in normalized for sig in old_event_log_utc_only_semantics) and "el.trigger_date <= '{now_local}'" not in normalized:
+    if all(sig in normalized for sig in dual_clock_event_log_semantics):
         return True
     old_campaign_event_lower_bound = (
         "{prefix}campaign_events ce",
@@ -1389,10 +1377,10 @@ def _is_legacy_campaign_rebuilds_due_sql(value: object) -> bool:
         "{prefix}campaign_events ce",
         "ce.trigger_mode = 'date'",
         "ce.trigger_date <= '{now_utc}'",
-        "c.publish_down is null or c.publish_down >= '{now_local}'",
+        "c.publish_down is null or c.publish_down >= '{now_utc}'",
         "el3.rotation <=> cld.rotation",
     )
-    if all(sig in normalized for sig in signatures):
+    if all(sig in normalized for sig in signatures) and "ce.trigger_date <= '{now_local}'" in normalized:
         return True
     old_rebuild_event_lower_bound = (
         "{prefix}campaign_events ce",
