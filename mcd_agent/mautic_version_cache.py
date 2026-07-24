@@ -261,6 +261,10 @@ def retire_zabbix_mautic_version_userparameter() -> dict[str, Any]:
         if _ZABBIX_HELPER_PATH.exists():
             _ZABBIX_HELPER_PATH.unlink()
             changed = True
+        legacy_backup = _ZABBIX_CONF_PATH.with_suffix(_ZABBIX_CONF_PATH.suffix + ".mcd-bak")
+        if legacy_backup.exists():
+            legacy_backup.unlink()
+            changed = True
     except OSError as exc:
         return {"status": "error", "reason": str(exc), "changed": changed}
     if not changed:

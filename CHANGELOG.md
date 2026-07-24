@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.9.262 - 2026-07-24
+- Fixed: migration away from the retired per-instance Zabbix Mautic-version
+  probe also removes its old inactive `mautic.conf.mcd-bak` file.
+
 ## 0.9.261 - 2026-07-24
 - Fixed: MCD now always runs Mautic console commands through the configured
   host PHP binary and never creates or executes `{instance}/.mcd/php`.
