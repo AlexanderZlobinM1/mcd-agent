@@ -64,11 +64,8 @@ from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
 from mcd_agent.grapesjs_ckeditor_patch import ensure_grapesjs_ckeditor_gpl_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
+from mcd_agent.mautic_version_cache import retire_zabbix_mautic_version_userparameter
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
-from mcd_agent.mautic_version_cache import (
-    install_zabbix_mautic_version_userparameter,
-    refresh_mautic_version_cache,
-)
 from mcd_agent.mode import (
     reconcile_empty_leads_cleanup_cron,
     reconcile_managed_cron,
@@ -370,7 +367,6 @@ _EXTERNAL_TASK_TYPES = {
     "mautic:campaigns:update": "campaign_rebuild",
 }
 _EXTERNAL_PROCESS_WRAPPERS = {"sudo", "timeout", "bash", "sh", "setsid", "nohup"}
-_ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC = 3600
 
 
 @dataclass(frozen=True)
@@ -6261,47 +6257,6 @@ def _dispatch_manual_requests_for_root(
         )
 
 
-def _zabbix_agent2_present() -> bool:
-    return (
-        Path("/etc/zabbix/zabbix_agent2.conf").exists()
-        or Path("/etc/zabbix/zabbix_agent2.d").exists()
-        or Path("/usr/sbin/zabbix_agent2").exists()
-        or Path("/usr/bin/zabbix_agent2").exists()
-    )
-
-
-def _ensure_zabbix_mautic_version_cache_guard(config: AgentConfig, installs: list[object]) -> None:
-    if not _zabbix_agent2_present():
-        return
-    install_res = install_zabbix_mautic_version_userparameter(restart_service=False)
-    actions_raw = install_res.get("actions") if isinstance(install_res, dict) else []
-    actions = [str(x) for x in actions_raw] if isinstance(actions_raw, list) else []
-    changed = any(action.startswith("userparameter:") for action in actions)
-    refresh_res = refresh_mautic_version_cache(installs, config.php_bin, run_as_user=config.mautic_run_as_user)
-    if changed:
-        try:
-            proc = subprocess.run(
-                ["systemctl", "restart", "zabbix-agent2"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if proc.returncode == 0:
-                logging.info(
-                    "zabbix mautic.version cache guard repaired UserParameter; caches_updated=%s",
-                    int(refresh_res.get("updated", 0) or 0) if isinstance(refresh_res, dict) else 0,
-                )
-            else:
-                msg = (proc.stderr or proc.stdout or "restart failed").strip()
-                logging.warning("zabbix mautic.version cache guard restart failed: %s", msg[:500])
-        except Exception as e:
-            logging.warning("zabbix mautic.version cache guard restart failed: %s", e)
-    else:
-        updated = int(refresh_res.get("updated", 0) or 0) if isinstance(refresh_res, dict) else 0
-        if updated:
-            logging.debug("zabbix mautic.version cache guard refreshed caches=%s", updated)
-
-
 def _refresh_instance_db_maps(
     installs: list[object],
     db_configs_by_root: dict[str, object],
@@ -6389,6 +6344,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     _sync_segment_whitelist_file(config, installs)
     _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
     _apply_instance_runtime_guard(installs, reason="startup")
+    retired_zabbix_probe = retire_zabbix_mautic_version_userparameter()
+    if bool(retired_zabbix_probe.get("changed", False)):
+        logging.info("retired per-instance Zabbix mautic.version probe")
+    elif str(retired_zabbix_probe.get("status", "ok")) == "error":
+        logging.warning("could not retire per-instance Zabbix mautic.version probe: %s", retired_zabbix_probe.get("reason", "unknown"))
     segment_sql_rings: dict[str, deque[int]] = {}
     segment_sql_rules_by_root: dict[str, dict[int, SQLSegmentRule]] = {}
     segment_sql_active_sets: dict[str, set[int]] = {}
@@ -6479,7 +6439,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_service_profile_apply_at = 0.0
     next_backup_profile_sync_at = 0.0
     next_backup_storage_probe_at = 0.0
-    next_zabbix_version_cache_guard_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     next_managed_cron_reconcile_at = 0.0
     next_viber_cron_reconcile_at = 0.0
@@ -6710,13 +6669,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             except Exception as e:
                 logging.warning("backup-profile sync from config failed: %s", e)
             next_backup_profile_sync_at = now + 60.0
-
-        if now >= next_zabbix_version_cache_guard_at:
-            try:
-                _ensure_zabbix_mautic_version_cache_guard(config, installs)
-            except Exception as e:
-                logging.warning("zabbix mautic.version cache guard failed: %s", e)
-            next_zabbix_version_cache_guard_at = now + _ZABBIX_VERSION_CACHE_GUARD_INTERVAL_SEC
 
         if config.backup_enabled and now >= next_backup_storage_probe_at:
             probe_allowed, probe_skip_reason = _backup_storage_probe_allowed(config)

@@ -11,7 +11,7 @@ from mcd_agent.executor import build_mautic_exec_args
 
 
 class InstanceRuntimeExecutorTest(unittest.TestCase):
-    def test_uses_instance_php_wrapper_when_present(self) -> None:
+    def test_uses_configured_php_even_when_legacy_wrapper_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "bin").mkdir()
@@ -29,7 +29,7 @@ class InstanceRuntimeExecutorTest(unittest.TestCase):
                 run_as_user=None,
             )
 
-        self.assertEqual(cmd[0], str(wrapper))
+        self.assertEqual(cmd[0], "/usr/bin/php")
 
     def test_falls_back_when_instance_php_wrapper_is_not_executable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
