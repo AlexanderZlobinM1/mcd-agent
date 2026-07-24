@@ -104,10 +104,6 @@ from mcd_agent.mautic6_core_patch import (
     revert_m6_plugin_update_metadata_patch,
 )
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
-from mcd_agent.mautic_version_cache import (
-    discover_and_refresh_mautic_version_cache,
-    install_zabbix_mautic_version_userparameter,
-)
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
 from mcd_agent.nginx_baseline import ensure_nginx_baseline
@@ -1792,8 +1788,6 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "status",
             "bootstrap-mysql-user",
-            "refresh-mautic-version-cache",
-            "install-mautic-version-cache",
         ],
         nargs="?",
         default="status",
@@ -2929,28 +2923,6 @@ def main() -> int:
             out = {"status": "ok", "zabbix_mysql_monitor": zbx_state}
             print(json.dumps(out, ensure_ascii=True, indent=2))
             return 0
-
-        if op == "refresh-mautic-version-cache":
-            out = discover_and_refresh_mautic_version_cache(cfg)
-            print(json.dumps(out, ensure_ascii=True, indent=2))
-            return 0 if str(out.get("status", "")).lower() == "ok" else 1
-
-        if op == "install-mautic-version-cache":
-            install_res = install_zabbix_mautic_version_userparameter(restart_service=not bool(args.no_restart))
-            refresh_res = discover_and_refresh_mautic_version_cache(cfg)
-            out = {
-                "status": "ok"
-                if str(install_res.get("status", "")).lower() == "ok"
-                and str(refresh_res.get("status", "")).lower() == "ok"
-                else "error",
-                "install": install_res,
-                "refresh": refresh_res,
-            }
-            print(json.dumps(out, ensure_ascii=True, indent=2))
-            if out["status"] == "ok":
-                _push_state_after_change(cfg, "zabbix-mautic-version-cache")
-                return 0
-            return 1
 
         fetched = fetch_service_profile(cfg, "apt")
         profile = fetched.get("profile") if isinstance(fetched, dict) else None

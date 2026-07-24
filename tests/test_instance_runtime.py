@@ -27,7 +27,7 @@ class InstanceRuntimeTest(unittest.TestCase):
     def _fake_run(self, cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
 
-    def test_keeps_shared_fpm_socket_and_materializes_cli_wrapper(self) -> None:
+    def test_keeps_shared_fpm_socket_and_removes_legacy_runtime_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             php_etc = base / "etc" / "php"
@@ -39,6 +39,9 @@ class InstanceRuntimeTest(unittest.TestCase):
             sites_enabled.mkdir(parents=True)
             inst_root = base / "var" / "www" / "merkurosiguranje" / "public_html"
             inst = self._install(inst_root)
+            legacy_dir = inst_root / ".mcd"
+            legacy_dir.mkdir()
+            (legacy_dir / "php").write_text("#!/bin/sh\n", encoding="utf-8")
             vhost = sites_available / "merkurosiguranje.sales-snap.com.conf"
             vhost.write_text(
                 f"""
@@ -66,16 +69,12 @@ server {{
 
             self.assertEqual(payload["status"], "ok")
             self.assertTrue(payload["changed"])
-            wrapper = generated / "instances" / "merkurosiguranje" / "php"
-            instance_wrapper = inst_root / ".mcd" / "php"
             self.assertFalse((php_etc / "8.3" / "fpm" / "pool.d" / "99-mcd.conf").exists())
             self.assertFalse((php_etc / "8.3" / "fpm" / "pool.d" / "mcd").exists())
             self.assertFalse((generated / "php" / "8.3" / "fpm" / "pools" / "mcd-merkurosiguranje.conf").exists())
             self.assertIn("fastcgi_pass unix:/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
-            self.assertIn("-d date.timezone='Europe/Belgrade'", wrapper.read_text(encoding="utf-8"))
-            self.assertIn("-d memory_limit='-1'", wrapper.read_text(encoding="utf-8"))
-            self.assertTrue(instance_wrapper.is_symlink())
-            self.assertEqual(instance_wrapper.resolve(), wrapper.resolve())
+            self.assertFalse(legacy_dir.exists())
+            self.assertIn(f"legacy_mcd_removed:{inst_root}", payload["actions"])
 
     def test_detects_legacy_var_run_php_fpm_socket(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -115,10 +114,10 @@ server {{
                 payload = instance_runtime.apply_instance_runtime([inst], reload_services=False)
 
             self.assertEqual(payload["status"], "ok")
-            self.assertTrue(payload["changed"])
+            self.assertFalse(payload["changed"])
             self.assertEqual(payload["instances"][0]["php_versions"], ["8.3"])
             self.assertIn("fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;", vhost.read_text(encoding="utf-8"))
-            self.assertTrue((inst_root / ".mcd" / "php").is_symlink())
+            self.assertFalse((inst_root / ".mcd").exists())
 
     def test_idempotent_apply_does_not_create_another_backup_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -159,9 +158,6 @@ server {{
                 snapshots_after_first = sorted(path.name for path in backups.iterdir())
                 second = instance_runtime.apply_instance_runtime([inst], reload_services=False)
                 snapshots_after_second = sorted(path.name for path in backups.iterdir())
-                wrapper = generated / "instances" / "merkurosiguranje" / "php"
-                wrapper.chmod(0o600)
-                repaired = instance_runtime.apply_instance_runtime([inst], reload_services=False)
 
             self.assertEqual(first["status"], "ok")
             self.assertTrue(first["changed"])
@@ -170,9 +166,6 @@ server {{
             self.assertFalse(second["changed"])
             self.assertEqual(second["backup_dir"], "")
             self.assertEqual(snapshots_after_second, snapshots_after_first)
-            self.assertTrue(repaired["changed"])
-            self.assertEqual(wrapper.stat().st_mode & 0o777, 0o755)
-            self.assertIn("wrapper_mode:merkurosiguranje:8.3", repaired["actions"])
 
     def test_prunes_only_timestamped_runtime_backups(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -249,7 +242,7 @@ server {{
             self.assertEqual(payload["instances"][0]["php_versions"], ["8.4"])
             self.assertIn("nginx_shared:", " ".join(payload["actions"]))
             self.assertIn("fastcgi_pass unix:/run/php/php8.4-fpm.sock;", vhost.read_text(encoding="utf-8"))
-            self.assertTrue((inst_root / ".mcd" / "php").is_symlink())
+            self.assertFalse((inst_root / ".mcd").exists())
 
     def test_ignores_inactive_backup_nginx_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -320,7 +313,7 @@ server {{
             pool_link.symlink_to(pool_dir)
             wrapper = generated / "instances" / slug / "php"
             wrapper.parent.mkdir(parents=True)
-            wrapper.write_text(instance_runtime._wrapper_script("8.3", inst, slug), encoding="utf-8")
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o755)
             instance_wrapper = inst_root / ".mcd" / "php"
             instance_wrapper.parent.mkdir(parents=True)

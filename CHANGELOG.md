@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.261 - 2026-07-24
+- Fixed: MCD now always runs Mautic console commands through the configured
+  host PHP binary and never creates or executes `{instance}/.mcd/php`.
+  All PHP limits, upload settings, and timezone now come solely from the
+  host CLI `conf.d` configuration.
+- Changed: legacy MCD-only instance directories containing the former PHP
+  wrapper and version cache are migrated and removed; generated wrappers are
+  also cleaned from `/opt/mcd/generated/instances/`.
+- Changed: retired the per-instance Zabbix `mautic.version[*]` UserParameter.
+  Zabbix remains host monitoring only; MCD's non-migrated version cache lives
+  under `/opt/mcd/generated/mautic-version/`.
+
 ## 0.9.260 - 2026-07-24
 - Fixed: campaign scheduling now compares Mautic's UTC campaign windows,
   event trigger dates, and event-log timestamps only with UTC. This prevents

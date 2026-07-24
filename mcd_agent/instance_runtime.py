@@ -163,23 +163,6 @@ def _single_active_shared_php_version() -> str | None:
     return None
 
 
-def _wrapper_script(version: str, inst: MauticInstall, slug: str) -> str:
-    tz = _instance_timezone(inst)
-    php = shutil.which(f"php{version}") or f"/usr/bin/php{version}"
-    return f"""#!/bin/sh
-# Managed by MCD. Per-instance PHP CLI wrapper.
-exec {php} \\
-  -d date.timezone='{tz}' \\
-  -d memory_limit='-1' \\
-  -d max_execution_time='300' \\
-  -d max_input_time='300' \\
-  -d max_input_vars='5000' \\
-  -d upload_max_filesize='64M' \\
-  -d post_max_size='64M' \\
-  "$@"
-"""
-
-
 def _write_if_changed(
     path: Path,
     text: str,
@@ -278,6 +261,58 @@ def _remove_file_if_exists(path: Path, backup_dir: Path, snapshots: dict[Path, _
     _snapshot(path, backup_dir, snapshots)
     _unlink_path(path)
     return True
+
+
+def _cleanup_legacy_instance_mcd_dir(
+    inst: MauticInstall,
+    backup_dir: Path,
+    snapshots: dict[Path, _Snapshot],
+) -> list[str]:
+    """Remove only the old MCD-owned instance directory after moving its cache."""
+    legacy_dir = Path(inst.root) / ".mcd"
+    if not legacy_dir.exists() or legacy_dir.is_symlink() or not legacy_dir.is_dir():
+        return []
+    try:
+        entries = {path.name for path in legacy_dir.iterdir()}
+    except OSError:
+        return [f"legacy_mcd_unreadable:{inst.root}"]
+    managed_entries = {"php", "mautic.version"}
+    if not entries.issubset(managed_entries):
+        return [f"legacy_mcd_unmanaged_preserved:{inst.root}"]
+
+    # Import here to keep version-cache code independent from runtime startup.
+    from mcd_agent.mautic_version_cache import migrate_legacy_mautic_version_cache
+
+    migrated = migrate_legacy_mautic_version_cache(inst.root)
+    _snapshot(legacy_dir, backup_dir, snapshots)
+    shutil.rmtree(legacy_dir)
+    actions = [f"legacy_mcd_removed:{inst.root}"]
+    if migrated:
+        actions.append(f"mautic_version_cache_migrated:{inst.root}")
+    return actions
+
+
+def _cleanup_legacy_generated_wrappers(
+    backup_dir: Path,
+    snapshots: dict[Path, _Snapshot],
+) -> list[str]:
+    legacy_root = GENERATED_ROOT / "instances"
+    if not legacy_root.is_dir():
+        return []
+    actions: list[str] = []
+    for wrapper in sorted(legacy_root.glob("*/php")):
+        if not wrapper.is_file() and not wrapper.is_symlink():
+            continue
+        _snapshot(wrapper, backup_dir, snapshots)
+        _unlink_path(wrapper)
+        actions.append(f"generated_wrapper_removed:{wrapper}")
+    for directory in sorted(legacy_root.glob("*"), reverse=True):
+        if directory.is_dir() and not directory.is_symlink():
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    return actions
 
 
 def _is_managed_include(path: Path) -> bool:
@@ -386,6 +421,11 @@ def apply_instance_runtime(
         except OSError as e:
             backup_prune_error = str(e)
     try:
+        if not dry_run:
+            wrapper_actions = _cleanup_legacy_generated_wrappers(backup_dir, snapshots)
+            if wrapper_actions:
+                changed = True
+                actions.extend(wrapper_actions)
         for inst in selected:
             slug = _pool_slug(inst)
             matched = [p for p in _active_nginx_files() if _nginx_file_matches_instance(p, inst)]
@@ -412,44 +452,16 @@ def apply_instance_runtime(
             results.append(row)
             if dry_run:
                 continue
+            legacy_actions = _cleanup_legacy_instance_mcd_dir(inst, backup_dir, snapshots)
+            if legacy_actions:
+                changed = True
+                actions.extend(legacy_actions)
             for version in sorted(inst_versions):
                 fpm_versions.add(version)
                 if _cleanup_instance_pool(version, slug, backup_dir, snapshots):
                     changed = True
                     fpm_config_changed_versions.add(version)
                     actions.append(f"pool_removed:{slug}:{version}")
-                wrapper_dir = GENERATED_ROOT / "instances" / slug
-                wrapper_path = wrapper_dir / "php"
-                wrapper_written = _write_if_changed(
-                    wrapper_path,
-                    _wrapper_script(version, inst, slug),
-                    backup_dir,
-                    snapshots,
-                )
-                wrapper_mode_repaired = False
-                if wrapper_path.is_file() and (wrapper_path.stat().st_mode & 0o777) != 0o755:
-                    wrapper_path.chmod(0o755)
-                    wrapper_mode_repaired = True
-                if wrapper_written:
-                    changed = True
-                    actions.append(f"wrapper:{slug}:{version}")
-                elif wrapper_mode_repaired:
-                    changed = True
-                    actions.append(f"wrapper_mode:{slug}:{version}")
-                instance_wrapper = Path(inst.root) / ".mcd" / "php"
-                instance_wrapper.parent.mkdir(parents=True, exist_ok=True)
-                if instance_wrapper.exists() or instance_wrapper.is_symlink():
-                    if not instance_wrapper.is_symlink() or os.readlink(instance_wrapper) != str(wrapper_path):
-                        _snapshot(instance_wrapper, backup_dir, snapshots)
-                        instance_wrapper.unlink()
-                        instance_wrapper.symlink_to(wrapper_path)
-                        changed = True
-                        actions.append(f"instance_wrapper:{slug}:{version}")
-                else:
-                    _snapshot(instance_wrapper, backup_dir, snapshots)
-                    instance_wrapper.symlink_to(wrapper_path)
-                    changed = True
-                    actions.append(f"instance_wrapper:{slug}:{version}")
                 for path in matched:
                     if _rewrite_nginx_file_to_shared(path, version, backup_dir, snapshots):
                         changed = True

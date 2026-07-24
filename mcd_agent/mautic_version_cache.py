@@ -1,55 +1,30 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 from typing import Any
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
-from mcd_agent.mautic_upgrade import _read_current_version
 from mcd_agent.models import MauticInstall
 
 _SEMVER_RE = re.compile(r"(\d+\.\d+\.\d+)")
-_VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
+_VERSION_CACHE_ROOT = Path("/opt/mcd/generated/mautic-version")
+_LEGACY_VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
 _ZABBIX_HELPER_PATH = Path("/usr/local/bin/zbx_mautic_version_cached.sh")
 _ZABBIX_CONF_PATH = Path("/etc/zabbix/zabbix_agent2.d/mautic.conf")
-
-_ZABBIX_HELPER = """#!/usr/bin/env bash
-set -u
-
-root="${1:-}"
-if [ -z "$root" ]; then
-  echo "-"
-  exit 0
-fi
-
-try_cache() {
-  local candidate="$1/.mcd/mautic.version"
-  if [ -s "$candidate" ]; then
-    cat "$candidate"
-    exit 0
-  fi
-}
-
-try_cache "$root"
-
-base="$(basename "$root")"
-case "$base" in
-  docroot|public|public_html)
-    try_cache "$(dirname "$root")"
-    ;;
-esac
-
-echo "-"
-"""
-
-
 def version_cache_path(root: str | Path) -> Path:
-    return Path(root) / _VERSION_CACHE_REL
+    normalized = os.path.abspath(str(root))
+    key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return _VERSION_CACHE_ROOT / f"{key}.version"
+
+
+def _legacy_version_cache_path(root: str | Path) -> Path:
+    return Path(root) / _LEGACY_VERSION_CACHE_REL
 
 
 def read_cached_mautic_version(root: str | Path) -> str | None:
@@ -61,6 +36,17 @@ def read_cached_mautic_version(root: str | Path) -> str | None:
     if raw and raw != "-":
         return raw.splitlines()[0].strip() or None
     return None
+
+
+def migrate_legacy_mautic_version_cache(root: str | Path) -> bool:
+    legacy = _legacy_version_cache_path(root)
+    try:
+        raw = legacy.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return False
+    if not raw or raw == "-":
+        return False
+    return write_mautic_version_cache(root, raw.splitlines()[0])
 
 
 def _atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
@@ -149,6 +135,9 @@ def _read_version_from_mcd_source(
     if not console:
         return None
     try:
+        # Avoid a module cycle: mautic_upgrade also refreshes this shared cache.
+        from mcd_agent.mautic_upgrade import _read_current_version
+
         value = _read_current_version(str(root), str(console), php_bin, run_as_user).strip()
     except Exception:
         return None
@@ -256,59 +245,50 @@ def discover_and_refresh_mautic_version_cache(cfg: AgentConfig) -> dict[str, Any
     return refresh_mautic_version_cache(installs, cfg.php_bin, run_as_user=cfg.mautic_run_as_user)
 
 
-def install_zabbix_mautic_version_userparameter(*, restart_service: bool = True) -> dict[str, Any]:
-    actions: list[str] = []
-    _atomic_write_text(_ZABBIX_HELPER_PATH, _ZABBIX_HELPER, mode=0o755)
-    actions.append(f"helper:{_ZABBIX_HELPER_PATH}")
-
-    _ZABBIX_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-    line = 'UserParameter=mautic.version[*],/usr/local/bin/zbx_mautic_version_cached.sh "$1"'
-    existing = ""
-    if _ZABBIX_CONF_PATH.exists():
-        existing = _ZABBIX_CONF_PATH.read_text(encoding="utf-8", errors="ignore")
-
-    lines = existing.splitlines()
+def retire_zabbix_mautic_version_userparameter() -> dict[str, Any]:
+    """Remove the retired per-instance Zabbix version probe without touching other checks."""
     changed = False
-    found = False
-    out_lines: list[str] = []
-    for raw in lines:
-        stripped = raw.strip()
-        if stripped.startswith("UserParameter=mautic.version["):
-            if not found:
-                out_lines.append(line)
-                found = True
-                if raw != line:
-                    changed = True
-            else:
+    if _ZABBIX_CONF_PATH.exists():
+        try:
+            lines = _ZABBIX_CONF_PATH.read_text(encoding="utf-8", errors="ignore").splitlines()
+            kept = [line for line in lines if not line.strip().startswith("UserParameter=mautic.version[")]
+            if kept != lines:
+                _atomic_write_text(_ZABBIX_CONF_PATH, "\n".join(kept).rstrip() + ("\n" if kept else ""))
                 changed = True
-            continue
-        out_lines.append(raw)
-    if not found:
-        if out_lines and out_lines[-1].strip():
-            out_lines.append("")
-        out_lines.append(line)
-        changed = True
-
-    if changed or not _ZABBIX_CONF_PATH.exists():
-        backup = None
-        if _ZABBIX_CONF_PATH.exists():
-            backup = _ZABBIX_CONF_PATH.with_suffix(_ZABBIX_CONF_PATH.suffix + ".mcd-bak")
-            shutil.copy2(_ZABBIX_CONF_PATH, backup)
-        _atomic_write_text(_ZABBIX_CONF_PATH, "\n".join(out_lines).rstrip() + "\n")
-        actions.append(f"userparameter:{_ZABBIX_CONF_PATH}")
-        if backup:
-            actions.append(f"backup:{backup}")
-
-    service_restart = "skipped"
-    if restart_service:
-        proc = subprocess.run(["systemctl", "restart", "zabbix-agent2"], capture_output=True, text=True, timeout=30)
-        service_restart = "ok" if proc.returncode == 0 else (proc.stderr or proc.stdout or "failed").strip()
-        actions.append("restart:zabbix-agent2")
-
-    return {
-        "status": "ok" if service_restart in {"skipped", "ok"} else "error",
-        "actions": actions,
-        "service_restart": service_restart,
-        "helper": str(_ZABBIX_HELPER_PATH),
-        "conf": str(_ZABBIX_CONF_PATH),
-    }
+        except OSError as exc:
+            return {"status": "error", "reason": str(exc), "changed": False}
+    try:
+        if _ZABBIX_HELPER_PATH.exists():
+            _ZABBIX_HELPER_PATH.unlink()
+            changed = True
+    except OSError as exc:
+        return {"status": "error", "reason": str(exc), "changed": changed}
+    if not changed:
+        return {"status": "ok", "changed": False, "restarted": False}
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "zabbix-agent2"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if active.returncode == 0 and (active.stdout or "").strip() == "active":
+            restarted = subprocess.run(
+                ["systemctl", "restart", "zabbix-agent2"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if restarted.returncode != 0:
+                return {
+                    "status": "error",
+                    "reason": (restarted.stderr or restarted.stdout or "zabbix restart failed").strip(),
+                    "changed": True,
+                    "restarted": False,
+                }
+            return {"status": "ok", "changed": True, "restarted": True}
+    except OSError as exc:
+        return {"status": "error", "reason": str(exc), "changed": True, "restarted": False}
+    return {"status": "ok", "changed": True, "restarted": False}

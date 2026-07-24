@@ -34,6 +34,7 @@ from mcd_agent.amazon_mailer_dep import (
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
+from mcd_agent.mautic_version_cache import write_mautic_version_cache
 
 
 CORE_PLUGIN_BUNDLES = {
@@ -59,8 +60,6 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "7.0": "7.0.0",
     "7.1": "7.1.2",
 }
-
-_VERSION_CACHE_REL = Path(".mcd") / "mautic.version"
 
 PHP84_PACKAGE_SUFFIXES = [
     "apcu",
@@ -150,14 +149,9 @@ def _write_upgrade_version_cache(root: str, version: str) -> int:
         if key in seen or key == "/" or not base.exists() or not base.is_dir():
             continue
         seen.add(key)
-        target = base / _VERSION_CACHE_REL
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
-            tmp.write_text(safe + "\n", encoding="utf-8")
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, target)
-            written += 1
+            if write_mautic_version_cache(base, safe):
+                written += 1
         except OSError:
             continue
     return written
