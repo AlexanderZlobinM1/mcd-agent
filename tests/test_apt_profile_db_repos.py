@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import sys
@@ -209,6 +210,8 @@ class AptProfileDbRepoTests(unittest.TestCase):
                 self.assertEqual(result["status"], "applied")
                 self.assertIn("smart.health.worst", apt_profile._ZABBIX_DISK_HEALTH_DROPIN.read_text())
                 self.assertIn("score_mdraid", apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.read_text())
+                self.assertIn("score_nvme_temperature", apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.read_text())
+                self.assertIn("nvme id-ctrl", apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.read_text())
                 self.assertEqual(apt_profile._ZABBIX_DISK_HEALTH_SCRIPT.stat().st_mode & 0o777, 0o755)
                 self.assertEqual(apt_profile._ZABBIX_DISK_HEALTH_SUDOERS.stat().st_mode & 0o777, 0o440)
         finally:
@@ -218,6 +221,30 @@ class AptProfileDbRepoTests(unittest.TestCase):
             apt_profile._dpkg_installed_versions = old_dpkg
             apt_profile.shutil.which = old_which
             apt_profile._run = old_run
+
+    def test_zabbix_nvme_temperature_uses_controller_limits(self) -> None:
+        script = apt_profile._ZABBIX_DISK_HEALTH_SCRIPT_TEXT
+        start = script.index("score_nvme_temperature() {")
+        end = script.index("\nscore_nvme() {", start)
+        helper = script[start:end]
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                helper
+                + "\nprintf '%s %s %s %s %s\\n' "
+                + "\"$(score_nvme_temperature 62 359 361)\" "
+                + "\"$(score_nvme_temperature 66 359 361)\" "
+                + "\"$(score_nvme_temperature 76 359 361)\" "
+                + "\"$(score_nvme_temperature 86 359 361)\" "
+                + "\"$(score_nvme_temperature 88 359 361)\"",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertEqual(proc.stdout.strip(), "5 4 3 2 1")
 
     def test_nodejs20_satisfied_requires_node20_and_npm(self) -> None:
         old_which = apt_profile.shutil.which
