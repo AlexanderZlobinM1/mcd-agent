@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.266 - 2026-07-26
+- Fixed: instance migration now discovers and transfers Let's Encrypt
+  certificates by their DNS SANs, so a certificate whose certbot directory is
+  named for another covered domain is preserved on the target.
+- Safety: migration finalization now requires a current target certificate
+  covering the primary domain before DNS cutover. A missing or expired
+  certificate leaves DNS unchanged and restores source maintenance instead of
+  exposing the target through the default deny vhost.
+
 ## 0.9.265 - 2026-07-26
 - Fixed: dedicated-host NVMe health uses each controller's reported warning
   and critical composite-temperature limits (`WCTEMP`/`CCTEMP`) instead of one
