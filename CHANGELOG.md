@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.267 - 2026-07-26
+- Fixed: the runtime agent version is now kept in sync with package metadata.
+  Self-update no longer reports an already-installed release as stale.
+- Added: a packaging regression test rejects a release when
+  `mcd_agent.__version__` and `pyproject.toml` differ.
+
 ## 0.9.266 - 2026-07-26
 - Fixed: instance migration now discovers and transfers Let's Encrypt
   certificates by their DNS SANs, so a certificate whose certbot directory is
