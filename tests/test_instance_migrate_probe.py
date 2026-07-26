@@ -234,6 +234,98 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         self.assertTrue(all(not name.startswith("/") for name in names))
         self.assertTrue(any(name.endswith("fullchain.pem") for name in names))
 
+    def test_letsencrypt_paths_include_certificate_named_for_another_domain_when_san_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "letsencrypt"
+            cert_name = "dijasporashop.sales-snap.com"
+            live = root / "live" / cert_name
+            archive = root / "archive" / cert_name
+            renewal = root / "renewal" / f"{cert_name}.conf"
+            live.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            (live / "fullchain.pem").write_text("cert", encoding="utf-8")
+            (live / "privkey.pem").write_text("key", encoding="utf-8")
+            (archive / "fullchain1.pem").write_text("cert", encoding="utf-8")
+            renewal.parent.mkdir(parents=True, exist_ok=True)
+            renewal.write_text("renewal", encoding="utf-8")
+
+            with (
+                patch.object(instance_migrate, "LETSENCRYPT_ROOT", root),
+                patch.object(instance_migrate, "_certificate_dns_names", return_value={"winwin.sales-snap.com"}),
+            ):
+                paths = instance_migrate._letsencrypt_paths_for_domains(["winwin.sales-snap.com"])
+
+        self.assertEqual(paths, [live, archive, renewal])
+
+    def test_write_nginx_vhost_uses_current_san_matched_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app_root = root / "app" / "public_html"
+            (app_root / "docroot").mkdir(parents=True)
+            (app_root / "docroot" / "index.php").write_text("<?php\n", encoding="utf-8")
+            cert_live = root / "letsencrypt" / "live" / "shared-certificate"
+            cert_live.mkdir(parents=True)
+            (cert_live / "fullchain.pem").write_text("cert", encoding="utf-8")
+            (cert_live / "privkey.pem").write_text("key", encoding="utf-8")
+            php_socket = root / "php8.3-fpm.sock"
+            php_socket.touch()
+            available = root / "sites-available"
+            enabled = root / "sites-enabled"
+            available.mkdir()
+            enabled.mkdir()
+
+            old_available = instance_migrate.NGINX_SITES_AVAILABLE
+            old_enabled = instance_migrate.NGINX_SITES_ENABLED
+            try:
+                instance_migrate.NGINX_SITES_AVAILABLE = available
+                instance_migrate.NGINX_SITES_ENABLED = enabled
+                with (
+                    patch.object(instance_migrate, "LETSENCRYPT_ROOT", root / "letsencrypt"),
+                    patch.object(instance_migrate, "_certificate_dns_names", return_value={"winwin.sales-snap.com"}),
+                    patch.object(instance_migrate, "_certificate_is_current", return_value=True),
+                    patch.object(instance_migrate, "_ensure_nginx_sites_layout"),
+                    patch.object(instance_migrate, "_detect_php_version", return_value="8.3"),
+                    patch.object(instance_migrate, "_php_fpm_socket", return_value=php_socket),
+                    patch.object(instance_migrate, "_run_checked", return_value=""),
+                    patch.object(instance_migrate, "_nginx_supports_http2_directive", return_value=False),
+                ):
+                    site = instance_migrate._write_nginx_vhost(
+                        root=app_root,
+                        domains=["winwin.sales-snap.com"],
+                        php_version="8.3",
+                    )
+            finally:
+                instance_migrate.NGINX_SITES_AVAILABLE = old_available
+                instance_migrate.NGINX_SITES_ENABLED = old_enabled
+
+            content = Path(site).read_text(encoding="utf-8")
+
+        self.assertIn("listen 443 ssl", content)
+        self.assertIn(f"ssl_certificate {cert_live / 'fullchain.pem'};", content)
+        self.assertIn(f"ssl_certificate_key {cert_live / 'privkey.pem'};", content)
+
+    def test_target_finalize_blocks_dns_cutover_without_current_certificate(self) -> None:
+        db = DBConfig(
+            host="localhost",
+            port=3306,
+            name="baza_target",
+            user="target_user",
+            password="target_password",
+            table_prefix="",
+        )
+        with patch.object(instance_migrate, "_target_db_from_direct_values", return_value=db), patch.object(
+            instance_migrate, "_matching_live_certificate", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "DNS cutover blocked"):
+                instance_migrate.finalize_target_relay(
+                    type("Cfg", (), {"state_db_path": "/tmp/mcd-state.sqlite"})(),
+                    target_root="/var/www/example/public_html",
+                    target_db_name="baza_target",
+                    target_db_user="target_user",
+                    target_db_password="target_password",
+                    domains_json='["example.sales-snap.com"]',
+                )
+
     def test_safe_tar_member_target_rejects_traversal(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unsafe tar member path"):
             instance_migrate._safe_tar_member_target(Path("/"), "../etc/passwd")

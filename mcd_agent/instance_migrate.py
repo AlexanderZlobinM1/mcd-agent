@@ -43,6 +43,7 @@ _MYSQL_DATE_FORMAT_GENERATED_RE = re.compile(
 )
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+LETSENCRYPT_ROOT = Path("/etc/letsencrypt")
 
 
 def _utc_now() -> str:
@@ -533,11 +534,27 @@ def receive_target_files(*, target_root: str, input_stream: Any, wipe_target: bo
 
 
 def _letsencrypt_paths_for_domains(domains: list[str]) -> list[Path]:
-    root = Path("/etc/letsencrypt")
+    root = LETSENCRYPT_ROOT
+    wanted = {str(domain or "").strip().lower().rstrip(".") for domain in domains if str(domain or "").strip()}
     paths: list[Path] = []
     seen: set[str] = set()
+    live_names: list[str] = []
+
+    # Preserve the old direct-name lookup for certificates issued specifically
+    # for a migrated domain, then add every certificate whose SAN covers it.
     for domain in domains:
-        for rel in (Path("live") / domain, Path("archive") / domain, Path("renewal") / f"{domain}.conf"):
+        name = str(domain or "").strip().lower().rstrip(".")
+        if name and (root / "live" / name).exists():
+            live_names.append(name)
+    live_root = root / "live"
+    if live_root.is_dir():
+        for live_dir in sorted(live_root.iterdir(), key=lambda item: item.name):
+            if not live_dir.is_dir() or not wanted.intersection(_certificate_dns_names(live_dir / "fullchain.pem")):
+                continue
+            live_names.append(live_dir.name)
+
+    for name in live_names:
+        for rel in (Path("live") / name, Path("archive") / name, Path("renewal") / f"{name}.conf"):
             path = root / rel
             key = str(path)
             if key in seen or not path.exists():
@@ -545,6 +562,47 @@ def _letsencrypt_paths_for_domains(domains: list[str]) -> list[Path]:
             seen.add(key)
             paths.append(path)
     return paths
+
+
+def _certificate_dns_names(cert_path: Path) -> set[str]:
+    if not cert_path.exists():
+        return set()
+    rc, out = _run(["openssl", "x509", "-in", str(cert_path), "-noout", "-ext", "subjectAltName"], timeout_sec=20)
+    if rc != 0:
+        return set()
+    return {match.lower().rstrip(".") for match in re.findall(r"DNS:([^,\s]+)", out, flags=re.IGNORECASE)}
+
+
+def _certificate_is_current(cert_path: Path) -> bool:
+    if not cert_path.exists():
+        return False
+    rc, _out = _run(["openssl", "x509", "-in", str(cert_path), "-noout", "-checkend", "0"], timeout_sec=20)
+    return rc == 0
+
+
+def _matching_live_certificate(domains: list[str], *, require_current: bool) -> Path | None:
+    if not domains:
+        return None
+    primary = str(domains[0] or "").strip().lower().rstrip(".")
+    if not primary:
+        return None
+    live_root = LETSENCRYPT_ROOT / "live"
+    if not live_root.is_dir():
+        return None
+    candidates: list[Path] = []
+    direct = live_root / primary
+    if direct.is_dir():
+        candidates.append(direct)
+    candidates.extend(path for path in sorted(live_root.iterdir(), key=lambda item: item.name) if path.is_dir() and path != direct)
+    for live_dir in candidates:
+        cert_path = live_dir / "fullchain.pem"
+        key_path = live_dir / "privkey.pem"
+        if not key_path.exists() or primary not in _certificate_dns_names(cert_path):
+            continue
+        if require_current and not _certificate_is_current(cert_path):
+            continue
+        return live_dir
+    return None
 
 
 def stream_source_letsencrypt(*, domains_json: str, output: Any) -> int:
@@ -701,6 +759,13 @@ def finalize_target_relay(
     target = Path(target_root).resolve()
     domains = _json_domains(domains_json)
     target_db = _target_db_from_direct_values(name=target_db_name, user=target_db_user, password=target_db_password)
+    cert_live = _matching_live_certificate(domains, require_current=True)
+    if cert_live is None:
+        raise RuntimeError(
+            "target TLS certificate is missing, expired, or does not cover "
+            + str(domains[0] if domains else "the migrated domain")
+            + "; DNS cutover blocked"
+        )
     print("progress: 88 target web config")
     _patch_local_php_db(target, target_db)
     _patch_local_php_instance_paths(target)
@@ -720,6 +785,7 @@ def finalize_target_relay(
         "target_db_name": target_db.name,
         "target_db_user": target_db.user,
         "nginx_vhost": site,
+        "tls_certificate": str(cert_live),
         "healthcheck_tail": health,
         "instances": instances,
     }
@@ -765,6 +831,10 @@ def _detect_php_version(raw: str | None = None) -> str:
     return ""
 
 
+def _php_fpm_socket(php_version: str) -> Path:
+    return Path(f"/run/php/php{php_version}-fpm.sock")
+
+
 def _nginx_web_root(root: Path) -> Path:
     for rel in ("docroot", "public"):
         candidate = root / rel
@@ -790,7 +860,7 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
     php = _detect_php_version(php_version)
     if not php:
         raise RuntimeError("target PHP-FPM version is not available")
-    sock = Path(f"/run/php/php{php}-fpm.sock")
+    sock = _php_fpm_socket(php)
     if not sock.exists():
         raise RuntimeError(f"target PHP-FPM socket is missing: {sock}")
     primary = domains[0]
@@ -798,14 +868,14 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
     site = NGINX_SITES_AVAILABLE / f"{primary}.conf"
     enabled = NGINX_SITES_ENABLED / f"{primary}.conf"
     server_names = " ".join(domains)
-    cert_live = Path("/etc/letsencrypt/live") / primary
+    cert_live = _matching_live_certificate(domains, require_current=True)
     ssl_block = ""
     listen = "listen 80;"
-    if (cert_live / "fullchain.pem").exists() and (cert_live / "privkey.pem").exists():
+    if cert_live is not None:
         listen = "listen 80;\n    listen 443 ssl http2;"
         ssl_block = f"""
-    ssl_certificate /etc/letsencrypt/live/{primary}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/{primary}/privkey.pem;
+    ssl_certificate {cert_live / "fullchain.pem"};
+    ssl_certificate_key {cert_live / "privkey.pem"};
 """
     content = render_nginx_template(
         "instance_migrate_vhost.conf",
