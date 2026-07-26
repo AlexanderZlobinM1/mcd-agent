@@ -803,8 +803,29 @@ score_mdraid() {
   echo "$s"
 }
 
+score_nvme_temperature() {
+  local temperature="$1" warning="$2" critical="$3" s=5
+  [[ "$temperature" =~ ^[0-9]+$ ]] || { echo "$s"; return; }
+
+  # WCTEMP/CCTEMP come from the NVMe controller and are expressed in Kelvin.
+  # Use those model-specific limits instead of a generic NVMe temperature
+  # ladder. Older controllers without limits retain the conservative fallback.
+  if ! [[ "$warning" =~ ^[0-9]+$ ]] || [ "$warning" -le 273 ]; then warning=343; fi
+  if ! [[ "$critical" =~ ^[0-9]+$ ]] || [ "$critical" -le "$warning" ]; then critical=$((warning + 10)); fi
+  warning=$((warning - 273))
+  critical=$((critical - 273))
+  local attention=$((warning - 10)) elevated=$((warning - 20))
+  [ "$elevated" -lt 50 ] && elevated=50
+
+  if [ "$temperature" -ge "$critical" ]; then s=1
+  elif [ "$temperature" -ge "$warning" ]; then s=2
+  elif [ "$temperature" -ge "$attention" ]; then s=3
+  elif [ "$temperature" -ge "$elevated" ]; then s=4; fi
+  echo "$s"
+}
+
 score_nvme() {
-  local dev="$1" s=5 out
+  local dev="$1" s=5 out identity
   if ! out=$(sudo nvme smart-log "$dev" 2>/dev/null); then echo; return; fi
   local cw me pu t
   cw=$(echo "$out" | awk -F: '/critical_warning/{gsub(/ /,"",$2); print $2; exit}' || echo 0)
@@ -821,10 +842,12 @@ score_nvme() {
   fi
   t=$(echo "$out" | awk -F'[ :]' '/^temperature/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/){print $i; exit}}' || echo '')
   if [[ "$t" =~ ^[0-9]+$ ]]; then
-    if [ "$t" -ge 80 ]; then s=1
-    elif [ "$t" -ge 70 ] && [ "$s" -gt 2 ]; then s=2
-    elif [ "$t" -ge 60 ] && [ "$s" -gt 3 ]; then s=3
-    elif [ "$t" -ge 50 ] && [ "$s" -gt 4 ]; then s=4; fi
+    identity=$(sudo nvme id-ctrl "$dev" 2>/dev/null || true)
+    local wt ct ts
+    wt=$(echo "$identity" | awk -F: '/^wctemp/{gsub(/ /,"",$2); print $2; exit}' || true)
+    ct=$(echo "$identity" | awk -F: '/^cctemp/{gsub(/ /,"",$2); print $2; exit}' || true)
+    ts=$(score_nvme_temperature "$t" "$wt" "$ct")
+    if [[ "$ts" =~ ^[1-5]$ ]] && [ "$ts" -lt "$s" ]; then s="$ts"; fi
   fi
   echo "$s"
 }

@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.265 - 2026-07-26
+- Fixed: dedicated-host NVMe health uses each controller's reported warning
+  and critical composite-temperature limits (`WCTEMP`/`CCTEMP`) instead of one
+  overly conservative temperature ladder for every model. Older controllers
+  without those fields retain the previous safe fallback thresholds.
+
 ## 0.9.264 - 2026-07-24
 - Fixed: scheduler monitoring now treats a task as processing only when its
   matching Mautic PHP console process is live. Stale state-db and plan entries
