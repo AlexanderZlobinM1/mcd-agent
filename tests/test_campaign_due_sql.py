@@ -148,6 +148,18 @@ class CampaignDueSqlTests(unittest.TestCase):
         root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[1]
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_utc}'", root_bootstrap_branch)
 
+    def test_trigger_due_catches_due_root_date_action_without_event_log(self) -> None:
+        # Regression: Neodent campaign 315 had existing campaign_leads and a
+        # root Viber date action, so native Mautic trigger could execute it
+        # even before an event-log row existed.
+        root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.rsplit("UNION", 1)[1]
+
+        self.assertIn("ce.parent_id IS NULL", root_bootstrap_branch)
+        self.assertIn("ce.trigger_mode = 'date'", root_bootstrap_branch)
+        self.assertIn("ce.trigger_date <= '{now_utc}'", root_bootstrap_branch)
+        self.assertIn("NOT EXISTS (", root_bootstrap_branch)
+        self.assertIn("{prefix}campaign_lead_event_log el0", root_bootstrap_branch)
+
     def test_trigger_due_catches_root_condition_campaign_leads_without_event_log(self) -> None:
         root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[1]
 

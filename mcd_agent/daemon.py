@@ -137,6 +137,8 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
+# Avoid spending an entire scheduler pass probing stale audit candidates.
+_CAMPAIGN_TRIGGER_STALE_SCAN_CAP = 8
 _IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
@@ -3190,6 +3192,12 @@ def _fill_from_ring(
         return 0
     launched_count = 0
     scans = len(ring)
+    if should_skip is not None:
+        # Campaign trigger audit entries may be complete but remain visible in
+        # the ring until their next audit refresh. Limit their DB preflight
+        # work so a large shared host cannot delay fresh due campaigns on
+        # later instance roots.
+        scans = min(scans, _CAMPAIGN_TRIGGER_STALE_SCAN_CAP)
     while (
         launched_count < max(1, int(max_launches or 1))
         and _running_count_for_entities(running, root, task_type, ring_entities) < ring_limit
