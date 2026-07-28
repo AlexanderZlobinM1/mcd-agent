@@ -108,6 +108,36 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(list(ring), [])
         store.add_running.assert_not_called()
 
+    def test_fill_from_ring_bounds_stale_campaign_preflight_checks(self) -> None:
+        # Audit candidates can be complete for months. Their due checks must
+        # not consume the full shared-host scheduler pass before a fresh
+        # campaign on a later root is considered.
+        ring = deque(range(1, daemon_mod._CAMPAIGN_TRIGGER_STALE_SCAN_CAP + 3))
+        cfg = SimpleNamespace(campaign_trigger_min_repeat_sec=0, campaign_trigger_audit_interval_sec=0)
+        store = Mock()
+        checked: list[int] = []
+
+        launched = _fill_from_ring(
+            ring=ring,
+            ring_limit=1,
+            total_limit=1,
+            root="/var/www/site",
+            task_type="campaign_trigger",
+            running={},
+            ring_entities=set(ring),
+            config=cfg,
+            store=store,
+            popens={},
+            build_args=Mock(),
+            should_skip=lambda eid: checked.append(eid) or True,
+            remove_on_launch=True,
+        )
+
+        self.assertEqual(launched, 0)
+        self.assertEqual(checked, list(range(1, daemon_mod._CAMPAIGN_TRIGGER_STALE_SCAN_CAP + 1)))
+        self.assertEqual(list(ring), [daemon_mod._CAMPAIGN_TRIGGER_STALE_SCAN_CAP + 1, daemon_mod._CAMPAIGN_TRIGGER_STALE_SCAN_CAP + 2])
+        store.add_running.assert_not_called()
+
     def test_campaign_trigger_progress_watchdog_kills_done_stale_process(self) -> None:
         root = "/var/www/site"
         key = _task_key(root, "campaign_trigger", 136)

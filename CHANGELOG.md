@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.268 - 2026-07-28
+- Fixed campaign scheduler fairness on shared MCD hosts: stale campaign-trigger
+  audit candidates now have a bounded preflight scan per scheduler pass, so a
+  large stale audit ring cannot delay a newly due campaign on another instance.
+- Added regression coverage for the bounded stale scan and for root date-action
+  campaigns with existing campaign leads but no event-log rows, matching the
+  Neodent campaign 315 shape.
+
 ## 0.9.267 - 2026-07-26
 - Fixed: the runtime agent version is now kept in sync with package metadata.
   Self-update no longer reports an already-installed release as stale.
