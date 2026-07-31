@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.9.269 - 2026-07-31
+- Added: MySQL hardware profiles now manage `max_user_connections` together
+  with `max_connections`. This removes legacy fixed per-user caps that could
+  be too low for dedicated hosts while retaining a plan-derived safeguard.
+
 ## 0.9.268 - 2026-07-28
 - Fixed campaign scheduler fairness on shared MCD hosts: stale campaign-trigger
   audit candidates now have a bounded preflight scan per scheduler pass, so a

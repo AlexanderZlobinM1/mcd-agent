@@ -22,6 +22,19 @@ import mcd_agent.service_profiles as service_profiles
 
 
 class ServiceProfileClusterGuardTests(unittest.TestCase):
+    def test_mysql_override_writes_hardware_user_connection_limit(self) -> None:
+        content = service_profiles._build_mysql_override(
+            {
+                "innodb_buffer_pool_size_mb": 32768,
+                "max_connections": 600,
+                "max_user_connections": 400,
+            },
+            engine="mysql",
+        )
+
+        self.assertIn("max_connections = 600", content)
+        self.assertIn("max_user_connections = 400", content)
+
     def test_php_fpm_opcache_override_includes_realpath_cache(self) -> None:
         content = service_profiles._build_opcache_override(
             {
