@@ -140,6 +140,7 @@ _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 # Avoid spending an entire scheduler pass probing stale audit candidates.
 _CAMPAIGN_TRIGGER_STALE_SCAN_CAP = 8
 _PRIORITY_DISPATCH_REGULAR_CHUNK = 8
+_TASK_LOCK_BUSY_RC = 75
 _IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
@@ -5176,6 +5177,141 @@ def _task_key(root: str, task_type: str, entity_id: int | None) -> str:
     return f"{root}|{task_type}|{eid}"
 
 
+def _task_execution_lock_key(root: str, task_type: str, entity_id: int | None) -> str:
+    if task_type in {"campaign_rebuild", "campaign_trigger", "campaign_update"}:
+        return _task_key(root, "campaign", entity_id)
+    return _task_key(root, task_type, entity_id)
+
+
+def _task_locked_args(task_key: str, args: list[str]) -> list[str]:
+    flock_bin = Path("/usr/bin/flock")
+    if not flock_bin.is_file():
+        return list(args)
+    lock_dir = Path("/run/lock/mcd-tasks")
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.warning("task execution lock unavailable: %s", exc)
+        return list(args)
+    digest = hashlib.sha256(str(task_key).encode("utf-8")).hexdigest()
+    return [
+        str(flock_bin),
+        "--nonblock",
+        "--conflict-exit-code",
+        str(_TASK_LOCK_BUSY_RC),
+        str(lock_dir / f"{digest}.lock"),
+        *args,
+    ]
+
+
+class _PriorityTaskExecutor:
+    def __init__(self) -> None:
+        self._active: dict[str, tuple[str, str]] = {}
+        self._last_started: dict[str, float] = {}
+        self._last_finished: dict[str, float] = {}
+        self._guard = threading.Lock()
+
+    def is_active(self, root: str, task_type: str, entity_id: int) -> bool:
+        key = _task_key(root, task_type, entity_id)
+        with self._guard:
+            return key in self._active
+
+    def last_finished(self, root: str, task_type: str, entity_id: int) -> float:
+        key = _task_key(root, task_type, entity_id)
+        with self._guard:
+            return float(self._last_finished.get(key, 0.0) or 0.0)
+
+    def last_started(self, root: str, task_type: str, entity_id: int) -> float:
+        key = _task_key(root, task_type, entity_id)
+        with self._guard:
+            return float(self._last_started.get(key, 0.0) or 0.0)
+
+    def launch(
+        self,
+        config: AgentConfig,
+        *,
+        root: str,
+        task_type: str,
+        entity_id: int,
+        args: list[str],
+        interval_sec: int,
+        max_parallel: int,
+    ) -> bool:
+        key = _task_key(root, task_type, entity_id)
+        now = time.time()
+        with self._guard:
+            if key in self._active:
+                return False
+            previous = float(self._last_started.get(key, 0.0) or 0.0)
+            if previous > 0 and now - previous < max(1, int(interval_sec or 1)):
+                return False
+            active_for_lane = sum(
+                1
+                for active_root, active_type in self._active.values()
+                if active_root == root and active_type == task_type
+            )
+            if active_for_lane >= max(1, int(max_parallel or 1)):
+                return False
+            self._active[key] = (root, task_type)
+            self._last_started[key] = now
+
+        def _run() -> None:
+            lock_key = _task_execution_lock_key(root, task_type, entity_id)
+            locked_args = _task_locked_args(lock_key, args)
+            logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
+            completed = False
+            rc: int | None = None
+            try:
+                timeout = max(0, int(getattr(config, "command_timeout_sec", 0) or 0))
+                proc = subprocess.run(
+                    locked_args,
+                    cwd=root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout if timeout > 0 else None,
+                    check=False,
+                )
+                rc = int(proc.returncode or 0)
+                if rc == _TASK_LOCK_BUSY_RC:
+                    logging.info("[%s] priority lock busy %s entity=%s", root, task_type, entity_id)
+                elif rc == 0:
+                    completed = True
+                    logging.info("[%s] priority finished %s entity=%s rc=0", root, task_type, entity_id)
+                else:
+                    logging.warning("[%s] priority failed %s entity=%s rc=%s", root, task_type, entity_id, rc)
+            except subprocess.TimeoutExpired:
+                logging.warning("[%s] priority timeout %s entity=%s", root, task_type, entity_id)
+            except Exception as exc:
+                logging.warning("[%s] priority error %s entity=%s: %s", root, task_type, entity_id, exc)
+            finally:
+                with self._guard:
+                    self._active.pop(key, None)
+                    if completed:
+                        self._last_finished[key] = time.time()
+                    elif rc == _TASK_LOCK_BUSY_RC:
+                        self._last_started.pop(key, None)
+
+        threading.Thread(target=_run, name=f"mcd-priority-{task_type}-{entity_id}", daemon=True).start()
+        return True
+
+
+def _priority_campaign_due_check_needed(
+    *,
+    now_ts: float,
+    last_checked_ts: float,
+    rebuild_started_ts: float,
+    rebuild_finished_ts: float,
+    checked_rebuild_ts: float,
+    interval_sec: int,
+) -> bool:
+    if rebuild_started_ts <= 0:
+        return False
+    if rebuild_finished_ts > checked_rebuild_ts:
+        return True
+    return now_ts - last_checked_ts >= max(1, int(interval_sec or 1))
+
+
 def _task_repeat_interval_sec(config: AgentConfig, task_type: str) -> int:
     if task_type == "segment":
         return max(0, int(getattr(config, "segment_full_scan_interval_sec", 0) or 0))
@@ -5702,6 +5838,7 @@ def _submit_if_slot(
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
         return False
 
+    args = _task_locked_args(_task_execution_lock_key(root, task_type, entity_id), args)
     proc = _spawn_command(root=root, args=args)
     task = RunningTask(
         row_id=0,
@@ -5947,8 +6084,9 @@ def _monitor_running(
         if proc is not None:
             rc = proc.poll()
             if rc is not None:
-                state = "done" if rc == 0 else "failed"
-                note = None if rc == 0 else "non_zero_exit"
+                lock_busy = rc == _TASK_LOCK_BUSY_RC
+                state = "done" if rc == 0 or lock_busy else "failed"
+                note = "task_lock_busy" if lock_busy else (None if rc == 0 else "non_zero_exit")
                 store.finish(task.row_id, state=state, rc=rc, note=note)
                 progress_watchdog.pop(key, None)
                 if rc == 0 and task.task_type == "segment":
@@ -5971,7 +6109,7 @@ def _monitor_running(
                 running.pop(key, None)
                 popens.pop(key, None)
                 respawned = False
-                if rc != 0:
+                if rc != 0 and not lock_busy:
                     logging.warning("[%s] %s entity=%s failed rc=%s", task.root, task.task_type, task.entity_id, rc)
                     retry_enabled = (config.task_retry_max <= 0) or (config.task_retry_max > 1)
                     if retry_enabled:
@@ -6540,6 +6678,127 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
     dispatch_instance_cursor = 0
     pusher = MCCStatePusher(config)
+
+    priority_executor = _PriorityTaskExecutor()
+    priority_trigger_last_checked: dict[str, float] = {}
+    priority_trigger_checked_rebuild: dict[str, float] = {}
+
+    def _priority_scheduler() -> None:
+        while True:
+            cfg = config
+            profile = str(getattr(cfg, "profile_name", "") or "").strip().lower()
+            if profile == "passive" or not cluster_route_allows(cfg, "cron"):
+                time.sleep(1.0)
+                continue
+            try:
+                if Path(cfg.scheduler_pause_flag_path).exists() or (cfg.backup_enabled and backup_lock_active(cfg)):
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+            for inst in list(installs):
+                if not getattr(inst, "db", None):
+                    continue
+                root = str(getattr(inst, "root", "") or "").strip()
+                if not root:
+                    continue
+                segment_ids = _segment_whitelist_effective_setting(cfg, inst)
+                campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
+                for segment_id in sorted(segment_ids):
+                    priority_executor.launch(
+                        cfg,
+                        root=root,
+                        task_type="segment",
+                        entity_id=int(segment_id),
+                        args=render_mautic_command(
+                            php_bin=cfg.php_bin,
+                            run_as_user=cfg.mautic_run_as_user,
+                            root=root,
+                            template=cfg.cmd_segment_update_template,
+                            id=int(segment_id),
+                            batch_limit=cfg.segment_batch_limit,
+                        ),
+                        interval_sec=max(1, int(cfg.segment_full_scan_interval_sec or 60)),
+                        max_parallel=max(1, int(cfg.segment_priority_parallel_idle or 1)),
+                    )
+
+                for campaign_id in sorted(campaign_ids):
+                    campaign_id = int(campaign_id)
+                    priority_executor.launch(
+                        cfg,
+                        root=root,
+                        task_type="campaign_rebuild",
+                        entity_id=campaign_id,
+                        args=render_mautic_command(
+                            php_bin=cfg.php_bin,
+                            run_as_user=cfg.mautic_run_as_user,
+                            root=root,
+                            template=cfg.cmd_campaign_rebuild_template,
+                            id=campaign_id,
+                        ),
+                        interval_sec=max(1, int(cfg.campaign_rebuild_min_repeat_sec or 60)),
+                        max_parallel=max(1, int(cfg.campaign_rebuild_priority_parallel or 1)),
+                    )
+                    if priority_executor.is_active(root, "campaign_rebuild", campaign_id):
+                        continue
+                    trigger_key = _task_key(root, "campaign_trigger", campaign_id)
+                    now_priority = time.time()
+                    rebuild_started = priority_executor.last_started(root, "campaign_rebuild", campaign_id)
+                    rebuild_finished = priority_executor.last_finished(root, "campaign_rebuild", campaign_id)
+                    last_checked = float(priority_trigger_last_checked.get(trigger_key, 0.0) or 0.0)
+                    checked_rebuild = float(priority_trigger_checked_rebuild.get(trigger_key, 0.0) or 0.0)
+                    trigger_interval = max(
+                        1,
+                        int(cfg.campaign_trigger_min_repeat_sec or 0),
+                        int(cfg.campaign_trigger_audit_interval_sec or 0),
+                    )
+                    if not _priority_campaign_due_check_needed(
+                        now_ts=now_priority,
+                        last_checked_ts=last_checked,
+                        rebuild_started_ts=rebuild_started,
+                        rebuild_finished_ts=rebuild_finished,
+                        checked_rebuild_ts=checked_rebuild,
+                        interval_sec=trigger_interval,
+                    ):
+                        continue
+                    try:
+                        now_utc_priority = datetime.now(timezone.utc)
+                        due = not _campaign_trigger_should_skip_launch(
+                            db=MauticDB(inst.db),
+                            config=cfg,
+                            root=root,
+                            campaign_id=campaign_id,
+                            sql_ctx=campaign_sql_time_context(now_utc_priority, inst.mautic_timezone),
+                        )
+                    except Exception as exc:
+                        logging.warning("[%s] priority campaign due check failed entity=%s: %s", root, campaign_id, exc)
+                        due = False
+                    priority_trigger_last_checked[trigger_key] = now_priority
+                    priority_trigger_checked_rebuild[trigger_key] = rebuild_finished
+                    if due:
+                        priority_executor.launch(
+                            cfg,
+                            root=root,
+                            task_type="campaign_trigger",
+                            entity_id=campaign_id,
+                            args=render_mautic_command(
+                                php_bin=cfg.php_bin,
+                                run_as_user=cfg.mautic_run_as_user,
+                                root=root,
+                                template=cfg.cmd_campaign_trigger_template,
+                                id=campaign_id,
+                                campaign_limit=cfg.campaign_limit,
+                                batch_limit=cfg.campaign_batch_limit,
+                            ),
+                            interval_sec=trigger_interval,
+                            max_parallel=max(1, int(cfg.campaign_trigger_priority_parallel or 1)),
+                        )
+            time.sleep(1.0)
+
+    if not single_cycle:
+        threading.Thread(target=_priority_scheduler, name="mcd-priority-scheduler", daemon=True).start()
 
     while True:
         _monitor_running(

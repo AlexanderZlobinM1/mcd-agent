@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.273 - 2026-08-03
+- Added: explicitly whitelisted segment and campaign work now has an internal
+  priority dispatcher independent of the full shared-host planning pass.
+  Per-task repeat guards still define the requested cadence.
+- Fixed: normal and priority dispatch use the same non-blocking execution lock.
+  Rebuild and trigger for one campaign also share a lock, preventing duplicate
+  execution and rebuild/trigger overlap across the two scheduler paths.
+- Fixed: campaign due-work is checked immediately after each priority rebuild
+  and then at the configured audit cadence, without idle per-second log noise.
+
 ## 0.9.272 - 2026-08-03
 - Added: scoped per-instance campaign whitelist settings, matching the existing
   segment whitelist ownership model on shared hosts.
