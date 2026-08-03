@@ -1705,6 +1705,7 @@ class MCCStatePusher:
         now_ts: float,
         include_signals: bool = True,
         profile_event: dict[str, Any] | None = None,
+        instances_snapshot_complete: bool = True,
     ) -> dict[str, Any]:
         identity = resolve_agent_identity(self.cfg)
         instances = []
@@ -1769,6 +1770,7 @@ class MCCStatePusher:
             "state_backend": self._state_backend_payload(now_ts),
             "cluster_assets": self._cluster_assets_payload(now_ts, installs),
             "instances": instances,
+            "instances_snapshot_complete": bool(instances_snapshot_complete),
             "instance_sizes": collect_instance_sizes(installs),
             "sent_at_utc": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
