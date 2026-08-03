@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -18,6 +19,8 @@ from mcd_agent.daemon import (
     _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT,
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
+    _PriorityTaskExecutor,
+    _TASK_LOCK_BUSY_RC,
     _campaign_pressure_active,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
@@ -33,8 +36,10 @@ from mcd_agent.daemon import (
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
+    _monitor_running,
     _plan_sql_segment_ring,
     _published_segment_whitelist_ids,
+    _priority_campaign_due_check_needed,
     _priority_interleaved_dispatch_installs,
     _recover_orphaned_imports_if_safe,
     _remove_ring_entities,
@@ -48,6 +53,8 @@ from mcd_agent.daemon import (
     _sync_segment_whitelist_file,
     _submit_import_if_segment_slot,
     _task_key,
+    _task_execution_lock_key,
+    _task_locked_args,
     _task_repeat_interval_sec,
 )
 from mcd_agent.ring_utils import advance_ring_after_launch
@@ -104,6 +111,134 @@ class CampaignRingDispatchTests(unittest.TestCase):
             "/priority", "/regular-2", "/regular-3",
             "/priority", "/regular-4",
         ])
+
+    def test_campaign_rebuild_and_trigger_share_execution_lock(self) -> None:
+        root = "/var/www/electronic/public_html"
+
+        rebuild = _task_execution_lock_key(root, "campaign_rebuild", 29)
+        trigger = _task_execution_lock_key(root, "campaign_trigger", 29)
+        other = _task_execution_lock_key(root, "campaign_trigger", 30)
+
+        self.assertEqual(rebuild, trigger)
+        self.assertNotEqual(trigger, other)
+
+    def test_task_lock_wraps_command_with_stable_flock_path(self) -> None:
+        args = ["php", "bin/console", "mautic:segments:update", "-i", "23"]
+        with patch.object(Path, "is_file", return_value=True), patch.object(Path, "mkdir"):
+            first = _task_locked_args("site|segment|23", args)
+            second = _task_locked_args("site|segment|23", args)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[:4], ["/usr/bin/flock", "--nonblock", "--conflict-exit-code", "75"])
+        self.assertEqual(first[-len(args):], args)
+
+    def test_priority_executor_has_separate_bounded_lane(self) -> None:
+        executor = _PriorityTaskExecutor()
+        release = threading.Event()
+        started = threading.Event()
+
+        def _run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            started.set()
+            release.wait(timeout=2)
+            return SimpleNamespace(returncode=0)
+
+        cfg = SimpleNamespace(command_timeout_sec=0)
+        with patch.object(daemon_mod.subprocess, "run", side_effect=_run):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=23,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                )
+            )
+            self.assertTrue(started.wait(timeout=1))
+            self.assertFalse(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=24,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                )
+            )
+            release.set()
+            deadline = time.time() + 2
+            while executor.is_active("/var/www/site", "segment", 23) and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertFalse(executor.is_active("/var/www/site", "segment", 23))
+        self.assertGreater(executor.last_finished("/var/www/site", "segment", 23), 0)
+
+    def test_priority_campaign_due_check_waits_for_its_first_rebuild(self) -> None:
+        self.assertFalse(
+            _priority_campaign_due_check_needed(
+                now_ts=100.0,
+                last_checked_ts=0.0,
+                rebuild_started_ts=0.0,
+                rebuild_finished_ts=0.0,
+                checked_rebuild_ts=0.0,
+                interval_sec=60,
+            )
+        )
+        self.assertTrue(
+            _priority_campaign_due_check_needed(
+                now_ts=101.0,
+                last_checked_ts=100.0,
+                rebuild_started_ts=90.0,
+                rebuild_finished_ts=101.0,
+                checked_rebuild_ts=0.0,
+                interval_sec=60,
+            )
+        )
+        self.assertTrue(
+            _priority_campaign_due_check_needed(
+                now_ts=160.0,
+                last_checked_ts=100.0,
+                rebuild_started_ts=90.0,
+                rebuild_finished_ts=101.0,
+                checked_rebuild_ts=101.0,
+                interval_sec=60,
+            )
+        )
+
+    def test_monitor_treats_execution_lock_contention_as_clean_skip(self) -> None:
+        root = "/var/www/site"
+        key = _task_key(root, "campaign_trigger", 29)
+        task = RunningTask(
+            row_id=7,
+            root=root,
+            task_key=key,
+            task_type="campaign_trigger",
+            entity_id=29,
+            command_str="php|bin/console|mautic:campaigns:trigger|-i|29",
+            timeout_sec=0,
+            attempts=1,
+            started_at=time.time(),
+            pid=1234,
+        )
+        proc = Mock()
+        proc.poll.return_value = _TASK_LOCK_BUSY_RC
+        store = Mock()
+        running = {key: task}
+        popens = {key: proc}
+
+        with patch.object(daemon_mod, "_respawn_task") as respawn:
+            _monitor_running(
+                config=SimpleNamespace(),
+                store=store,
+                running=running,
+                popens=popens,
+            )
+
+        store.finish.assert_called_once_with(7, state="done", rc=_TASK_LOCK_BUSY_RC, note="task_lock_busy")
+        respawn.assert_not_called()
+        self.assertNotIn(key, running)
 
     def test_campaign_whitelist_is_scoped_to_matching_instance(self) -> None:
         cfg = SimpleNamespace(
