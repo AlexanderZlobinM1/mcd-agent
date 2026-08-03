@@ -37,6 +37,7 @@ def test_housekeeping_plugin_runtime_keys_are_stable() -> None:
 def test_segment_whitelist_instance_runtime_keys_are_stable() -> None:
     expected = {
         "segment_whitelist_instance_settings",
+        "campaign_whitelist_instance_settings",
     }
 
     assert expected <= daemon._STABLE_RUNTIME_KEYS

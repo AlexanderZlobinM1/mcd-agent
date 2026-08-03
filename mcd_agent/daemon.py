@@ -139,6 +139,7 @@ _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 # Avoid spending an entire scheduler pass probing stale audit candidates.
 _CAMPAIGN_TRIGGER_STALE_SCAN_CAP = 8
+_PRIORITY_DISPATCH_REGULAR_CHUNK = 8
 _IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
@@ -283,6 +284,7 @@ _VIBER_STATS_STABLE_RUNTIME_KEYS = {
 }
 _SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS = {
     "segment_whitelist_instance_settings",
+    "campaign_whitelist_instance_settings",
 }
 _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
     "empty_leads_cleanup_enabled",
@@ -657,6 +659,46 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
         return set(_to_int_list(raw))
 
     return global_segment_ids()
+
+
+def _campaign_whitelist_effective_setting(config: AgentConfig, inst: object) -> set[int]:
+    if bool(getattr(config, "disable_whitelist", False)):
+        return set()
+
+    global_ids = set(getattr(config, "campaign_whitelist", []) or []) | _load_id_file(
+        getattr(config, "campaign_whitelist_file", None)
+    )
+    settings = getattr(config, "campaign_whitelist_instance_settings", {})
+    if not isinstance(settings, dict):
+        return global_ids
+
+    instance_keys = _viber_stats_setting_keys(inst)
+    qualified_keys: list[str] = []
+    instance_key_set = set(instance_keys)
+    for raw_key in settings:
+        key = str(raw_key or "").strip()
+        base_key, separator, _host_name = key.partition("@")
+        if separator and base_key in instance_key_set and key not in instance_key_set:
+            qualified_keys.append(key)
+
+    for key in instance_keys + qualified_keys + ["default"]:
+        if key not in settings:
+            continue
+        raw = settings.get(key)
+        if isinstance(raw, dict):
+            if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
+                return set()
+            if _to_boolish(raw.get("disable_whitelist"), False):
+                return set()
+            ids_raw = raw.get(
+                "campaign_whitelist",
+                raw.get("campaigns", raw.get("ids", raw.get("whitelist", []))),
+            )
+            return set(_to_int_list(ids_raw))
+        if isinstance(raw, bool):
+            return global_ids if raw else set()
+        return set(_to_int_list(raw))
+    return global_ids
 
 
 def _segment_whitelist_file_key_for_instance(inst: object) -> str:
@@ -3184,6 +3226,7 @@ def _fill_from_ring(
     blocked_entities: set[int] | None = None,
     dynamic_blocked=None,
     should_skip=None,
+    remove_on_skip: bool = True,
     remove_on_launch: bool = False,
     on_launch=None,
     max_launches: int = 1,
@@ -3218,7 +3261,8 @@ def _fill_from_ring(
                 logging.warning("[%s] %s entity=%s skip check failed: %s", root, task_type, eid, e)
                 skip_entity = False
             if skip_entity:
-                _advance_ring_after_launch(ring, eid, remove_on_launch=True)
+                remove_skipped = bool(remove_on_skip(eid)) if callable(remove_on_skip) else bool(remove_on_skip)
+                _advance_ring_after_launch(ring, eid, remove_on_launch=remove_skipped)
                 continue
         if _is_running(running, root, task_type, eid):
             ring.rotate(-1)
@@ -3245,7 +3289,8 @@ def _fill_from_ring(
                     on_launch(eid)
                 except Exception:
                     pass
-            _advance_ring_after_launch(ring, eid, remove_on_launch=remove_on_launch)
+            remove_launched = bool(remove_on_launch(eid)) if callable(remove_on_launch) else bool(remove_on_launch)
+            _advance_ring_after_launch(ring, eid, remove_on_launch=remove_launched)
             launched_count += 1
         else:
             break
@@ -5373,6 +5418,34 @@ def _rotated_dispatch_installs(installs: list[object], cursor: int) -> list[obje
     return list(installs[start:]) + list(installs[:start])
 
 
+def _priority_interleaved_dispatch_installs(
+    installs: list[object],
+    config: AgentConfig,
+    *,
+    regular_chunk: int = _PRIORITY_DISPATCH_REGULAR_CHUNK,
+) -> list[object]:
+    if not installs:
+        return []
+    priority = [
+        inst
+        for inst in installs
+        if _segment_whitelist_effective_setting(config, inst)
+        or _campaign_whitelist_effective_setting(config, inst)
+    ]
+    if not priority:
+        return list(installs)
+    priority_roots = {str(getattr(inst, "root", "") or "") for inst in priority}
+    regular = [inst for inst in installs if str(getattr(inst, "root", "") or "") not in priority_roots]
+    if not regular:
+        return priority
+    out: list[object] = []
+    chunk_size = max(1, int(regular_chunk or 1))
+    for start in range(0, len(regular), chunk_size):
+        out.extend(priority)
+        out.extend(regular[start : start + chunk_size])
+    return out
+
+
 def _campaign_pressure_active(
     config: AgentConfig,
     running: dict[str, RunningTask],
@@ -7182,6 +7255,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     continue
                 root = inst.root
                 segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
+                campaign_whitelist_for_inst = _campaign_whitelist_effective_setting(config, inst)
                 db = MauticDB(inst.db)
                 sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
                 sql_ring_enabled_for_root = bool(
@@ -7715,7 +7789,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             logging.warning("[%s] campaign weight query failed: %s", root, e)
                             campaign_weight_query_failed = True
                             campaign_weight_rows = []
-                        camp_w = _campaign_weights(campaign_all_ids, campaign_weight_rows, campaign_whitelist, now_ts)
+                        camp_w = _campaign_weights(
+                            campaign_all_ids,
+                            campaign_weight_rows,
+                            campaign_whitelist_for_inst,
+                            now_ts,
+                        )
                         store.put_weights("campaign", root, camp_w)
                     latest_priority_ids = _latest_campaign_ids(campaign_weight_rows, config.campaign_latest_priority_count)
                     if not latest_priority_ids:
@@ -7729,14 +7808,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     trg_prio, trg_reg = _split_campaign_circles(
                         campaign_trigger_ids,
                         camp_w,
-                        campaign_whitelist,
+                        campaign_whitelist_for_inst,
                         config.campaign_priority_size,
                         latest_priority_ids,
                     )
                     reb_prio, reb_reg = _split_campaign_circles(
                         campaign_rebuild_ids,
                         camp_w,
-                        campaign_whitelist,
+                        campaign_whitelist_for_inst,
                         config.campaign_priority_size,
                         latest_priority_ids,
                     )
@@ -8211,7 +8290,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         cluster_import_allowed = cluster_route_allows(config, "import")
         cluster_cache_allowed = cluster_route_allows(config, "cache")
 
-        dispatch_installs = _rotated_dispatch_installs(installs, dispatch_instance_cursor)
+        dispatch_installs = _priority_interleaved_dispatch_installs(
+            _rotated_dispatch_installs(installs, dispatch_instance_cursor),
+            config,
+        )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
         for inst in dispatch_installs:
@@ -8221,6 +8303,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
             root = inst.root
             segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
+            campaign_whitelist_for_inst = _campaign_whitelist_effective_setting(config, inst)
             db = MauticDB(inst.db)
             now_utc = datetime.now(timezone.utc)
             sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
@@ -9120,7 +9203,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     ),
                     dynamic_blocked=_trigger_waits_for_rebuild,
                     should_skip=_trigger_has_no_due_work,
-                    remove_on_launch=True,
+                    remove_on_skip=lambda cid: cid not in campaign_whitelist_for_inst,
+                    remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                     on_launch=_mark_campaign_trigger_cycle,
                 )
                 if launched <= 0:
@@ -9201,7 +9285,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             ),
                             dynamic_blocked=_trigger_waits_for_rebuild,
                             should_skip=_trigger_has_no_due_work,
-                            remove_on_launch=True,
+                            remove_on_skip=lambda cid: cid not in campaign_whitelist_for_inst,
+                            remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                             on_launch=_mark_campaign_trigger_cycle,
                         )
                 return launched
@@ -9232,7 +9317,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         id=cid,
                     ),
                     dynamic_blocked=_rebuild_waits_for_trigger,
-                    remove_on_launch=True,
+                    remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                     on_launch=_mark_campaign_rebuild_cycle,
                 )
                 if launched <= 0:
@@ -9304,7 +9389,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 id=cid,
                             ),
                             dynamic_blocked=_rebuild_waits_for_trigger,
-                            remove_on_launch=True,
+                            remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                             on_launch=_mark_campaign_rebuild_cycle,
                         )
                 return launched
