@@ -379,9 +379,10 @@ Important:
   - `runtime.campaign_pressure_min_running_count` defaults to `2`; this many
     simultaneous campaign workers trigger campaign pressure immediately. Set to
     `0` to disable the count rule.
-  - `runtime.campaign_trigger_audit_interval_sec` bounds the safety audit that
-    periodically enqueues published campaigns as explicit
-    `mautic:campaigns:trigger -i ID` runs. Set to `0` to disable.
+  - Active MCD profiles run the campaign safety audit every 60 seconds. It
+    evaluates published campaigns against Mautic's due-work conditions and
+    runs `mautic:campaigns:trigger -i ID` only for eligible IDs; passive
+    profiles keep external cron ownership.
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.
 - Runtime tuning for Viber stats:
   - `runtime.viber_stats_enabled = true` enables the built-in `viber:stats:update` scheduler for instances where a Viber plugin is installed.

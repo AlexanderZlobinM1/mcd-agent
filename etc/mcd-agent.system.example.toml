@@ -138,9 +138,9 @@ segment_batch_limit = 1000
 campaign_batch_limit = 1000
 # Campaign limit for trigger command. 0/off/unlimited omits --campaign-limit.
 campaign_limit = 0
-# Safety audit: periodically enqueue published campaigns as explicit
-# `mautic:campaigns:trigger -i ID` runs, bounded per campaign by this interval.
-campaign_trigger_audit_interval_sec = 300
+# Safety audit: every minute evaluate published campaigns against Mautic's
+# due-work conditions and run only eligible IDs. Active MCD profiles enforce 60.
+campaign_trigger_audit_interval_sec = 60
 # Limit for mautic:import.
 import_limit = 1000
 

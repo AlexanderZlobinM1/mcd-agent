@@ -16,6 +16,44 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.campaign_limit, 0)
         self.assertIn("{campaign_limit_arg}", cfg.cmd_campaign_trigger_template)
+        self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 60)
+
+    def test_active_profile_enforces_one_minute_campaign_audit(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "midi"',
+                    "[runtime]",
+                    "campaign_trigger_audit_interval_sec = 300",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 60)
+
+    def test_passive_profile_keeps_external_campaign_schedule_unchanged(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "passive"',
+                    "[runtime]",
+                    "campaign_trigger_audit_interval_sec = 300",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
         self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 300)
 
     def test_host_scheduler_parallel_limit_is_runtime_configurable(self) -> None:
