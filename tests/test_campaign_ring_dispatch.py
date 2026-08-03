@@ -65,6 +65,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
         _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.clear()
         _CAMPAIGN_REBUILD_FINISHED_AT.clear()
+        daemon_mod._ENTITY_LAUNCH_GUARD.clear()
         with daemon_mod._SEGMENT_SQL_WORKERS_LOCK:
             daemon_mod._SEGMENT_SQL_WORKERS.clear()
 
@@ -174,6 +175,48 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertFalse(executor.is_active("/var/www/site", "segment", 23))
         self.assertGreater(executor.last_finished("/var/www/site", "segment", 23), 0)
+
+    def test_priority_executor_updates_normal_scheduler_repeat_guard(self) -> None:
+        executor = _PriorityTaskExecutor()
+        cfg = SimpleNamespace(command_timeout_sec=0, segment_full_scan_interval_sec=60)
+        completed = threading.Event()
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=100.0),
+            patch.object(daemon_mod.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+        ):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=23,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                    on_success=completed.set,
+                )
+            )
+            self.assertTrue(completed.wait(timeout=1))
+
+        self.assertFalse(
+            daemon_mod._launch_allowed(
+                cfg,
+                "/var/www/site",
+                "segment",
+                23,
+                now_ts=130.0,
+            )
+        )
+        self.assertTrue(
+            daemon_mod._launch_allowed(
+                cfg,
+                "/var/www/site",
+                "segment",
+                23,
+                now_ts=160.0,
+            )
+        )
 
     def test_priority_campaign_due_check_waits_for_its_first_rebuild(self) -> None:
         self.assertFalse(

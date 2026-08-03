@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.274 - 2026-08-03
+- Fixed: priority launches now update the same repeat guard and completion
+  markers as normal scheduler launches. This prevents a normal planning pass
+  from repeating a just-finished priority segment or campaign task.
+- Added: regression coverage for cross-path repeat suppression after a
+  successful priority execution.
+
 ## 0.9.273 - 2026-08-03
 - Added: explicitly whitelisted segment and campaign work now has an internal
   priority dispatcher independent of the full shared-host planning pass.

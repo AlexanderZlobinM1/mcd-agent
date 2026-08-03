@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -5236,11 +5237,14 @@ class _PriorityTaskExecutor:
         args: list[str],
         interval_sec: int,
         max_parallel: int,
+        on_success: Callable[[], None] | None = None,
     ) -> bool:
         key = _task_key(root, task_type, entity_id)
         now = time.time()
         with self._guard:
             if key in self._active:
+                return False
+            if not _launch_allowed(config, root, task_type, entity_id, now_ts=now):
                 return False
             previous = float(self._last_started.get(key, 0.0) or 0.0)
             if previous > 0 and now - previous < max(1, int(interval_sec or 1)):
@@ -5254,6 +5258,7 @@ class _PriorityTaskExecutor:
                 return False
             self._active[key] = (root, task_type)
             self._last_started[key] = now
+            _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, task_type, entity_id)] = now
 
         def _run() -> None:
             lock_key = _task_execution_lock_key(root, task_type, entity_id)
@@ -5285,6 +5290,17 @@ class _PriorityTaskExecutor:
             except Exception as exc:
                 logging.warning("[%s] priority error %s entity=%s: %s", root, task_type, entity_id, exc)
             finally:
+                if completed and on_success is not None:
+                    try:
+                        on_success()
+                    except Exception as exc:
+                        logging.warning(
+                            "[%s] priority completion hook failed %s entity=%s: %s",
+                            root,
+                            task_type,
+                            entity_id,
+                            exc,
+                        )
                 with self._guard:
                     self._active.pop(key, None)
                     if completed:
@@ -6683,6 +6699,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     priority_trigger_last_checked: dict[str, float] = {}
     priority_trigger_checked_rebuild: dict[str, float] = {}
 
+    def _priority_trigger_completed(root: str, campaign_id: int, db_cfg: object) -> None:
+        _mark_campaign_trigger_finished(root, campaign_id)
+        _campaign_email_counter_reconcile(
+            db=MauticDB(db_cfg),
+            root=root,
+            campaign_id=campaign_id,
+            reason="priority-trigger-exit",
+            force=True,
+        )
+
     def _priority_scheduler() -> None:
         while True:
             cfg = config
@@ -6722,6 +6748,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         interval_sec=max(1, int(cfg.segment_full_scan_interval_sec or 60)),
                         max_parallel=max(1, int(cfg.segment_priority_parallel_idle or 1)),
+                        on_success=lambda root=root, segment_id=int(segment_id): _mark_segment_finished(
+                            root,
+                            segment_id,
+                        ),
                     )
 
                 for campaign_id in sorted(campaign_ids):
@@ -6740,6 +6770,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         interval_sec=max(1, int(cfg.campaign_rebuild_min_repeat_sec or 60)),
                         max_parallel=max(1, int(cfg.campaign_rebuild_priority_parallel or 1)),
+                        on_success=lambda root=root, campaign_id=campaign_id: _mark_campaign_rebuild_finished(
+                            root,
+                            campaign_id,
+                        ),
                     )
                     if priority_executor.is_active(root, "campaign_rebuild", campaign_id):
                         continue
@@ -6794,6 +6828,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             ),
                             interval_sec=trigger_interval,
                             max_parallel=max(1, int(cfg.campaign_trigger_priority_parallel or 1)),
+                            on_success=lambda root=root, campaign_id=campaign_id, db_cfg=inst.db: _priority_trigger_completed(
+                                root,
+                                campaign_id,
+                                db_cfg,
+                            ),
                         )
             time.sleep(1.0)
 
