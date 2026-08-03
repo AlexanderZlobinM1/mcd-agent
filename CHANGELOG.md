@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.275 - 2026-08-03
+- Fixed: full MCC state pushes now reload the shared instance inventory before
+  serialization. An instance deleted by a separate `mcd-cli` process can no
+  longer be reintroduced by the daemon's stale in-memory list.
+- Added: full inventory snapshots are explicitly marked as complete. A failed
+  inventory read is marked incomplete so MCC never prunes cache rows from a
+  fallback payload.
+
 ## 0.9.274 - 2026-08-03
 - Fixed: priority launches now update the same repeat guard and completion
   markers as normal scheduler launches. This prevents a normal planning pass

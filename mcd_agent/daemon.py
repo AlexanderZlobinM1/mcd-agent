@@ -6517,6 +6517,17 @@ def _refresh_instance_db_maps(
             mautic_timezones_by_root.pop(root, None)
 
 
+def _inventory_snapshot_for_push(
+    inventory: InstanceInventory,
+    current: list[MauticInstall],
+) -> tuple[list[MauticInstall], bool]:
+    try:
+        return inventory.list_instances(), True
+    except Exception as exc:
+        logging.warning("inventory refresh before MCC state push failed: %s", exc)
+        return current, False
+
+
 def _apply_instance_runtime_guard(installs: list[MauticInstall], *, reason: str) -> None:
     try:
         payload = apply_instance_runtime(installs, reload_services=True)
@@ -8350,12 +8361,23 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 last_db_watchdog_ts[root] = now
 
         if pusher.enabled():
+            previous_roots = {str(item.root) for item in installs}
+            installs, instances_snapshot_complete = _inventory_snapshot_for_push(inventory, installs)
+            current_roots = {str(item.root) for item in installs}
+            if instances_snapshot_complete and current_roots != previous_roots:
+                logging.info(
+                    "inventory refreshed before MCC state push: before=%s after=%s",
+                    len(previous_roots),
+                    len(current_roots),
+                )
+                _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
             pending_profile_event = read_pending_profile_event(config)
             payload = pusher.build_payload(
                 installs=installs,
                 profile_name=config.profile_name,
                 now_ts=now,
                 profile_event=pending_profile_event,
+                instances_snapshot_complete=instances_snapshot_complete,
             )
             payload_no_ts = dict(payload)
             payload_no_ts.pop("sent_at_utc", None)

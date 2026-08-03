@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from mcd_agent.backup import _cluster_node_slug
 from mcd_agent.cluster_routing import cluster_local_identity_values
-from mcd_agent.daemon import _cluster_local_full_done_for_date
+from mcd_agent.daemon import _cluster_local_full_done_for_date, _inventory_snapshot_for_push
 from mcd_agent.state_push import (
     MCCStatePusher,
     _DEFAULT_STATE_PUSH_TIMEOUT_SEC,
@@ -32,6 +32,28 @@ def _cfg(**overrides: object) -> SimpleNamespace:
 
 
 class ClusterFileIdentityTests(unittest.TestCase):
+    def test_state_push_refreshes_inventory_from_shared_state_db(self) -> None:
+        current = [SimpleNamespace(root="/var/www/deleted/public_html")]
+        fresh = [SimpleNamespace(root="/var/www/active/public_html")]
+        inventory = SimpleNamespace(list_instances=lambda: fresh)
+
+        snapshot, complete = _inventory_snapshot_for_push(inventory, current)
+
+        self.assertIs(snapshot, fresh)
+        self.assertTrue(complete)
+
+    def test_state_push_marks_fallback_snapshot_incomplete(self) -> None:
+        current = [SimpleNamespace(root="/var/www/active/public_html")]
+
+        class BrokenInventory:
+            def list_instances(self):
+                raise RuntimeError("state db unavailable")
+
+        snapshot, complete = _inventory_snapshot_for_push(BrokenInventory(), current)
+
+        self.assertIs(snapshot, current)
+        self.assertFalse(complete)
+
     def test_ip_identity_values_include_mcc_host_slug(self) -> None:
         with patch("mcd_agent.cluster_routing.subprocess.check_output", return_value="37.27.135.183 10.0.0.1\n"):
             vals = cluster_local_identity_values(_cfg())
