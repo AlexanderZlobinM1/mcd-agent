@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 0.9.271 - 2026-08-03
+- Fixed: the agent source distribution now includes `requirements.txt`, which
+  is required by MCC release validation and by the host self-update installer.
+
 ## 0.9.270 - 2026-08-03
 - Fixed: active MCD profiles now enforce a one-minute campaign safety audit,
   including hosts carrying the previous five-minute runtime setting. The audit
