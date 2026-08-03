@@ -19,6 +19,7 @@ from mcd_agent.daemon import (
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _campaign_pressure_active,
+    _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
@@ -34,6 +35,7 @@ from mcd_agent.daemon import (
     _merge_campaign_trigger_audit_ids,
     _plan_sql_segment_ring,
     _published_segment_whitelist_ids,
+    _priority_interleaved_dispatch_installs,
     _recover_orphaned_imports_if_safe,
     _remove_ring_entities,
     _rotated_dispatch_installs,
@@ -81,6 +83,99 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(_rotated_dispatch_installs(installs, 0), ["a", "b", "c"])
         self.assertEqual(_rotated_dispatch_installs(installs, 1), ["b", "c", "a"])
         self.assertEqual(_rotated_dispatch_installs(installs, 4), ["b", "c", "a"])
+
+    def test_priority_dispatch_is_revisited_between_regular_chunks(self) -> None:
+        priority = SimpleNamespace(root="/priority", instance_uid="priority@host")
+        regular = [SimpleNamespace(root=f"/regular-{idx}", instance_uid=f"regular-{idx}@host") for idx in range(5)]
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={"priority@host": {"ids": [23]}},
+            campaign_whitelist=[],
+            campaign_whitelist_file=None,
+            campaign_whitelist_instance_settings={},
+        )
+
+        planned = _priority_interleaved_dispatch_installs([*regular, priority], cfg, regular_chunk=2)
+
+        self.assertEqual([inst.root for inst in planned], [
+            "/priority", "/regular-0", "/regular-1",
+            "/priority", "/regular-2", "/regular-3",
+            "/priority", "/regular-4",
+        ])
+
+    def test_campaign_whitelist_is_scoped_to_matching_instance(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            campaign_whitelist=[99],
+            campaign_whitelist_file=None,
+            campaign_whitelist_instance_settings={"electronic@host": {"campaign_whitelist": [29]}},
+        )
+        electronic = SimpleNamespace(
+            root="/var/www/electronic/public_html",
+            instance_uid="electronic@host",
+            primary_domain="electronic.sales-snap.com",
+            name="electronic.sales-snap.com",
+            domains=[],
+        )
+        other = SimpleNamespace(
+            root="/var/www/other/public_html",
+            instance_uid="other@host",
+            primary_domain="other.sales-snap.com",
+            name="other.sales-snap.com",
+            domains=[],
+        )
+
+        self.assertEqual(_campaign_whitelist_effective_setting(cfg, electronic), {29})
+        self.assertEqual(_campaign_whitelist_effective_setting(cfg, other), {99})
+
+    def test_priority_campaign_skip_keeps_candidate_for_fast_recheck(self) -> None:
+        ring = deque([29])
+        cfg = SimpleNamespace(campaign_trigger_min_repeat_sec=0, campaign_trigger_audit_interval_sec=0)
+
+        launched = _fill_from_ring(
+            ring=ring,
+            ring_limit=1,
+            total_limit=1,
+            root="/var/www/electronic/public_html",
+            task_type="campaign_trigger",
+            running={},
+            ring_entities={29},
+            config=cfg,
+            store=Mock(),
+            popens={},
+            build_args=Mock(),
+            should_skip=lambda _campaign_id: True,
+            remove_on_skip=False,
+            remove_on_launch=False,
+        )
+
+        self.assertEqual(launched, 0)
+        self.assertEqual(list(ring), [29])
+
+    def test_priority_campaign_retention_does_not_keep_weight_only_candidate(self) -> None:
+        ring = deque([29, 30])
+        cfg = SimpleNamespace(campaign_trigger_min_repeat_sec=0, campaign_trigger_audit_interval_sec=0)
+
+        _fill_from_ring(
+            ring=ring,
+            ring_limit=1,
+            total_limit=1,
+            root="/var/www/electronic/public_html",
+            task_type="campaign_trigger",
+            running={},
+            ring_entities={29, 30},
+            config=cfg,
+            store=Mock(),
+            popens={},
+            build_args=Mock(),
+            should_skip=lambda _campaign_id: True,
+            remove_on_skip=lambda campaign_id: campaign_id != 29,
+            remove_on_launch=lambda campaign_id: campaign_id != 29,
+        )
+
+        self.assertEqual(list(ring), [29])
 
     def test_fill_from_ring_skips_stale_campaign_without_launching(self) -> None:
         ring = deque([136])

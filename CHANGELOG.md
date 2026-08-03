@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.272 - 2026-08-03
+- Added: scoped per-instance campaign whitelist settings, matching the existing
+  segment whitelist ownership model on shared hosts.
+- Fixed: priority instances are revisited between bounded chunks of regular
+  instance dispatch. Priority segment and campaign work therefore follows its
+  own repeat guard instead of waiting for a complete shared-host traversal.
+- Fixed: priority campaign candidates remain in their ring after a successful
+  run or a temporary no-due-work preflight. The shared task key and normal
+  concurrency limits still prevent duplicate parallel execution.
+
 ## 0.9.271 - 2026-08-03
 - Fixed: the agent source distribution now includes `requirements.txt`, which
   is required by MCC release validation and by the host self-update installer.

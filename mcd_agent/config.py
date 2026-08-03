@@ -524,6 +524,7 @@ class AgentConfig:
     segment_whitelist_instance_settings: dict[str, Any]
     campaign_whitelist: list[int]
     campaign_whitelist_file: str | None
+    campaign_whitelist_instance_settings: dict[str, Any]
     segment_priority_weight_threshold: float
     segment_priority_size: int
     segment_mode: str
@@ -2052,6 +2053,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_whitelist_instance_settings": "segment_whitelist_instance_settings",
     "campaign_whitelist": "campaign_whitelist",
     "campaign_whitelist_file": "campaign_whitelist_file",
+    "campaign_whitelist_instance_settings": "campaign_whitelist_instance_settings",
     "segment_priority_weight_threshold": "segment_priority_weight_threshold",
     "segment_priority_size": "segment_priority_size",
     "segment_mode": "segment_mode",
@@ -2826,6 +2828,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         ),
         campaign_whitelist=_normalize_int_list(runtime.get("campaign_whitelist", [])),
         campaign_whitelist_file=str(runtime.get("campaign_whitelist_file")).strip() if runtime.get("campaign_whitelist_file") else None,
+        campaign_whitelist_instance_settings=(
+            dict(runtime.get("campaign_whitelist_instance_settings", {}))
+            if isinstance(runtime.get("campaign_whitelist_instance_settings", {}), dict)
+            else {}
+        ),
         segment_priority_weight_threshold=float(runtime.get("segment_priority_weight_threshold", 60)),
         segment_priority_size=int(runtime.get("segment_priority_size", 5)),
         segment_mode=str(runtime.get("segment_mode", "id_weighted")),
