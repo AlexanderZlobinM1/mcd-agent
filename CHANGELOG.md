@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.9.270 - 2026-08-03
+- Fixed: active MCD profiles now enforce a one-minute campaign safety audit,
+  including hosts carrying the previous five-minute runtime setting. The audit
+  still launches native Mautic trigger commands only after exact due-work
+  checks, so published but idle campaigns are not executed unnecessarily.
+- Safety: passive profiles retain external cron ownership and are unchanged.
+
 ## 0.9.269 - 2026-07-31
 - Added: MySQL hardware profiles now manage `max_user_connections` together
   with `max_connections`. This removes legacy fixed per-user caps that could

@@ -354,13 +354,13 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(list(ring), [4, 5])
 
-    def test_campaign_trigger_repeat_guard_uses_audit_interval_floor(self) -> None:
+    def test_campaign_trigger_repeat_guard_uses_one_minute_audit_floor(self) -> None:
         cfg = SimpleNamespace(
             campaign_trigger_min_repeat_sec=10,
-            campaign_trigger_audit_interval_sec=300,
+            campaign_trigger_audit_interval_sec=60,
         )
 
-        self.assertEqual(_task_repeat_interval_sec(cfg, "campaign_trigger"), 300)
+        self.assertEqual(_task_repeat_interval_sec(cfg, "campaign_trigger"), 60)
 
     def test_campaign_trigger_audit_ids_persist_between_due_sql_cycles(self) -> None:
         audit_ids = [684, 683, 681, 678, 668, 667, 657, 656]

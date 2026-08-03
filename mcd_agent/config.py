@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - py3.10 compatibility
 
 
 CURRENT_CONFIG_SCHEMA_VERSION = 2
+_CAMPAIGN_TRIGGER_AUDIT_INTERVAL_SEC = 60
 LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
     "max_parallel_campaigns",
     "max_parallel_segments_idle",
@@ -1126,6 +1127,16 @@ def _enforce_campaign_rebuild_guard(cfg: AgentConfig) -> AgentConfig:
     if not updates:
         return cfg
     return replace(cfg, **updates)
+
+
+def _enforce_campaign_trigger_audit_policy(cfg: AgentConfig) -> AgentConfig:
+    """Keep active MCD campaign safety audits on a one-minute cadence."""
+    profile = (cfg.profile_name or "").strip().lower()
+    if profile == "passive" or not _campaign_trigger_slots_enabled(cfg):
+        return cfg
+    if cfg.campaign_trigger_audit_interval_sec == _CAMPAIGN_TRIGGER_AUDIT_INTERVAL_SEC:
+        return cfg
+    return replace(cfg, campaign_trigger_audit_interval_sec=_CAMPAIGN_TRIGGER_AUDIT_INTERVAL_SEC)
 
 
 def _enforce_profile_guards(cfg: AgentConfig) -> AgentConfig:
@@ -2591,7 +2602,9 @@ def _load_config_inner(path: str) -> AgentConfig:
     campaign_trigger_priority_parallel = int(runtime.get("campaign_trigger_priority_parallel", campaign_priority_parallel))
     campaign_trigger_regular_parallel = int(runtime.get("campaign_trigger_regular_parallel", campaign_regular_parallel))
     campaign_trigger_min_repeat_sec = int(runtime.get("campaign_trigger_min_repeat_sec", 10))
-    campaign_trigger_audit_interval_sec = int(runtime.get("campaign_trigger_audit_interval_sec", 300))
+    campaign_trigger_audit_interval_sec = int(
+        runtime.get("campaign_trigger_audit_interval_sec", _CAMPAIGN_TRIGGER_AUDIT_INTERVAL_SEC)
+    )
     campaign_trigger_due_guard_enabled = bool(runtime.get("campaign_trigger_due_guard_enabled", True))
     campaign_trigger_progress_watchdog_enabled = bool(
         runtime.get("campaign_trigger_progress_watchdog_enabled", True)
@@ -3450,6 +3463,7 @@ def _load_config_inner(path: str) -> AgentConfig:
     profiled = _apply_profile(cfg)
     merged = _reapply_manual_runtime_overrides(profiled, runtime)
     merged = _enforce_campaign_rebuild_guard(merged)
+    merged = _enforce_campaign_trigger_audit_policy(merged)
     merged = _enforce_profile_guards(merged)
     if merged.disable_whitelist:
         merged = replace(merged, segment_whitelist=[], segment_whitelist_file=None, campaign_whitelist=[], campaign_whitelist_file=None)
