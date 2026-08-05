@@ -566,6 +566,8 @@ class AgentConfig:
     campaign_rebuild_max_cycles_per_tick: int
     campaign_rebuild_priority_parallel: int
     campaign_rebuild_regular_parallel: int
+    campaign_native_fallback_enabled: bool
+    campaign_native_fallback_interval_sec: int
     enable_contacts_cleanup: bool
     contacts_cleanup_interval_sec: int
     contacts_cleanup_quiet_hour: int
@@ -2107,6 +2109,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "campaign_rebuild_max_cycles_per_tick": "campaign_rebuild_max_cycles_per_tick",
     "campaign_rebuild_priority_parallel": "campaign_rebuild_priority_parallel",
     "campaign_rebuild_regular_parallel": "campaign_rebuild_regular_parallel",
+    "campaign_native_fallback_enabled": "campaign_native_fallback_enabled",
+    "campaign_native_fallback_interval_sec": "campaign_native_fallback_interval_sec",
     "enable_contacts_cleanup": "enable_contacts_cleanup",
     "contacts_cleanup_interval_sec": "contacts_cleanup_interval_sec",
     "contacts_cleanup_quiet_hour": "contacts_cleanup_quiet_hour",
@@ -2344,6 +2348,8 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
         elif isinstance(current, int):
             if attr == "campaign_limit":
                 updates[attr] = _normalize_campaign_limit(raw_value)
+            elif attr == "campaign_native_fallback_interval_sec":
+                updates[attr] = max(300, int(raw_value or 3600))
             else:
                 updates[attr] = int(raw_value)
         elif isinstance(current, float):
@@ -2886,6 +2892,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         campaign_rebuild_max_cycles_per_tick=int(runtime.get("campaign_rebuild_max_cycles_per_tick", 4)),
         campaign_rebuild_priority_parallel=int(runtime.get("campaign_rebuild_priority_parallel", 4)),
         campaign_rebuild_regular_parallel=int(runtime.get("campaign_rebuild_regular_parallel", 1)),
+        campaign_native_fallback_enabled=bool(runtime.get("campaign_native_fallback_enabled", False)),
+        campaign_native_fallback_interval_sec=max(
+            300,
+            int(runtime.get("campaign_native_fallback_interval_sec", 3600) or 3600),
+        ),
         enable_contacts_cleanup=bool(runtime.get("enable_contacts_cleanup", False)),
         contacts_cleanup_interval_sec=int(runtime.get("contacts_cleanup_interval_sec", 86_400)),
         contacts_cleanup_quiet_hour=int(runtime.get("contacts_cleanup_quiet_hour", 2)),

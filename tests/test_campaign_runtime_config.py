@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from mcd_agent.config import load_config
+from mcd_agent.daemon import _campaign_native_fallback_args
 
 
 class CampaignRuntimeConfigTests(unittest.TestCase):
@@ -234,6 +236,38 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         cfg = load_config(str(path), allow_recover_from_mcc=False)
 
         self.assertFalse(cfg.enable_campaign_rebuild)
+
+    def test_native_campaign_fallback_is_opt_in_and_clamped(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "[runtime]\ncampaign_native_fallback_enabled = true\ncampaign_native_fallback_interval_sec = 1\n",
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertTrue(cfg.campaign_native_fallback_enabled)
+        self.assertEqual(cfg.campaign_native_fallback_interval_sec, 300)
+
+    def test_native_campaign_fallback_runs_global_update_before_trigger(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        console = root / "bin" / "console"
+        console.parent.mkdir()
+        console.write_text("#!/bin/sh\n", encoding="utf-8")
+        cfg = SimpleNamespace(
+            php_bin="php",
+            mautic_run_as_user=None,
+            cmd_campaign_update_template="mautic:campaigns:update -i {id}",
+            cmd_campaign_trigger_template="mautic:campaigns:trigger -i {id}{campaign_limit_arg} --batch-limit={batch_limit}",
+            campaign_limit=0,
+            campaign_batch_limit=500,
+        )
+
+        args = _campaign_native_fallback_args(cfg, str(root))
+
+        self.assertEqual(args[:2], ["/bin/sh", "-c"])
+        self.assertIn("mautic:campaigns:update --no-interaction &&", args[2])
+        self.assertIn("mautic:campaigns:trigger --batch-limit=500 --no-interaction", args[2])
 
 
 if __name__ == "__main__":

@@ -235,6 +235,12 @@ campaign_rebuild_poll_interval_sec = 300
 # Max cycles per rebuild tick.
 campaign_rebuild_max_cycles_per_tick = 4
 
+# Native campaign safety fallback. When enabled, MCD runs the global Mautic
+# campaign update followed by trigger once per interval, after the regular
+# scheduler has been idle for this instance. The single result is reported to MCC.
+campaign_native_fallback_enabled = false
+campaign_native_fallback_interval_sec = 3600
+
 # Enable contacts cleanup task.
 enable_contacts_cleanup = false
 # Minimum interval between cleanup runs, sec.

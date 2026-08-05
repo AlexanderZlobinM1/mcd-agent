@@ -1377,6 +1377,10 @@ class MCCStatePusher:
             "rule_hits": 0,
         }
         self._db_watchdog_events_pending: list[dict[str, Any]] = []
+        # Native campaign fallback runs are sparse diagnostic events. Keep a
+        # bounded recent window so MCC receives recovery evidence without a
+        # scheduler-log firehose.
+        self._campaign_native_fallback_events_pending: list[dict[str, Any]] = []
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -1484,6 +1488,23 @@ class MCCStatePusher:
         )
         self._db_watchdog_events_pending = self._db_watchdog_events_pending[-200:]
 
+    def add_campaign_native_fallback(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        event = {
+            "ts": str(payload.get("ts", "")).strip()
+            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "root": str(payload.get("root", "")).strip(),
+            "status": str(payload.get("status", "")).strip() or "unknown",
+            "operation_rc": payload.get("operation_rc"),
+            "pending_before": int(payload.get("pending_before", 0) or 0),
+            "pending_after": int(payload.get("pending_after", 0) or 0),
+            "email_stats_before": int(payload.get("email_stats_before", 0) or 0),
+            "email_stats_after": int(payload.get("email_stats_after", 0) or 0),
+        }
+        self._campaign_native_fallback_events_pending.append(event)
+        self._campaign_native_fallback_events_pending = self._campaign_native_fallback_events_pending[-100:]
+
     def _signals_payload(self) -> dict[str, Any]:
         base = self.latest_signals if isinstance(self.latest_signals, dict) else {}
         out = dict(base)
@@ -1520,6 +1541,11 @@ class MCCStatePusher:
             details_raw = out.get("details")
             details = dict(details_raw) if isinstance(details_raw, dict) else {}
             details["db_watchdog_recent"] = self._db_watchdog_events_pending[-50:]
+            out["details"] = details
+        if self._campaign_native_fallback_events_pending:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["campaign_native_fallback_recent"] = self._campaign_native_fallback_events_pending[-50:]
             out["details"] = details
         return out
 

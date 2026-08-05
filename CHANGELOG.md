@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.277 - 2026-08-05
+- Added: an opt-in native campaign safety fallback. Once per configured interval,
+  an active MCD host runs global `mautic:campaigns:update` followed by
+  `mautic:campaigns:trigger` only after local campaign work is idle.
+- Added: one compact MCC signal per fallback run with return code and before/after
+  due-event and campaign-email counts, so recovery differences are auditable.
+- Fixed: fallback metrics now render each Mautic database table prefix before
+  querying, so prefixed installations do not skip the fallback preflight.
+
 ## 0.9.275 - 2026-08-03
 - Fixed: full MCC state pushes now reload the shared instance inventory before
   serialization. An instance deleted by a separate `mcd-cli` process can no
