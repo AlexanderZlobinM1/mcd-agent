@@ -5749,6 +5749,37 @@ def _priority_interleaved_dispatch_installs(
     return out
 
 
+def _campaign_pressure_active(
+    config: AgentConfig,
+    running: dict[str, RunningTask],
+    root: str,
+    *,
+    trigger_prio_ring: deque[int],
+    trigger_reg_ring: deque[int],
+    rebuild_prio_ring: deque[int],
+    rebuild_reg_ring: deque[int],
+    trigger_dynamic_blocked=None,
+    now_ts: float | None = None,
+) -> bool:
+    if not bool(getattr(config, "segment_throttle_during_campaigns", True)):
+        return False
+    running_campaigns = [
+        task
+        for task in running.values()
+        if task.root == root and task.task_type in _SCHEDULER_CAMPAIGN_TASK_TYPES
+    ]
+    if not running_campaigns:
+        return False
+    min_running_count = max(0, int(getattr(config, "campaign_pressure_min_running_count", 2) or 0))
+    if min_running_count > 0 and len(running_campaigns) >= min_running_count:
+        return True
+    min_running_sec = max(0, int(getattr(config, "campaign_pressure_min_running_sec", 120) or 0))
+    if min_running_sec <= 0:
+        return True
+    now = time.time() if now_ts is None else float(now_ts)
+    return any(now - float(task.started_at or 0) >= min_running_sec for task in running_campaigns)
+
+
 def _running_count_for_entities(
     running: dict[str, RunningTask],
     root: str,
@@ -9159,7 +9190,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 _publish_monitor_cycle()
                 continue
 
-            segment_throttled_active = bool(throttled.get(root, False))
+            campaign_pressure = _campaign_pressure_active(
+                config,
+                running,
+                root,
+                trigger_prio_ring=trg_prio_ring,
+                trigger_reg_ring=trg_reg_ring,
+                rebuild_prio_ring=reb_prio_ring,
+                rebuild_reg_ring=reb_reg_ring,
+                trigger_dynamic_blocked=_trigger_waits_for_rebuild,
+                now_ts=now,
+            )
+            segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
             segment_slot_limit = _effective_segment_slot_limit(
                 config,
                 segment_throttled_active,

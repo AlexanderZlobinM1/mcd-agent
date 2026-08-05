@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.281 - 2026-08-05
+- Preserved: configured campaign-pressure throttling still reduces the segment
+  lane for long or concurrent campaign work. This resource guard is separate
+  from scheduler ownership: segment tasks cannot consume campaign slots or
+  prevent campaign update, trigger, and rebuild launches.
+
 ## 0.9.280 - 2026-08-05
 - Changed: host scheduler capacity is split into independent segment/import and
   campaign lanes. Saturated `segment`, `segment_sql`, or `import` work cannot

@@ -21,6 +21,7 @@ from mcd_agent.daemon import (
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _PriorityTaskExecutor,
     _TASK_LOCK_BUSY_RC,
+    _campaign_pressure_active,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
@@ -1412,6 +1413,68 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(removed, 3)
         self.assertEqual(list(ring), [101, 305])
+
+    def test_campaign_pressure_preserves_configured_segment_throttle(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(
+            segment_throttle_during_campaigns=True,
+            campaign_pressure_min_running_sec=120,
+            campaign_pressure_min_running_count=2,
+        )
+        running = {
+            _task_key(root, "campaign_trigger", 104): RunningTask(
+                row_id=1,
+                root=root,
+                task_key=_task_key(root, "campaign_trigger", 104),
+                task_type="campaign_trigger",
+                entity_id=104,
+                command_str="campaign trigger 104",
+                timeout_sec=3600,
+                attempts=1,
+                started_at=100.0,
+                pid=1004,
+            )
+        }
+
+        self.assertFalse(
+            _campaign_pressure_active(
+                cfg,
+                running,
+                root,
+                trigger_prio_ring=deque(),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+                now_ts=150.0,
+            )
+        )
+        self.assertTrue(
+            _campaign_pressure_active(
+                cfg,
+                running,
+                root,
+                trigger_prio_ring=deque(),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque(),
+                rebuild_reg_ring=deque(),
+                now_ts=221.0,
+            )
+        )
+
+    def test_campaign_pressure_can_still_be_disabled(self) -> None:
+        cfg = SimpleNamespace(segment_throttle_during_campaigns=False)
+
+        self.assertFalse(
+            _campaign_pressure_active(
+                cfg,
+                {},
+                "/var/www/site",
+                trigger_prio_ring=deque([104]),
+                trigger_reg_ring=deque(),
+                rebuild_prio_ring=deque([105]),
+                rebuild_reg_ring=deque(),
+            )
+        )
 
     def test_segment_whitelist_uses_instance_specific_setting(self) -> None:
         cfg = SimpleNamespace(
