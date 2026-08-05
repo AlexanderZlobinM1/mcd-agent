@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.9.278 - 2026-08-05
+- Fixed: native fallback metrics now inspect the real prefixed Mautic event-log
+  schema and support both current and legacy scheduling columns. Metric failures
+  are best-effort diagnostics and can no longer suppress native commands.
+- Changed: each fallback always runs the global native campaign update and
+  trigger commands without campaign or batch arguments. Shared hosts admit only
+  one fallback instance at a time and emit one compact completion log.
+- Added: fallback outcomes and recovered-work deltas accumulate per instance in
+  the agent state database across restarts. MCC receives cumulative totals and a
+  bounded recent history; operation events retain 30 days with a 5000-row cap.
+
 ## 0.9.277 - 2026-08-05
 - Added: an opt-in native campaign safety fallback. Once per configured interval,
   an active MCD host runs global `mautic:campaigns:update` followed by

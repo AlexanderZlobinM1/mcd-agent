@@ -5224,6 +5224,10 @@ class _PriorityTaskExecutor:
                 for active_root, active_type in self._active.values()
             )
 
+    def has_active_task_type(self, task_type: str) -> bool:
+        with self._guard:
+            return any(active_type == task_type for _active_root, active_type in self._active.values())
+
     def last_finished(self, root: str, task_type: str, entity_id: int) -> float:
         key = _task_key(root, task_type, entity_id)
         with self._guard:
@@ -5246,6 +5250,7 @@ class _PriorityTaskExecutor:
         max_parallel: int,
         on_success: Callable[[], None] | None = None,
         on_complete: Callable[[int | None], None] | None = None,
+        log_lifecycle: bool = True,
     ) -> bool:
         key = _task_key(root, task_type, entity_id)
         now = time.time()
@@ -5271,7 +5276,8 @@ class _PriorityTaskExecutor:
         def _run() -> None:
             lock_key = _task_execution_lock_key(root, task_type, entity_id)
             locked_args = _task_locked_args(lock_key, args)
-            logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
+            if log_lifecycle:
+                logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
             completed = False
             rc: int | None = None
             try:
@@ -5287,16 +5293,21 @@ class _PriorityTaskExecutor:
                 )
                 rc = int(proc.returncode or 0)
                 if rc == _TASK_LOCK_BUSY_RC:
-                    logging.info("[%s] priority lock busy %s entity=%s", root, task_type, entity_id)
+                    if log_lifecycle:
+                        logging.info("[%s] priority lock busy %s entity=%s", root, task_type, entity_id)
                 elif rc == 0:
                     completed = True
-                    logging.info("[%s] priority finished %s entity=%s rc=0", root, task_type, entity_id)
+                    if log_lifecycle:
+                        logging.info("[%s] priority finished %s entity=%s rc=0", root, task_type, entity_id)
                 else:
-                    logging.warning("[%s] priority failed %s entity=%s rc=%s", root, task_type, entity_id, rc)
+                    if log_lifecycle:
+                        logging.warning("[%s] priority failed %s entity=%s rc=%s", root, task_type, entity_id, rc)
             except subprocess.TimeoutExpired:
-                logging.warning("[%s] priority timeout %s entity=%s", root, task_type, entity_id)
+                if log_lifecycle:
+                    logging.warning("[%s] priority timeout %s entity=%s", root, task_type, entity_id)
             except Exception as exc:
-                logging.warning("[%s] priority error %s entity=%s: %s", root, task_type, entity_id, exc)
+                if log_lifecycle:
+                    logging.warning("[%s] priority error %s entity=%s: %s", root, task_type, entity_id, exc)
             finally:
                 if completed and on_success is not None:
                     try:
@@ -5331,35 +5342,74 @@ class _PriorityTaskExecutor:
         return True
 
 
-def _campaign_native_fallback_metrics(db: MauticDB) -> tuple[int, int]:
-    """Return due untriggered campaign logs and campaign-generated email rows."""
-    pending = db.fetch_count(
-        "SELECT COUNT(*) FROM {prefix}campaign_lead_event_log "
-        "WHERE triggered = 0 AND date_scheduled IS NOT NULL AND date_scheduled <= UTC_TIMESTAMP()"
-    )
-    sent = db.fetch_count("SELECT COUNT(*) FROM {prefix}email_stats WHERE source = 'campaign.event'")
-    return max(0, int(pending or 0)), max(0, int(sent or 0))
+def _campaign_native_fallback_metrics(db: MauticDB) -> dict[str, object]:
+    """Collect best-effort, schema-aware evidence around one native fallback run."""
+    out: dict[str, object] = {"pending_due": None, "email_stats": None, "error": ""}
+    errors: list[str] = []
+
+    try:
+        event_columns = {
+            str(row.get("Field") or "").strip().lower()
+            for row in db.fetch_rows("SHOW COLUMNS FROM `{prefix}campaign_lead_event_log`")
+            if isinstance(row, dict)
+        }
+        if {"date_triggered", "is_scheduled", "trigger_date"}.issubset(event_columns):
+            pending_query = (
+                "SELECT COUNT(*) FROM {prefix}campaign_lead_event_log "
+                "WHERE date_triggered IS NULL AND is_scheduled = 1 "
+                "AND (trigger_date IS NULL OR trigger_date <= UTC_TIMESTAMP())"
+            )
+        elif {"triggered", "date_scheduled"}.issubset(event_columns):
+            pending_query = (
+                "SELECT COUNT(*) FROM {prefix}campaign_lead_event_log "
+                "WHERE triggered = 0 AND date_scheduled IS NOT NULL "
+                "AND date_scheduled <= UTC_TIMESTAMP()"
+            )
+        else:
+            raise RuntimeError("unsupported campaign_lead_event_log schema")
+        out["pending_due"] = max(0, int(db.fetch_count(pending_query) or 0))
+    except Exception as exc:
+        errors.append(f"pending_due:{type(exc).__name__}:{exc}")
+
+    try:
+        email_columns = {
+            str(row.get("Field") or "").strip().lower()
+            for row in db.fetch_rows("SHOW COLUMNS FROM `{prefix}email_stats`")
+            if isinstance(row, dict)
+        }
+        if "source" not in email_columns:
+            raise RuntimeError("email_stats.source is unavailable")
+        out["email_stats"] = max(
+            0,
+            int(db.fetch_count("SELECT COUNT(*) FROM {prefix}email_stats WHERE source = 'campaign.event'") or 0),
+        )
+    except Exception as exc:
+        errors.append(f"email_stats:{type(exc).__name__}:{exc}")
+
+    out["error"] = "; ".join(errors)[:500]
+    return out
 
 
 def _campaign_native_fallback_args(config: AgentConfig, root: str) -> list[str]:
-    def _global_template(template: str) -> str:
-        return template.replace(" -i {id}", "").replace(" --id={id}", "").replace("{id}", "")
-
     update = render_mautic_command(
         php_bin=config.php_bin,
         run_as_user=config.mautic_run_as_user,
         root=root,
-        template=_global_template(config.cmd_campaign_update_template),
+        template="mautic:campaigns:update",
     )
     trigger = render_mautic_command(
         php_bin=config.php_bin,
         run_as_user=config.mautic_run_as_user,
         root=root,
-        template=_global_template(config.cmd_campaign_trigger_template),
-        campaign_limit=config.campaign_limit,
-        batch_limit=config.campaign_batch_limit,
+        template="mautic:campaigns:trigger",
     )
-    return ["/bin/sh", "-c", f"{shlex.join(update)} && {shlex.join(trigger)}"]
+    script = (
+        f"{shlex.join(update)}; update_rc=$?; "
+        f"{shlex.join(trigger)}; trigger_rc=$?; "
+        'if [ "$update_rc" -ne 0 ]; then exit 100; fi; '
+        'if [ "$trigger_rc" -ne 0 ]; then exit 101; fi; exit 0'
+    )
+    return ["/bin/sh", "-c", script]
 
 
 def _priority_campaign_due_check_needed(
@@ -6792,6 +6842,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 root = str(getattr(inst, "root", "") or "").strip()
                 if not root:
                     continue
+                if root not in last_campaign_native_fallback_ts:
+                    last_campaign_native_fallback_ts[root] = pusher.campaign_native_fallback_last_run_ts(root)
                 fallback_interval = max(300, int(getattr(cfg, "campaign_native_fallback_interval_sec", 3600) or 3600))
                 fallback_due = (
                     bool(getattr(cfg, "campaign_native_fallback_enabled", False))
@@ -6801,64 +6853,75 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     fallback_due
                     and _running_campaign_total(running, root) == 0
                     and not priority_executor.has_active_campaign_work(root)
+                    and not priority_executor.has_active_task_type("campaign_native_fallback")
                 ):
-                    try:
-                        pending_before, email_before = _campaign_native_fallback_metrics(MauticDB(inst.db))
-                    except Exception as exc:
-                        logging.warning("[%s] campaign native fallback preflight failed: %s", root, exc)
-                        last_campaign_native_fallback_ts[root] = time.time()
-                    else:
-                        last_campaign_native_fallback_ts[root] = time.time()
+                    metrics_before = _campaign_native_fallback_metrics(MauticDB(inst.db))
 
-                        def _fallback_completed(
-                            rc: int | None,
-                            *,
-                            root: str = root,
-                            db_cfg: object = inst.db,
-                            pending_before: int = pending_before,
-                            email_before: int = email_before,
-                        ) -> None:
-                            try:
-                                pending_after, email_after = _campaign_native_fallback_metrics(MauticDB(db_cfg))
-                            except Exception:
-                                pending_after, email_after = pending_before, email_before
-                            status = "ok" if rc == 0 else "error"
-                            event = {
-                                "root": root,
-                                "status": status,
-                                "operation_rc": rc,
-                                "pending_before": pending_before,
-                                "pending_after": pending_after,
-                                "email_stats_before": email_before,
-                                "email_stats_after": email_after,
-                            }
-                            pusher.add_campaign_native_fallback(event)
-                            level = logging.info if rc == 0 else logging.warning
-                            level(
-                                "[%s] campaign native fallback status=%s rc=%s pending=%s->%s email_stats=%s->%s",
-                                root,
-                                status,
-                                rc,
-                                pending_before,
-                                pending_after,
-                                email_before,
-                                email_after,
-                            )
-
-                        fallback_started = priority_executor.launch(
-                            cfg,
-                            root=root,
-                            task_type="campaign_native_fallback",
-                            entity_id=0,
-                            args=_campaign_native_fallback_args(cfg, root),
-                            interval_sec=fallback_interval,
-                            max_parallel=1,
-                            on_complete=_fallback_completed,
+                    def _fallback_completed(
+                        rc: int | None,
+                        *,
+                        root: str = root,
+                        db_cfg: object = inst.db,
+                        metrics_before: dict[str, object] = metrics_before,
+                    ) -> None:
+                        metrics_after = _campaign_native_fallback_metrics(MauticDB(db_cfg))
+                        before_error = str(metrics_before.get("error") or "").strip()
+                        after_error = str(metrics_after.get("error") or "").strip()
+                        metric_error = "; ".join(part for part in (before_error, after_error) if part)[:500]
+                        status = "ok" if rc == 0 else "error"
+                        failed_stage = ""
+                        if rc == 100:
+                            failed_stage = "update"
+                        elif rc == 101:
+                            failed_stage = "trigger"
+                        elif rc not in (0, None):
+                            failed_stage = "executor"
+                        elif rc is None:
+                            failed_stage = "timeout_or_exception"
+                        event = {
+                            "root": root,
+                            "status": status,
+                            "failed_stage": failed_stage,
+                            "operation_rc": rc,
+                            "metrics_status": "error" if metric_error else "ok",
+                            "metrics_error": metric_error,
+                            "pending_before": metrics_before.get("pending_due"),
+                            "pending_after": metrics_after.get("pending_due"),
+                            "email_stats_before": metrics_before.get("email_stats"),
+                            "email_stats_after": metrics_after.get("email_stats"),
+                        }
+                        pusher.add_campaign_native_fallback(event)
+                        level = logging.info if rc == 0 else logging.warning
+                        level(
+                            "[%s] campaign native fallback status=%s stage=%s rc=%s metrics=%s "
+                            "pending=%s->%s email_stats=%s->%s",
+                            root,
+                            status,
+                            failed_stage or "complete",
+                            rc,
+                            "error" if metric_error else "ok",
+                            metrics_before.get("pending_due"),
+                            metrics_after.get("pending_due"),
+                            metrics_before.get("email_stats"),
+                            metrics_after.get("email_stats"),
                         )
-                        if fallback_started:
-                            # Keep priority work out of this pass. The fallback
-                            # was admitted only while this root was idle.
-                            continue
+
+                    fallback_started = priority_executor.launch(
+                        cfg,
+                        root=root,
+                        task_type="campaign_native_fallback",
+                        entity_id=0,
+                        args=_campaign_native_fallback_args(cfg, root),
+                        interval_sec=fallback_interval,
+                        max_parallel=1,
+                        on_complete=_fallback_completed,
+                        log_lifecycle=False,
+                    )
+                    if fallback_started:
+                        last_campaign_native_fallback_ts[root] = time.time()
+                        # Keep priority work out of this pass. The fallback
+                        # was admitted only while this root was idle.
+                        continue
                 segment_ids = _segment_whitelist_effective_setting(cfg, inst)
                 campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
                 for segment_id in sorted(segment_ids):

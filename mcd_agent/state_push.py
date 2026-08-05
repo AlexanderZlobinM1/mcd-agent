@@ -58,6 +58,8 @@ _PROFILE_EVENT_EMPTY_UNTIL: dict[str, float] = {}
 _MYSQL_WARN_THROTTLE: dict[str, dict[str, Any]] = {}
 _MYSQL_WARN_THROTTLE_SEC = 300
 _DEFAULT_STATE_PUSH_TIMEOUT_SEC = 20
+_CAMPAIGN_NATIVE_FALLBACK_RETENTION_SEC = 30 * 86400
+_CAMPAIGN_NATIVE_FALLBACK_MAX_EVENTS = 5000
 
 
 def _galera_routing_eligibility(galera: dict[str, Any]) -> tuple[bool, str]:
@@ -199,8 +201,206 @@ def _state_conn(cfg: AgentConfig) -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_events_status ON outbound_events(status, created_at)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS campaign_native_fallback_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          root TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          payload_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_campaign_native_fallback_events_created "
+        "ON campaign_native_fallback_events(created_at DESC, id DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS campaign_native_fallback_stats (
+          root TEXT PRIMARY KEY,
+          runs INTEGER NOT NULL DEFAULT 0,
+          native_errors INTEGER NOT NULL DEFAULT 0,
+          metric_errors INTEGER NOT NULL DEFAULT 0,
+          recovered_pending INTEGER NOT NULL DEFAULT 0,
+          recovered_email_stats INTEGER NOT NULL DEFAULT 0,
+          first_run_at REAL NOT NULL,
+          last_run_at REAL NOT NULL,
+          last_status TEXT NOT NULL,
+          last_failed_stage TEXT NOT NULL DEFAULT '',
+          last_operation_rc INTEGER,
+          last_metrics_status TEXT NOT NULL DEFAULT 'unknown',
+          last_metrics_error TEXT NOT NULL DEFAULT '',
+          last_pending_before INTEGER,
+          last_pending_after INTEGER,
+          last_email_stats_before INTEGER,
+          last_email_stats_after INTEGER
+        )
+        """
+    )
     _migrate_legacy_profile_event_file(conn, cfg)
     return conn
+
+
+def _nullable_nonnegative_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _store_campaign_native_fallback_event(cfg: AgentConfig, event: dict[str, Any], now_ts: float) -> None:
+    root = str(event.get("root", "") or "").strip()
+    if not root:
+        return
+    status = str(event.get("status", "") or "unknown").strip() or "unknown"
+    failed_stage = str(event.get("failed_stage", "") or "").strip()[:80]
+    metrics_status = str(event.get("metrics_status", "") or "unknown").strip() or "unknown"
+    metrics_error = str(event.get("metrics_error", "") or "").strip()[:500]
+    operation_rc = event.get("operation_rc")
+    try:
+        operation_rc = int(operation_rc) if operation_rc is not None else None
+    except (TypeError, ValueError):
+        operation_rc = None
+    pending_before = _nullable_nonnegative_int(event.get("pending_before"))
+    pending_after = _nullable_nonnegative_int(event.get("pending_after"))
+    email_before = _nullable_nonnegative_int(event.get("email_stats_before"))
+    email_after = _nullable_nonnegative_int(event.get("email_stats_after"))
+    recovered_pending = (
+        max(0, pending_before - pending_after)
+        if pending_before is not None and pending_after is not None
+        else 0
+    )
+    recovered_email_stats = (
+        max(0, email_after - email_before)
+        if email_before is not None and email_after is not None
+        else 0
+    )
+    native_error = 0 if status == "ok" and operation_rc == 0 else 1
+    metric_error = 0 if metrics_status == "ok" else 1
+
+    conn = _state_conn(cfg)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO campaign_native_fallback_events(root, created_at, payload_json) VALUES (?, ?, ?)",
+            (root, now_ts, json.dumps(event, ensure_ascii=True, separators=(",", ":"))),
+        )
+        conn.execute(
+            """
+            INSERT INTO campaign_native_fallback_stats (
+              root, runs, native_errors, metric_errors, recovered_pending,
+              recovered_email_stats, first_run_at, last_run_at, last_status,
+              last_failed_stage, last_operation_rc, last_metrics_status,
+              last_metrics_error, last_pending_before, last_pending_after,
+              last_email_stats_before, last_email_stats_after
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(root) DO UPDATE SET
+              runs = campaign_native_fallback_stats.runs + 1,
+              native_errors = campaign_native_fallback_stats.native_errors + excluded.native_errors,
+              metric_errors = campaign_native_fallback_stats.metric_errors + excluded.metric_errors,
+              recovered_pending = campaign_native_fallback_stats.recovered_pending + excluded.recovered_pending,
+              recovered_email_stats = campaign_native_fallback_stats.recovered_email_stats + excluded.recovered_email_stats,
+              last_run_at = excluded.last_run_at,
+              last_status = excluded.last_status,
+              last_failed_stage = excluded.last_failed_stage,
+              last_operation_rc = excluded.last_operation_rc,
+              last_metrics_status = excluded.last_metrics_status,
+              last_metrics_error = excluded.last_metrics_error,
+              last_pending_before = excluded.last_pending_before,
+              last_pending_after = excluded.last_pending_after,
+              last_email_stats_before = excluded.last_email_stats_before,
+              last_email_stats_after = excluded.last_email_stats_after
+            """,
+            (
+                root,
+                native_error,
+                metric_error,
+                recovered_pending,
+                recovered_email_stats,
+                now_ts,
+                now_ts,
+                status,
+                failed_stage,
+                operation_rc,
+                metrics_status,
+                metrics_error,
+                pending_before,
+                pending_after,
+                email_before,
+                email_after,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM campaign_native_fallback_events WHERE created_at < ?",
+            (now_ts - _CAMPAIGN_NATIVE_FALLBACK_RETENTION_SEC,),
+        )
+        conn.execute(
+            """
+            DELETE FROM campaign_native_fallback_events
+            WHERE id IN (
+              SELECT id FROM campaign_native_fallback_events
+              ORDER BY created_at DESC, id DESC
+              LIMIT -1 OFFSET ?
+            )
+            """,
+            (_CAMPAIGN_NATIVE_FALLBACK_MAX_EVENTS,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_campaign_native_fallback_events(cfg: AgentConfig, limit: int = 50) -> list[dict[str, Any]]:
+    conn = _state_conn(cfg)
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM campaign_native_fallback_events ORDER BY created_at DESC, id DESC LIMIT ?",
+            (max(1, min(500, int(limit or 50))),),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            out.append(payload)
+    return out
+
+
+def _read_campaign_native_fallback_stats(cfg: AgentConfig) -> list[dict[str, Any]]:
+    conn = _state_conn(cfg)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM campaign_native_fallback_stats ORDER BY root ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        for key in ("first_run_at", "last_run_at"):
+            ts = float(item.get(key) or 0.0)
+            item[key] = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts > 0 else ""
+        out.append(item)
+    return out
+
+
+def _campaign_native_fallback_last_run_ts(cfg: AgentConfig, root: str) -> float:
+    conn = _state_conn(cfg)
+    try:
+        row = conn.execute(
+            "SELECT last_run_at FROM campaign_native_fallback_stats WHERE root = ?",
+            (str(root or "").strip(),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return float(row["last_run_at"] or 0.0) if row is not None else 0.0
 
 
 def _migrate_legacy_profile_event_file(conn: sqlite3.Connection, cfg: AgentConfig) -> None:
@@ -1389,6 +1589,12 @@ class MCCStatePusher:
         self.latest_signals = payload
         self.latest_signals_ts = now_ts
 
+    def campaign_native_fallback_last_run_ts(self, root: str) -> float:
+        try:
+            return _campaign_native_fallback_last_run_ts(self.cfg, root)
+        except Exception:
+            return 0.0
+
     def add_fs_permissions_fix(
         self,
         count: int = 1,
@@ -1491,19 +1697,27 @@ class MCCStatePusher:
     def add_campaign_native_fallback(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
+        now_ts = time.time()
         event = {
             "ts": str(payload.get("ts", "")).strip()
-            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            or datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "root": str(payload.get("root", "")).strip(),
             "status": str(payload.get("status", "")).strip() or "unknown",
+            "failed_stage": str(payload.get("failed_stage", "")).strip()[:80],
             "operation_rc": payload.get("operation_rc"),
-            "pending_before": int(payload.get("pending_before", 0) or 0),
-            "pending_after": int(payload.get("pending_after", 0) or 0),
-            "email_stats_before": int(payload.get("email_stats_before", 0) or 0),
-            "email_stats_after": int(payload.get("email_stats_after", 0) or 0),
+            "metrics_status": str(payload.get("metrics_status", "")).strip() or "unknown",
+            "metrics_error": str(payload.get("metrics_error", "")).strip()[:500],
+            "pending_before": _nullable_nonnegative_int(payload.get("pending_before")),
+            "pending_after": _nullable_nonnegative_int(payload.get("pending_after")),
+            "email_stats_before": _nullable_nonnegative_int(payload.get("email_stats_before")),
+            "email_stats_after": _nullable_nonnegative_int(payload.get("email_stats_after")),
         }
         self._campaign_native_fallback_events_pending.append(event)
         self._campaign_native_fallback_events_pending = self._campaign_native_fallback_events_pending[-100:]
+        try:
+            _store_campaign_native_fallback_event(self.cfg, event, now_ts)
+        except Exception as exc:
+            logging.warning("campaign native fallback state write failed: %s", exc)
 
     def _signals_payload(self) -> dict[str, Any]:
         base = self.latest_signals if isinstance(self.latest_signals, dict) else {}
@@ -1542,10 +1756,39 @@ class MCCStatePusher:
             details = dict(details_raw) if isinstance(details_raw, dict) else {}
             details["db_watchdog_recent"] = self._db_watchdog_events_pending[-50:]
             out["details"] = details
-        if self._campaign_native_fallback_events_pending:
+        try:
+            fallback_recent = _read_campaign_native_fallback_events(self.cfg, limit=50)
+            fallback_stats = _read_campaign_native_fallback_stats(self.cfg)
+        except Exception:
+            fallback_recent = list(self._campaign_native_fallback_events_pending[-50:])
+            fallback_stats = []
+        if fallback_stats:
+            totals["campaign_native_fallback_runs"] = sum(int(row.get("runs", 0) or 0) for row in fallback_stats)
+            totals["campaign_native_fallback_native_errors"] = sum(
+                int(row.get("native_errors", 0) or 0) for row in fallback_stats
+            )
+            totals["campaign_native_fallback_metric_errors"] = sum(
+                int(row.get("metric_errors", 0) or 0) for row in fallback_stats
+            )
+            totals["campaign_native_fallback_recovered_pending"] = sum(
+                int(row.get("recovered_pending", 0) or 0) for row in fallback_stats
+            )
+            totals["campaign_native_fallback_recovered_email_stats"] = sum(
+                int(row.get("recovered_email_stats", 0) or 0) for row in fallback_stats
+            )
+            out["totals"] = totals
             details_raw = out.get("details")
             details = dict(details_raw) if isinstance(details_raw, dict) else {}
-            details["campaign_native_fallback_recent"] = self._campaign_native_fallback_events_pending[-50:]
+            details["campaign_native_fallback_stats"] = fallback_stats
+            details["campaign_native_fallback_retention"] = {
+                "days": int(_CAMPAIGN_NATIVE_FALLBACK_RETENTION_SEC // 86400),
+                "max_events": int(_CAMPAIGN_NATIVE_FALLBACK_MAX_EVENTS),
+            }
+            out["details"] = details
+        if fallback_recent:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["campaign_native_fallback_recent"] = fallback_recent
             out["details"] = details
         return out
 

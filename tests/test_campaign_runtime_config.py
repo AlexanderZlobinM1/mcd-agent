@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mcd_agent.config import load_config
-from mcd_agent.daemon import _campaign_native_fallback_args
+from mcd_agent.daemon import _campaign_native_fallback_args, _campaign_native_fallback_metrics
 
 
 class CampaignRuntimeConfigTests(unittest.TestCase):
@@ -266,8 +266,56 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         args = _campaign_native_fallback_args(cfg, str(root))
 
         self.assertEqual(args[:2], ["/bin/sh", "-c"])
-        self.assertIn("mautic:campaigns:update --no-interaction &&", args[2])
-        self.assertIn("mautic:campaigns:trigger --batch-limit=500 --no-interaction", args[2])
+        self.assertIn("mautic:campaigns:update --no-interaction; update_rc=$?", args[2])
+        self.assertIn("mautic:campaigns:trigger --no-interaction; trigger_rc=$?", args[2])
+        self.assertNotIn("--batch-limit", args[2])
+        self.assertNotIn(" -i ", args[2])
+
+    def test_native_campaign_fallback_metrics_support_current_mautic_schema(self) -> None:
+        class FakeDB:
+            def __init__(self) -> None:
+                self.count_queries: list[str] = []
+
+            def fetch_rows(self, query: str) -> list[dict[str, str]]:
+                self.assert_prefix(query)
+                if "campaign_lead_event_log" in query:
+                    return [{"Field": name} for name in ("date_triggered", "is_scheduled", "trigger_date")]
+                return [{"Field": "source"}]
+
+            def fetch_count(self, query: str) -> int:
+                self.assert_prefix(query)
+                self.count_queries.append(query)
+                return 7 if "campaign_lead_event_log" in query else 11
+
+            @staticmethod
+            def assert_prefix(query: str) -> None:
+                if "{prefix}" not in query:
+                    raise AssertionError(f"missing prefix placeholder: {query}")
+
+        db = FakeDB()
+        metrics = _campaign_native_fallback_metrics(db)  # type: ignore[arg-type]
+
+        self.assertEqual(metrics["pending_due"], 7)
+        self.assertEqual(metrics["email_stats"], 11)
+        self.assertEqual(metrics["error"], "")
+        self.assertIn("date_triggered IS NULL", db.count_queries[0])
+
+    def test_native_campaign_fallback_metrics_are_best_effort(self) -> None:
+        class PartialDB:
+            def fetch_rows(self, query: str) -> list[dict[str, str]]:
+                if "campaign_lead_event_log" in query:
+                    return [{"Field": "unexpected"}]
+                return [{"Field": "source"}]
+
+            @staticmethod
+            def fetch_count(query: str) -> int:
+                return 13
+
+        metrics = _campaign_native_fallback_metrics(PartialDB())  # type: ignore[arg-type]
+
+        self.assertIsNone(metrics["pending_due"])
+        self.assertEqual(metrics["email_stats"], 13)
+        self.assertIn("unsupported campaign_lead_event_log schema", str(metrics["error"]))
 
 
 if __name__ == "__main__":
