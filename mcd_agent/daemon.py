@@ -1524,18 +1524,69 @@ def _segment_sql_worker_total_count() -> int:
         return len(_SEGMENT_SQL_WORKERS)
 
 
-def _scheduler_host_running_count(running: dict[str, "RunningTask"]) -> int:
+_SCHEDULER_SEGMENT_TASK_TYPES = frozenset({"segment", "segment_sql", "import"})
+_SCHEDULER_CAMPAIGN_TASK_TYPES = frozenset({"campaign_update", "campaign_trigger", "campaign_rebuild"})
+
+
+def _scheduler_task_lane(task_type: str | None) -> str | None:
+    normalized = str(task_type or "").strip().lower()
+    if normalized in _SCHEDULER_SEGMENT_TASK_TYPES:
+        return "segment"
+    if normalized in _SCHEDULER_CAMPAIGN_TASK_TYPES:
+        return "campaign"
+    return None
+
+
+def _scheduler_host_lane_limit(config: AgentConfig, task_type: str | None) -> int:
+    host_limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
+    lane = _scheduler_task_lane(task_type)
+    if host_limit <= 0 or lane is None:
+        return host_limit
+    if lane == "segment":
+        if str(getattr(config, "segment_mode", "")).strip().lower() == "classic_loop":
+            configured = 1
+        else:
+            configured = max(0, int(getattr(config, "segment_priority_parallel_idle", 0) or 0)) + max(
+                0,
+                int(getattr(config, "segment_regular_parallel_idle", 0) or 0),
+            )
+    else:
+        configured = max(0, int(getattr(config, "campaign_total_parallel", 0) or 0))
+        if configured <= 0:
+            configured = max(
+                max(0, int(getattr(config, "campaign_priority_parallel", 0) or 0))
+                + max(0, int(getattr(config, "campaign_regular_parallel", 0) or 0)),
+                max(0, int(getattr(config, "campaign_trigger_priority_parallel", 0) or 0))
+                + max(0, int(getattr(config, "campaign_trigger_regular_parallel", 0) or 0)),
+                max(0, int(getattr(config, "campaign_rebuild_priority_parallel", 0) or 0))
+                + max(0, int(getattr(config, "campaign_rebuild_regular_parallel", 0) or 0)),
+            )
+    return min(host_limit, configured if configured > 0 else host_limit)
+
+
+def _scheduler_host_running_count(
+    running: dict[str, "RunningTask"],
+    task_type: str | None = None,
+) -> int:
+    lane = _scheduler_task_lane(task_type)
+    if lane == "segment":
+        return sum(1 for task in running.values() if task.task_type in _SCHEDULER_SEGMENT_TASK_TYPES) + (
+            _segment_sql_worker_total_count()
+        )
+    if lane == "campaign":
+        return sum(1 for task in running.values() if task.task_type in _SCHEDULER_CAMPAIGN_TASK_TYPES)
     return len(running) + _segment_sql_worker_total_count()
 
 
 def _scheduler_host_slots_available(
     config: AgentConfig,
     running: dict[str, "RunningTask"],
+    task_type: str | None = None,
 ) -> int | None:
-    limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
+    limit = _scheduler_host_lane_limit(config, task_type)
     if limit <= 0:
         return None
-    return max(0, limit - _scheduler_host_running_count(running))
+    return max(0, limit - _scheduler_host_running_count(running, task_type))
 
 
 def _segment_sql_running_state_ids(
@@ -1859,7 +1910,7 @@ def _run_sql_segment_ring(
     limit = max(0, int(configured_limit or 0))
     if limit <= 0 or not ring or not rules:
         return 0
-    host_slots = _scheduler_host_slots_available(config, running)
+    host_slots = _scheduler_host_slots_available(config, running, "segment_sql")
     if host_slots is not None and host_slots <= 0:
         return 0
     if async_worker and max(
@@ -1871,7 +1922,7 @@ def _run_sql_segment_ring(
     launched = 0
     scans = len(ring)
     while scans > 0 and launched < limit:
-        host_slots = _scheduler_host_slots_available(config, running)
+        host_slots = _scheduler_host_slots_available(config, running, "segment_sql")
         if host_slots is not None and host_slots <= 0:
             break
         sid = int(ring[0])
@@ -5698,39 +5749,6 @@ def _priority_interleaved_dispatch_installs(
     return out
 
 
-def _campaign_pressure_active(
-    config: AgentConfig,
-    running: dict[str, RunningTask],
-    root: str,
-    *,
-    trigger_prio_ring: deque[int],
-    trigger_reg_ring: deque[int],
-    rebuild_prio_ring: deque[int],
-    rebuild_reg_ring: deque[int],
-    trigger_dynamic_blocked=None,
-    now_ts: float | None = None,
-) -> bool:
-    if not bool(getattr(config, "segment_throttle_during_campaigns", True)):
-        return False
-    running_campaigns = [
-        t
-        for t in running.values()
-        if t.root == root and t.task_type in {"campaign_update", "campaign_trigger", "campaign_rebuild"}
-    ]
-    if not running_campaigns:
-        return False
-    min_running_count = max(0, int(getattr(config, "campaign_pressure_min_running_count", 2) or 0))
-    if min_running_count > 0 and len(running_campaigns) >= min_running_count:
-        return True
-    min_running_sec = max(0, int(getattr(config, "campaign_pressure_min_running_sec", 120) or 0))
-    if min_running_sec <= 0:
-        return True
-    now = time.time() if now_ts is None else float(now_ts)
-    if any(now - float(t.started_at or 0) >= min_running_sec for t in running_campaigns):
-        return True
-    return False
-
-
 def _running_count_for_entities(
     running: dict[str, RunningTask],
     root: str,
@@ -5746,23 +5764,10 @@ def _running_count_for_entities(
     )
 
 
-def _campaign_rebuild_backlog_present(
-    priority_rings: dict[str, deque[int]],
-    regular_rings: dict[str, deque[int]],
-) -> bool:
-    return any(bool(ring) for ring in priority_rings.values()) or any(
-        bool(ring) for ring in regular_rings.values()
-    )
-
-
 def _effective_segment_slot_limit(
     config: AgentConfig,
     throttled_active: bool,
-    *,
-    campaign_rebuild_backlog: bool = False,
 ) -> int:
-    if campaign_rebuild_backlog:
-        return 0
     if config.segment_mode == "classic_loop":
         return 1
     if throttled_active:
@@ -5964,7 +5969,7 @@ def _submit_if_slot(
             prev = store.last_task_started_at(key)
             if prev > 0 and time.time() - float(prev) < float(min_repeat):
                 return False
-    host_slots = _scheduler_host_slots_available(config, running)
+    host_slots = _scheduler_host_slots_available(config, running, task_type)
     if host_slots is not None and host_slots <= 0:
         return False
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
@@ -8813,13 +8818,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
-        # Exact rebuild candidates mean Mautic campaign membership differs from
-        # its source segments. Let current segment work drain instead of
-        # refilling every host slot and starving campaign rebuilds indefinitely.
-        host_campaign_rebuild_backlog = _campaign_rebuild_backlog_present(
-            campaign_rebuild_prio_rings,
-            campaign_rebuild_reg_rings,
-        )
         for inst in dispatch_installs:
             if not inst.db:
                 logging.warning("[%s] skip install without db config", inst.root)
@@ -9161,22 +9159,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 _publish_monitor_cycle()
                 continue
 
-            campaign_pressure = _campaign_pressure_active(
-                config,
-                running,
-                root,
-                trigger_prio_ring=trg_prio_ring,
-                trigger_reg_ring=trg_reg_ring,
-                rebuild_prio_ring=reb_prio_ring,
-                rebuild_reg_ring=reb_reg_ring,
-                trigger_dynamic_blocked=_trigger_waits_for_rebuild,
-                now_ts=now,
-            )
-            segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
+            segment_throttled_active = bool(throttled.get(root, False))
             segment_slot_limit = _effective_segment_slot_limit(
                 config,
                 segment_throttled_active,
-                campaign_rebuild_backlog=host_campaign_rebuild_backlog,
             )
             import_segment_slot_limit = max(1, segment_slot_limit) if cluster_import_allowed else segment_slot_limit
             segment_sql_db_running_count = _segment_sql_active_db_rebuild_query_count(db)

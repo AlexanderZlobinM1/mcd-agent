@@ -21,8 +21,6 @@ from mcd_agent.daemon import (
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _PriorityTaskExecutor,
     _TASK_LOCK_BUSY_RC,
-    _campaign_pressure_active,
-    _campaign_rebuild_backlog_present,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
@@ -77,14 +75,46 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(list(ring), [4, 5])
 
-    def test_host_scheduler_limit_counts_tasks_across_instance_roots(self) -> None:
+    def test_host_scheduler_limit_counts_same_lane_tasks_across_instance_roots(self) -> None:
         running = {
             "a": SimpleNamespace(root="/var/www/a", task_type="segment"),
-            "b": SimpleNamespace(root="/var/www/b", task_type="campaign_trigger"),
+            "b": SimpleNamespace(root="/var/www/b", task_type="segment"),
         }
-        cfg = SimpleNamespace(scheduler_host_max_parallel=2)
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=2,
+            segment_mode="id_weighted",
+            segment_priority_parallel_idle=1,
+            segment_regular_parallel_idle=1,
+        )
 
-        self.assertEqual(_scheduler_host_slots_available(cfg, running), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment"), 0)
+
+    def test_segment_and_campaign_host_slots_are_independent_in_both_directions(self) -> None:
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=6,
+            segment_mode="id_weighted",
+            segment_priority_parallel_idle=3,
+            segment_regular_parallel_idle=1,
+            campaign_total_parallel=2,
+        )
+        prodajadelova = "/var/www/prodajadelova/public_html"
+        segments_full = {
+            f"segment-{idx}": SimpleNamespace(root=f"/var/www/segment-{idx}", task_type="segment")
+            for idx in range(4)
+        }
+        campaigns_full = {
+            f"campaign-{campaign_id}": SimpleNamespace(
+                root=prodajadelova,
+                task_type="campaign_rebuild",
+                entity_id=campaign_id,
+            )
+            for campaign_id in (22, 17)
+        }
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, segments_full, "segment"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, segments_full, "campaign_rebuild"), 2)
+        self.assertEqual(_scheduler_host_slots_available(cfg, campaigns_full, "campaign_rebuild"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, campaigns_full, "segment"), 4)
 
     def test_dispatch_rotation_changes_first_instance_each_tick(self) -> None:
         installs = ["a", "b", "c"]
@@ -1024,26 +1054,6 @@ class CampaignRingDispatchTests(unittest.TestCase):
         cfg.segment_throttle_whitelist_only = True
         self.assertEqual(_effective_segment_slot_limit(cfg, True), 1)
 
-    def test_due_campaign_rebuilds_suspend_new_segment_admission_host_wide(self) -> None:
-        cfg = SimpleNamespace(
-            segment_mode="id_weighted",
-            segment_throttle_whitelist_only=False,
-            segment_throttle_whitelist_parallel=1,
-            segment_priority_parallel_idle=3,
-            segment_regular_parallel_idle=1,
-            segment_priority_parallel_throttled=2,
-            segment_regular_parallel_throttled=0,
-        )
-        priority = {"/var/www/prodajadelova/public_html": deque([22, 17])}
-        regular = {"/var/www/prodajadelova/public_html": deque([8, 10])}
-
-        self.assertTrue(_campaign_rebuild_backlog_present(priority, regular))
-        self.assertEqual(
-            _effective_segment_slot_limit(cfg, False, campaign_rebuild_backlog=True),
-            0,
-        )
-        self.assertFalse(_campaign_rebuild_backlog_present({"root": deque()}, {"root": deque()}))
-
     def test_fill_from_ring_launches_only_one_entity_per_scheduler_pass(self) -> None:
         root = "/var/www/site"
         ring = deque([11, 22, 33])
@@ -1402,165 +1412,6 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(removed, 3)
         self.assertEqual(list(ring), [101, 305])
-
-    def test_campaign_pressure_ignores_short_single_campaign(self) -> None:
-        root = "/var/www/site"
-        cfg = SimpleNamespace(
-            segment_throttle_during_campaigns=True,
-            enable_campaign_rebuild=True,
-            campaign_pressure_min_running_sec=120,
-            campaign_pressure_min_running_count=2,
-        )
-        running = {
-            _task_key(root, "campaign_trigger", 104): RunningTask(
-                row_id=1,
-                root=root,
-                task_key=_task_key(root, "campaign_trigger", 104),
-                task_type="campaign_trigger",
-                entity_id=104,
-                command_str="campaign trigger 104",
-                timeout_sec=3600,
-                attempts=1,
-                started_at=100.0,
-                pid=1004,
-            )
-        }
-
-        self.assertFalse(
-            _campaign_pressure_active(
-                cfg,
-                running,
-                root,
-                trigger_prio_ring=deque(),
-                trigger_reg_ring=deque(),
-                rebuild_prio_ring=deque(),
-                rebuild_reg_ring=deque(),
-                now_ts=150.0,
-            )
-        )
-
-    def test_campaign_pressure_throttles_segments_when_campaign_runs_long(self) -> None:
-        root = "/var/www/site"
-        cfg = SimpleNamespace(
-            segment_throttle_during_campaigns=True,
-            enable_campaign_rebuild=True,
-            campaign_pressure_min_running_sec=120,
-            campaign_pressure_min_running_count=2,
-        )
-        running = {
-            _task_key(root, "campaign_trigger", 104): RunningTask(
-                row_id=1,
-                root=root,
-                task_key=_task_key(root, "campaign_trigger", 104),
-                task_type="campaign_trigger",
-                entity_id=104,
-                command_str="campaign trigger 104",
-                timeout_sec=3600,
-                attempts=1,
-                started_at=100.0,
-                pid=1004,
-            )
-        }
-
-        self.assertTrue(
-            _campaign_pressure_active(
-                cfg,
-                running,
-                root,
-                trigger_prio_ring=deque(),
-                trigger_reg_ring=deque(),
-                rebuild_prio_ring=deque(),
-                rebuild_reg_ring=deque(),
-                now_ts=221.0,
-            )
-        )
-
-    def test_campaign_pressure_throttles_segments_when_campaign_count_threshold_is_met(self) -> None:
-        root = "/var/www/site"
-        cfg = SimpleNamespace(
-            segment_throttle_during_campaigns=True,
-            enable_campaign_rebuild=True,
-            campaign_pressure_min_running_sec=120,
-            campaign_pressure_min_running_count=2,
-        )
-        running = {
-            _task_key(root, "campaign_trigger", 104): RunningTask(
-                row_id=1,
-                root=root,
-                task_key=_task_key(root, "campaign_trigger", 104),
-                task_type="campaign_trigger",
-                entity_id=104,
-                command_str="campaign trigger 104",
-                timeout_sec=3600,
-                attempts=1,
-                started_at=100.0,
-                pid=1004,
-            ),
-            _task_key(root, "campaign_rebuild", 105): RunningTask(
-                row_id=2,
-                root=root,
-                task_key=_task_key(root, "campaign_rebuild", 105),
-                task_type="campaign_rebuild",
-                entity_id=105,
-                command_str="campaign rebuild 105",
-                timeout_sec=3600,
-                attempts=1,
-                started_at=100.0,
-                pid=1005,
-            ),
-        }
-
-        self.assertTrue(
-            _campaign_pressure_active(
-                cfg,
-                running,
-                root,
-                trigger_prio_ring=deque(),
-                trigger_reg_ring=deque(),
-                rebuild_prio_ring=deque(),
-                rebuild_reg_ring=deque(),
-                now_ts=101.0,
-            )
-        )
-
-    def test_campaign_pressure_ignores_launchable_campaign_queue(self) -> None:
-        root = "/var/www/site"
-        cfg = SimpleNamespace(
-            segment_throttle_during_campaigns=True,
-            enable_campaign_rebuild=True,
-            campaign_pressure_min_running_sec=120,
-            campaign_pressure_min_running_count=2,
-        )
-
-        self.assertFalse(
-            _campaign_pressure_active(
-                cfg,
-                {},
-                root,
-                trigger_prio_ring=deque([104]),
-                trigger_reg_ring=deque(),
-                rebuild_prio_ring=deque(),
-                rebuild_reg_ring=deque(),
-                trigger_dynamic_blocked=lambda cid: False,
-                now_ts=100.0,
-            )
-        )
-
-    def test_campaign_pressure_can_be_disabled_for_segment_scheduler(self) -> None:
-        root = "/var/www/site"
-        cfg = SimpleNamespace(segment_throttle_during_campaigns=False, enable_campaign_rebuild=True)
-
-        self.assertFalse(
-            _campaign_pressure_active(
-                cfg,
-                {},
-                root,
-                trigger_prio_ring=deque([104]),
-                trigger_reg_ring=deque(),
-                rebuild_prio_ring=deque([105]),
-                rebuild_reg_ring=deque(),
-            )
-        )
 
     def test_segment_whitelist_uses_instance_specific_setting(self) -> None:
         cfg = SimpleNamespace(

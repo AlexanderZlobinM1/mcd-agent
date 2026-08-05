@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.280 - 2026-08-05
+- Changed: host scheduler capacity is split into independent segment/import and
+  campaign lanes. Saturated `segment`, `segment_sql`, or `import` work cannot
+  block `campaign_update`, `campaign_trigger`, or `campaign_rebuild`, and busy
+  campaign workers no longer consume or throttle segment capacity.
+- Regression: covers the Prodajadelova rebuild ring `22/17/8/10` on a shared
+  host with all segment slots occupied, including isolation in both directions.
+
 ## 0.9.279 - 2026-08-05
 - Fixed: exact campaign rebuild backlog now temporarily suspends new segment
   admission across the host. Existing segment work drains and frees a scheduler
