@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.9.279 - 2026-08-05
+- Fixed: exact campaign rebuild backlog now temporarily suspends new segment
+  admission across the host. Existing segment work drains and frees a scheduler
+  slot for campaign membership rebuilds instead of continuously refilling every
+  slot and starving due campaigns on shared hosts.
+- Regression: covers the Prodajadelova campaigns 8/10/17/22 shape where native
+  `campaigns:update` recovered missing campaign membership after MCD rebuilds
+  had not launched while segment work saturated the host scheduler.
+
 ## 0.9.278 - 2026-08-05
 - Fixed: native fallback metrics now inspect the real prefixed Mautic event-log
   schema and support both current and legacy scheduling columns. Metric failures

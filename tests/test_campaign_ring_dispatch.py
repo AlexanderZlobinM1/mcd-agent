@@ -22,6 +22,7 @@ from mcd_agent.daemon import (
     _PriorityTaskExecutor,
     _TASK_LOCK_BUSY_RC,
     _campaign_pressure_active,
+    _campaign_rebuild_backlog_present,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
@@ -1022,6 +1023,26 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         cfg.segment_throttle_whitelist_only = True
         self.assertEqual(_effective_segment_slot_limit(cfg, True), 1)
+
+    def test_due_campaign_rebuilds_suspend_new_segment_admission_host_wide(self) -> None:
+        cfg = SimpleNamespace(
+            segment_mode="id_weighted",
+            segment_throttle_whitelist_only=False,
+            segment_throttle_whitelist_parallel=1,
+            segment_priority_parallel_idle=3,
+            segment_regular_parallel_idle=1,
+            segment_priority_parallel_throttled=2,
+            segment_regular_parallel_throttled=0,
+        )
+        priority = {"/var/www/prodajadelova/public_html": deque([22, 17])}
+        regular = {"/var/www/prodajadelova/public_html": deque([8, 10])}
+
+        self.assertTrue(_campaign_rebuild_backlog_present(priority, regular))
+        self.assertEqual(
+            _effective_segment_slot_limit(cfg, False, campaign_rebuild_backlog=True),
+            0,
+        )
+        self.assertFalse(_campaign_rebuild_backlog_present({"root": deque()}, {"root": deque()}))
 
     def test_fill_from_ring_launches_only_one_entity_per_scheduler_pass(self) -> None:
         root = "/var/www/site"

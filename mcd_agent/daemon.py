@@ -5746,7 +5746,23 @@ def _running_count_for_entities(
     )
 
 
-def _effective_segment_slot_limit(config: AgentConfig, throttled_active: bool) -> int:
+def _campaign_rebuild_backlog_present(
+    priority_rings: dict[str, deque[int]],
+    regular_rings: dict[str, deque[int]],
+) -> bool:
+    return any(bool(ring) for ring in priority_rings.values()) or any(
+        bool(ring) for ring in regular_rings.values()
+    )
+
+
+def _effective_segment_slot_limit(
+    config: AgentConfig,
+    throttled_active: bool,
+    *,
+    campaign_rebuild_backlog: bool = False,
+) -> int:
+    if campaign_rebuild_backlog:
+        return 0
     if config.segment_mode == "classic_loop":
         return 1
     if throttled_active:
@@ -8797,6 +8813,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
+        # Exact rebuild candidates mean Mautic campaign membership differs from
+        # its source segments. Let current segment work drain instead of
+        # refilling every host slot and starving campaign rebuilds indefinitely.
+        host_campaign_rebuild_backlog = _campaign_rebuild_backlog_present(
+            campaign_rebuild_prio_rings,
+            campaign_rebuild_reg_rings,
+        )
         for inst in dispatch_installs:
             if not inst.db:
                 logging.warning("[%s] skip install without db config", inst.root)
@@ -9150,7 +9173,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 now_ts=now,
             )
             segment_throttled_active = bool(throttled.get(root, False) or campaign_pressure)
-            segment_slot_limit = _effective_segment_slot_limit(config, segment_throttled_active)
+            segment_slot_limit = _effective_segment_slot_limit(
+                config,
+                segment_throttled_active,
+                campaign_rebuild_backlog=host_campaign_rebuild_backlog,
+            )
             import_segment_slot_limit = max(1, segment_slot_limit) if cluster_import_allowed else segment_slot_limit
             segment_sql_db_running_count = _segment_sql_active_db_rebuild_query_count(db)
             segment_launched_this_tick = 0
@@ -9247,7 +9274,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     template=config.cmd_segment_full_update_template,
                     batch_limit=config.segment_batch_limit,
                 )
-                classic_segment_limit = _segment_task_limit_after_import(running, root, 1)
+                classic_segment_limit = _segment_task_limit_after_import(
+                    running,
+                    root,
+                    min(1, segment_slot_limit),
+                )
                 if classic_segment_limit > 0 and segment_launched_this_tick <= 0:
                     if _submit_if_slot(
                         config=config,
@@ -9275,6 +9306,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     seg_reg_limit = max(0, config.segment_regular_parallel_idle)
                 seg_total_limit = seg_prio_limit + seg_reg_limit
                 seg_total_limit = _segment_task_limit_after_import(running, root, seg_total_limit)
+                seg_total_limit = min(seg_total_limit, max(0, int(segment_slot_limit)))
                 eff_seg_prio_limit = seg_prio_limit
                 eff_seg_reg_limit = seg_reg_limit
                 prefer_priority_spill = False
