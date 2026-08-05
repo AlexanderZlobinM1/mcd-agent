@@ -1699,6 +1699,7 @@ class MCCStatePusher:
             return
         now_ts = time.time()
         event = {
+            "event_id": str(payload.get("event_id", "")).strip() or uuid.uuid4().hex,
             "ts": str(payload.get("ts", "")).strip()
             or datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "root": str(payload.get("root", "")).strip(),

@@ -9,7 +9,8 @@
   one fallback instance at a time and emit one compact completion log.
 - Added: fallback outcomes and recovered-work deltas accumulate per instance in
   the agent state database across restarts. MCC receives cumulative totals and a
-  bounded recent history; operation events retain 30 days with a 5000-row cap.
+  bounded recent history with stable event IDs; operation events retain 30 days
+  with a 5000-row cap so MCC can persist and deduplicate its canonical aggregate.
 
 ## 0.9.277 - 2026-08-05
 - Added: an opt-in native campaign safety fallback. Once per configured interval,

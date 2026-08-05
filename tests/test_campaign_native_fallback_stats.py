@@ -66,6 +66,7 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
         self.assertEqual(signals["totals"]["campaign_native_fallback_runs"], 2)
         self.assertEqual(signals["totals"]["campaign_native_fallback_recovered_email_stats"], 3)
         self.assertEqual(len(signals["details"]["campaign_native_fallback_recent"]), 2)
+        self.assertTrue(signals["details"]["campaign_native_fallback_recent"][0]["event_id"])
         self.assertEqual(signals["details"]["campaign_native_fallback_retention"]["days"], 30)
 
     def test_event_retention_removes_rows_older_than_thirty_days(self) -> None:
