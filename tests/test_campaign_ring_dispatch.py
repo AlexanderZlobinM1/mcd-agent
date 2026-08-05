@@ -636,8 +636,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn("el.is_scheduled = 1", due_sql)
         self.assertNotIn("el.date_triggered IS NULL", due_sql)
         self.assertNotIn("el.date_triggered < el.trigger_date", due_sql)
-        self.assertIn("el.trigger_date <= '{now_utc}'", due_sql)
-        self.assertNotIn("{now_local}", due_sql)
+        self.assertIn("el.trigger_date <= '{now_event_log}'", due_sql)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_utc}'", due_sql)
 
         self.assertIn("el.is_scheduled = 1", progress_sql)

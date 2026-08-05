@@ -22,9 +22,13 @@ class CampaignSqlTimeContextTests(unittest.TestCase):
             with self.subTest(tz_name=tz_name):
                 ctx = campaign_sql_time_context(now_utc, tz_name)
                 expected_local = now_utc.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S")
+                expected_event_log = (
+                    now_utc.strftime("%Y-%m-%d %H:%M:%S") if tz_name == "UTC" else expected_local
+                )
 
                 self.assertEqual(ctx["now_utc"], "2026-05-14 06:00:00")
                 self.assertEqual(ctx["now_local"], expected_local)
+                self.assertEqual(ctx["now_event_log"], expected_event_log)
 
     def test_dst_transition_is_not_fixed_two_hour_shift(self) -> None:
         winter_utc = datetime(2026, 1, 14, 6, 0, 0, tzinfo=timezone.utc)
@@ -43,6 +47,7 @@ class CampaignSqlTimeContextTests(unittest.TestCase):
 
         self.assertEqual(ctx["now_utc"], "2026-05-14 06:00:00")
         self.assertEqual(ctx["now_local"], "2026-05-14 06:00:00")
+        self.assertEqual(ctx["now_event_log"], "2026-05-14 06:00:00")
 
 
 if __name__ == "__main__":

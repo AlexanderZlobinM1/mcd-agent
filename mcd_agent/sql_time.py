@@ -33,9 +33,12 @@ def campaign_sql_time_context(now_utc: datetime, mautic_timezone: str | None) ->
         now_utc = now_utc.astimezone(timezone.utc)
     now_local = mautic_local_datetime(now_utc, mautic_timezone)
 
+    campaign_now = now_local if now_local.utcoffset() != timedelta(0) else now_utc
+
     return {
         "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
         "now_local": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+        "now_event_log": campaign_now.strftime("%Y-%m-%d %H:%M:%S"),
         "window_start_utc_24h": (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
         "window_start_utc_7d": (now_utc - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
         "window_start_local_24h": (now_local - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),

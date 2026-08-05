@@ -2621,7 +2621,7 @@ def _campaign_trigger_event_log_due_exists_sql(campaign_id: int) -> str:
         "    WHERE el.campaign_id = c.id "
         "      AND el.is_scheduled = 1 "
         "      AND ("
-        "        (el.trigger_date IS NOT NULL AND el.trigger_date <= '{now_utc}') "
+        "        (el.trigger_date IS NOT NULL AND el.trigger_date <= '{now_event_log}') "
         "        OR el.trigger_date IS NULL"
         "      ) "
         "    LIMIT 1"

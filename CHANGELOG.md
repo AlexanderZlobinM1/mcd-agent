@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.283 - 2026-08-05
+- Fixed: campaign trigger due-guard now evaluates scheduled event-log timestamps
+  against a timezone-aware baseline (`now_event_log`) derived from the instance
+  timezone. UTC-configured instances still use UTC, non-UTC instances use local
+  campaign time for due checks.
+
+## 0.9.282 - 2026-08-05
+- Fixed: campaign trigger due-guard now treats scheduled event-log timestamps as due
+  when they are stored in local time and differ from UTC by the instance timezone.
+  This addresses hosts where `campaign_lead_event_log.trigger_date` is shifted
+  versus UTC and otherwise appears as future by strict UTC comparison.
+
 ## 0.9.281 - 2026-08-05
 - Preserved: configured campaign-pressure throttling still reduces the segment
   lane for long or concurrent campaign work. This resource guard is separate

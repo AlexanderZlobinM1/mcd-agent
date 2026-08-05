@@ -206,8 +206,7 @@ class CampaignDueSqlTests(unittest.TestCase):
         guard_sql = _campaign_trigger_event_log_due_exists_sql(162)
 
         self.assertIn("FROM {prefix}campaign_lead_event_log el", guard_sql)
-        self.assertIn("el.trigger_date <= '{now_utc}'", guard_sql)
-        self.assertNotIn("{now_local}", guard_sql)
+        self.assertIn("el.trigger_date <= '{now_event_log}'", guard_sql)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_utc}'", guard_sql)
 
     def test_trigger_due_is_strictly_event_log_driven(self) -> None:
