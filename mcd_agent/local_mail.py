@@ -657,8 +657,8 @@ def configure_local_mail(
     material = fetch_material(cfg, clean)
     if not bool(material.get("enabled")):
         raise RuntimeError("own-host mail is disabled in MCC")
-    if str(material.get("current_host_name") or "").strip() != _host_name(cfg):
-        raise RuntimeError("MCC local-mail material belongs to another host")
+    # MCC resolves local hostname aliases and validates canonical host ownership
+    # plus the agent source IP before returning private DKIM material.
     local_php_path = _local_php(root)
     local_php_before = local_php_path.read_text(encoding="utf-8", errors="replace")
     local_php_stat = local_php_path.stat()

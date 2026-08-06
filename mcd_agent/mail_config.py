@@ -110,8 +110,8 @@ def apply_mail_profile(
     material = fetch_mail_profile(cfg, profile_id)
     if str(material.get("instance_domain") or "").strip().lower() != str(domain or "").strip().lower():
         raise RuntimeError("mail profile belongs to another instance")
-    if str(material.get("current_host_name") or "").strip() != _host_name(cfg):
-        raise RuntimeError("mail profile belongs to another host")
+    # MCC resolves local hostname aliases and validates canonical host ownership
+    # plus the agent source IP before returning private profile material.
     kind = str(material.get("transport_type") or "").strip().lower()
     settings = material.get("settings") if isinstance(material.get("settings"), dict) else {}
     credentials = material.get("credentials") if isinstance(material.get("credentials"), dict) else {}

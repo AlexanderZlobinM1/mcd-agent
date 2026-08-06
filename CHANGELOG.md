@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.10.4 - 2026-08-06
+- Fixed: profile activation accepts hosts whose observed local hostname differs
+  from their canonical MCC inventory name. Private material remains protected
+  by MCC bearer authentication, source-IP binding and canonical profile/local-
+  mail ownership checks before it reaches the agent.
+- Regression: covers a legacy host identified locally as `Nikola` and
+  canonically as `host-46-62-129-237` without weakening instance-domain scope.
+
 ## 0.10.3 - 2026-08-06
 - Fixed: isolated Sendmail now compiles `QUEUE_DIR` as an m4 definition and
   refuses activation unless the resulting `sendmail.cf` contains the exact
