@@ -109,6 +109,10 @@ def _quote_ident(value: str) -> str:
     return "`" + str(value).replace("`", "``") + "`"
 
 
+def _quote_sql(value: str) -> str:
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 def _clean_domain(raw: str) -> str:
     domain = str(raw or "").strip().lower().rstrip(".")
     if not domain:

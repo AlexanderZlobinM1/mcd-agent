@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.10.9 - 2026-08-06
+- Fixed: managed image database-user cleanup now uses the agent's local SQL
+  literal quoting helper instead of failing safely with an undefined helper
+  after the database was removed.
+- Regression: executes the complete convention-matched database and user
+  cleanup path and verifies the exact guarded SQL statements.
+
 ## 0.10.8 - 2026-08-06
 - Fixed: image deployment accepts a pre-existing instance parent only when it
   is an empty directory, while non-empty or non-directory paths remain blocked.

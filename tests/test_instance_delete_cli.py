@@ -23,6 +23,47 @@ class _Inventory:
 
 
 class InstanceDeleteCliTests(unittest.TestCase):
+    def test_delete_drops_exact_managed_image_database_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "public_html"
+            root.mkdir()
+            plan = instance_delete.InstanceDeletePlan(
+                root=root,
+                local_php=None,
+                domains=[],
+                nginx_paths=[],
+                db_name="baza_shop",
+                db_host="localhost",
+                db_port="3306",
+                db_user="korisnik_shop",
+                db_password="secret",
+                delete_files=False,
+                delete_vhost=False,
+                delete_db=True,
+            )
+            sql: list[str] = []
+
+            def mysql_exec(statement: str, **_kwargs: object) -> str:
+                sql.append(statement)
+                return ""
+
+            with (
+                patch.object(instance_delete, "build_delete_plan", return_value=plan),
+                patch.object(instance_delete.os, "geteuid", return_value=0),
+                patch.object(instance_delete, "_mysql_exec", side_effect=mysql_exec),
+                patch("mcd_agent.inventory.InstanceInventory.rescan", return_value=0),
+            ):
+                result = instance_delete.delete_instance_artifacts(
+                    SimpleNamespace(state_db_path=str(Path(tmp) / "state.db")),
+                    root=str(root),
+                    delete_db=True,
+                    yes=True,
+                )
+
+        self.assertTrue(result["deleted"]["db_user"])
+        self.assertEqual(sql[0], "DROP DATABASE IF EXISTS `baza_shop`")
+        self.assertEqual(sql[1], "DROP USER IF EXISTS 'korisnik_shop'@'localhost'")
+
     def test_delete_removes_empty_parent_when_webroot_is_already_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             var_www = Path(tmp) / "var-www"
