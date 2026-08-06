@@ -112,7 +112,7 @@ MAILER(`smtp')dnl
         self.assertFalse(any("MASQUERADE" in line for line in active))
         self.assertIn("define(`confDOMAIN_NAME', `mail.app.sales-snap.com')dnl", result)
         self.assertIn("Port=2525, Addr=127.0.0.1", result)
-        self.assertIn("QUEUE_DIR(`/var/spool/mqueue-mcd')", result)
+        self.assertIn("define(`QUEUE_DIR', `/var/spool/mqueue-mcd')", result)
         self.assertEqual(result.count(local_mail._SENDMAIL_BEGIN), 1)
         self.assertLess(result.index(local_mail._SENDMAIL_BEGIN), result.index("MAILER(`smtp')dnl"))
 
@@ -126,7 +126,12 @@ MAILER(`smtp')dnl
             isolated_service = base / "mcd-local-mail-sendmail.service"
             source = "define(`SMART_HOST', `mail.sales-snap.com')dnl\nMAILER(`smtp')dnl\n"
             system_mc.write_text(source, encoding="utf-8")
-            compiled = subprocess.CompletedProcess(["m4"], 0, stdout=b"compiled config\n", stderr=b"")
+            compiled = subprocess.CompletedProcess(
+                ["m4"],
+                0,
+                stdout=f"compiled config\nO QueueDirectory={isolated_queue}\n".encode(),
+                stderr=b"",
+            )
             patches = (
                 patch.object(local_mail, "SENDMAIL_MC", system_mc),
                 patch.object(local_mail, "SENDMAIL_ISOLATED_MC", isolated_mc),
@@ -145,9 +150,33 @@ MAILER(`smtp')dnl
 
             self.assertEqual(system_mc.read_text(encoding="utf-8"), source)
             self.assertFalse((base / "mqueue").exists())
-            self.assertEqual(isolated_cf.read_text(encoding="utf-8"), "compiled config\n")
+            self.assertIn(
+                f"O QueueDirectory={isolated_queue}",
+                isolated_cf.read_text(encoding="utf-8"),
+            )
             self.assertIn("127.0.0.1", isolated_mc.read_text(encoding="utf-8"))
             self.assertIn("sendmail.cf -bD", isolated_service.read_text(encoding="utf-8"))
+
+    def test_sendmail_configuration_rejects_compiled_system_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            system_mc = base / "system-sendmail.mc"
+            system_mc.write_text("MAILER(`smtp')dnl\n", encoding="utf-8")
+            isolated_service = base / "mcd-local-mail-sendmail.service"
+            compiled = subprocess.CompletedProcess(
+                ["m4"],
+                0,
+                stdout=b"O QueueDirectory=/var/spool/mqueue\n",
+                stderr=b"",
+            )
+            with patch.object(local_mail, "SENDMAIL_MC", system_mc), patch.object(
+                local_mail, "SENDMAIL_ISOLATED_MC", base / "mcd" / "sendmail.mc"
+            ), patch.object(local_mail, "SENDMAIL_ISOLATED_CF", base / "mcd" / "sendmail.cf"), patch.object(
+                local_mail, "SENDMAIL_ISOLATED_SERVICE", isolated_service
+            ), patch.object(local_mail.subprocess, "run", return_value=compiled):
+                with self.assertRaisesRegex(RuntimeError, "dedicated queue path"):
+                    local_mail._configure_sendmail("mail.app.sales-snap.com")
+            self.assertFalse(isolated_service.exists())
 
     def test_mautic_patch_uses_quota_wrapper_and_instance_from_domain(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -235,6 +264,10 @@ MAILER(`smtp')dnl
                 (0, 0),
             )
         self.assertEqual(calls[0], ("127.0.0.1", 2525, 30))
+        self.assertEqual(
+            calls[1][2],
+            b"From: mailer@app.sales-snap.com\r\nTo: one@example.com\r\n\r\nhello\r\n",
+        )
 
     def test_recipient_parser_prefers_envelope_recipients(self) -> None:
         data = b"To: header@example.com\n\nhello\n"

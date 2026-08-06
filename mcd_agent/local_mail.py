@@ -257,6 +257,7 @@ def _sendmail_direct_text(text: str, mail_hostname: str) -> str:
         r"^\s*MASQUERADE_DOMAIN\(",
         r"^\s*DAEMON_OPTIONS\(",
         r"^\s*QUEUE_DIR\(",
+        r"^\s*define\(\s*`QUEUE_DIR'",
         r"^\s*define\(\s*`confPID_FILE'",
     )
     lines: list[str] = []
@@ -273,7 +274,7 @@ def _sendmail_direct_text(text: str, mail_hostname: str) -> str:
     managed_block = [
         _SENDMAIL_BEGIN,
         f"DAEMON_OPTIONS(`Family=inet, Name=MCD, Port={_SENDMAIL_ISOLATED_PORT}, Addr=127.0.0.1')dnl",
-        f"QUEUE_DIR(`{SENDMAIL_ISOLATED_QUEUE}')dnl",
+        f"define(`QUEUE_DIR', `{SENDMAIL_ISOLATED_QUEUE}')dnl",
         "define(`confPID_FILE', `/run/mcd-local-mail-sendmail.pid')dnl",
         "INPUT_MAIL_FILTER(`opendkim', `S=inet:8891@localhost, F=T, T=R:2m')dnl",
         "define(`confMILTER_MACROS_ENVFROM', `i, {auth_type}, {auth_authen}, {auth_ssf}, {auth_author}, {mail_mailer}, {mail_host}, {mail_addr}')dnl",
@@ -306,7 +307,11 @@ def _configure_sendmail(mail_hostname: str) -> None:
             "isolated Sendmail configuration build failed: "
             + (proc.stderr or b"").decode("utf-8", errors="replace").strip()
         )
-    _write_atomic(SENDMAIL_ISOLATED_CF, proc.stdout.decode("utf-8", errors="strict"), mode=0o600)
+    compiled = proc.stdout.decode("utf-8", errors="strict")
+    expected_queue = f"O QueueDirectory={SENDMAIL_ISOLATED_QUEUE}"
+    if expected_queue not in compiled.splitlines():
+        raise RuntimeError("isolated Sendmail configuration did not compile the dedicated queue path")
+    _write_atomic(SENDMAIL_ISOLATED_CF, compiled, mode=0o600)
     SENDMAIL_ISOLATED_QUEUE.mkdir(parents=True, exist_ok=True)
     os.chmod(SENDMAIL_ISOLATED_QUEUE, 0o770)
     try:
@@ -888,9 +893,10 @@ def _message_sender(data: bytes, domain: str) -> str:
 def _deliver_message(*, item: dict[str, Any], domain: str, recipients: list[str], data: bytes) -> tuple[int, int]:
     mta = str(item.get("mta") or "sendmail").strip().lower()
     port = _SENDMAIL_ISOLATED_PORT if mta == "sendmail" else 25
+    wire_data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
     try:
         with smtplib.SMTP("127.0.0.1", port, timeout=30) as client:
-            refused = client.sendmail(_message_sender(data, domain), recipients, data)
+            refused = client.sendmail(_message_sender(data, domain), recipients, wire_data)
     except (OSError, smtplib.SMTPException) as exc:
         print(f"own-host mail delivery failed for {domain}: {exc}", file=sys.stderr)
         return 75, len(recipients)

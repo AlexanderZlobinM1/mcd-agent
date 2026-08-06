@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.3 - 2026-08-06
+- Fixed: isolated Sendmail now compiles `QUEUE_DIR` as an m4 definition and
+  refuses activation unless the resulting `sendmail.cf` contains the exact
+  dedicated `/var/spool/mqueue-mcd` path. It cannot consume a sibling system
+  Sendmail queue.
+- Fixed: own-host SMTP submission normalizes message line endings to CRLF
+  before passing byte payloads to Python `smtplib`, preventing Sendmail from
+  rejecting Symfony Mailer messages with `Bare linefeed (LF) not allowed`.
+- Regression: verifies the compiled queue guard, untouched system Sendmail
+  configuration, isolated listener selection and SMTP wire line endings.
+
 ## 0.10.2 - 2026-08-06
 - Fixed: profile activation test mail reads both supported Mautic `local.php`
   layouts: arrays returned by newer releases and the `$parameters = array(...)`
