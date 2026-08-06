@@ -23,6 +23,90 @@ class _Inventory:
 
 
 class InstanceDeleteCliTests(unittest.TestCase):
+    def test_delete_blocks_before_mail_cleanup_when_nginx_preflight_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "public_html"
+            root.mkdir()
+            nginx_path = Path(tmp) / "shop.example.com.conf"
+            nginx_path.write_text("invalid", encoding="utf-8")
+            plan = instance_delete.InstanceDeletePlan(
+                root=root,
+                local_php=None,
+                domains=["shop.example.com"],
+                nginx_paths=[nginx_path],
+                db_name="",
+                db_host="",
+                db_port="",
+                db_user="",
+                db_password="",
+                delete_files=True,
+                delete_vhost=True,
+                delete_db=False,
+            )
+
+            with (
+                patch.object(instance_delete, "build_delete_plan", return_value=plan),
+                patch.object(instance_delete.os, "geteuid", return_value=0),
+                patch.object(instance_delete, "_run", return_value=(1, "broken config")),
+                patch("mcd_agent.local_mail.disable_local_mail") as disable_mail,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "nginx -t failed before"):
+                    instance_delete.delete_instance_artifacts(
+                        SimpleNamespace(state_db_path=str(Path(tmp) / "state.db")),
+                        root=str(root),
+                        domains=["shop.example.com"],
+                        delete_files=True,
+                        delete_vhost=True,
+                        yes=True,
+                    )
+
+        disable_mail.assert_not_called()
+
+    def test_delete_disables_local_mail_before_destructive_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "public_html"
+            root.mkdir()
+            plan = instance_delete.InstanceDeletePlan(
+                root=root,
+                local_php=None,
+                domains=["shop.example.com"],
+                nginx_paths=[],
+                db_name="baza_shop",
+                db_host="localhost",
+                db_port="3306",
+                db_user="shop",
+                db_password="secret",
+                delete_files=True,
+                delete_vhost=True,
+                delete_db=True,
+            )
+            order: list[str] = []
+
+            def disable_mail(*_args: object, **_kwargs: object) -> dict[str, object]:
+                order.append("mail")
+                return {"status": "ok"}
+
+            with (
+                patch.object(instance_delete, "build_delete_plan", return_value=plan),
+                patch.object(instance_delete.os, "geteuid", return_value=0),
+                patch("mcd_agent.local_mail.disable_local_mail", side_effect=disable_mail),
+                patch.object(instance_delete, "_mysql_exec", side_effect=lambda *_a, **_k: order.append("db")),
+                patch.object(instance_delete, "_remove_instance_root", side_effect=lambda *_a, **_k: order.append("files")),
+                patch("mcd_agent.inventory.InstanceInventory.rescan", return_value=0),
+            ):
+                result = instance_delete.delete_instance_artifacts(
+                    SimpleNamespace(state_db_path=str(Path(tmp) / "state.db")),
+                    root=str(root),
+                    domains=["shop.example.com"],
+                    delete_files=True,
+                    delete_vhost=True,
+                    delete_db=True,
+                    yes=True,
+                )
+
+        self.assertEqual(order, ["mail", "db", "files"])
+        self.assertEqual(result["deleted"]["local_mail"], ["shop.example.com"])
+
     def test_delete_can_use_absolute_root_after_inventory_row_is_gone(self) -> None:
         cfg = SimpleNamespace(state_db_path="/tmp/mcd-state.db")
         root = "/var/www/ss/public_html"

@@ -41,21 +41,23 @@ class InstanceDeleteNginxTests(unittest.TestCase):
 
         candidates = instance_delete._nginx_candidates(Path(root), ["delete.sales-snap.com"])
 
-        self.assertEqual(candidates, [self.enabled / delete_conf.name])
+        self.assertEqual(candidates, [self.enabled / delete_conf.name, delete_conf])
 
-    def test_disable_symlink_preserves_available_config(self) -> None:
+    def test_delete_vhost_removes_enabled_and_available_config(self) -> None:
         conf = self.available / "site.sales-snap.com.conf"
         conf.write_text("server { server_name site.sales-snap.com; }\n", encoding="utf-8")
         enabled = self.enabled / conf.name
         enabled.symlink_to(conf)
 
-        changed, _msg = instance_delete._disable_nginx_vhost(enabled)
+        candidates = instance_delete._nginx_candidates(Path("/var/www/site"), ["site.sales-snap.com"])
+        messages = [instance_delete._disable_nginx_vhost(path)[1] for path in candidates]
 
-        self.assertTrue(changed)
         self.assertFalse(enabled.exists() or enabled.is_symlink())
-        self.assertTrue(conf.exists())
+        self.assertFalse(conf.exists())
+        self.assertTrue(any("enabled nginx config" in message for message in messages))
+        self.assertTrue(any("available nginx config" in message for message in messages))
 
-    def test_disable_regular_enabled_file_copies_to_available_first(self) -> None:
+    def test_delete_regular_enabled_file_does_not_create_available_copy(self) -> None:
         enabled = self.enabled / "legacy.sales-snap.com.conf"
         enabled.write_text("server { server_name legacy.sales-snap.com; }\n", encoding="utf-8")
 
@@ -63,10 +65,19 @@ class InstanceDeleteNginxTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertFalse(enabled.exists())
-        self.assertEqual(
-            (self.available / enabled.name).read_text(encoding="utf-8"),
-            "server { server_name legacy.sales-snap.com; }\n",
-        )
+        self.assertFalse((self.available / enabled.name).exists())
+
+    def test_delete_vhost_preserves_other_domain(self) -> None:
+        keep_conf = self.available / "keep.sales-snap.com.conf"
+        keep_conf.write_text("server { server_name keep.sales-snap.com; }\n", encoding="utf-8")
+        keep_enabled = self.enabled / keep_conf.name
+        keep_enabled.symlink_to(keep_conf)
+
+        candidates = instance_delete._nginx_candidates(Path("/var/www/site"), ["delete.sales-snap.com"])
+
+        self.assertEqual(candidates, [])
+        self.assertTrue(keep_conf.exists())
+        self.assertTrue(keep_enabled.exists())
 
     def test_remove_instance_root_retries_after_directory_not_empty(self) -> None:
         root = Path(self.tmp.name) / "public_html"

@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.7 - 2026-08-06
+- Fixed: full instance deletion now disables any matching MCD-managed local
+  mail domain before database, vhost or file removal. Missing local-mail state
+  is an idempotent no-op; a real mail cleanup failure blocks deletion.
+- Fixed: vhost deletion removes both the exact `sites-enabled` entry and its
+  exact domain-matched `sites-available` configuration while preserving every
+  unrelated virtual host. An nginx preflight blocks changes when the existing
+  host configuration is already invalid.
+- Regression: covers local-mail cleanup ordering, exact vhost ownership and
+  complete enabled/available removal.
+
 ## 0.10.6 - 2026-08-06
 - Fixed: URL-encoded mailer DSNs are escaped for the Symfony parameter bag, so
   values such as `%2Fusr` cannot be interpreted as missing DI parameters and

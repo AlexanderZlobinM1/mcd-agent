@@ -213,19 +213,12 @@ def _nginx_candidates(root: Path, domains: list[str]) -> list[Path]:
     if not domain_set:
         return []
     enabled_root = _nginx_dir("sites-enabled")
-    enabled_dir = enabled_root.resolve(strict=False)
     for domain in sorted(domain_set):
         enabled = enabled_root / f"{domain}.conf"
         if (enabled.exists() or enabled.is_symlink()) and _nginx_matches_domain(enabled, domain_set):
             wanted.append(enabled)
 
     for base in _NGINX_DIRS:
-        try:
-            base_resolved = base.resolve(strict=False)
-        except Exception:
-            continue
-        if base_resolved != enabled_dir:
-            continue
         if not base.exists() or not base.is_dir():
             continue
         for item in base.iterdir():
@@ -240,26 +233,18 @@ def _disable_nginx_vhost(path: Path) -> tuple[bool, str]:
     if not (path.exists() or path.is_symlink()):
         return False, f"nginx vhost already absent: {path}"
     enabled_dir = _nginx_dir("sites-enabled").resolve(strict=False)
-    available_dir = _nginx_dir("sites-available")
+    available_dir = _nginx_dir("sites-available").resolve(strict=False)
     try:
         parent = path.parent.resolve(strict=False)
     except Exception:
         raise RuntimeError(f"unsafe nginx path: {path}")
-    if parent != enabled_dir:
-        return False, f"preserved non-enabled nginx config: {path}"
-    if path.is_symlink():
+    if parent not in {enabled_dir, available_dir}:
+        raise RuntimeError(f"unsafe nginx path: {path}")
+    if parent == enabled_dir:
         path.unlink()
-        return True, f"removed enabled symlink: {path}"
-
-    # Legacy guard: sites-enabled must contain symlinks only. If an older host
-    # has a regular file there, preserve the config in sites-available first and
-    # then disable the enabled copy.
-    available_dir.mkdir(parents=True, exist_ok=True)
-    target = available_dir / path.name
-    if not target.exists():
-        shutil.copy2(path, target)
+        return True, f"removed enabled nginx config: {path}"
     path.unlink()
-    return True, f"moved regular enabled config to sites-available and disabled: {path}"
+    return True, f"removed available nginx config: {path}"
 
 
 def _inventory_db_for_root(cfg: AgentConfig | None, root: Path) -> DBConfig | None:
@@ -482,7 +467,7 @@ def delete_instance_artifacts(
     result: dict[str, Any] = {
         "status": "planned" if dry_run else "ok",
         "plan": _plan_public(plan),
-        "deleted": {"files": False, "vhost": [], "db": False},
+        "deleted": {"files": False, "vhost": [], "db": False, "local_mail": []},
         "warnings": [],
     }
     if dry_run:
@@ -491,6 +476,22 @@ def delete_instance_artifacts(
         raise RuntimeError("--yes is required")
     if os.geteuid() != 0:
         raise RuntimeError("must run as root")
+
+    if plan.delete_vhost and plan.nginx_paths:
+        rc, out = _run(["nginx", "-t"], timeout_sec=30)
+        if rc != 0:
+            raise RuntimeError("nginx -t failed before vhost removal: " + out)
+
+    if plan.delete_vhost:
+        from mcd_agent.local_mail import disable_local_mail
+
+        for domain in plan.domains:
+            try:
+                mail_result = disable_local_mail(cfg, domain=domain)
+            except Exception as exc:
+                raise RuntimeError(f"failed to disable local mail for {domain}: {exc}") from exc
+            if not bool(mail_result.get("already_disabled", False)):
+                result["deleted"]["local_mail"].append(domain)
 
     if plan.delete_db:
         print(f"Dropping database {plan.db_name}")
