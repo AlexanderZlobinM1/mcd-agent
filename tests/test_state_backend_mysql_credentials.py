@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from mcd_agent.cli import _state_db_missing_only
 from mcd_agent.state_backend import mysql_state_enabled, state_backend_status
 
 
@@ -36,7 +38,40 @@ class StateBackendMysqlCredentialTests(unittest.TestCase):
 
         self.assertTrue(mysql_state_enabled(cfg))
 
+    def test_bootstrap_allows_existing_database_with_missing_schema(self) -> None:
+        status = {
+            "mode": "legacy",
+            "active_backend": "sqlite",
+            "reason": "mysql_schema_unavailable",
+            "error": "state schema not initialized: table=mcd_schema_version missing=id,schema_version,updated_at",
+        }
+
+        with patch("mcd_agent.cli.state_database_exists", return_value=(True, "ok")):
+            self.assertTrue(_state_db_missing_only(_cfg(), status))
+
+    def test_bootstrap_rejects_existing_database_for_unrelated_probe_error(self) -> None:
+        status = {
+            "mode": "legacy",
+            "active_backend": "sqlite",
+            "reason": "mysql_schema_unavailable",
+            "error": "connection timed out",
+        }
+
+        with patch("mcd_agent.cli.state_database_exists", return_value=(True, "ok")):
+            self.assertFalse(_state_db_missing_only(_cfg(), status))
+
+    def test_bootstrap_rejects_active_mysql_backend(self) -> None:
+        status = {
+            "mode": "mysql",
+            "active_backend": "mysql",
+            "reason": "ok",
+        }
+
+        with patch("mcd_agent.cli.state_database_exists") as exists:
+            self.assertFalse(_state_db_missing_only(_cfg(), status))
+
+        exists.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
-

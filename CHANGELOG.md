@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.10.15 - 2026-08-07
+- Fixed: explicit `state-db init` now accepts an existing state database whose
+  MCD tables or schema-version record have not been initialized. This repairs
+  interrupted `mysql_hybrid` rollouts instead of leaving the agent in noisy
+  SQLite fallback mode.
+- Guarded: bootstrap remains unavailable when MySQL state is already active or
+  when the probe failed for an unrelated connection error.
+
 ## 0.10.14 - 2026-08-07
 - Fixed: own-host MX delivery now opens TCP/25 through an exact, comment-tagged
   firewall rule instead of leaving Sendmail unreachable behind a default-drop

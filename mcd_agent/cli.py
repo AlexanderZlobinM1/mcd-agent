@@ -322,7 +322,18 @@ def _state_db_missing_only(cfg, st: dict[str, object]) -> bool:
         return False
     exists, msg = state_database_exists(cfg)
     if msg == "ok":
-        return not bool(exists)
+        if not bool(exists):
+            return True
+        reason = str(st.get("reason", "") or "").strip().lower()
+        error = str(st.get("error", "") or "").strip().lower()
+        return reason == "mysql_schema_unavailable" and any(
+            token in error
+            for token in (
+                "state schema not initialized",
+                "state schema version missing",
+                "unsupported state schema version",
+            )
+        )
     txt = str(msg or "").lower()
     if any(token in txt for token in ("unknown database", "access denied", "denied")):
         return True
