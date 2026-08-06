@@ -143,8 +143,12 @@ _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 _CAMPAIGN_TRIGGER_STALE_SCAN_CAP = 8
 _PRIORITY_DISPATCH_REGULAR_CHUNK = 8
 _TASK_LOCK_BUSY_RC = 75
+_CAMPAIGN_EXACT_TASK_TYPES = frozenset({"campaign_update", "campaign_rebuild", "campaign_trigger"})
 _IMPORT_FAST_FOLLOW_SEC = 60
 _ENTITY_LAUNCH_GUARD: dict[str, float] = {}
+_CAMPAIGN_FALLBACK_COORDINATOR_LOCK = threading.RLock()
+_CAMPAIGN_FALLBACK_ACTIVE_ROOTS: set[str] = set()
+_CAMPAIGN_DISPATCHING_ROOTS: dict[str, int] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
@@ -5268,13 +5272,63 @@ def _task_key(root: str, task_type: str, entity_id: int | None) -> str:
     return f"{root}|{task_type}|{eid}"
 
 
+def _campaign_dispatch_begin(root: str, task_type: str) -> bool:
+    if task_type not in _CAMPAIGN_EXACT_TASK_TYPES:
+        return True
+    with _CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
+        if root in _CAMPAIGN_FALLBACK_ACTIVE_ROOTS:
+            return False
+        _CAMPAIGN_DISPATCHING_ROOTS[root] = int(_CAMPAIGN_DISPATCHING_ROOTS.get(root, 0) or 0) + 1
+        return True
+
+
+def _campaign_dispatch_end(root: str, task_type: str) -> None:
+    if task_type not in _CAMPAIGN_EXACT_TASK_TYPES:
+        return
+    with _CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
+        remaining = int(_CAMPAIGN_DISPATCHING_ROOTS.get(root, 0) or 0) - 1
+        if remaining > 0:
+            _CAMPAIGN_DISPATCHING_ROOTS[root] = remaining
+        else:
+            _CAMPAIGN_DISPATCHING_ROOTS.pop(root, None)
+
+
+def _campaign_fallback_try_begin(
+    root: str,
+    *,
+    campaign_worker_active: bool,
+    priority_campaign_active: bool,
+) -> bool:
+    with _CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
+        if (
+            root in _CAMPAIGN_FALLBACK_ACTIVE_ROOTS
+            or int(_CAMPAIGN_DISPATCHING_ROOTS.get(root, 0) or 0) > 0
+            or campaign_worker_active
+            or priority_campaign_active
+        ):
+            return False
+        _CAMPAIGN_FALLBACK_ACTIVE_ROOTS.add(root)
+        return True
+
+
+def _campaign_fallback_end(root: str) -> None:
+    with _CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
+        _CAMPAIGN_FALLBACK_ACTIVE_ROOTS.discard(root)
+
+
 def _task_execution_lock_key(root: str, task_type: str, entity_id: int | None) -> str:
-    if task_type in {"campaign_rebuild", "campaign_trigger", "campaign_update"}:
+    if task_type in _CAMPAIGN_EXACT_TASK_TYPES:
         return _task_key(root, "campaign", entity_id)
     return _task_key(root, task_type, entity_id)
 
 
-def _task_locked_args(task_key: str, args: list[str]) -> list[str]:
+def _task_locked_args(
+    task_key: str,
+    args: list[str],
+    *,
+    root: str = "",
+    task_type: str = "",
+) -> list[str]:
     flock_bin = Path("/usr/bin/flock")
     if not flock_bin.is_file():
         return list(args)
@@ -5285,13 +5339,25 @@ def _task_locked_args(task_key: str, args: list[str]) -> list[str]:
         logging.warning("task execution lock unavailable: %s", exc)
         return list(args)
     digest = hashlib.sha256(str(task_key).encode("utf-8")).hexdigest()
-    return [
+    locked_args = [
         str(flock_bin),
         "--nonblock",
         "--conflict-exit-code",
         str(_TASK_LOCK_BUSY_RC),
         str(lock_dir / f"{digest}.lock"),
         *args,
+    ]
+    if task_type not in _CAMPAIGN_EXACT_TASK_TYPES and task_type != "campaign_native_fallback":
+        return locked_args
+    root_digest = hashlib.sha256(f"{root}|campaign-root".encode("utf-8")).hexdigest()
+    return [
+        str(flock_bin),
+        "--shared" if task_type in _CAMPAIGN_EXACT_TASK_TYPES else "--exclusive",
+        "--nonblock",
+        "--conflict-exit-code",
+        str(_TASK_LOCK_BUSY_RC),
+        str(lock_dir / f"{root_digest}.lock"),
+        *locked_args,
     ]
 
 
@@ -5346,28 +5412,35 @@ class _PriorityTaskExecutor:
     ) -> bool:
         key = _task_key(root, task_type, entity_id)
         now = time.time()
-        with self._guard:
-            if key in self._active:
-                return False
-            if not _launch_allowed(config, root, task_type, entity_id, now_ts=now):
-                return False
-            previous = float(self._last_started.get(key, 0.0) or 0.0)
-            if previous > 0 and now - previous < max(1, int(interval_sec or 1)):
-                return False
-            active_for_lane = sum(
-                1
-                for active_root, active_type in self._active.values()
-                if active_root == root and active_type == task_type
-            )
-            if active_for_lane >= max(1, int(max_parallel or 1)):
-                return False
-            self._active[key] = (root, task_type)
-            self._last_started[key] = now
-            _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, task_type, entity_id)] = now
+        if not _campaign_dispatch_begin(root, task_type):
+            return False
+        admitted = False
+        try:
+            with self._guard:
+                previous = float(self._last_started.get(key, 0.0) or 0.0)
+                active_for_lane = sum(
+                    1
+                    for active_root, active_type in self._active.values()
+                    if active_root == root and active_type == task_type
+                )
+                admitted = (
+                    key not in self._active
+                    and _launch_allowed(config, root, task_type, entity_id, now_ts=now)
+                    and not (previous > 0 and now - previous < max(1, int(interval_sec or 1)))
+                    and active_for_lane < max(1, int(max_parallel or 1))
+                )
+                if admitted:
+                    self._active[key] = (root, task_type)
+                    self._last_started[key] = now
+                    _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, task_type, entity_id)] = now
+        finally:
+            _campaign_dispatch_end(root, task_type)
+        if not admitted:
+            return False
 
         def _run() -> None:
             lock_key = _task_execution_lock_key(root, task_type, entity_id)
-            locked_args = _task_locked_args(lock_key, args)
+            locked_args = _task_locked_args(lock_key, args, root=root, task_type=task_type)
             if log_lifecycle:
                 logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
             completed = False
@@ -6032,6 +6105,42 @@ def _submit_if_slot(
     ignore_limit: bool = False,
     manual_request_id: int | None = None,
 ) -> bool:
+    if not _campaign_dispatch_begin(root, task_type):
+        return False
+    try:
+        return _submit_if_slot_uncoordinated(
+            config=config,
+            store=store,
+            running=running,
+            root=root,
+            task_type=task_type,
+            entity_id=entity_id,
+            args=args,
+            timeout_sec=timeout_sec,
+            max_parallel_for_type=max_parallel_for_type,
+            popens=popens,
+            ignore_limit=ignore_limit,
+            manual_request_id=manual_request_id,
+        )
+    finally:
+        _campaign_dispatch_end(root, task_type)
+
+
+def _submit_if_slot_uncoordinated(
+    *,
+    config: AgentConfig,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    root: str,
+    task_type: str,
+    entity_id: int | None,
+    args: list[str],
+    timeout_sec: int,
+    max_parallel_for_type: int,
+    popens: dict[str, subprocess.Popen[bytes]] | None = None,
+    ignore_limit: bool = False,
+    manual_request_id: int | None = None,
+) -> bool:
     key = _task_key(root, task_type, entity_id)
     if key in running:
         return False
@@ -6051,7 +6160,12 @@ def _submit_if_slot(
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
         return False
 
-    args = _task_locked_args(_task_execution_lock_key(root, task_type, entity_id), args)
+    args = _task_locked_args(
+        _task_execution_lock_key(root, task_type, entity_id),
+        args,
+        root=root,
+        task_type=task_type,
+    )
     proc = _spawn_command(root=root, args=args)
     task = RunningTask(
         row_id=0,
@@ -6102,38 +6216,43 @@ def _respawn_task(
             return False
     if retry_max > 0 and task.attempts >= retry_max:
         return False
-    try:
-        args = task.command_str.split(_CMD_SEP)
-        proc = _spawn_command(root=task.root, args=args)
-    except Exception as e:  # pragma: no cover - defensive
-        logging.warning("[%s] respawn failed %s: %s", task.root, task.task_type, e)
+    if not _campaign_dispatch_begin(task.root, task.task_type):
         return False
+    try:
+        try:
+            args = task.command_str.split(_CMD_SEP)
+            proc = _spawn_command(root=task.root, args=args)
+        except Exception as e:  # pragma: no cover - defensive
+            logging.warning("[%s] respawn failed %s: %s", task.root, task.task_type, e)
+            return False
 
-    next_task = RunningTask(
-        row_id=0,
-        root=task.root,
-        task_key=task.task_key,
-        task_type=task.task_type,
-        entity_id=task.entity_id,
-        command_str=task.command_str,
-        timeout_sec=task.timeout_sec,
-        attempts=task.attempts + 1,
-        started_at=time.time(),
-        pid=proc.pid,
-        manual_request_id=task.manual_request_id,
-    )
-    next_task.row_id = store.add_running(next_task)
-    running[next_task.task_key] = next_task
-    popens[next_task.task_key] = proc
-    logging.warning(
-        "[%s] retry %s entity=%s attempt=%s pid=%s",
-        task.root,
-        task.task_type,
-        task.entity_id,
-        next_task.attempts,
-        next_task.pid,
-    )
-    return True
+        next_task = RunningTask(
+            row_id=0,
+            root=task.root,
+            task_key=task.task_key,
+            task_type=task.task_type,
+            entity_id=task.entity_id,
+            command_str=task.command_str,
+            timeout_sec=task.timeout_sec,
+            attempts=task.attempts + 1,
+            started_at=time.time(),
+            pid=proc.pid,
+            manual_request_id=task.manual_request_id,
+        )
+        next_task.row_id = store.add_running(next_task)
+        running[next_task.task_key] = next_task
+        popens[next_task.task_key] = proc
+        logging.warning(
+            "[%s] retry %s entity=%s attempt=%s pid=%s",
+            task.root,
+            task.task_type,
+            task.entity_id,
+            next_task.attempts,
+            next_task.pid,
+        )
+        return True
+    finally:
+        _campaign_dispatch_end(task.root, task.task_type)
 
 
 def _campaign_trigger_progress_watchdog(
@@ -6959,6 +7078,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     fallback_block_reason = "priority_campaign_active"
                 elif fallback_due and priority_executor.has_active_task_type("campaign_native_fallback"):
                     fallback_block_reason = "host_fallback_active"
+                if fallback_due and not fallback_block_reason:
+                    reserved = _campaign_fallback_try_begin(
+                        root,
+                        campaign_worker_active=_running_campaign_total(running, root) > 0,
+                        priority_campaign_active=priority_executor.has_active_campaign_work(root),
+                    )
+                    if not reserved:
+                        fallback_block_reason = "campaign_dispatch_race"
                 if fallback_due and fallback_block_reason:
                     pusher.set_campaign_native_fallback_runtime(
                         root,
@@ -7008,54 +7135,74 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         metrics_before: dict[str, object] = metrics_before,
                         started_at: float = fallback_started_at,
                         schedule_delay_sec: int = fallback_schedule_delay_sec,
+                        previous_run_ts: float = fallback_last,
+                        scheduled_at: float = fallback_scheduled_at,
                     ) -> None:
-                        metrics_after = _campaign_native_fallback_metrics(MauticDB(db_cfg))
-                        before_error = str(metrics_before.get("error") or "").strip()
-                        after_error = str(metrics_after.get("error") or "").strip()
-                        metric_error = "; ".join(part for part in (before_error, after_error) if part)[:500]
-                        status = "ok" if rc == 0 else "error"
-                        failed_stage = ""
-                        if rc == 100:
-                            failed_stage = "update"
-                        elif rc == 101:
-                            failed_stage = "trigger"
-                        elif rc not in (0, None):
-                            failed_stage = "executor"
-                        elif rc is None:
-                            failed_stage = "timeout_or_exception"
-                        event = {
-                            "root": root,
-                            "status": status,
-                            "failed_stage": failed_stage,
-                            "operation_rc": rc,
-                            "metrics_status": "error" if metric_error else "ok",
-                            "metrics_error": metric_error,
-                            "pending_before": metrics_before.get("pending_due"),
-                            "pending_after": metrics_after.get("pending_due"),
-                            "email_stats_before": metrics_before.get("email_stats"),
-                            "email_stats_after": metrics_after.get("email_stats"),
-                            "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).strftime(
-                                "%Y-%m-%dT%H:%M:%SZ"
-                            ),
-                            "duration_sec": max(0, int(time.time() - started_at)),
-                            "schedule_delay_sec": schedule_delay_sec,
-                        }
-                        pusher.add_campaign_native_fallback(event)
-                        pusher.set_campaign_native_fallback_runtime(root, None)
-                        level = logging.info if rc == 0 else logging.warning
-                        level(
-                            "[%s] campaign native fallback status=%s stage=%s rc=%s metrics=%s "
-                            "pending=%s->%s email_stats=%s->%s",
-                            root,
-                            status,
-                            failed_stage or "complete",
-                            rc,
-                            "error" if metric_error else "ok",
-                            metrics_before.get("pending_due"),
-                            metrics_after.get("pending_due"),
-                            metrics_before.get("email_stats"),
-                            metrics_after.get("email_stats"),
-                        )
+                        try:
+                            if rc == _TASK_LOCK_BUSY_RC:
+                                last_campaign_native_fallback_ts[root] = previous_run_ts
+                                pusher.set_campaign_native_fallback_runtime(
+                                    root,
+                                    {
+                                        "status": "deferred",
+                                        "reason": "campaign_root_lock_busy",
+                                        "scheduled_at": datetime.fromtimestamp(
+                                            scheduled_at,
+                                            tz=timezone.utc,
+                                        ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        "delay_sec": max(0, int(time.time() - scheduled_at)),
+                                    },
+                                )
+                                return
+                            metrics_after = _campaign_native_fallback_metrics(MauticDB(db_cfg))
+                            before_error = str(metrics_before.get("error") or "").strip()
+                            after_error = str(metrics_after.get("error") or "").strip()
+                            metric_error = "; ".join(part for part in (before_error, after_error) if part)[:500]
+                            status = "ok" if rc == 0 else "error"
+                            failed_stage = ""
+                            if rc == 100:
+                                failed_stage = "update"
+                            elif rc == 101:
+                                failed_stage = "trigger"
+                            elif rc not in (0, None):
+                                failed_stage = "executor"
+                            elif rc is None:
+                                failed_stage = "timeout_or_exception"
+                            event = {
+                                "root": root,
+                                "status": status,
+                                "failed_stage": failed_stage,
+                                "operation_rc": rc,
+                                "metrics_status": "error" if metric_error else "ok",
+                                "metrics_error": metric_error,
+                                "pending_before": metrics_before.get("pending_due"),
+                                "pending_after": metrics_after.get("pending_due"),
+                                "email_stats_before": metrics_before.get("email_stats"),
+                                "email_stats_after": metrics_after.get("email_stats"),
+                                "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ"
+                                ),
+                                "duration_sec": max(0, int(time.time() - started_at)),
+                                "schedule_delay_sec": schedule_delay_sec,
+                            }
+                            pusher.add_campaign_native_fallback(event)
+                            pusher.set_campaign_native_fallback_runtime(root, None)
+                            level = logging.info if rc == 0 else logging.warning
+                            level(
+                                "[%s] campaign native fallback status=%s stage=%s rc=%s metrics=%s "
+                                "pending=%s->%s email_stats=%s->%s",
+                                root,
+                                status,
+                                failed_stage or "complete",
+                                rc,
+                                "error" if metric_error else "ok",
+                                metrics_before.get("pending_due"),
+                                metrics_after.get("pending_due"),
+                                metrics_before.get("email_stats"),
+                                metrics_after.get("email_stats"),
+                            )
+                        finally:
+                            _campaign_fallback_end(root)
 
                     fallback_started = priority_executor.launch(
                         cfg,
@@ -7075,6 +7222,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         # Keep priority work out of this pass. The fallback
                         # was admitted only while this root was idle.
                         continue
+                    _campaign_fallback_end(root)
                     pusher.set_campaign_native_fallback_runtime(
                         root,
                         {

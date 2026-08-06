@@ -22,6 +22,10 @@ from mcd_agent.daemon import (
     _PriorityTaskExecutor,
     _TASK_LOCK_BUSY_RC,
     _campaign_pressure_active,
+    _campaign_dispatch_begin,
+    _campaign_dispatch_end,
+    _campaign_fallback_end,
+    _campaign_fallback_try_begin,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_event_log_due_exists_sql,
@@ -68,6 +72,9 @@ class CampaignRingDispatchTests(unittest.TestCase):
         daemon_mod._ENTITY_LAUNCH_GUARD.clear()
         with daemon_mod._SEGMENT_SQL_WORKERS_LOCK:
             daemon_mod._SEGMENT_SQL_WORKERS.clear()
+        with daemon_mod._CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
+            daemon_mod._CAMPAIGN_FALLBACK_ACTIVE_ROOTS.clear()
+            daemon_mod._CAMPAIGN_DISPATCHING_ROOTS.clear()
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])
@@ -164,6 +171,52 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first[:4], ["/usr/bin/flock", "--nonblock", "--conflict-exit-code", "75"])
         self.assertEqual(first[-len(args):], args)
+
+    def test_native_fallback_and_exact_campaigns_share_exclusive_root_gate(self) -> None:
+        root = "/var/www/dexyco/public_html"
+        args = ["php", "bin/console", "mautic:campaigns:trigger"]
+        with patch.object(Path, "is_file", return_value=True), patch.object(Path, "mkdir"):
+            exact = _task_locked_args(
+                "dexyco|campaign|176",
+                [*args, "-i", "176"],
+                root=root,
+                task_type="campaign_trigger",
+            )
+            fallback = _task_locked_args(
+                "dexyco|campaign_native_fallback|0",
+                args,
+                root=root,
+                task_type="campaign_native_fallback",
+            )
+
+        self.assertEqual(exact[1], "--shared")
+        self.assertEqual(fallback[1], "--exclusive")
+        self.assertEqual(exact[5], fallback[5])
+
+    def test_native_fallback_coordinator_blocks_trigger_and_rebuild_but_not_segments(self) -> None:
+        root = "/var/www/dexyco/public_html"
+        self.assertTrue(
+            _campaign_fallback_try_begin(
+                root,
+                campaign_worker_active=False,
+                priority_campaign_active=False,
+            )
+        )
+        self.assertFalse(_campaign_dispatch_begin(root, "campaign_trigger"))
+        self.assertFalse(_campaign_dispatch_begin(root, "campaign_rebuild"))
+        self.assertTrue(_campaign_dispatch_begin(root, "segment"))
+        _campaign_dispatch_end(root, "segment")
+        _campaign_fallback_end(root)
+
+        self.assertTrue(_campaign_dispatch_begin(root, "campaign_trigger"))
+        self.assertFalse(
+            _campaign_fallback_try_begin(
+                root,
+                campaign_worker_active=False,
+                priority_campaign_active=False,
+            )
+        )
+        _campaign_dispatch_end(root, "campaign_trigger")
 
     def test_priority_executor_has_separate_bounded_lane(self) -> None:
         executor = _PriorityTaskExecutor()

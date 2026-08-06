@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.9.287 - 2026-08-06
+- Fixed: native fallback owns an exclusive per-instance campaign gate for its
+  complete global update/trigger pair. MCD exact rebuild/trigger launches use
+  the shared side of the same gate and cannot overlap the fallback, while
+  segment and import scheduling remain independent.
+- Added: an in-process dispatch coordinator closes the admission race before a
+  child process starts; the root-level `flock` provides restart and
+  cross-process protection. Lock contention defers fallback without recording
+  a false native-command error.
+- Regression: covers the observed Dexyco overlap between a global fallback
+  trigger and exact campaign 176.
+
 ## 0.9.286 - 2026-08-06
 - Fixed: newly discovered campaigns in the priority lane are inserted ahead of
   previously queued priority work for both rebuild and trigger scheduling. A
