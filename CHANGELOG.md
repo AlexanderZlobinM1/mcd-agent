@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.9.284 - 2026-08-06
+- Fixed: campaign watchdog and priority timeout termination now signal the
+  complete isolated process group. A stopped `flock` wrapper can no longer
+  leave its `sudo`/PHP campaign command running indefinitely as an orphan.
+- Added: native fallback executions have a six-hour safety timeout and publish
+  compact `deferred`/`running` runtime state to MCC, including schedule delay,
+  PID, start time and final duration.
+- Added: fallback statistics now accumulate `recovered_runs` in addition to
+  recovered pending and email-stat deltas, making MCD misses directly countable.
+
 ## 0.9.283 - 2026-08-05
 - Fixed: campaign trigger due-guard now evaluates scheduled event-log timestamps
   against a timezone-aware baseline (`now_event_log`) derived from the instance

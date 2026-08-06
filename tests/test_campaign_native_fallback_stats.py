@@ -35,6 +35,8 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
                 "pending_after": 0,
                 "email_stats_before": 10,
                 "email_stats_after": 13,
+                "duration_sec": 75,
+                "schedule_delay_sec": 9,
             }
         )
         pusher.add_campaign_native_fallback(
@@ -57,6 +59,7 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
         self.assertEqual(stats[0]["runs"], 2)
         self.assertEqual(stats[0]["native_errors"], 1)
         self.assertEqual(stats[0]["metric_errors"], 1)
+        self.assertEqual(stats[0]["recovered_runs"], 1)
         self.assertEqual(stats[0]["recovered_pending"], 4)
         self.assertEqual(stats[0]["recovered_email_stats"], 3)
 
@@ -64,10 +67,28 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
         self.assertGreater(restarted.campaign_native_fallback_last_run_ts("/var/www/example/public_html"), 0)
         signals = restarted._signals_payload()
         self.assertEqual(signals["totals"]["campaign_native_fallback_runs"], 2)
+        self.assertEqual(signals["totals"]["campaign_native_fallback_recovered_runs"], 1)
         self.assertEqual(signals["totals"]["campaign_native_fallback_recovered_email_stats"], 3)
         self.assertEqual(len(signals["details"]["campaign_native_fallback_recent"]), 2)
         self.assertTrue(signals["details"]["campaign_native_fallback_recent"][0]["event_id"])
         self.assertEqual(signals["details"]["campaign_native_fallback_retention"]["days"], 30)
+        self.assertEqual(signals["details"]["campaign_native_fallback_recent"][0]["duration_sec"], 75)
+
+        restarted.set_campaign_native_fallback_runtime(
+            "/var/www/example/public_html",
+            {
+                "status": "running",
+                "pid": 123,
+                "started_at": "2026-08-06T10:00:00Z",
+            },
+        )
+        runtime_signals = restarted._signals_payload()
+        self.assertEqual(
+            runtime_signals["details"]["campaign_native_fallback_runtime"][0]["status"],
+            "running",
+        )
+        restarted.set_campaign_native_fallback_runtime("/var/www/example/public_html", None)
+        self.assertNotIn("campaign_native_fallback_runtime", restarted._signals_payload()["details"])
 
     def test_event_retention_removes_rows_older_than_thirty_days(self) -> None:
         pusher = MCCStatePusher(self.cfg)  # type: ignore[arg-type]
@@ -107,6 +128,49 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
             "/var/www/example/public_html",
             "/var/www/example/public_html",
         ])
+
+    def test_existing_stats_table_is_migrated_for_recovered_run_counter(self) -> None:
+        with sqlite3.connect(self.cfg.state_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE campaign_native_fallback_stats (
+                  root TEXT PRIMARY KEY,
+                  runs INTEGER NOT NULL DEFAULT 0,
+                  native_errors INTEGER NOT NULL DEFAULT 0,
+                  metric_errors INTEGER NOT NULL DEFAULT 0,
+                  recovered_pending INTEGER NOT NULL DEFAULT 0,
+                  recovered_email_stats INTEGER NOT NULL DEFAULT 0,
+                  first_run_at REAL NOT NULL,
+                  last_run_at REAL NOT NULL,
+                  last_status TEXT NOT NULL,
+                  last_failed_stage TEXT NOT NULL DEFAULT '',
+                  last_operation_rc INTEGER,
+                  last_metrics_status TEXT NOT NULL DEFAULT 'unknown',
+                  last_metrics_error TEXT NOT NULL DEFAULT '',
+                  last_pending_before INTEGER,
+                  last_pending_after INTEGER,
+                  last_email_stats_before INTEGER,
+                  last_email_stats_after INTEGER
+                )
+                """
+            )
+
+        pusher = MCCStatePusher(self.cfg)  # type: ignore[arg-type]
+        pusher.add_campaign_native_fallback(
+            {
+                "root": "/var/www/example/public_html",
+                "status": "ok",
+                "operation_rc": 0,
+                "metrics_status": "ok",
+                "pending_before": 1,
+                "pending_after": 0,
+                "email_stats_before": 3,
+                "email_stats_after": 3,
+            }
+        )
+
+        stats = _read_campaign_native_fallback_stats(self.cfg)  # type: ignore[arg-type]
+        self.assertEqual(stats[0]["recovered_runs"], 1)
 
 
 if __name__ == "__main__":

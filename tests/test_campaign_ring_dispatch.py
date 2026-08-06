@@ -173,10 +173,10 @@ class CampaignRingDispatchTests(unittest.TestCase):
         def _run(*_args: object, **_kwargs: object) -> SimpleNamespace:
             started.set()
             release.wait(timeout=2)
-            return SimpleNamespace(returncode=0)
+            return SimpleNamespace(pid=1234, wait=lambda timeout=None: 0)
 
         cfg = SimpleNamespace(command_timeout_sec=0)
-        with patch.object(daemon_mod.subprocess, "run", side_effect=_run):
+        with patch.object(daemon_mod, "_spawn_command", side_effect=_run):
             self.assertTrue(
                 executor.launch(
                     cfg,
@@ -215,7 +215,11 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         with (
             patch.object(daemon_mod.time, "time", return_value=100.0),
-            patch.object(daemon_mod.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+            patch.object(
+                daemon_mod,
+                "_spawn_command",
+                return_value=SimpleNamespace(pid=1235, wait=lambda timeout=None: 0),
+            ),
         ):
             self.assertTrue(
                 executor.launch(
@@ -248,6 +252,64 @@ class CampaignRingDispatchTests(unittest.TestCase):
                 23,
                 now_ts=160.0,
             )
+        )
+
+    def test_priority_timeout_kills_the_spawned_process_group(self) -> None:
+        executor = _PriorityTaskExecutor()
+        completed = threading.Event()
+        result: list[int | None] = []
+
+        class TimedOutProcess:
+            pid = 4321
+
+            @staticmethod
+            def wait(timeout: int | None = None) -> int:
+                raise daemon_mod.subprocess.TimeoutExpired(["php"], timeout or 1)
+
+        cfg = SimpleNamespace(command_timeout_sec=0, segment_kill_grace_sec=7)
+        with (
+            patch.object(daemon_mod, "_spawn_command", return_value=TimedOutProcess()),
+            patch.object(daemon_mod, "_kill_pid") as kill_pid,
+        ):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="campaign_native_fallback",
+                    entity_id=0,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                    timeout_sec=10,
+                    on_complete=lambda rc: (result.append(rc), completed.set()),
+                )
+            )
+            self.assertTrue(completed.wait(timeout=1))
+
+        kill_pid.assert_called_once_with(4321, 7)
+        self.assertEqual(result, [None])
+
+    def test_kill_pid_signals_isolated_process_group(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        def _killpg(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+
+        with (
+            patch.object(daemon_mod, "_is_pid_alive", return_value=True),
+            patch.object(daemon_mod.os, "getpgid", return_value=7001),
+            patch.object(daemon_mod.os, "getpgrp", return_value=8001),
+            patch.object(daemon_mod.os, "killpg", side_effect=_killpg),
+        ):
+            daemon_mod._kill_pid(7001, 0)
+
+        self.assertEqual(
+            calls,
+            [
+                (7001, daemon_mod.signal.SIGTERM),
+                (7001, 0),
+                (7001, daemon_mod.signal.SIGKILL),
+            ],
         )
 
     def test_priority_campaign_due_check_waits_for_its_first_rebuild(self) -> None:

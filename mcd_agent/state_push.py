@@ -222,6 +222,7 @@ def _state_conn(cfg: AgentConfig) -> sqlite3.Connection:
           runs INTEGER NOT NULL DEFAULT 0,
           native_errors INTEGER NOT NULL DEFAULT 0,
           metric_errors INTEGER NOT NULL DEFAULT 0,
+          recovered_runs INTEGER NOT NULL DEFAULT 0,
           recovered_pending INTEGER NOT NULL DEFAULT 0,
           recovered_email_stats INTEGER NOT NULL DEFAULT 0,
           first_run_at REAL NOT NULL,
@@ -238,6 +239,15 @@ def _state_conn(cfg: AgentConfig) -> sqlite3.Connection:
         )
         """
     )
+    fallback_stat_columns = {
+        str(row["name"] or "")
+        for row in conn.execute("PRAGMA table_info(campaign_native_fallback_stats)").fetchall()
+    }
+    if "recovered_runs" not in fallback_stat_columns:
+        conn.execute(
+            "ALTER TABLE campaign_native_fallback_stats "
+            "ADD COLUMN recovered_runs INTEGER NOT NULL DEFAULT 0"
+        )
     _migrate_legacy_profile_event_file(conn, cfg)
     return conn
 
@@ -278,6 +288,7 @@ def _store_campaign_native_fallback_event(cfg: AgentConfig, event: dict[str, Any
         if email_before is not None and email_after is not None
         else 0
     )
+    recovered_run = int(recovered_pending > 0 or recovered_email_stats > 0)
     native_error = 0 if status == "ok" and operation_rc == 0 else 1
     metric_error = 0 if metrics_status == "ok" else 1
 
@@ -291,16 +302,17 @@ def _store_campaign_native_fallback_event(cfg: AgentConfig, event: dict[str, Any
         conn.execute(
             """
             INSERT INTO campaign_native_fallback_stats (
-              root, runs, native_errors, metric_errors, recovered_pending,
+              root, runs, native_errors, metric_errors, recovered_runs, recovered_pending,
               recovered_email_stats, first_run_at, last_run_at, last_status,
               last_failed_stage, last_operation_rc, last_metrics_status,
               last_metrics_error, last_pending_before, last_pending_after,
               last_email_stats_before, last_email_stats_after
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(root) DO UPDATE SET
               runs = campaign_native_fallback_stats.runs + 1,
               native_errors = campaign_native_fallback_stats.native_errors + excluded.native_errors,
               metric_errors = campaign_native_fallback_stats.metric_errors + excluded.metric_errors,
+              recovered_runs = campaign_native_fallback_stats.recovered_runs + excluded.recovered_runs,
               recovered_pending = campaign_native_fallback_stats.recovered_pending + excluded.recovered_pending,
               recovered_email_stats = campaign_native_fallback_stats.recovered_email_stats + excluded.recovered_email_stats,
               last_run_at = excluded.last_run_at,
@@ -318,6 +330,7 @@ def _store_campaign_native_fallback_event(cfg: AgentConfig, event: dict[str, Any
                 root,
                 native_error,
                 metric_error,
+                recovered_run,
                 recovered_pending,
                 recovered_email_stats,
                 now_ts,
@@ -1581,6 +1594,7 @@ class MCCStatePusher:
         # bounded recent window so MCC receives recovery evidence without a
         # scheduler-log firehose.
         self._campaign_native_fallback_events_pending: list[dict[str, Any]] = []
+        self._campaign_native_fallback_runtime: dict[str, dict[str, Any]] = {}
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -1594,6 +1608,17 @@ class MCCStatePusher:
             return _campaign_native_fallback_last_run_ts(self.cfg, root)
         except Exception:
             return 0.0
+
+    def set_campaign_native_fallback_runtime(self, root: str, payload: dict[str, Any] | None) -> None:
+        key = str(root or "").strip()
+        if not key:
+            return
+        if payload is None:
+            self._campaign_native_fallback_runtime.pop(key, None)
+            return
+        item = dict(payload)
+        item["root"] = key
+        self._campaign_native_fallback_runtime[key] = item
 
     def add_fs_permissions_fix(
         self,
@@ -1712,6 +1737,9 @@ class MCCStatePusher:
             "pending_after": _nullable_nonnegative_int(payload.get("pending_after")),
             "email_stats_before": _nullable_nonnegative_int(payload.get("email_stats_before")),
             "email_stats_after": _nullable_nonnegative_int(payload.get("email_stats_after")),
+            "started_at": str(payload.get("started_at", "") or "").strip(),
+            "duration_sec": _nullable_nonnegative_int(payload.get("duration_sec")),
+            "schedule_delay_sec": _nullable_nonnegative_int(payload.get("schedule_delay_sec")),
         }
         self._campaign_native_fallback_events_pending.append(event)
         self._campaign_native_fallback_events_pending = self._campaign_native_fallback_events_pending[-100:]
@@ -1771,6 +1799,9 @@ class MCCStatePusher:
             totals["campaign_native_fallback_metric_errors"] = sum(
                 int(row.get("metric_errors", 0) or 0) for row in fallback_stats
             )
+            totals["campaign_native_fallback_recovered_runs"] = sum(
+                int(row.get("recovered_runs", 0) or 0) for row in fallback_stats
+            )
             totals["campaign_native_fallback_recovered_pending"] = sum(
                 int(row.get("recovered_pending", 0) or 0) for row in fallback_stats
             )
@@ -1790,6 +1821,14 @@ class MCCStatePusher:
             details_raw = out.get("details")
             details = dict(details_raw) if isinstance(details_raw, dict) else {}
             details["campaign_native_fallback_recent"] = fallback_recent
+            out["details"] = details
+        if self._campaign_native_fallback_runtime:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["campaign_native_fallback_runtime"] = [
+                dict(self._campaign_native_fallback_runtime[root])
+                for root in sorted(self._campaign_native_fallback_runtime)
+            ]
             out["details"] = details
         return out
 

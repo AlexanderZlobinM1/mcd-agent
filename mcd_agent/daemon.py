@@ -136,6 +136,7 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
+_CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 # Avoid spending an entire scheduler pass probing stale audit candidates.
@@ -5197,18 +5198,44 @@ def _sync_external_running_tasks(
 def _kill_pid(pid: int, grace_sec: int) -> None:
     if not _is_pid_alive(pid):
         return
+    # Scheduler children are started in their own session. Signal the whole
+    # process group so killing a flock/sudo wrapper cannot leave the PHP
+    # console process running forever as an orphan.
     try:
-        os.kill(pid, signal.SIGTERM)
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = 0
+    kill_group = pgid > 1 and pgid != os.getpgrp()
+
+    def _alive() -> bool:
+        if not kill_group:
+            return _is_pid_alive(pid)
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _signal(sig: int) -> None:
+        if kill_group:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+
+    try:
+        _signal(signal.SIGTERM)
     except OSError:
         return
     deadline = time.time() + max(0, grace_sec)
     while time.time() < deadline:
-        if not _is_pid_alive(pid):
+        if not _alive():
             return
         time.sleep(0.5)
-    if _is_pid_alive(pid):
+    if _alive():
         try:
-            os.kill(pid, signal.SIGKILL)
+            _signal(signal.SIGKILL)
         except OSError:
             return
 
@@ -5301,6 +5328,8 @@ class _PriorityTaskExecutor:
         max_parallel: int,
         on_success: Callable[[], None] | None = None,
         on_complete: Callable[[int | None], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        timeout_sec: int | None = None,
         log_lifecycle: bool = True,
     ) -> bool:
         key = _task_key(root, task_type, entity_id)
@@ -5331,18 +5360,20 @@ class _PriorityTaskExecutor:
                 logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
             completed = False
             rc: int | None = None
+            proc: subprocess.Popen[bytes] | None = None
             try:
-                timeout = max(0, int(getattr(config, "command_timeout_sec", 0) or 0))
-                proc = subprocess.run(
-                    locked_args,
-                    cwd=root,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=timeout if timeout > 0 else None,
-                    check=False,
+                timeout = max(
+                    0,
+                    int(
+                        timeout_sec
+                        if timeout_sec is not None
+                        else (getattr(config, "command_timeout_sec", 0) or 0)
+                    ),
                 )
-                rc = int(proc.returncode or 0)
+                proc = _spawn_command(root=root, args=locked_args)
+                if on_start is not None:
+                    on_start(int(proc.pid))
+                rc = int(proc.wait(timeout=timeout if timeout > 0 else None) or 0)
                 if rc == _TASK_LOCK_BUSY_RC:
                     if log_lifecycle:
                         logging.info("[%s] priority lock busy %s entity=%s", root, task_type, entity_id)
@@ -5354,6 +5385,8 @@ class _PriorityTaskExecutor:
                     if log_lifecycle:
                         logging.warning("[%s] priority failed %s entity=%s rc=%s", root, task_type, entity_id, rc)
             except subprocess.TimeoutExpired:
+                if proc is not None:
+                    _kill_pid(proc.pid, int(getattr(config, "segment_kill_grace_sec", 10) or 10))
                 if log_lifecycle:
                     logging.warning("[%s] priority timeout %s entity=%s", root, task_type, entity_id)
             except Exception as exc:
@@ -6897,17 +6930,63 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if root not in last_campaign_native_fallback_ts:
                     last_campaign_native_fallback_ts[root] = pusher.campaign_native_fallback_last_run_ts(root)
                 fallback_interval = max(300, int(getattr(cfg, "campaign_native_fallback_interval_sec", 3600) or 3600))
+                fallback_now = time.time()
+                fallback_last = float(last_campaign_native_fallback_ts.get(root, 0.0) or 0.0)
+                fallback_scheduled_at = fallback_last + fallback_interval if fallback_last > 0 else fallback_now
+                fallback_enabled = bool(getattr(cfg, "campaign_native_fallback_enabled", False))
+                if not fallback_enabled:
+                    pusher.set_campaign_native_fallback_runtime(root, None)
                 fallback_due = (
-                    bool(getattr(cfg, "campaign_native_fallback_enabled", False))
-                    and time.time() - float(last_campaign_native_fallback_ts.get(root, 0.0) or 0.0) >= fallback_interval
+                    fallback_enabled
+                    and fallback_now - fallback_last >= fallback_interval
                 )
-                if (
-                    fallback_due
-                    and _running_campaign_total(running, root) == 0
-                    and not priority_executor.has_active_campaign_work(root)
-                    and not priority_executor.has_active_task_type("campaign_native_fallback")
-                ):
+                fallback_block_reason = ""
+                if fallback_due and _running_campaign_total(running, root) > 0:
+                    fallback_block_reason = "campaign_worker_active"
+                elif fallback_due and priority_executor.has_active_campaign_work(root):
+                    fallback_block_reason = "priority_campaign_active"
+                elif fallback_due and priority_executor.has_active_task_type("campaign_native_fallback"):
+                    fallback_block_reason = "host_fallback_active"
+                if fallback_due and fallback_block_reason:
+                    pusher.set_campaign_native_fallback_runtime(
+                        root,
+                        {
+                            "status": "deferred",
+                            "reason": fallback_block_reason,
+                            "scheduled_at": datetime.fromtimestamp(
+                                fallback_scheduled_at,
+                                tz=timezone.utc,
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "delay_sec": max(0, int((fallback_now - fallback_scheduled_at) // 60) * 60),
+                        },
+                    )
+                if fallback_due and not fallback_block_reason:
                     metrics_before = _campaign_native_fallback_metrics(MauticDB(inst.db))
+                    fallback_started_at = time.time()
+                    fallback_schedule_delay_sec = max(0, int(fallback_started_at - fallback_scheduled_at))
+
+                    def _fallback_started(
+                        pid: int,
+                        *,
+                        root: str = root,
+                        started_at: float = fallback_started_at,
+                        scheduled_at: float = fallback_scheduled_at,
+                        delay_sec: int = fallback_schedule_delay_sec,
+                    ) -> None:
+                        pusher.set_campaign_native_fallback_runtime(
+                            root,
+                            {
+                                "status": "running",
+                                "pid": int(pid),
+                                "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ"
+                                ),
+                                "scheduled_at": datetime.fromtimestamp(scheduled_at, tz=timezone.utc).strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ"
+                                ),
+                                "schedule_delay_sec": delay_sec,
+                            },
+                        )
 
                     def _fallback_completed(
                         rc: int | None,
@@ -6915,6 +6994,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         root: str = root,
                         db_cfg: object = inst.db,
                         metrics_before: dict[str, object] = metrics_before,
+                        started_at: float = fallback_started_at,
+                        schedule_delay_sec: int = fallback_schedule_delay_sec,
                     ) -> None:
                         metrics_after = _campaign_native_fallback_metrics(MauticDB(db_cfg))
                         before_error = str(metrics_before.get("error") or "").strip()
@@ -6941,8 +7022,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "pending_after": metrics_after.get("pending_due"),
                             "email_stats_before": metrics_before.get("email_stats"),
                             "email_stats_after": metrics_after.get("email_stats"),
+                            "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            ),
+                            "duration_sec": max(0, int(time.time() - started_at)),
+                            "schedule_delay_sec": schedule_delay_sec,
                         }
                         pusher.add_campaign_native_fallback(event)
+                        pusher.set_campaign_native_fallback_runtime(root, None)
                         level = logging.info if rc == 0 else logging.warning
                         level(
                             "[%s] campaign native fallback status=%s stage=%s rc=%s metrics=%s "
@@ -6967,6 +7054,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         interval_sec=fallback_interval,
                         max_parallel=1,
                         on_complete=_fallback_completed,
+                        on_start=_fallback_started,
+                        timeout_sec=_CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC,
                         log_lifecycle=False,
                     )
                     if fallback_started:
@@ -6974,6 +7063,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         # Keep priority work out of this pass. The fallback
                         # was admitted only while this root was idle.
                         continue
+                    pusher.set_campaign_native_fallback_runtime(
+                        root,
+                        {
+                            "status": "deferred",
+                            "reason": "launch_guard",
+                            "scheduled_at": datetime.fromtimestamp(
+                                fallback_scheduled_at,
+                                tz=timezone.utc,
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "delay_sec": max(0, int((time.time() - fallback_scheduled_at) // 60) * 60),
+                        },
+                    )
                 segment_ids = _segment_whitelist_effective_setting(cfg, inst)
                 campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
                 for segment_id in sorted(segment_ids):
