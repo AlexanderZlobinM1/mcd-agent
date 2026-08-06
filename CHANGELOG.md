@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 0.10.0 - 2026-08-06
+- Added: MCD applies MCC-stored per-instance mail profiles for own-host mail,
+  SMTP, Amazon SES API and SendGrid API. Missing Symfony mailer bridges are
+  installed through the existing guarded Composer dependency workflow.
+- Added: own-host mail uses per-instance DKIM keys, MCC-provided sender
+  settings and atomic daily/monthly recipient quotas. Existing native Sendmail
+  hosts remain on Sendmail; clean new hosts install Postfix and OpenDKIM.
+- Added: profile activation sends a real Symfony Mailer test message to the
+  current MCC user's email before MCC marks the profile active.
+- Safety: MTA, OpenDKIM and Mautic changes roll back on failure. Existing
+  Sendmail queues are quarantined before first direct-delivery activation and
+  restored if activation fails; unmanaged MTAs are never replaced.
+- Changed: instance mail state is stored only under `/etc/mcd/local-mail` and
+  `/var/lib/mcd/local-mail`; no instance `.mcd` runtime directory is created.
+
 ## 0.9.287 - 2026-08-06
 - Fixed: native fallback owns an exclusive per-instance campaign gate for its
   complete global update/trigger pair. MCD exact rebuild/trigger launches use

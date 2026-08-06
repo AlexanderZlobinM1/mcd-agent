@@ -760,6 +760,8 @@ def install_from_image(
     yes: bool = False,
     run_certbot: bool = True,
     certbot_dns_credential_ref: str | None = None,
+    own_mail: bool = False,
+    mail_profile_id: str | None = None,
 ) -> dict[str, Any]:
     plan = build_plan(image_ref=image_ref, domain=domain, php_version=php_version)
     if not yes:
@@ -832,6 +834,22 @@ def install_from_image(
                 print("Running certbot via nginx HTTP-01")
                 _run_certbot_http01(plan)
 
+        if mail_profile_id:
+            print("Applying MCC mail profile")
+            from mcd_agent.mail_config import apply_mail_profile
+
+            apply_mail_profile(
+                cfg,
+                profile_id=str(mail_profile_id),
+                domain=plan.domain,
+                root=str(plan.webroot),
+            )
+        elif own_mail:
+            print("Configuring per-instance own-host mail")
+            from mcd_agent.local_mail import configure_local_mail
+
+            configure_local_mail(cfg, domain=plan.domain, root=str(plan.webroot))
+
     from mcd_agent.inventory import InstanceInventory
 
     inv = InstanceInventory(cfg.state_db_path)
@@ -843,5 +861,7 @@ def install_from_image(
         "webroot": str(plan.webroot),
         "db_name": plan.db_name,
         "php_version": plan.php_version,
+        "mail_mode": "own_host" if own_mail or mail_profile_id else "external",
+        "mail_profile_id": str(mail_profile_id or ""),
         "instances": count,
     }

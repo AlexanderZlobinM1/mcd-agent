@@ -1,0 +1,925 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from email import policy
+from email.parser import BytesParser
+from email.utils import getaddresses
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from typing import Any
+from urllib import parse, request
+
+from mcd_agent.config import AgentConfig
+
+
+CONFIG_ROOT = Path("/etc/mcd/local-mail")
+STATE_ROOT = Path("/var/lib/mcd/local-mail")
+DOMAINS_PATH = CONFIG_ROOT / "domains.json"
+QUOTA_DB_PATH = STATE_ROOT / "quota.sqlite3"
+SENDMAIL_MC = Path("/etc/mail/sendmail.mc")
+SENDMAIL_MC_BASELINE = STATE_ROOT / "sendmail.mc.baseline"
+POSTFIX_MAIN_CF = Path("/etc/postfix/main.cf")
+POSTFIX_MAIN_CF_BASELINE = STATE_ROOT / "postfix.main.cf.baseline"
+OPENDKIM_CONF = Path("/etc/opendkim.conf")
+OPENDKIM_CONF_BASELINE = STATE_ROOT / "opendkim.conf.baseline"
+OPENDKIM_DEFAULT = Path("/etc/default/opendkim")
+OPENDKIM_DEFAULT_BASELINE = STATE_ROOT / "opendkim.default.baseline"
+OPENDKIM_KEYS = Path("/etc/opendkim/keys")
+OPENDKIM_KEY_TABLE = CONFIG_ROOT / "KeyTable"
+OPENDKIM_SIGNING_TABLE = CONFIG_ROOT / "SigningTable"
+SUBMIT_WRAPPER = Path("/usr/local/bin/mcd-mail-submit")
+SENDMAIL_BIN = Path("/usr/sbin/sendmail")
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+_SENDMAIL_BEGIN = "dnl MCD LOCAL MAIL BEGIN"
+_SENDMAIL_END = "dnl MCD LOCAL MAIL END"
+_OPENDKIM_BEGIN = "# MCD LOCAL MAIL BEGIN"
+_OPENDKIM_END = "# MCD LOCAL MAIL END"
+
+
+def _run(args: list[str], *, timeout_sec: int = 300, input_bytes: bytes | None = None) -> tuple[int, str]:
+    proc = subprocess.run(
+        args,
+        input=input_bytes,
+        capture_output=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    output = (proc.stdout or b"") + (proc.stderr or b"")
+    return int(proc.returncode), output.decode("utf-8", errors="replace").strip()
+
+
+def _domain(raw: str) -> str:
+    value = str(raw or "").strip().lower().rstrip(".")
+    if not _DOMAIN_RE.match(value):
+        raise RuntimeError(f"invalid instance domain: {raw}")
+    return value
+
+
+def _host_name(cfg: AgentConfig) -> str:
+    return str(cfg.mcc_host_name or socket.gethostname()).strip()
+
+
+def _mcc_json(
+    cfg: AgentConfig,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    timeout_sec: int = 60,
+) -> dict[str, Any]:
+    base = str(cfg.mcc_url or "").rstrip("/")
+    token = str(cfg.mcc_token or "").strip()
+    if not base or not token:
+        raise RuntimeError("mcc.url and mcc.token are required")
+    url = base + "/" + str(path or "").lstrip("/")
+    if query:
+        url += "?" + parse.urlencode(query)
+    body = None
+    headers = {"Authorization": f"Bearer {token}"}
+    method = "GET"
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        method = "POST"
+    req = request.Request(url, data=body, headers=headers, method=method)
+    with request.urlopen(req, timeout=max(1, int(timeout_sec))) as response:
+        parsed = json.loads(response.read().decode("utf-8", errors="replace"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("MCC returned invalid local-mail JSON")
+    return parsed
+
+
+def fetch_material(cfg: AgentConfig, domain: str) -> dict[str, Any]:
+    return _mcc_json(
+        cfg,
+        "/api/v1/agent/local-mail/material",
+        query={"domain": _domain(domain), "host_name": _host_name(cfg)},
+    )
+
+
+def _load_domains() -> dict[str, Any]:
+    if not DOMAINS_PATH.exists():
+        return {"schema": 1, "domains": {}}
+    try:
+        payload = json.loads(DOMAINS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    domains = payload.get("domains")
+    if not isinstance(domains, dict):
+        domains = {}
+    return {"schema": 1, "domains": domains}
+
+
+def _write_atomic(path: Path, content: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _save_domains(payload: dict[str, Any]) -> None:
+    _write_atomic(DOMAINS_PATH, json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+
+
+def _backup_once(source: Path, target: Path) -> None:
+    if target.exists() or not source.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    os.chmod(target, 0o600)
+
+
+def _package_installed(name: str) -> bool:
+    rc, out = _run(["dpkg-query", "-W", "-f=${db:Status-Status}", name], timeout_sec=30)
+    return rc == 0 and out.strip() == "installed"
+
+
+def _apt_install() -> str:
+    sendmail_path = shutil.which("sendmail")
+    native_sendmail = _package_installed("sendmail-bin")
+    native_postfix = _package_installed("postfix")
+    if native_sendmail:
+        mta = "sendmail"
+    elif native_postfix:
+        domains = _load_domains().get("domains", {})
+        managed_postfix = POSTFIX_MAIN_CF_BASELINE.exists() or any(
+            isinstance(item, dict) and str(item.get("mta") or "") == "postfix"
+            for item in (domains.values() if isinstance(domains, dict) else [])
+        )
+        if not managed_postfix:
+            raise RuntimeError("existing unmanaged Postfix must be reviewed before enabling own-host mail")
+        mta = "postfix"
+    elif sendmail_path:
+        raise RuntimeError(
+            f"unsupported existing MTA owns {sendmail_path}; own-host mail will not replace it automatically"
+        )
+    else:
+        mta = "postfix"
+    packages: list[str] = []
+    if not native_sendmail and not native_postfix:
+        packages.append("postfix")
+    if not _package_installed("opendkim"):
+        packages.append("opendkim")
+    if not _package_installed("opendkim-tools"):
+        packages.append("opendkim-tools")
+    if not packages:
+        return mta
+    if "postfix" in packages:
+        rc, out = _run(
+            ["debconf-set-selections"],
+            timeout_sec=30,
+            input_bytes=(
+                b"postfix postfix/main_mailer_type select Internet Site\n"
+                b"postfix postfix/mailname string localhost\n"
+            ),
+        )
+        if rc != 0:
+            raise RuntimeError("postfix package preseed failed: " + out)
+    rc, out = _run(["apt-get", "update"], timeout_sec=600)
+    if rc != 0:
+        raise RuntimeError("apt-get update failed: " + out)
+    rc, out = _run(
+        ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", *packages],
+        timeout_sec=900,
+    )
+    if rc != 0:
+        raise RuntimeError("mail package installation failed: " + out)
+    missing_tools = [name for name in ("sendmail", "opendkim", "opendkim-testkey") if shutil.which(name) is None]
+    if missing_tools:
+        raise RuntimeError("mail package installation did not provide: " + ", ".join(missing_tools))
+    return mta
+
+
+def _strip_block(text: str, begin: str, end: str) -> str:
+    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end) + r"\s*", re.DOTALL)
+    return re.sub(pattern, "", str(text or "")).rstrip() + "\n"
+
+
+def _sendmail_direct_text(text: str, mail_hostname: str) -> str:
+    out = _strip_block(text, _SENDMAIL_BEGIN, _SENDMAIL_END)
+    disabled_patterns = (
+        r"^\s*define\(\s*`SMART_HOST'",
+        r"^\s*FEATURE\(\s*`allmasquerade'",
+        r"^\s*FEATURE\(\s*`masquerade_envelope'",
+        r"^\s*MASQUERADE_AS\(",
+        r"^\s*MASQUERADE_DOMAIN\(",
+    )
+    lines: list[str] = []
+    domain_replaced = False
+    for line in out.splitlines():
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in disabled_patterns):
+            lines.append("dnl MCD disabled for own-host mail: " + line)
+            continue
+        if re.search(r"^\s*define\(\s*`confDOMAIN_NAME'", line, re.IGNORECASE):
+            lines.append(f"define(`confDOMAIN_NAME', `{mail_hostname}')dnl")
+            domain_replaced = True
+            continue
+        lines.append(line)
+    managed_block = [
+        _SENDMAIL_BEGIN,
+        "INPUT_MAIL_FILTER(`opendkim', `S=local:/run/opendkim/opendkim.sock, F=T, T=R:2m')dnl",
+        "define(`confMILTER_MACROS_ENVFROM', `i, {auth_type}, {auth_authen}, {auth_ssf}, {auth_author}, {mail_mailer}, {mail_host}, {mail_addr}')dnl",
+        _SENDMAIL_END,
+    ]
+    insert_at = next(
+        (index for index, line in enumerate(lines) if re.search(r"^\s*MAILER\(", line, re.IGNORECASE)),
+        len(lines),
+    )
+    prefix: list[str] = []
+    if not domain_replaced:
+        prefix.append(f"define(`confDOMAIN_NAME', `{mail_hostname}')dnl")
+    lines[insert_at:insert_at] = [*prefix, *managed_block]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _configure_sendmail(mail_hostname: str) -> None:
+    if not SENDMAIL_MC.exists():
+        raise RuntimeError(f"sendmail.mc not found: {SENDMAIL_MC}")
+    _backup_once(SENDMAIL_MC, SENDMAIL_MC_BASELINE)
+    current = SENDMAIL_MC.read_text(encoding="utf-8", errors="replace")
+    _write_atomic(SENDMAIL_MC, _sendmail_direct_text(current, mail_hostname), mode=0o644)
+    rc, out = _run(["make", "-C", str(SENDMAIL_MC.parent)], timeout_sec=120)
+    if rc != 0:
+        raise RuntimeError("sendmail configuration build failed: " + out)
+
+
+def _configure_postfix(mail_hostname: str) -> None:
+    if not POSTFIX_MAIN_CF.exists():
+        raise RuntimeError(f"Postfix main.cf not found: {POSTFIX_MAIN_CF}")
+    _backup_once(POSTFIX_MAIN_CF, POSTFIX_MAIN_CF_BASELINE)
+    settings = {
+        "myhostname": mail_hostname,
+        "myorigin": "$myhostname",
+        "inet_interfaces": "loopback-only",
+        "mydestination": "$myhostname, localhost.$mydomain, localhost",
+        "relayhost": "",
+        "smtp_tls_security_level": "may",
+        "smtp_tls_CApath": "/etc/ssl/certs",
+        "smtpd_milters": "inet:localhost:8891",
+        "non_smtpd_milters": "inet:localhost:8891",
+        "milter_default_action": "tempfail",
+        "milter_protocol": "6",
+    }
+    for key, value in settings.items():
+        rc, out = _run(["postconf", "-e", f"{key} = {value}"], timeout_sec=30)
+        if rc != 0:
+            raise RuntimeError(f"Postfix setting failed for {key}: {out}")
+    rc, out = _run(["postfix", "check"], timeout_sec=60)
+    if rc != 0:
+        raise RuntimeError("Postfix validation failed: " + out)
+
+
+def _configure_mta(mta: str, mail_hostname: str) -> None:
+    if mta == "postfix":
+        _configure_postfix(mail_hostname)
+        return
+    if mta == "sendmail":
+        _configure_sendmail(mail_hostname)
+        return
+    raise RuntimeError(f"unsupported managed MTA: {mta}")
+
+
+def _managed_mta(domains: dict[str, Any], default: str = "sendmail") -> str:
+    values = {
+        str(item.get("mta") or default).strip().lower()
+        for item in domains.values()
+        if isinstance(item, dict)
+    }
+    if len(values) > 1:
+        raise RuntimeError("managed own-host domains disagree on the host MTA")
+    return next(iter(values), default)
+
+
+def _configure_opendkim(domains: dict[str, Any], *, mta: str = "sendmail") -> None:
+    existing = OPENDKIM_CONF.read_text(encoding="utf-8", errors="replace") if OPENDKIM_CONF.exists() else ""
+    managed = _OPENDKIM_BEGIN in existing and _OPENDKIM_END in existing
+    if not managed and re.search(r"(?im)^\s*(KeyTable|SigningTable)\s+", existing):
+        raise RuntimeError("existing unmanaged OpenDKIM signing configuration must be reviewed before enabling own-host mail")
+    _backup_once(OPENDKIM_CONF, OPENDKIM_CONF_BASELINE)
+    _backup_once(OPENDKIM_DEFAULT, OPENDKIM_DEFAULT_BASELINE)
+    base = _strip_block(existing, _OPENDKIM_BEGIN, _OPENDKIM_END)
+    base = "\n".join(
+        line
+        for line in base.splitlines()
+        if not re.search(r"^\s*(Mode|Socket|Canonicalization|OversignHeaders)\s+", line, re.IGNORECASE)
+    ).rstrip() + "\n"
+    socket_value = "inet:8891@localhost" if mta == "postfix" else "local:/run/opendkim/opendkim.sock"
+    block = "\n".join(
+        [
+            _OPENDKIM_BEGIN,
+            "Mode s",
+            f"Socket {socket_value}",
+            "Canonicalization relaxed/simple",
+            "OversignHeaders From",
+            f"KeyTable refile:{OPENDKIM_KEY_TABLE}",
+            f"SigningTable refile:{OPENDKIM_SIGNING_TABLE}",
+            _OPENDKIM_END,
+        ]
+    )
+    _write_atomic(OPENDKIM_CONF, base.rstrip() + "\n" + block + "\n", mode=0o644)
+    default_text = OPENDKIM_DEFAULT.read_text(encoding="utf-8", errors="replace") if OPENDKIM_DEFAULT.exists() else ""
+    if re.search(r"(?m)^\s*SOCKET=", default_text):
+        default_text = re.sub(r"(?m)^\s*SOCKET=.*$", f'SOCKET="{socket_value}"', default_text)
+    else:
+        default_text = default_text.rstrip() + f'\nSOCKET="{socket_value}"\n'
+    _write_atomic(OPENDKIM_DEFAULT, default_text, mode=0o644)
+
+    key_lines: list[str] = []
+    signing_lines: list[str] = []
+    for domain, item in sorted(domains.items()):
+        selector = str(item.get("selector") or "mcd").strip()
+        key_path = OPENDKIM_KEYS / domain / f"{selector}.private"
+        key_lines.append(f"{selector}._domainkey.{domain} {domain}:{selector}:{key_path}")
+        signing_lines.append(f"*@{domain} {selector}._domainkey.{domain}")
+    _write_atomic(OPENDKIM_KEY_TABLE, "\n".join(key_lines) + "\n", mode=0o640)
+    _write_atomic(OPENDKIM_SIGNING_TABLE, "\n".join(signing_lines) + "\n", mode=0o640)
+    try:
+        shutil.chown(OPENDKIM_KEY_TABLE, user="root", group="opendkim")
+        shutil.chown(OPENDKIM_SIGNING_TABLE, user="root", group="opendkim")
+    except LookupError as exc:
+        raise RuntimeError("opendkim service account is missing") from exc
+
+
+def _write_key(domain: str, selector: str, private_key: str) -> Path:
+    key_dir = OPENDKIM_KEYS / domain
+    key_dir.mkdir(parents=True, exist_ok=True)
+    key_path = key_dir / f"{selector}.private"
+    _write_atomic(key_path, private_key.rstrip() + "\n", mode=0o600)
+    try:
+        shutil.chown(key_dir, user="opendkim", group="opendkim")
+        shutil.chown(key_path, user="opendkim", group="opendkim")
+    except LookupError as exc:
+        raise RuntimeError("opendkim service account is missing") from exc
+    return key_path
+
+
+def _write_submit_wrapper() -> None:
+    _write_atomic(
+        SUBMIT_WRAPPER,
+        "#!/bin/sh\nexec /usr/local/bin/mcd-cli local-mail submit \"$@\"\n",
+        mode=0o755,
+    )
+
+
+def _local_php(root: str) -> Path:
+    base = Path(str(root or "").strip())
+    if not base.is_absolute() or Path("/var/www") not in base.parents:
+        raise RuntimeError("instance root must be below /var/www")
+    for relative in ("config/local.php", "app/config/local.php"):
+        path = base / relative
+        if path.exists():
+            return path
+    raise RuntimeError("Mautic local.php not found")
+
+
+def _php_quote(value: str) -> str:
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _set_php_parameter(text: str, key: str, value: str) -> str:
+    pattern = rf"(['\"]{re.escape(key)}['\"]\s*=>\s*)(?:['\"][^'\"]*['\"]|null)"
+    updated, count = re.subn(pattern, lambda match: match.group(1) + _php_quote(value), text)
+    if not count:
+        raise RuntimeError(f"Mautic local.php parameter is missing: {key}")
+    return updated
+
+
+def _set_php_parameter_if_present(text: str, key: str, value: str) -> str:
+    try:
+        return _set_php_parameter(text, key, value)
+    except RuntimeError:
+        return text
+
+
+def _configure_mautic(root: str, domain: str, settings: dict[str, Any] | None = None) -> None:
+    path = _local_php(root)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    stat = path.stat()
+    values = dict(settings or {})
+    command = f"{SUBMIT_WRAPPER} --instance-domain={domain} -- -oi -t"
+    dsn = "sendmail://default?command=" + parse.quote(command, safe="")
+    text = _set_php_parameter(text, "mailer_dsn", dsn)
+    text = _set_php_parameter(text, "mailer_from_email", str(values.get("from_email") or f"mailer@{domain}"))
+    text = _set_php_parameter_if_present(text, "mailer_from_name", str(values.get("from_name") or "Sales Snap"))
+    text = _set_php_parameter(text, "mailer_return_path", str(values.get("return_path") or f"bounce@{domain}"))
+    _write_atomic(path, text, mode=stat.st_mode & 0o777)
+    os.chown(path, stat.st_uid, stat.st_gid)
+
+
+def _send_test_message(cfg: AgentConfig, *, root: str, recipient: str, profile_name: str) -> str:
+    target = str(recipient or "").strip().lower()
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", target):
+        raise RuntimeError("valid MCC user email is required for the mail configuration test")
+    local_php = _local_php(root)
+    base = Path(root)
+    autoload_candidates = [base / "vendor" / "autoload.php", base.parent / "vendor" / "autoload.php"]
+    autoload = next((path for path in autoload_candidates if path.exists()), None)
+    if autoload is None:
+        raise RuntimeError("Mautic vendor/autoload.php not found for mail test")
+    script = r"""<?php
+require $argv[2];
+$params = include $argv[1];
+if (isset($params['parameters']) && is_array($params['parameters'])) { $params = $params['parameters']; }
+$dsn = (string)($params['mailer_dsn'] ?? '');
+$from = (string)($params['mailer_from_email'] ?? '');
+$fromName = (string)($params['mailer_from_name'] ?? 'Sales Snap');
+$returnPath = (string)($params['mailer_return_path'] ?? $from);
+if ($dsn === '' || $from === '') { fwrite(STDERR, "mailer_dsn or mailer_from_email is missing\n"); exit(2); }
+$transport = Symfony\Component\Mailer\Transport::fromDsn($dsn);
+$mailer = new Symfony\Component\Mailer\Mailer($transport);
+$email = (new Symfony\Component\Mime\Email())
+    ->from(new Symfony\Component\Mime\Address($from, $fromName))
+    ->to($argv[3])
+    ->returnPath($returnPath)
+    ->subject('Sales Snap mail configuration test')
+    ->text('Mail configuration "'.$argv[4].'" was applied and tested successfully by MCC/MCD.');
+$mailer->send($email);
+echo "test message accepted\n";
+"""
+    with tempfile.NamedTemporaryFile(prefix="mcd-mail-test-", suffix=".php", delete=False) as handle:
+        script_path = Path(handle.name)
+        handle.write(script.encode("utf-8"))
+    try:
+        os.chmod(script_path, 0o644)
+        rc, out = _run(
+            [
+                "sudo",
+                "-u",
+                "www-data",
+                str(cfg.php_bin or "/usr/bin/php"),
+                str(script_path),
+                str(local_php),
+                str(autoload),
+                target,
+                str(profile_name or "Mail profile")[:80],
+            ],
+            timeout_sec=max(120, int(cfg.command_timeout_sec or 300)),
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+    if rc != 0:
+        raise RuntimeError("test email failed: " + out)
+    return out or "test message accepted"
+
+
+def _quota_connection() -> sqlite3.Connection:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(QUOTA_DB_PATH), timeout=30, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS counters ("
+        "domain TEXT PRIMARY KEY, daily_period TEXT NOT NULL, daily_used INTEGER NOT NULL, "
+        "monthly_period TEXT NOT NULL, monthly_used INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    return conn
+
+
+def _periods(now: datetime | None = None) -> tuple[str, str]:
+    current = now or datetime.now(UTC)
+    return current.strftime("%Y-%m-%d"), current.strftime("%Y-%m")
+
+
+def _seed_quota(domain: str, material: dict[str, Any]) -> None:
+    day, month = _periods()
+    source_day = str(material.get("daily_period") or "")
+    source_month = str(material.get("monthly_period") or "")
+    source_daily = max(0, int(material.get("daily_used") or 0)) if source_day == day else 0
+    source_monthly = max(0, int(material.get("monthly_used") or 0)) if source_month == month else 0
+    with _quota_connection() as conn:
+        existing = conn.execute(
+            "SELECT daily_period,daily_used,monthly_period,monthly_used FROM counters WHERE domain=?",
+            (domain,),
+        ).fetchone()
+        if existing:
+            local_daily = int(existing[1]) if str(existing[0]) == day else 0
+            local_monthly = int(existing[3]) if str(existing[2]) == month else 0
+            source_daily = max(source_daily, local_daily)
+            source_monthly = max(source_monthly, local_monthly)
+        conn.execute(
+            "INSERT INTO counters(domain,daily_period,daily_used,monthly_period,monthly_used,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(domain) DO UPDATE SET daily_period=excluded.daily_period,"
+            "daily_used=excluded.daily_used,monthly_period=excluded.monthly_period,"
+            "monthly_used=excluded.monthly_used,updated_at=excluded.updated_at",
+            (domain, day, source_daily, month, source_monthly, datetime.now(UTC).isoformat()),
+        )
+
+
+def quota_state(domain: str) -> dict[str, Any]:
+    day, month = _periods()
+    with _quota_connection() as conn:
+        row = conn.execute(
+            "SELECT daily_period,daily_used,monthly_period,monthly_used FROM counters WHERE domain=?",
+            (_domain(domain),),
+        ).fetchone()
+    return {
+        "daily_period": day,
+        "daily_used": int(row[1]) if row and str(row[0]) == day else 0,
+        "monthly_period": month,
+        "monthly_used": int(row[3]) if row and str(row[2]) == month else 0,
+    }
+
+
+def _push_status(cfg: AgentConfig, domain: str, *, status: str, error: str = "") -> None:
+    state = quota_state(domain)
+    _mcc_json(
+        cfg,
+        "/api/v1/agent/local-mail/status",
+        payload={
+            "instance_domain": domain,
+            "mcc_host_name": _host_name(cfg),
+            "hostname": socket.gethostname(),
+            "status": status,
+            "error": error,
+            **state,
+        },
+        timeout_sec=3,
+    )
+
+
+def _quarantine_legacy_queue() -> dict[str, Any]:
+    queue_dir = Path("/var/spool/mqueue")
+    if not queue_dir.exists():
+        return {"count": 0, "path": ""}
+    files = [path for path in queue_dir.iterdir() if path.is_file() and path.name[:2] in {"qf", "df", "xf", "Qf"}]
+    if not files:
+        return {"count": 0, "path": ""}
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    target = STATE_ROOT / "legacy-queue" / stamp
+    target.mkdir(parents=True, exist_ok=False)
+    os.chmod(target, 0o700)
+    for path in files:
+        shutil.move(str(path), str(target / path.name))
+    return {"count": len(files), "path": str(target)}
+
+
+def _restore_legacy_queue(quarantine: dict[str, Any]) -> None:
+    raw = str(quarantine.get("path") or "").strip()
+    if not raw:
+        return
+    source = Path(raw)
+    queue_dir = Path("/var/spool/mqueue")
+    if STATE_ROOT not in source.parents or not source.is_dir():
+        raise RuntimeError("legacy queue quarantine path is invalid")
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    for path in source.iterdir():
+        target = queue_dir / path.name
+        if target.exists():
+            raise RuntimeError(f"legacy queue restore collision: {target}")
+        shutil.move(str(path), str(target))
+    source.rmdir()
+
+
+def configure_local_mail(
+    cfg: AgentConfig,
+    *,
+    domain: str,
+    root: str,
+    test_recipient: str = "",
+    profile_name: str = "Own host",
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise RuntimeError("local-mail configure must run as root")
+    clean = _domain(domain)
+    material = fetch_material(cfg, clean)
+    if not bool(material.get("enabled")):
+        raise RuntimeError("own-host mail is disabled in MCC")
+    if str(material.get("current_host_name") or "").strip() != _host_name(cfg):
+        raise RuntimeError("MCC local-mail material belongs to another host")
+    local_php_path = _local_php(root)
+    local_php_before = local_php_path.read_text(encoding="utf-8", errors="replace")
+    local_php_stat = local_php_path.stat()
+    mta = _apt_install()
+    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_ROOT, 0o700)
+    os.chmod(STATE_ROOT, 0o700)
+    payload = _load_domains()
+    payload_before = json.loads(json.dumps(payload))
+    domains = payload["domains"]
+    first_activation = not bool(domains)
+    selector = str(material.get("selector") or "mcd").strip()
+    key_path = _write_key(clean, selector, str(material.get("private_key_pem") or ""))
+    domains[clean] = {
+        "instance_domain": clean,
+        "root": str(Path(root)),
+        "mail_hostname": str(material.get("mail_hostname") or "mail." + clean),
+        "selector": selector,
+        "key_path": str(key_path),
+        "daily_limit": int(material.get("daily_limit") or 100),
+        "monthly_limit": int(material.get("monthly_limit") or 1000),
+        "config_schema_version": int(material.get("config_schema_version") or 1),
+        "mta": mta,
+    }
+    queue_quarantine = {"count": 0, "path": ""}
+    try:
+        _save_domains(payload)
+        _seed_quota(clean, material)
+        _write_submit_wrapper()
+        _configure_opendkim(domains, mta=mta)
+        if first_activation:
+            _run(["systemctl", "stop", mta], timeout_sec=90)
+            if mta == "sendmail":
+                queue_quarantine = _quarantine_legacy_queue()
+        primary_domain = sorted(domains)[0]
+        primary_mail_hostname = str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+        _configure_mta(mta, primary_mail_hostname)
+        sender_settings = material.get("settings") if isinstance(material.get("settings"), dict) else {}
+        _configure_mautic(root, clean, sender_settings)
+        for service in ("opendkim", mta):
+            rc, out = _run(["systemctl", "enable", "--now", service], timeout_sec=90)
+            if rc != 0:
+                raise RuntimeError(f"{service} start failed: {out}")
+            rc, out = _run(["systemctl", "restart", service], timeout_sec=90)
+            if rc != 0:
+                raise RuntimeError(f"{service} restart failed: {out}")
+        if mta == "sendmail":
+            rc, out = _run(["sendmail", "-bt", "-d0.1"], timeout_sec=30, input_bytes=b"$=w\n")
+            if rc != 0:
+                raise RuntimeError("sendmail validation failed: " + out)
+        if mta == "postfix":
+            rc, out = _run(["postfix", "check"], timeout_sec=60)
+            if rc != 0:
+                raise RuntimeError("Postfix validation failed: " + out)
+        dkim_error = ""
+        for attempt in range(5):
+            rc, out = _run(
+                ["opendkim-testkey", "-d", clean, "-s", selector, "-k", str(key_path)],
+                timeout_sec=30,
+            )
+            if rc == 0:
+                dkim_error = ""
+                break
+            dkim_error = out
+            if attempt < 4:
+                import time
+
+                time.sleep(5)
+        if dkim_error:
+            raise RuntimeError("DKIM validation failed: " + dkim_error)
+        test_result = ""
+        if str(test_recipient or "").strip():
+            test_result = _send_test_message(
+                cfg,
+                root=root,
+                recipient=test_recipient,
+                profile_name=profile_name,
+            )
+        _push_status(cfg, clean, status="ok")
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        try:
+            _write_atomic(local_php_path, local_php_before, mode=local_php_stat.st_mode & 0o777)
+            os.chown(local_php_path, local_php_stat.st_uid, local_php_stat.st_gid)
+            _save_domains(payload_before)
+            previous_domains = payload_before.get("domains") if isinstance(payload_before.get("domains"), dict) else {}
+            if first_activation:
+                if mta == "postfix":
+                    _restore_baseline(POSTFIX_MAIN_CF_BASELINE, POSTFIX_MAIN_CF)
+                else:
+                    _restore_baseline(SENDMAIL_MC_BASELINE, SENDMAIL_MC)
+                _restore_baseline(OPENDKIM_CONF_BASELINE, OPENDKIM_CONF)
+                _restore_baseline(OPENDKIM_DEFAULT_BASELINE, OPENDKIM_DEFAULT)
+                if mta == "sendmail" and SENDMAIL_MC.exists():
+                    rc, out = _run(["make", "-C", str(SENDMAIL_MC.parent)], timeout_sec=120)
+                    if rc != 0:
+                        rollback_errors.append("sendmail baseline build failed: " + out)
+                if mta == "sendmail":
+                    _restore_legacy_queue(queue_quarantine)
+                _run(["systemctl", "disable", "--now", "opendkim"], timeout_sec=90)
+            elif previous_domains:
+                previous_mta = _managed_mta(previous_domains, mta)
+                _configure_opendkim(previous_domains, mta=previous_mta)
+                primary_domain = sorted(previous_domains)[0]
+                _configure_mta(
+                    previous_mta,
+                    str(previous_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+                )
+                _run(["systemctl", "restart", "opendkim"], timeout_sec=90)
+            _run(["systemctl", "restart", mta], timeout_sec=90)
+        except Exception as rollback_exc:
+            rollback_errors.append(str(rollback_exc))
+        if clean not in payload_before.get("domains", {}) and key_path.exists():
+            try:
+                key_path.unlink()
+            except OSError as key_exc:
+                rollback_errors.append(f"temporary DKIM key cleanup failed: {key_exc}")
+        if rollback_errors:
+            raise RuntimeError(f"{exc}; rollback errors: {'; '.join(rollback_errors)}") from exc
+        raise
+    return {
+        "status": "ok",
+        "instance_domain": clean,
+        "mail_hostname": domains[clean]["mail_hostname"],
+        "mta": mta,
+        "legacy_queue_quarantine": queue_quarantine,
+        "test_email": test_result,
+        **quota_state(clean),
+    }
+
+
+def _restore_baseline(source: Path, target: Path) -> None:
+    if source.exists():
+        shutil.copy2(source, target)
+
+
+def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise RuntimeError("local-mail disable must run as root")
+    clean = _domain(domain)
+    payload = _load_domains()
+    domains = payload["domains"]
+    payload_before = json.loads(json.dumps(payload))
+    item = domains.get(clean)
+    if not isinstance(item, dict):
+        return {"status": "ok", "instance_domain": clean, "remaining_domains": len(domains), "already_disabled": True}
+    domains.pop(clean, None)
+    mta = str(item.get("mta") or "sendmail").strip().lower()
+    try:
+        _save_domains(payload)
+        if domains:
+            remaining_mta = _managed_mta(domains, mta)
+            _configure_opendkim(domains, mta=remaining_mta)
+            primary_domain = sorted(domains)[0]
+            _configure_mta(
+                remaining_mta,
+                str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain),
+            )
+            rc, out = _run(["systemctl", "restart", "opendkim"], timeout_sec=90)
+            if rc != 0:
+                raise RuntimeError("opendkim restart failed: " + out)
+        else:
+            if mta == "postfix":
+                _restore_baseline(POSTFIX_MAIN_CF_BASELINE, POSTFIX_MAIN_CF)
+            else:
+                _restore_baseline(SENDMAIL_MC_BASELINE, SENDMAIL_MC)
+            _restore_baseline(OPENDKIM_CONF_BASELINE, OPENDKIM_CONF)
+            _restore_baseline(OPENDKIM_DEFAULT_BASELINE, OPENDKIM_DEFAULT)
+            if mta == "sendmail" and SENDMAIL_MC.exists():
+                rc, out = _run(["make", "-C", str(SENDMAIL_MC.parent)], timeout_sec=120)
+                if rc != 0:
+                    raise RuntimeError("sendmail baseline build failed: " + out)
+            _run(["systemctl", "disable", "--now", "opendkim"], timeout_sec=90)
+        rc, out = _run(["systemctl", "restart", mta], timeout_sec=90)
+        if rc != 0:
+            raise RuntimeError(f"{mta} restart failed: " + out)
+    except Exception as exc:
+        _save_domains(payload_before)
+        previous_domains = payload_before.get("domains") if isinstance(payload_before.get("domains"), dict) else {}
+        try:
+            if previous_domains:
+                previous_mta = _managed_mta(previous_domains, mta)
+                _configure_opendkim(previous_domains, mta=previous_mta)
+                primary_domain = sorted(previous_domains)[0]
+                _configure_mta(
+                    previous_mta,
+                    str(previous_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+                )
+                _run(["systemctl", "restart", "opendkim"], timeout_sec=90)
+                _run(["systemctl", "restart", previous_mta], timeout_sec=90)
+        except Exception as rollback_exc:
+            raise RuntimeError(f"{exc}; rollback failed: {rollback_exc}") from exc
+        raise
+    if item:
+        key_path = Path(str(item.get("key_path") or ""))
+        if key_path.exists() and OPENDKIM_KEYS in key_path.parents:
+            key_path.unlink()
+            try:
+                key_path.parent.rmdir()
+            except OSError:
+                pass
+    return {"status": "ok", "instance_domain": clean, "remaining_domains": len(domains)}
+
+
+def _message_recipients(args: list[str], data: bytes) -> list[str]:
+    recipients: list[str] = []
+    if "--" in args:
+        recipients.extend(value for value in args[args.index("--") + 1 :] if value and not value.startswith("-"))
+    if not recipients:
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(data, headersonly=True)
+            values = [str(message.get(name)) for name in ("to", "cc", "bcc") if message.get(name)]
+            recipients.extend(address for _name, address in getaddresses(values) if address)
+        except Exception:
+            recipients = []
+    return sorted({value.strip().lower() for value in recipients if value.strip()})
+
+
+def _reserve_quota(domain: str, count: int, daily_limit: int, monthly_limit: int) -> dict[str, Any]:
+    day, month = _periods()
+    conn = _quota_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT daily_period,daily_used,monthly_period,monthly_used FROM counters WHERE domain=?",
+            (domain,),
+        ).fetchone()
+        daily_used = int(row[1]) if row and str(row[0]) == day else 0
+        monthly_used = int(row[3]) if row and str(row[2]) == month else 0
+        if daily_used + count > daily_limit or monthly_used + count > monthly_limit:
+            conn.execute("ROLLBACK")
+            raise RuntimeError(
+                f"own-host mail quota exceeded for {domain}: daily {daily_used}/{daily_limit}, monthly {monthly_used}/{monthly_limit}"
+            )
+        daily_used += count
+        monthly_used += count
+        conn.execute(
+            "INSERT INTO counters(domain,daily_period,daily_used,monthly_period,monthly_used,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(domain) DO UPDATE SET daily_period=excluded.daily_period,"
+            "daily_used=excluded.daily_used,monthly_period=excluded.monthly_period,"
+            "monthly_used=excluded.monthly_used,updated_at=excluded.updated_at",
+            (domain, day, daily_used, month, monthly_used, datetime.now(UTC).isoformat()),
+        )
+        conn.execute("COMMIT")
+        return {"daily_period": day, "daily_used": daily_used, "monthly_period": month, "monthly_used": monthly_used}
+    finally:
+        conn.close()
+
+
+def _release_quota(domain: str, count: int) -> None:
+    day, month = _periods()
+    with _quota_connection() as conn:
+        conn.execute(
+            "UPDATE counters SET daily_used=CASE WHEN daily_period=? THEN MAX(0,daily_used-?) ELSE daily_used END,"
+            "monthly_used=CASE WHEN monthly_period=? THEN MAX(0,monthly_used-?) ELSE monthly_used END,updated_at=? WHERE domain=?",
+            (day, count, month, count, datetime.now(UTC).isoformat(), domain),
+        )
+
+
+def submit_local_mail(
+    *,
+    domain: str,
+    sendmail_args: list[str],
+    data: bytes | None = None,
+    cfg: AgentConfig | None = None,
+) -> int:
+    clean = _domain(domain)
+    payload = _load_domains()
+    item = payload["domains"].get(clean)
+    if not isinstance(item, dict):
+        print(f"own-host mail is not configured for {clean}", file=sys.stderr)
+        return 69
+    message_data = data if data is not None else sys.stdin.buffer.read()
+    raw_args = list(sendmail_args or [])
+    recipients = _message_recipients(raw_args, message_data)
+    actual_args = raw_args[1:] if raw_args[:1] == ["--"] else raw_args
+    count = max(1, len(recipients))
+    try:
+        _reserve_quota(clean, count, int(item.get("daily_limit") or 100), int(item.get("monthly_limit") or 1000))
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 75
+    if not SENDMAIL_BIN.exists():
+        _release_quota(clean, count)
+        print(f"sendmail binary not found: {SENDMAIL_BIN}", file=sys.stderr)
+        return 69
+    proc = subprocess.run([str(SENDMAIL_BIN), *actual_args], input=message_data, check=False)
+    if proc.returncode != 0:
+        _release_quota(clean, count)
+    elif cfg is not None:
+        try:
+            _push_status(cfg, clean, status="ok")
+        except Exception:
+            pass
+    return int(proc.returncode)
+
+
+def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> dict[str, Any]:
+    clean = _domain(domain)
+    payload = _load_domains()
+    item = payload["domains"].get(clean)
+    if not isinstance(item, dict):
+        return {"status": "disabled", "instance_domain": clean}
+    state = quota_state(clean)
+    service_status: dict[str, str] = {}
+    errors: list[str] = []
+    mta = str(item.get("mta") or "sendmail").strip().lower()
+    for service in (mta, "opendkim"):
+        rc, out = _run(["systemctl", "is-active", service], timeout_sec=15)
+        service_status[service] = out.strip() or ("active" if rc == 0 else "inactive")
+        if rc != 0:
+            errors.append(f"{service} is not active")
+    status = "ok" if not errors else "error"
+    if push:
+        _push_status(cfg, clean, status=status, error="; ".join(errors))
+    return {
+        "status": status,
+        "instance_domain": clean,
+        "mail_hostname": str(item.get("mail_hostname") or ""),
+        "mta": mta,
+        "daily_limit": int(item.get("daily_limit") or 100),
+        "monthly_limit": int(item.get("monthly_limit") or 1000),
+        "services": service_status,
+        "error": "; ".join(errors),
+        **state,
+    }

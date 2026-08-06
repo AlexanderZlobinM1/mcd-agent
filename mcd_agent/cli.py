@@ -104,6 +104,8 @@ from mcd_agent.mautic6_core_patch import (
     revert_m6_plugin_update_metadata_patch,
 )
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
+from mcd_agent.local_mail import configure_local_mail, disable_local_mail, local_mail_status, submit_local_mail
+from mcd_agent.mail_config import apply_mail_profile
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
 from mcd_agent.nginx_baseline import ensure_nginx_baseline
@@ -1709,7 +1711,39 @@ def _build_parser() -> argparse.ArgumentParser:
     img.add_argument("--certbot-dns-credential-ref", default="")
     img.add_argument("--yes", action="store_true")
     img.add_argument("--no-certbot", action="store_true")
+    img.add_argument("--own-mail", action="store_true")
+    img.add_argument("--mail-profile-id", default="")
     img.add_argument("--json", action="store_true")
+
+    local_mail = sub.add_parser("local-mail", help="Manage per-instance own-host mail")
+    local_mail_sub = local_mail.add_subparsers(dest="op", required=True)
+    local_mail_configure = local_mail_sub.add_parser("configure")
+    local_mail_configure.add_argument("--config", default=default_cfg)
+    local_mail_configure.add_argument("--instance-domain", required=True)
+    local_mail_configure.add_argument("--root", required=True)
+    local_mail_configure.add_argument("--json", action="store_true")
+    local_mail_disable = local_mail_sub.add_parser("disable")
+    local_mail_disable.add_argument("--config", default=default_cfg)
+    local_mail_disable.add_argument("--instance-domain", required=True)
+    local_mail_disable.add_argument("--json", action="store_true")
+    local_mail_status = local_mail_sub.add_parser("status")
+    local_mail_status.add_argument("--config", default=default_cfg)
+    local_mail_status.add_argument("--instance-domain", required=True)
+    local_mail_status.add_argument("--push", action="store_true")
+    local_mail_status.add_argument("--json", action="store_true")
+    local_mail_submit = local_mail_sub.add_parser("submit")
+    local_mail_submit.add_argument("--config", default=default_cfg)
+    local_mail_submit.add_argument("--instance-domain", required=True)
+    local_mail_submit.add_argument("sendmail_args", nargs=argparse.REMAINDER)
+
+    mail_config = sub.add_parser("mail-config", help="Apply an MCC-stored instance mail profile")
+    mail_config_sub = mail_config.add_subparsers(dest="mail_config_op", required=True)
+    mail_config_apply = mail_config_sub.add_parser("apply")
+    mail_config_apply.add_argument("--config", default=default_cfg)
+    mail_config_apply.add_argument("--profile-id", required=True)
+    mail_config_apply.add_argument("--instance-domain", required=True)
+    mail_config_apply.add_argument("--root", required=True)
+    mail_config_apply.add_argument("--json", action="store_true")
 
     cmove = sub.add_parser("composer-move", help="Move a zip Mautic instance to a Composer skeleton")
     cmove.add_argument("--config", default=default_cfg)
@@ -2757,6 +2791,8 @@ def main() -> int:
                     yes=bool(args.yes),
                     run_certbot=not bool(args.no_certbot),
                     certbot_dns_credential_ref=str(args.certbot_dns_credential_ref or "").strip() or None,
+                    own_mail=bool(args.own_mail),
+                    mail_profile_id=str(args.mail_profile_id or "").strip() or None,
                 )
         else:
             result = install_from_image(
@@ -2767,10 +2803,59 @@ def main() -> int:
                 yes=bool(args.yes),
                 run_certbot=not bool(args.no_certbot),
                 certbot_dns_credential_ref=str(args.certbot_dns_credential_ref or "").strip() or None,
+                own_mail=bool(args.own_mail),
+                mail_profile_id=str(args.mail_profile_id or "").strip() or None,
             )
         if bool(args.json):
             print(json.dumps(result, ensure_ascii=True, indent=2))
         _push_state_after_change(cfg, "mautic-image-install")
+        return 0
+
+    if args.cmd == "local-mail":
+        cfg = load_config(args.config)
+        if args.op == "submit":
+            return submit_local_mail(
+                domain=str(args.instance_domain),
+                sendmail_args=list(args.sendmail_args or []),
+                cfg=cfg,
+            )
+        try:
+            if args.op == "configure":
+                if not str(args.root or "").strip():
+                    raise RuntimeError("--root is required for local-mail configure")
+                result = configure_local_mail(cfg, domain=str(args.instance_domain), root=str(args.root))
+            elif args.op == "disable":
+                result = disable_local_mail(cfg, domain=str(args.instance_domain))
+            else:
+                result = local_mail_status(cfg, domain=str(args.instance_domain), push=bool(args.push))
+        except Exception as exc:
+            if bool(args.json):
+                print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=True))
+            else:
+                print(f"local-mail error: {exc}", file=sys.stderr)
+            return 1
+        if bool(args.json):
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        else:
+            print(json.dumps(result, ensure_ascii=True))
+        return 0
+
+    if args.cmd == "mail-config":
+        cfg = load_config(args.config)
+        try:
+            result = apply_mail_profile(
+                cfg,
+                profile_id=str(args.profile_id),
+                domain=str(args.instance_domain),
+                root=str(args.root),
+            )
+        except Exception as exc:
+            if bool(args.json):
+                print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=True))
+            else:
+                print(f"mail-config error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=True, indent=2 if bool(args.json) else None))
         return 0
 
     if args.cmd == "composer-move":

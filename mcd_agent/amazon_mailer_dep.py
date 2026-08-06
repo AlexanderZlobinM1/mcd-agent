@@ -436,3 +436,20 @@ def ensure_mailer_packages_for_sender_config(
         reason=reason,
         ensure_node=SENDGRID_MAILER_PACKAGE in required,
     )
+
+
+def ensure_mailer_packages(
+    *,
+    config: AgentConfig,
+    root: str,
+    packages: set[str],
+    reason: str,
+) -> bool:
+    return _ensure_mailer_packages(
+        config=config,
+        root=root,
+        console_path=str(Path(root) / "bin" / "console"),
+        required=set(packages),
+        reason=reason,
+        ensure_node=SENDGRID_MAILER_PACKAGE in packages,
+    )
