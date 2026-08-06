@@ -1,5 +1,14 @@
 # MCD Changelog
 
+## 0.10.14 - 2026-08-07
+- Fixed: own-host MX delivery now opens TCP/25 through an exact, comment-tagged
+  firewall rule instead of leaving Sendmail unreachable behind a default-drop
+  host policy.
+- Guarded: a dedicated idempotent systemd unit restores that one rule after a
+  reboot and removes only its own rule when the final own-host domain is
+  disabled. Local submission on 2525 and all unrelated firewall rules remain
+  unchanged.
+
 ## 0.10.13 - 2026-08-07
 - Fixed: mail-profile test delivery no longer supplies an empty Symfony
   return-path address when Mautic intentionally leaves the setting blank.

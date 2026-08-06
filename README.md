@@ -577,6 +577,9 @@ Important:
   that instance; no IMAP mailbox credentials are required. External SMTP,
   Amazon SES and SendGrid profiles keep their Mautic return path unchanged,
   including an intentionally empty value.
+- While at least one own-host domain is active, MCD maintains one exact,
+  comment-tagged TCP/25 firewall rule through `mcd-local-mail-firewall.service`.
+  Disabling the final own-host domain removes only that managed rule.
 
 ## Benchmark notes (current host)
 - Baseline standard command (scheduler paused):  

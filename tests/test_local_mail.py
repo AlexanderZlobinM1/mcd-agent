@@ -163,6 +163,32 @@ MAILER(`smtp')dnl
             self.assertIn("--kind=bounce|--kind=feedback_loop", text)
             self.assertNotIn('receive "$@"', text)
 
+    def test_smtp_firewall_is_exact_idempotent_and_systemd_managed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            helper = Path(td) / "mcd-local-mail-firewall"
+            service = Path(td) / "mcd-local-mail-firewall.service"
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                return 0, ""
+
+            with patch.object(local_mail, "SMTP_FIREWALL_HELPER", helper), patch.object(
+                local_mail, "SMTP_FIREWALL_SERVICE", service
+            ), patch.object(local_mail.shutil, "which", return_value="/usr/sbin/iptables"), patch.object(
+                local_mail, "_run", side_effect=fake_run
+            ):
+                local_mail._configure_smtp_firewall()
+
+            helper_text = helper.read_text(encoding="utf-8")
+            self.assertIn("--dport 25", helper_text)
+            self.assertIn(local_mail._SMTP_FIREWALL_COMMENT, helper_text)
+            self.assertIn("-C INPUT", helper_text)
+            self.assertIn("-I INPUT 1", helper_text)
+            self.assertIn("-D INPUT", helper_text)
+            self.assertIn("RemainAfterExit=yes", service.read_text(encoding="utf-8"))
+            self.assertIn(["systemctl", "enable", "--now", local_mail._SMTP_FIREWALL_SERVICE_NAME], calls)
+
     def test_inbound_routes_are_exact_and_reject_other_domain_mailboxes(self) -> None:
         aliases, virtual = local_mail._inbound_route_lines({"app.sales-snap.com": {}})
 

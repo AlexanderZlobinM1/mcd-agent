@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import shutil
 import smtplib
 import socket
@@ -62,6 +63,8 @@ SUBMIT_SUDOERS = Path("/etc/sudoers.d/mcd-local-mail")
 RECEIVE_WRAPPER = Path("/usr/local/bin/mcd-mail-receive")
 RECEIVE_ROOT_HELPER = Path("/usr/local/libexec/mcd-mail-receive-root")
 RECEIVE_SUDOERS = Path("/etc/sudoers.d/mcd-local-mail-receive")
+SMTP_FIREWALL_HELPER = Path("/usr/local/libexec/mcd-local-mail-firewall")
+SMTP_FIREWALL_SERVICE = Path("/etc/systemd/system/mcd-local-mail-firewall.service")
 SENDMAIL_BIN = Path("/usr/sbin/sendmail")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _SENDMAIL_BEGIN = "dnl MCD LOCAL MAIL BEGIN"
@@ -74,6 +77,8 @@ _SENDMAIL_INBOUND_BEGIN = "dnl MCD LOCAL MAIL INBOUND BEGIN"
 _SENDMAIL_INBOUND_END = "dnl MCD LOCAL MAIL INBOUND END"
 _SENDMAIL_ISOLATED_PORT = 2525
 _SENDMAIL_SERVICE_NAME = "mcd-local-mail-sendmail"
+_SMTP_FIREWALL_SERVICE_NAME = "mcd-local-mail-firewall"
+_SMTP_FIREWALL_COMMENT = "MCD own-host inbound SMTP"
 _MAIL_TEST_SCRIPT = r"""<?php
 require $argv[2];
 $included = include $argv[1];
@@ -326,6 +331,94 @@ def _remove_receive_wrapper() -> None:
     for path in (RECEIVE_WRAPPER, RECEIVE_ROOT_HELPER, RECEIVE_SUDOERS, POSTFIX_VIRTUAL_ALIASES):
         path.unlink(missing_ok=True)
     Path(str(POSTFIX_VIRTUAL_ALIASES) + ".db").unlink(missing_ok=True)
+
+
+def _smtp_firewall_rule(iptables: str, operation: str) -> list[str]:
+    return [
+        iptables,
+        "-w",
+        operation,
+        "INPUT",
+        "-p",
+        "tcp",
+        "--dport",
+        "25",
+        "-m",
+        "comment",
+        "--comment",
+        _SMTP_FIREWALL_COMMENT,
+        "-j",
+        "ACCEPT",
+    ]
+
+
+def _configure_smtp_firewall() -> None:
+    iptables = shutil.which("iptables")
+    if not iptables:
+        raise RuntimeError("iptables is required for own-host inbound SMTP")
+    helper = f"""#!/bin/sh
+set -eu
+IPTABLES={shlex.quote(iptables)}
+COMMENT={shlex.quote(_SMTP_FIREWALL_COMMENT)}
+case "${{1:-}}" in
+  allow)
+    "$IPTABLES" -w -C INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null ||
+      "$IPTABLES" -w -I INPUT 1 -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT
+    ;;
+  deny)
+    while "$IPTABLES" -w -C INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
+      "$IPTABLES" -w -D INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT
+    done
+    ;;
+  *) exit 64 ;;
+esac
+"""
+    _write_atomic(SMTP_FIREWALL_HELPER, helper, mode=0o755)
+    _write_atomic(
+        SMTP_FIREWALL_SERVICE,
+        f"""[Unit]
+Description=MCD own-host inbound SMTP firewall rule
+After=network-pre.target
+Before=network.target sendmail.service postfix.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={SMTP_FIREWALL_HELPER} allow
+ExecStop={SMTP_FIREWALL_HELPER} deny
+
+[Install]
+WantedBy=multi-user.target
+""",
+        mode=0o644,
+    )
+    rc, out = _run([str(SMTP_FIREWALL_HELPER), "allow"], timeout_sec=30)
+    if rc != 0:
+        raise RuntimeError("own-host SMTP firewall rule failed: " + out)
+    rc, out = _run(["systemctl", "daemon-reload"], timeout_sec=30)
+    if rc != 0:
+        raise RuntimeError("systemd reload failed for own-host SMTP firewall: " + out)
+    rc, out = _run(["systemctl", "enable", "--now", _SMTP_FIREWALL_SERVICE_NAME], timeout_sec=90)
+    if rc != 0:
+        raise RuntimeError("own-host SMTP firewall service failed: " + out)
+
+
+def _remove_smtp_firewall() -> None:
+    _run(["systemctl", "disable", "--now", _SMTP_FIREWALL_SERVICE_NAME], timeout_sec=90)
+    iptables = shutil.which("iptables")
+    if iptables:
+        for _attempt in range(32):
+            rc, _out = _run(_smtp_firewall_rule(iptables, "-C"), timeout_sec=15)
+            if rc != 0:
+                break
+            rc, out = _run(_smtp_firewall_rule(iptables, "-D"), timeout_sec=15)
+            if rc != 0:
+                raise RuntimeError("own-host SMTP firewall cleanup failed: " + out)
+        else:
+            raise RuntimeError("own-host SMTP firewall cleanup exceeded the duplicate-rule limit")
+    SMTP_FIREWALL_SERVICE.unlink(missing_ok=True)
+    SMTP_FIREWALL_HELPER.unlink(missing_ok=True)
+    _run(["systemctl", "daemon-reload"], timeout_sec=30)
 
 
 def _package_installed(name: str) -> bool:
@@ -975,6 +1068,7 @@ def configure_local_mail(
     domains = payload["domains"]
     first_activation = not bool(domains)
     inbound_was_managed = INBOUND_BASELINE_MANIFEST.exists()
+    firewall_was_managed = SMTP_FIREWALL_SERVICE.exists()
     selector = str(material.get("selector") or "mcd").strip()
     key_path = _write_key(clean, selector, str(material.get("private_key_pem") or ""))
     domains[clean] = {
@@ -999,6 +1093,7 @@ def configure_local_mail(
         primary_mail_hostname = str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
         _configure_mta(mta, primary_mail_hostname)
         _configure_inbound(domains, mta=mta)
+        _configure_smtp_firewall()
         sender_settings = material.get("settings") if isinstance(material.get("settings"), dict) else {}
         _configure_mautic(root, clean, sender_settings)
         _clear_mautic_cache(cfg, root)
@@ -1064,6 +1159,7 @@ def configure_local_mail(
                     _remove_isolated_sendmail()
                 _restore_inbound_baseline()
                 _remove_receive_wrapper()
+                _remove_smtp_firewall()
                 _restore_baseline(OPENDKIM_CONF_BASELINE, OPENDKIM_CONF)
                 _restore_baseline(OPENDKIM_DEFAULT_BASELINE, OPENDKIM_DEFAULT)
                 _run(["systemctl", "disable", "--now", "opendkim"], timeout_sec=90)
@@ -1080,6 +1176,10 @@ def configure_local_mail(
                 else:
                     _restore_inbound_baseline()
                     _remove_receive_wrapper()
+                if firewall_was_managed:
+                    _configure_smtp_firewall()
+                else:
+                    _remove_smtp_firewall()
                 _run(["systemctl", "restart", "opendkim"], timeout_sec=90)
                 _run(["systemctl", "restart", _delivery_service(previous_mta)], timeout_sec=90)
                 if previous_mta == "sendmail":
@@ -1125,6 +1225,7 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
     domains = payload["domains"]
     payload_before = json.loads(json.dumps(payload))
     inbound_was_managed = INBOUND_BASELINE_MANIFEST.exists()
+    firewall_was_managed = SMTP_FIREWALL_SERVICE.exists()
     item = domains.get(clean)
     if not isinstance(item, dict):
         return {"status": "ok", "instance_domain": clean, "remaining_domains": len(domains), "already_disabled": True}
@@ -1141,6 +1242,7 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
                 str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain),
             )
             _configure_inbound(domains, mta=remaining_mta)
+            _configure_smtp_firewall()
             services = ["opendkim", _delivery_service(remaining_mta)]
             if remaining_mta == "sendmail":
                 services.append("sendmail")
@@ -1155,6 +1257,7 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
                 _remove_isolated_sendmail()
             _restore_inbound_baseline()
             _remove_receive_wrapper()
+            _remove_smtp_firewall()
             _restore_baseline(OPENDKIM_CONF_BASELINE, OPENDKIM_CONF)
             _restore_baseline(OPENDKIM_DEFAULT_BASELINE, OPENDKIM_DEFAULT)
             _run(["systemctl", "disable", "--now", "opendkim"], timeout_sec=90)
@@ -1183,6 +1286,10 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
                 else:
                     _restore_inbound_baseline()
                     _remove_receive_wrapper()
+                if firewall_was_managed:
+                    _configure_smtp_firewall()
+                else:
+                    _remove_smtp_firewall()
                 _run(["systemctl", "restart", "opendkim"], timeout_sec=90)
                 _run(["systemctl", "restart", _delivery_service(previous_mta)], timeout_sec=90)
                 if previous_mta == "sendmail":
@@ -1408,7 +1515,7 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
     service_status: dict[str, str] = {}
     errors: list[str] = []
     mta = str(item.get("mta") or "sendmail").strip().lower()
-    required_services = (_delivery_service(mta), "opendkim")
+    required_services = (_delivery_service(mta), "opendkim", _SMTP_FIREWALL_SERVICE_NAME)
     for service in required_services:
         rc, out = _run(["systemctl", "is-active", service], timeout_sec=15)
         service_status[service] = out.strip() or ("active" if rc == 0 else "inactive")
@@ -1417,6 +1524,15 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
     if mta == "sendmail":
         rc, out = _run(["systemctl", "is-active", "sendmail"], timeout_sec=15)
         service_status["sendmail"] = out.strip() or ("active" if rc == 0 else "inactive")
+        if rc != 0:
+            errors.append("sendmail is not active")
+    iptables = shutil.which("iptables")
+    if not iptables:
+        errors.append("iptables is not available")
+    else:
+        rc, _out = _run(_smtp_firewall_rule(iptables, "-C"), timeout_sec=15)
+        if rc != 0:
+            errors.append("own-host inbound SMTP firewall rule is missing")
     status = "ok" if not errors else "error"
     if push:
         _push_status(cfg, clean, status=status, error="; ".join(errors))
