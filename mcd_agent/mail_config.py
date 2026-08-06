@@ -6,6 +6,7 @@ from urllib import parse
 
 from mcd_agent.amazon_mailer_dep import (
     AMAZON_MAILER_PACKAGE,
+    HTTP_CLIENT_PACKAGE,
     SENDGRID_MAILER_PACKAGE,
     ensure_mailer_packages,
 )
@@ -64,10 +65,20 @@ def _external_dsn(kind: str, settings: dict[str, Any], credentials: dict[str, An
         scheme = "smtps" if str(settings.get("encryption") or "starttls") == "tls" else "smtp"
         return f"{scheme}://{user}:{password}@{host}:{port}", set()
     if kind == "amazon_ses_api":
-        access = parse.quote(str(credentials.get("access_key") or ""), safe="")
-        secret = parse.quote(str(credentials.get("secret_key") or ""), safe="")
+        method = str(settings.get("delivery_method") or "ses+api").strip().lower()
+        if method == "ses+smtp":
+            access = parse.quote(str(credentials.get("smtp_username") or ""), safe="")
+            secret = parse.quote(str(credentials.get("smtp_password") or ""), safe="")
+        else:
+            access = parse.quote(str(credentials.get("access_key") or ""), safe="")
+            secret = parse.quote(str(credentials.get("secret_key") or ""), safe="")
         region = parse.quote(str(settings.get("region") or "eu-central-1"), safe="")
-        return f"ses+api://{access}:{secret}@default?region={region}", {AMAZON_MAILER_PACKAGE}
+        if method not in {"mautic+ses+api", "ses+api", "ses+https", "ses+smtp"}:
+            raise RuntimeError(f"unsupported Amazon SES delivery method: {method}")
+        packages = {AMAZON_MAILER_PACKAGE}
+        if method != "ses+smtp":
+            packages.add(HTTP_CLIENT_PACKAGE)
+        return f"{method}://{access}:{secret}@default?region={region}", packages
     if kind == "sendgrid_api":
         key = parse.quote(str(credentials.get("api_key") or ""), safe="")
         return f"sendgrid+api://{key}@default", {SENDGRID_MAILER_PACKAGE}
@@ -167,3 +178,34 @@ def apply_mail_profile(
         except Exception:
             pass
         raise
+
+
+def preflight_mail_profile(
+    cfg: AgentConfig,
+    *,
+    profile_id: str,
+    domain: str,
+    root: str,
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise RuntimeError("mail-config preflight must run as root")
+    material = fetch_mail_profile(cfg, profile_id)
+    if str(material.get("instance_domain") or "").strip().lower() != str(domain or "").strip().lower():
+        raise RuntimeError("mail profile belongs to another instance")
+    kind = str(material.get("transport_type") or "").strip().lower()
+    settings = material.get("settings") if isinstance(material.get("settings"), dict) else {}
+    credentials = material.get("credentials") if isinstance(material.get("credentials"), dict) else {}
+    _dsn, packages = _external_dsn(kind, settings, credentials)
+    changed = ensure_mailer_packages(
+        config=cfg,
+        root=root,
+        packages=packages,
+        reason=f"MCC mail profile preflight {profile_id}",
+    )
+    return {
+        "status": "ok",
+        "profile_id": profile_id,
+        "transport_type": kind,
+        "packages": sorted(packages),
+        "changed": bool(changed),
+    }

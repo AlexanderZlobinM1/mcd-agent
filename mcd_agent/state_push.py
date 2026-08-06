@@ -1493,6 +1493,9 @@ def _parse_sender_config_from_local_php(root: str) -> tuple[dict[str, str], str]
             "mail_transport": _read_php_array_string(txt, "mail_transport"),
             "email_transport": _read_php_array_string(txt, "email_transport"),
             "mailer_host": _read_php_array_string(txt, "mailer_host"),
+            "mailer_from_email": _read_php_array_string(txt, "mailer_from_email"),
+            "mailer_from_name": _read_php_array_string(txt, "mailer_from_name"),
+            "mailer_return_path": _read_php_array_string(txt, "mailer_return_path"),
         }
         return cfg, ps
     return {}, ""
@@ -1516,7 +1519,7 @@ def _sender_mask_dsn(raw: str) -> str:
         return re.sub(r":[^:@/]{4,}@", ":***@", s)[:120]
 
 
-def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str, str]:
+def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str, Any]:
     plugin_names = {str(x.get("bundle", "")).strip().lower() for x in plugins if isinstance(x, dict)}
     cfg, source_path = _parse_sender_config_from_local_php(root)
     transport = (
@@ -1529,22 +1532,38 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
     dsn_masked = _sender_mask_dsn(dsn_raw)
     dsn_scheme = ""
     dsn_host = ""
+    dsn_port: int | None = None
+    dsn_username_present = False
+    dsn_password_present = False
+    dsn_query: dict[str, str] = {}
     if dsn_raw:
         try:
             u = urlsplit(dsn_raw)
             dsn_scheme = str(u.scheme or "").strip().lower()
             dsn_host = str(u.hostname or "").strip().lower()
+            dsn_port = int(u.port) if u.port is not None else None
+            dsn_username_present = bool(u.username)
+            dsn_password_present = bool(u.password)
+            dsn_query = {
+                str(key).strip(): str(value or "").strip()
+                for key, value in parse_qsl(u.query, keep_blank_values=True)
+                if str(key).strip()
+            }
         except Exception:
             dsn_scheme = ""
             dsn_host = ""
+            dsn_port = None
+            dsn_username_present = False
+            dsn_password_present = False
+            dsn_query = {}
     mailer_host = str(cfg.get("mailer_host", "") or "").strip().lower()
 
     has_ses_plugin = "amazonsesbundle" in plugin_names
-    has_zender = "mauticzenderbundle" in plugin_names
     # Mautic 4 commonly uses legacy transport names (e.g. mautic.transport.amazon_api).
     transport_is_amazon = "amazon" in transport
     transport_is_amazon_api = "amazon_api" in transport
     transport_is_ses = ("ses" in transport) or transport_is_amazon
+    configured = bool(dsn_raw or transport or mailer_host)
 
     key = "unknown"
     label = "unknown"
@@ -1575,15 +1594,20 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
     elif "mailgun+" in dsn_low or "mailgun" in transport:
         key = "mailgun_api"
         label = "mailgun+api"
-    elif "smtp://" in dsn_low or transport == "smtp":
+    elif dsn_scheme in {"smtp", "smtps"} or transport == "smtp":
         key = "smtp"
         label = "smtp"
-    elif transport in {"sendmail", "mail"}:
+    elif dsn_scheme in {"sendmail", "native"} or transport in {"sendmail", "mail"}:
         key = "sendmail"
         label = "sendmail"
-    elif has_zender:
-        key = "zender_api"
-        label = "zender+api"
+
+    own_host = bool(dsn_scheme == "sendmail" and "mcd-mail-submit" in dsn_raw.lower())
+    if own_host:
+        key = "own_host"
+        label = "own host"
+    elif configured and key == "unknown":
+        key = "custom"
+        label = dsn_scheme or transport or "configured"
 
     title_lines = [
         f"Sender type: {label}",
@@ -1602,15 +1626,31 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
     hints: list[str] = []
     if has_ses_plugin:
         hints.append("AmazonSesBundle")
-    if has_zender:
-        hints.append("MauticZenderBundle")
     if hints:
         title_lines.append("plugin_hints: " + ",".join(hints))
 
+    safe_config: dict[str, Any] = {
+        "configured": configured,
+        "source": source_path,
+        "method": label if configured and key != "unknown" else "",
+        "sender_key": key if configured else "unknown",
+        "dsn_scheme": dsn_scheme,
+        "dsn_host": dsn_host,
+        "dsn_port": dsn_port,
+        "region": str(dsn_query.get("region", "") or "").strip().lower(),
+        "from_email": str(cfg.get("mailer_from_email", "") or "").strip(),
+        "from_name": str(cfg.get("mailer_from_name", "") or "").strip(),
+        "return_path": str(cfg.get("mailer_return_path", "") or "").strip(),
+        "credentials_present": {
+            "username": dsn_username_present,
+            "password": dsn_password_present,
+        },
+    }
     return {
         "sender_type": label,
         "sender_key": key,
         "sender_title": "\n".join(title_lines),
+        "sender_config": safe_config,
     }
 
 
@@ -2101,6 +2141,7 @@ class MCCStatePusher:
                     "sender_type": str(sender.get("sender_type", "") or "").strip() or "unknown",
                     "sender_key": str(sender.get("sender_key", "") or "").strip() or "unknown",
                     "sender_title": str(sender.get("sender_title", "") or "").strip(),
+                    "sender_config": sender.get("sender_config") if isinstance(sender.get("sender_config"), dict) else {},
                 }
             )
         instances.sort(key=lambda x: str(x["instance_uid"]))

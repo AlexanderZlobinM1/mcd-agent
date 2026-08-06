@@ -30,6 +30,7 @@ SENDGRID_MAILER_REQUIRED_BUNDLES: set[str] = {
 }
 
 AMAZON_MAILER_PACKAGE = "symfony/amazon-mailer"
+HTTP_CLIENT_PACKAGE = "symfony/http-client"
 SENDGRID_MAILER_PACKAGE = "symfony/sendgrid-mailer:*"
 
 _MAUTIC_COMPOSER_REQUIRE_MARKERS = {
@@ -292,7 +293,7 @@ def _required_mailer_packages_from_bundles(bundles: set[str]) -> set[str]:
         if not b:
             continue
         if b in AMAZON_MAILER_REQUIRED_BUNDLES:
-            out.add(AMAZON_MAILER_PACKAGE)
+            out.update({AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE})
         if _bundle_requires_sendgrid_mailer(b):
             out.add(SENDGRID_MAILER_PACKAGE)
     return out
@@ -411,7 +412,7 @@ def ensure_amazon_mailer_for_bundles(
         config=config,
         root=root,
         console_path=console_path,
-        required={AMAZON_MAILER_PACKAGE},
+        required={AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE},
         reason=reason,
         ensure_node=False,
     )

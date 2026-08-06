@@ -105,7 +105,7 @@ from mcd_agent.mautic6_core_patch import (
 )
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.local_mail import configure_local_mail, disable_local_mail, local_mail_status, submit_local_mail
-from mcd_agent.mail_config import apply_mail_profile
+from mcd_agent.mail_config import apply_mail_profile, preflight_mail_profile
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
 from mcd_agent.nginx_baseline import ensure_nginx_baseline
@@ -1744,6 +1744,12 @@ def _build_parser() -> argparse.ArgumentParser:
     mail_config_apply.add_argument("--instance-domain", required=True)
     mail_config_apply.add_argument("--root", required=True)
     mail_config_apply.add_argument("--json", action="store_true")
+    mail_config_preflight = mail_config_sub.add_parser("preflight")
+    mail_config_preflight.add_argument("--config", default=default_cfg)
+    mail_config_preflight.add_argument("--profile-id", required=True)
+    mail_config_preflight.add_argument("--instance-domain", required=True)
+    mail_config_preflight.add_argument("--root", required=True)
+    mail_config_preflight.add_argument("--json", action="store_true")
 
     cmove = sub.add_parser("composer-move", help="Move a zip Mautic instance to a Composer skeleton")
     cmove.add_argument("--config", default=default_cfg)
@@ -2843,7 +2849,8 @@ def main() -> int:
     if args.cmd == "mail-config":
         cfg = load_config(args.config)
         try:
-            result = apply_mail_profile(
+            operation = preflight_mail_profile if str(args.mail_config_op) == "preflight" else apply_mail_profile
+            result = operation(
                 cfg,
                 profile_id=str(args.profile_id),
                 domain=str(args.instance_domain),

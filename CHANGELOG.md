@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.10 - 2026-08-06
+- Fixed: `MauticZenderBundle` is no longer classified as an email sender. MCD
+  derives sender state only from the active `local.php` mail transport or DSN,
+  including own-host `mcd-mail-submit` sendmail configurations.
+- Added: instance state reports a secret-free snapshot of the active mail
+  configuration: method, source file, region/host/port, sender addresses and
+  credential-presence flags. DSN credentials are never included in state.
+- Added: Amazon SES profiles support `mautic+ses+api`, `ses+api`, `ses+https`
+  and `ses+smtp`. MCD installs the Symfony Amazon Mailer and HTTP client where
+  required and provides a package-only mail profile preflight operation.
+
 ## 0.10.9 - 2026-08-06
 - Fixed: managed image database-user cleanup now uses the agent's local SQL
   literal quoting helper instead of failing safely with an undefined helper

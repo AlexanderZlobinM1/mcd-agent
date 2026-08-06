@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcd_agent import mail_config
-from mcd_agent.amazon_mailer_dep import AMAZON_MAILER_PACKAGE, SENDGRID_MAILER_PACKAGE
+from mcd_agent.amazon_mailer_dep import AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE, SENDGRID_MAILER_PACKAGE
 
 
 class MailConfigTests(unittest.TestCase):
@@ -66,11 +66,28 @@ class MailConfigTests(unittest.TestCase):
     def test_ses_api_requires_the_symfony_bridge(self) -> None:
         dsn, packages = mail_config._external_dsn(
             "amazon_ses_api",
-            {"region": "eu-central-1"},
+            {"region": "eu-central-1", "delivery_method": "ses+api"},
             {"access_key": "access", "secret_key": "secret"},
         )
         self.assertEqual(dsn, "ses+api://access:secret@default?region=eu-central-1")
-        self.assertEqual(packages, {AMAZON_MAILER_PACKAGE})
+        self.assertEqual(packages, {AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE})
+
+    def test_managed_and_smtp_ses_methods_use_the_selected_dsn_and_credentials(self) -> None:
+        managed, managed_packages = mail_config._external_dsn(
+            "amazon_ses_api",
+            {"region": "eu-central-1", "delivery_method": "mautic+ses+api"},
+            {"access_key": "access", "secret_key": "secret"},
+        )
+        smtp, smtp_packages = mail_config._external_dsn(
+            "amazon_ses_api",
+            {"region": "eu-central-1", "delivery_method": "ses+smtp"},
+            {"smtp_username": "smtp-user", "smtp_password": "smtp-secret"},
+        )
+
+        self.assertEqual(managed, "mautic+ses+api://access:secret@default?region=eu-central-1")
+        self.assertEqual(managed_packages, {AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE})
+        self.assertEqual(smtp, "ses+smtp://smtp-user:smtp-secret@default?region=eu-central-1")
+        self.assertEqual(smtp_packages, {AMAZON_MAILER_PACKAGE})
 
     def test_sendgrid_api_requires_the_symfony_bridge(self) -> None:
         dsn, packages = mail_config._external_dsn(
