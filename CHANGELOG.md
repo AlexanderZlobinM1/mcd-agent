@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.10.5 - 2026-08-06
+- Fixed: the isolated Sendmail systemd unit now stops with `SIGINT`, which the
+  daemon handles immediately and cleanly, instead of waiting for the default
+  90-second `SIGTERM` timeout when a second instance refreshes DKIM mappings.
+- Safety: the isolated service has a bounded 15-second stop timeout; the system
+  Sendmail service, configuration and queue remain outside MCD ownership.
+- Regression: verifies the generated unit carries both stop safeguards.
+
 ## 0.10.4 - 2026-08-06
 - Fixed: profile activation accepts hosts whose observed local hostname differs
   from their canonical MCC inventory name. Private material remains protected

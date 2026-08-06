@@ -155,7 +155,10 @@ MAILER(`smtp')dnl
                 isolated_cf.read_text(encoding="utf-8"),
             )
             self.assertIn("127.0.0.1", isolated_mc.read_text(encoding="utf-8"))
-            self.assertIn("sendmail.cf -bD", isolated_service.read_text(encoding="utf-8"))
+            service_text = isolated_service.read_text(encoding="utf-8")
+            self.assertIn("sendmail.cf -bD", service_text)
+            self.assertIn("KillSignal=SIGINT", service_text)
+            self.assertIn("TimeoutStopSec=15s", service_text)
 
     def test_sendmail_configuration_rejects_compiled_system_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:

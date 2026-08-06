@@ -330,6 +330,8 @@ Requires=opendkim.service
 Type=simple
 ExecStart=/usr/sbin/sendmail -C/etc/mcd/local-mail/sendmail.cf -bD -q5m
 ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGINT
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=5s
 
