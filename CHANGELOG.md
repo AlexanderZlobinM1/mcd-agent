@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.11 - 2026-08-06
+- Added: mail-profile apply can preserve credentials from the active Mautic
+  `mailer_dsn` while changing between `mautic+ses+api`, `ses+api` and
+  `ses+https`. Blank credential fields retain their current values and supplied
+  fields replace only the corresponding value.
+- Guarded: SES API credentials are never reused for `ses+smtp`, which requires
+  its own SMTP username and password.
+- Added: after apply and test succeed, MCD reports the effective credentials to
+  MCC through the authenticated mail-profile status endpoint for encrypted
+  control-plane storage. Credentials are not included in command output.
+
 ## 0.10.10 - 2026-08-06
 - Fixed: `MauticZenderBundle` is no longer classified as an email sender. MCD
   derives sender state only from the active `local.php` mail transport or DSN,

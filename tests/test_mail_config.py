@@ -9,6 +9,24 @@ from mcd_agent.amazon_mailer_dep import AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKA
 
 
 class MailConfigTests(unittest.TestCase):
+    def test_success_status_captures_effective_credentials_without_printing_them(self) -> None:
+        cfg = SimpleNamespace(mcc_host_name="host-1")
+        with patch.object(mail_config, "_mcc_json") as mcc_json, patch.object(
+            mail_config,
+            "_host_name",
+            return_value="host-1",
+        ):
+            mail_config._profile_status(
+                cfg,
+                "profile-1",
+                status="tested",
+                tested=True,
+                credentials={"access_key": "ACCESS", "secret_key": "SECRET"},
+            )
+
+        payload = mcc_json.call_args.kwargs["payload"]
+        self.assertEqual(payload["credentials"], {"access_key": "ACCESS", "secret_key": "SECRET"})
+
     def test_external_dsn_is_escaped_for_symfony_parameter_bag(self) -> None:
         with patch.object(mail_config, "_local_php") as local_php, patch.object(
             mail_config, "_write_atomic"
@@ -88,6 +106,60 @@ class MailConfigTests(unittest.TestCase):
         self.assertEqual(managed_packages, {AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE})
         self.assertEqual(smtp, "ses+smtp://smtp-user:smtp-secret@default?region=eu-central-1")
         self.assertEqual(smtp_packages, {AMAZON_MAILER_PACKAGE})
+
+    def test_ses_api_method_change_preserves_current_credentials_when_fields_are_blank(self) -> None:
+        with patch.object(
+            mail_config,
+            "_current_mailer_dsn",
+            return_value="mautic+ses+api://OLDACCESS:OLDSECRET@default?region=eu-central-1",
+        ):
+            credentials = mail_config._credentials_for_apply(
+                "/var/www/app/public_html",
+                "amazon_ses_api",
+                {
+                    "delivery_method": "ses+api",
+                    "_preserve_current_credentials": True,
+                },
+                {},
+            )
+
+        self.assertEqual(credentials, {"access_key": "OLDACCESS", "secret_key": "OLDSECRET"})
+
+    def test_entered_ses_key_replaces_only_that_current_value(self) -> None:
+        with patch.object(
+            mail_config,
+            "_current_mailer_dsn",
+            return_value="ses+api://OLDACCESS:OLDSECRET@default?region=eu-central-1",
+        ):
+            credentials = mail_config._credentials_for_apply(
+                "/var/www/app/public_html",
+                "amazon_ses_api",
+                {
+                    "delivery_method": "ses+https",
+                    "_preserve_current_credentials": True,
+                },
+                {"access_key": "NEWACCESS"},
+            )
+
+        self.assertEqual(credentials, {"access_key": "NEWACCESS", "secret_key": "OLDSECRET"})
+
+    def test_ses_api_credentials_are_not_reused_for_ses_smtp(self) -> None:
+        with patch.object(
+            mail_config,
+            "_current_mailer_dsn",
+            return_value="ses+api://ACCESS:SECRET@default?region=eu-central-1",
+        ):
+            credentials = mail_config._credentials_for_apply(
+                "/var/www/app/public_html",
+                "amazon_ses_api",
+                {
+                    "delivery_method": "ses+smtp",
+                    "_preserve_current_credentials": True,
+                },
+                {},
+            )
+
+        self.assertEqual(credentials, {})
 
     def test_sendgrid_api_requires_the_symfony_bridge(self) -> None:
         dsn, packages = mail_config._external_dsn(

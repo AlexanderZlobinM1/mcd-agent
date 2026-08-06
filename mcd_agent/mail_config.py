@@ -8,6 +8,7 @@ from mcd_agent.amazon_mailer_dep import (
     AMAZON_MAILER_PACKAGE,
     HTTP_CLIENT_PACKAGE,
     SENDGRID_MAILER_PACKAGE,
+    _read_php_array_string,
     ensure_mailer_packages,
 )
 from mcd_agent.config import AgentConfig
@@ -26,6 +27,10 @@ from mcd_agent.local_mail import (
 )
 
 
+_PRESERVE_CURRENT_CREDENTIALS = "_preserve_current_credentials"
+_SES_API_METHODS = {"mautic+ses+api", "ses+api", "ses+https"}
+
+
 def fetch_mail_profile(cfg: AgentConfig, profile_id: str) -> dict[str, Any]:
     return _mcc_json(
         cfg,
@@ -41,25 +46,83 @@ def _profile_status(
     status: str,
     error: str = "",
     tested: bool = False,
+    credentials: dict[str, str] | None = None,
 ) -> None:
+    payload: dict[str, Any] = {
+        "profile_id": str(profile_id),
+        "mcc_host_name": _host_name(cfg),
+        "status": status,
+        "error": error,
+        "tested": bool(tested),
+    }
+    if credentials:
+        payload["credentials"] = {str(key): str(value) for key, value in credentials.items() if str(value)}
     _mcc_json(
         cfg,
         "/api/v1/agent/mail-config/status",
-        payload={
-            "profile_id": str(profile_id),
-            "mcc_host_name": _host_name(cfg),
-            "status": status,
-            "error": error,
-            "tested": bool(tested),
-        },
+        payload=payload,
         timeout_sec=10,
     )
 
 
+def _required_credential(credentials: dict[str, Any], key: str) -> str:
+    value = str(credentials.get(key) or "")
+    if not value:
+        raise RuntimeError(f"mail profile credential is missing: {key}")
+    return value
+
+
+def _current_mailer_dsn(root: str) -> str:
+    text = _local_php(root).read_text(encoding="utf-8", errors="replace")
+    return str(_read_php_array_string(text, "mailer_dsn") or "").replace("%%", "%").strip()
+
+
+def _credentials_for_apply(
+    root: str,
+    kind: str,
+    settings: dict[str, Any],
+    credentials: dict[str, Any],
+) -> dict[str, str]:
+    effective = {str(key): str(value or "") for key, value in credentials.items() if str(value or "")}
+    if not bool(settings.get(_PRESERVE_CURRENT_CREDENTIALS)):
+        return effective
+
+    current_dsn = _current_mailer_dsn(root)
+    try:
+        current = parse.urlsplit(current_dsn)
+    except ValueError:
+        return effective
+    current_method = str(current.scheme or "").strip().lower()
+    target_method = str(settings.get("delivery_method") or "").strip().lower()
+    if kind == "amazon_ses_api":
+        if current_method in _SES_API_METHODS and target_method in _SES_API_METHODS:
+            current_values = {
+                "access_key": parse.unquote(str(current.username or "")),
+                "secret_key": parse.unquote(str(current.password or "")),
+            }
+        elif current_method == target_method == "ses+smtp":
+            current_values = {
+                "smtp_username": parse.unquote(str(current.username or "")),
+                "smtp_password": parse.unquote(str(current.password or "")),
+            }
+        else:
+            current_values = {}
+    elif kind == "smtp" and current_method in {"smtp", "smtps"}:
+        current_values = {
+            "username": parse.unquote(str(current.username or "")),
+            "password": parse.unquote(str(current.password or "")),
+        }
+    elif kind == "sendgrid_api" and current_method == "sendgrid+api":
+        current_values = {"api_key": parse.unquote(str(current.username or ""))}
+    else:
+        current_values = {}
+    return {**current_values, **effective}
+
+
 def _external_dsn(kind: str, settings: dict[str, Any], credentials: dict[str, Any]) -> tuple[str, set[str]]:
     if kind == "smtp":
-        user = parse.quote(str(credentials.get("username") or ""), safe="")
-        password = parse.quote(str(credentials.get("password") or ""), safe="")
+        user = parse.quote(_required_credential(credentials, "username"), safe="")
+        password = parse.quote(_required_credential(credentials, "password"), safe="")
         host = str(settings.get("host") or "").strip()
         port = int(settings.get("port") or 587)
         scheme = "smtps" if str(settings.get("encryption") or "starttls") == "tls" else "smtp"
@@ -67,11 +130,11 @@ def _external_dsn(kind: str, settings: dict[str, Any], credentials: dict[str, An
     if kind == "amazon_ses_api":
         method = str(settings.get("delivery_method") or "ses+api").strip().lower()
         if method == "ses+smtp":
-            access = parse.quote(str(credentials.get("smtp_username") or ""), safe="")
-            secret = parse.quote(str(credentials.get("smtp_password") or ""), safe="")
+            access = parse.quote(_required_credential(credentials, "smtp_username"), safe="")
+            secret = parse.quote(_required_credential(credentials, "smtp_password"), safe="")
         else:
-            access = parse.quote(str(credentials.get("access_key") or ""), safe="")
-            secret = parse.quote(str(credentials.get("secret_key") or ""), safe="")
+            access = parse.quote(_required_credential(credentials, "access_key"), safe="")
+            secret = parse.quote(_required_credential(credentials, "secret_key"), safe="")
         region = parse.quote(str(settings.get("region") or "eu-central-1"), safe="")
         if method not in {"mautic+ses+api", "ses+api", "ses+https", "ses+smtp"}:
             raise RuntimeError(f"unsupported Amazon SES delivery method: {method}")
@@ -80,7 +143,7 @@ def _external_dsn(kind: str, settings: dict[str, Any], credentials: dict[str, An
             packages.add(HTTP_CLIENT_PACKAGE)
         return f"{method}://{access}:{secret}@default?region={region}", packages
     if kind == "sendgrid_api":
-        key = parse.quote(str(credentials.get("api_key") or ""), safe="")
+        key = parse.quote(_required_credential(credentials, "api_key"), safe="")
         return f"sendgrid+api://{key}@default", {SENDGRID_MAILER_PACKAGE}
     raise RuntimeError(f"unsupported external mail transport: {kind}")
 
@@ -133,6 +196,7 @@ def apply_mail_profile(
             path = _local_php(root)
             before = path.read_text(encoding="utf-8", errors="replace")
             stat = path.stat()
+            credentials = _credentials_for_apply(root, kind, settings, credentials)
             dsn, packages = _external_dsn(kind, settings, credentials)
             try:
                 if packages:
@@ -168,7 +232,13 @@ def apply_mail_profile(
                 "own_host_disable": disable_result,
             }
         try:
-            _profile_status(cfg, profile_id, status="tested", tested=True)
+            _profile_status(
+                cfg,
+                profile_id,
+                status="tested",
+                tested=True,
+                credentials=credentials if kind != "own_host" else None,
+            )
         except Exception:
             pass
         return {"profile_id": profile_id, "transport_type": kind, **result}
