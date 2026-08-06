@@ -1,5 +1,15 @@
 # MCD Changelog
 
+## 0.10.6 - 2026-08-06
+- Fixed: URL-encoded mailer DSNs are escaped for the Symfony parameter bag, so
+  values such as `%2Fusr` cannot be interpreted as missing DI parameters and
+  break Mautic web requests after mail-profile activation.
+- Fixed: direct mail tests decode Symfony percent literals before constructing
+  the transport; the same handling covers own-host, SMTP, SES and SendGrid.
+- Safety: own-host activation must now rebuild the Mautic cache before success.
+  Rollback restores `local.php` and rebuilds the cache from the restored config.
+- Regression: covers own-host and credential-bearing external DSN persistence.
+
 ## 0.10.5 - 2026-08-06
 - Fixed: the isolated Sendmail systemd unit now stops with `SIGINT`, which the
   daemon handles immediately and cleanly, instead of waiting for the default

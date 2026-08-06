@@ -62,6 +62,7 @@ if (is_array($included)) {
 }
 if (isset($params['parameters']) && is_array($params['parameters'])) { $params = $params['parameters']; }
 $dsn = (string)($params['mailer_dsn'] ?? '');
+$dsn = str_replace('%%', '%', $dsn);
 $from = (string)($params['mailer_from_email'] ?? '');
 $fromName = (string)($params['mailer_from_name'] ?? 'Sales Snap');
 $returnPath = (string)($params['mailer_return_path'] ?? $from);
@@ -505,6 +506,10 @@ def _php_quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def _symfony_config_escape(value: str) -> str:
+    return str(value).replace("%", "%%")
+
+
 def _set_php_parameter(text: str, key: str, value: str) -> str:
     pattern = rf"(['\"]{re.escape(key)}['\"]\s*=>\s*)(?:['\"][^'\"]*['\"]|null)"
     updated, count = re.subn(pattern, lambda match: match.group(1) + _php_quote(value), text)
@@ -527,12 +532,24 @@ def _configure_mautic(root: str, domain: str, settings: dict[str, Any] | None = 
     values = dict(settings or {})
     command = f"{SUBMIT_WRAPPER} --instance-domain={domain} -- -oi -t"
     dsn = "sendmail://default?command=" + parse.quote(command, safe="")
-    text = _set_php_parameter(text, "mailer_dsn", dsn)
+    text = _set_php_parameter(text, "mailer_dsn", _symfony_config_escape(dsn))
     text = _set_php_parameter(text, "mailer_from_email", str(values.get("from_email") or f"mailer@{domain}"))
     text = _set_php_parameter_if_present(text, "mailer_from_name", str(values.get("from_name") or "Sales Snap"))
     text = _set_php_parameter(text, "mailer_return_path", str(values.get("return_path") or f"bounce@{domain}"))
     _write_atomic(path, text, mode=stat.st_mode & 0o777)
     os.chown(path, stat.st_uid, stat.st_gid)
+
+
+def _clear_mautic_cache(cfg: AgentConfig, root: str) -> None:
+    console = Path(root) / "bin" / "console"
+    if not console.exists():
+        raise RuntimeError("Mautic bin/console not found")
+    rc, out = _run(
+        ["sudo", "-u", "www-data", str(cfg.php_bin or "/usr/bin/php"), str(console), "cache:clear"],
+        timeout_sec=max(600, int(cfg.command_timeout_sec or 300)),
+    )
+    if rc != 0:
+        raise RuntimeError("Mautic cache clear failed after mail configuration: " + out)
 
 
 def _send_test_message(cfg: AgentConfig, *, root: str, recipient: str, profile_name: str) -> str:
@@ -698,6 +715,7 @@ def configure_local_mail(
         _configure_mta(mta, primary_mail_hostname)
         sender_settings = material.get("settings") if isinstance(material.get("settings"), dict) else {}
         _configure_mautic(root, clean, sender_settings)
+        _clear_mautic_cache(cfg, root)
         for service in ("opendkim", _delivery_service(mta)):
             rc, out = _run(["systemctl", "enable", "--now", service], timeout_sec=90)
             if rc != 0:
@@ -747,6 +765,7 @@ def configure_local_mail(
         try:
             _write_atomic(local_php_path, local_php_before, mode=local_php_stat.st_mode & 0o777)
             os.chown(local_php_path, local_php_stat.st_uid, local_php_stat.st_gid)
+            _clear_mautic_cache(cfg, root)
             _save_domains(payload_before)
             previous_domains = payload_before.get("domains") if isinstance(payload_before.get("domains"), dict) else {}
             if first_activation:

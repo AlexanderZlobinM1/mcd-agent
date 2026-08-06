@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 from urllib import parse
 
@@ -12,13 +11,14 @@ from mcd_agent.amazon_mailer_dep import (
 )
 from mcd_agent.config import AgentConfig
 from mcd_agent.local_mail import (
+    _clear_mautic_cache,
     _host_name,
     _local_php,
     _mcc_json,
-    _run,
     _send_test_message,
     _set_php_parameter,
     _set_php_parameter_if_present,
+    _symfony_config_escape,
     _write_atomic,
     configure_local_mail,
     disable_local_mail,
@@ -77,25 +77,13 @@ def _external_dsn(kind: str, settings: dict[str, Any], credentials: dict[str, An
 def _configure_external_mautic(root: str, settings: dict[str, Any], dsn: str) -> None:
     path = _local_php(root)
     text = path.read_text(encoding="utf-8", errors="replace")
-    text = _set_php_parameter(text, "mailer_dsn", dsn)
+    text = _set_php_parameter(text, "mailer_dsn", _symfony_config_escape(dsn))
     text = _set_php_parameter(text, "mailer_from_email", str(settings.get("from_email") or ""))
     text = _set_php_parameter_if_present(text, "mailer_from_name", str(settings.get("from_name") or "Sales Snap"))
     text = _set_php_parameter(text, "mailer_return_path", str(settings.get("return_path") or ""))
     stat = path.stat()
     _write_atomic(path, text, mode=stat.st_mode & 0o777)
     os.chown(path, stat.st_uid, stat.st_gid)
-
-
-def _clear_mautic_cache(cfg: AgentConfig, root: str) -> None:
-    console = Path(root) / "bin" / "console"
-    if not console.exists():
-        raise RuntimeError("Mautic bin/console not found")
-    rc, out = _run(
-        ["sudo", "-u", "www-data", str(cfg.php_bin or "/usr/bin/php"), str(console), "cache:clear"],
-        timeout_sec=max(600, int(cfg.command_timeout_sec or 300)),
-    )
-    if rc != 0:
-        raise RuntimeError("Mautic cache clear failed after mail configuration: " + out)
 
 
 def apply_mail_profile(

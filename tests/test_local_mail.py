@@ -191,10 +191,16 @@ MAILER(`smtp')dnl
             with patch.object(local_mail, "_local_php", return_value=path):
                 local_mail._configure_mautic("/var/www/app/public_html", "app.sales-snap.com")
             result = path.read_text(encoding="utf-8")
-            self.assertIn("mcd-mail-submit%20--instance-domain%3Dapp.sales-snap.com%20--%20-oi%20-t", result)
+            self.assertIn(
+                "mcd-mail-submit%%20--instance-domain%%3Dapp.sales-snap.com%%20--%%20-oi%%20-t",
+                result,
+            )
             self.assertIn("'mailer_from_email'=>'mailer@app.sales-snap.com'", result)
             self.assertIn("'mailer_return_path'=>'bounce@app.sales-snap.com'", result)
             self.assertNotIn("/.mcd/", result)
+
+    def test_mail_test_unescapes_symfony_percent_literals(self) -> None:
+        self.assertIn("str_replace('%%', '%', $dsn)", local_mail._MAIL_TEST_SCRIPT)
 
     def test_quota_counts_recipients_and_rolls_back_sendmail_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:

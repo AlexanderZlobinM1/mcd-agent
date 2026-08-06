@@ -9,6 +9,25 @@ from mcd_agent.amazon_mailer_dep import AMAZON_MAILER_PACKAGE, SENDGRID_MAILER_P
 
 
 class MailConfigTests(unittest.TestCase):
+    def test_external_dsn_is_escaped_for_symfony_parameter_bag(self) -> None:
+        with patch.object(mail_config, "_local_php") as local_php, patch.object(
+            mail_config, "_write_atomic"
+        ) as write_atomic, patch.object(mail_config.os, "chown"):
+            path = local_php.return_value
+            path.read_text.return_value = (
+                "<?php return ['parameters'=>['mailer_dsn'=>'smtp://localhost',"
+                "'mailer_from_email'=>'old@example.com','mailer_return_path'=>'old@example.com']];"
+            )
+            path.stat.return_value = SimpleNamespace(st_mode=0o100640, st_uid=33, st_gid=33)
+            mail_config._configure_external_mautic(
+                "/var/www/app/public_html",
+                {"from_email": "new@example.com", "return_path": "bounce@example.com"},
+                "smtp://user:p%40ss@example.com:587",
+            )
+
+        stored = write_atomic.call_args.args[1]
+        self.assertIn("smtp://user:p%%40ss@example.com:587", stored)
+
     def test_canonical_mcc_host_name_may_differ_from_local_hostname(self) -> None:
         cfg = SimpleNamespace(mcc_host_name="")
         material = {
