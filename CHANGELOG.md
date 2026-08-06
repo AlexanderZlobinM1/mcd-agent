@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.10.1 - 2026-08-06
+- Fixed: own-host activation on an existing Sendmail host now uses an isolated
+  loopback listener, generated configuration and dedicated queue. MCD no longer
+  edits `/etc/mail/sendmail.mc`, restarts the system Sendmail service or moves
+  its existing queue, so sibling instances retain their current relay path.
+- Fixed: the Mautic quota wrapper now reaches root-owned MCC mail state through
+  a single validated sudoers helper and submits to the isolated listener. Daily
+  and monthly recipient accounting remains atomic without exposing MCD state to
+  the shared web user.
+- Regression: covers dedicated Sendmail port/queue generation, isolated SMTP
+  submission and quota rollback after delivery failure.
+
 ## 0.10.0 - 2026-08-06
 - Added: MCD applies MCC-stored per-instance mail profiles for own-host mail,
   SMTP, Amazon SES API and SendGrid API. Missing Symfony mailer bridges are
@@ -9,9 +21,8 @@
   hosts remain on Sendmail; clean new hosts install Postfix and OpenDKIM.
 - Added: profile activation sends a real Symfony Mailer test message to the
   current MCC user's email before MCC marks the profile active.
-- Safety: MTA, OpenDKIM and Mautic changes roll back on failure. Existing
-  Sendmail queues are quarantined before first direct-delivery activation and
-  restored if activation fails; unmanaged MTAs are never replaced.
+- Safety: MTA, OpenDKIM and Mautic changes roll back on failure; unmanaged MTAs
+  are never replaced.
 - Changed: instance mail state is stored only under `/etc/mcd/local-mail` and
   `/var/lib/mcd/local-mail`; no instance `.mcd` runtime directory is created.
 

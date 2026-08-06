@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,7 +13,13 @@ from mcd_agent import local_mail
 
 class LocalMailTests(unittest.TestCase):
     def test_clean_host_installs_postfix_and_opendkim(self) -> None:
-        installed = {"sendmail-bin": False, "postfix": False, "opendkim": False, "opendkim-tools": False}
+        installed = {
+            "sendmail-bin": False,
+            "postfix": False,
+            "opendkim": False,
+            "opendkim-tools": False,
+            "sudo": False,
+        }
         commands = []
 
         def fake_run(args, **_kwargs):
@@ -22,8 +29,8 @@ class LocalMailTests(unittest.TestCase):
             if args == ["debconf-set-selections"] or args[:2] == ["apt-get", "update"]:
                 return 0, ""
             if args[:4] == ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install"]:
-                self.assertEqual(args[4:], ["-y", "postfix", "opendkim", "opendkim-tools"])
-                installed.update({"postfix": True, "opendkim": True, "opendkim-tools": True})
+                self.assertEqual(args[4:], ["-y", "postfix", "opendkim", "opendkim-tools", "sudo"])
+                installed.update({"postfix": True, "opendkim": True, "opendkim-tools": True, "sudo": True})
                 return 0, ""
             self.fail(f"unexpected command: {args}")
 
@@ -34,6 +41,8 @@ class LocalMailTests(unittest.TestCase):
                 return "/usr/sbin/opendkim"
             if name == "opendkim-testkey" and installed["opendkim-tools"]:
                 return "/usr/sbin/opendkim-testkey"
+            if name == "sudo" and installed["sudo"]:
+                return "/usr/bin/sudo"
             return None
 
         with patch.object(local_mail, "_run", side_effect=fake_run), patch.object(
@@ -59,6 +68,8 @@ class LocalMailTests(unittest.TestCase):
             self.fail(f"unexpected command: {args}")
 
         def fake_which(name):
+            if name == "sudo":
+                return "/usr/bin/sudo"
             if name == "sendmail" or installed.get("opendkim" if name == "opendkim" else "opendkim-tools"):
                 return "/usr/sbin/" + name
             return None
@@ -94,8 +105,43 @@ MAILER(`smtp')dnl
         self.assertFalse(any("SMART_HOST" in line for line in active))
         self.assertFalse(any("MASQUERADE" in line for line in active))
         self.assertIn("define(`confDOMAIN_NAME', `mail.app.sales-snap.com')dnl", result)
+        self.assertIn("Port=2525, Addr=127.0.0.1", result)
+        self.assertIn("QUEUE_DIR(`/var/spool/mqueue-mcd')", result)
         self.assertEqual(result.count(local_mail._SENDMAIL_BEGIN), 1)
         self.assertLess(result.index(local_mail._SENDMAIL_BEGIN), result.index("MAILER(`smtp')dnl"))
+
+    def test_sendmail_configuration_does_not_modify_system_config_or_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            system_mc = base / "system-sendmail.mc"
+            isolated_mc = base / "mcd" / "sendmail.mc"
+            isolated_cf = base / "mcd" / "sendmail.cf"
+            isolated_queue = base / "mqueue-mcd"
+            isolated_service = base / "mcd-local-mail-sendmail.service"
+            source = "define(`SMART_HOST', `mail.sales-snap.com')dnl\nMAILER(`smtp')dnl\n"
+            system_mc.write_text(source, encoding="utf-8")
+            compiled = subprocess.CompletedProcess(["m4"], 0, stdout=b"compiled config\n", stderr=b"")
+            patches = (
+                patch.object(local_mail, "SENDMAIL_MC", system_mc),
+                patch.object(local_mail, "SENDMAIL_ISOLATED_MC", isolated_mc),
+                patch.object(local_mail, "SENDMAIL_ISOLATED_CF", isolated_cf),
+                patch.object(local_mail, "SENDMAIL_ISOLATED_QUEUE", isolated_queue),
+                patch.object(local_mail, "SENDMAIL_ISOLATED_SERVICE", isolated_service),
+                patch.object(local_mail.subprocess, "run", return_value=compiled),
+                patch.object(local_mail, "_run", return_value=(0, "")),
+                patch.object(local_mail.shutil, "chown"),
+            )
+            for item in patches:
+                item.start()
+            self.addCleanup(lambda: [item.stop() for item in reversed(patches)])
+
+            local_mail._configure_sendmail("mail.app.sales-snap.com")
+
+            self.assertEqual(system_mc.read_text(encoding="utf-8"), source)
+            self.assertFalse((base / "mqueue").exists())
+            self.assertEqual(isolated_cf.read_text(encoding="utf-8"), "compiled config\n")
+            self.assertIn("127.0.0.1", isolated_mc.read_text(encoding="utf-8"))
+            self.assertIn("sendmail.cf -bD", isolated_service.read_text(encoding="utf-8"))
 
     def test_mautic_patch_uses_quota_wrapper_and_instance_from_domain(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -118,7 +164,6 @@ MAILER(`smtp')dnl
             config_root = base / "etc"
             state_root = base / "state"
             domains_path = config_root / "domains.json"
-            sendmail = base / "sendmail"
             config_root.mkdir()
             domains_path.write_text(
                 json.dumps(
@@ -135,14 +180,12 @@ MAILER(`smtp')dnl
                 ),
                 encoding="utf-8",
             )
-            sendmail.write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n", encoding="utf-8")
-            sendmail.chmod(0o755)
             patches = (
                 patch.object(local_mail, "CONFIG_ROOT", config_root),
                 patch.object(local_mail, "STATE_ROOT", state_root),
                 patch.object(local_mail, "DOMAINS_PATH", domains_path),
                 patch.object(local_mail, "QUOTA_DB_PATH", state_root / "quota.sqlite3"),
-                patch.object(local_mail, "SENDMAIL_BIN", sendmail),
+                patch.object(local_mail, "_deliver_message", return_value=(0, 0)),
             )
             for item in patches:
                 item.start()
@@ -152,11 +195,40 @@ MAILER(`smtp')dnl
             self.assertEqual(local_mail.quota_state("app.sales-snap.com")["daily_used"], 2)
             self.assertEqual(local_mail.submit_local_mail(domain="app.sales-snap.com", sendmail_args=["--", "-t"], data=data), 75)
 
-            sendmail.write_text("#!/bin/sh\ncat >/dev/null\nexit 1\n", encoding="utf-8")
-            sendmail.chmod(0o755)
+            local_mail._deliver_message.return_value = (75, 1)
             one = b"From: mailer@app.sales-snap.com\nTo: three@example.com\n\nhello\n"
-            self.assertEqual(local_mail.submit_local_mail(domain="app.sales-snap.com", sendmail_args=["--", "-t"], data=one), 1)
+            self.assertEqual(local_mail.submit_local_mail(domain="app.sales-snap.com", sendmail_args=["--", "-t"], data=one), 75)
             self.assertEqual(local_mail.quota_state("app.sales-snap.com")["daily_used"], 2)
+
+    def test_sendmail_delivery_uses_isolated_listener(self) -> None:
+        calls = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout):
+                calls.append((host, port, timeout))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def sendmail(self, sender, recipients, data):
+                calls.append((sender, tuple(recipients), data))
+                return {}
+
+        data = b"From: mailer@app.sales-snap.com\nTo: one@example.com\n\nhello\n"
+        with patch.object(local_mail.smtplib, "SMTP", FakeSMTP):
+            self.assertEqual(
+                local_mail._deliver_message(
+                    item={"mta": "sendmail"},
+                    domain="app.sales-snap.com",
+                    recipients=["one@example.com"],
+                    data=data,
+                ),
+                (0, 0),
+            )
+        self.assertEqual(calls[0], ("127.0.0.1", 2525, 30))
 
     def test_recipient_parser_prefers_envelope_recipients(self) -> None:
         data = b"To: header@example.com\n\nhello\n"
