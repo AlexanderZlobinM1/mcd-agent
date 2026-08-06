@@ -172,6 +172,72 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
         stats = _read_campaign_native_fallback_stats(self.cfg)  # type: ignore[arg-type]
         self.assertEqual(stats[0]["recovered_runs"], 1)
 
+    def test_existing_098284_counter_is_backfilled_from_retained_events(self) -> None:
+        root = "/var/www/example/public_html"
+        recovered = {
+            "root": root,
+            "status": "ok",
+            "operation_rc": 0,
+            "metrics_status": "ok",
+            "pending_before": 0,
+            "pending_after": 0,
+            "email_stats_before": 10,
+            "email_stats_after": 16,
+        }
+        with sqlite3.connect(self.cfg.state_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE campaign_native_fallback_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  root TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE campaign_native_fallback_stats (
+                  root TEXT PRIMARY KEY,
+                  runs INTEGER NOT NULL DEFAULT 0,
+                  native_errors INTEGER NOT NULL DEFAULT 0,
+                  metric_errors INTEGER NOT NULL DEFAULT 0,
+                  recovered_runs INTEGER NOT NULL DEFAULT 0,
+                  recovered_pending INTEGER NOT NULL DEFAULT 0,
+                  recovered_email_stats INTEGER NOT NULL DEFAULT 0,
+                  first_run_at REAL NOT NULL,
+                  last_run_at REAL NOT NULL,
+                  last_status TEXT NOT NULL,
+                  last_failed_stage TEXT NOT NULL DEFAULT '',
+                  last_operation_rc INTEGER,
+                  last_metrics_status TEXT NOT NULL DEFAULT 'unknown',
+                  last_metrics_error TEXT NOT NULL DEFAULT '',
+                  last_pending_before INTEGER,
+                  last_pending_after INTEGER,
+                  last_email_stats_before INTEGER,
+                  last_email_stats_after INTEGER
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO campaign_native_fallback_events(root, created_at, payload_json) VALUES (?, ?, ?)",
+                (root, time.time(), json.dumps(recovered)),
+            )
+            conn.execute(
+                """
+                INSERT INTO campaign_native_fallback_stats (
+                  root, runs, recovered_runs, recovered_email_stats,
+                  first_run_at, last_run_at, last_status
+                ) VALUES (?, 1, 0, 6, ?, ?, 'ok')
+                """,
+                (root, time.time(), time.time()),
+            )
+
+        first = _read_campaign_native_fallback_stats(self.cfg)  # type: ignore[arg-type]
+        second = _read_campaign_native_fallback_stats(self.cfg)  # type: ignore[arg-type]
+        self.assertEqual(first[0]["recovered_runs"], 1)
+        self.assertEqual(second[0]["recovered_runs"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

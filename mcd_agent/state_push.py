@@ -248,6 +248,7 @@ def _state_conn(cfg: AgentConfig) -> sqlite3.Connection:
             "ALTER TABLE campaign_native_fallback_stats "
             "ADD COLUMN recovered_runs INTEGER NOT NULL DEFAULT 0"
         )
+    _backfill_campaign_native_fallback_recovered_runs(conn)
     _migrate_legacy_profile_event_file(conn, cfg)
     return conn
 
@@ -259,6 +260,66 @@ def _nullable_nonnegative_int(value: Any) -> int | None:
         return max(0, int(value))
     except (TypeError, ValueError):
         return None
+
+
+def _backfill_campaign_native_fallback_recovered_runs(conn: sqlite3.Connection) -> None:
+    """Backfill the 0.9.284 counter once from retained durable events."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS state_schema_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration = "campaign_native_fallback_recovered_runs_v1"
+    if conn.execute("SELECT 1 FROM state_schema_migrations WHERE name = ?", (migration,)).fetchone():
+        return
+
+    recovered_by_root: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT root, payload_json FROM campaign_native_fallback_events ORDER BY id"
+    ).fetchall():
+        root = str(row["root"] or "").strip()
+        if not root:
+            continue
+        try:
+            event = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        pending_before = _nullable_nonnegative_int(event.get("pending_before"))
+        pending_after = _nullable_nonnegative_int(event.get("pending_after"))
+        email_before = _nullable_nonnegative_int(event.get("email_stats_before"))
+        email_after = _nullable_nonnegative_int(event.get("email_stats_after"))
+        recovered_pending = (
+            max(0, pending_before - pending_after)
+            if pending_before is not None and pending_after is not None
+            else 0
+        )
+        recovered_email_stats = (
+            max(0, email_after - email_before)
+            if email_before is not None and email_after is not None
+            else 0
+        )
+        if recovered_pending > 0 or recovered_email_stats > 0:
+            recovered_by_root[root] = recovered_by_root.get(root, 0) + 1
+
+    for root, recovered_runs in recovered_by_root.items():
+        conn.execute(
+            """
+            UPDATE campaign_native_fallback_stats
+            SET recovered_runs = MAX(recovered_runs, ?)
+            WHERE root = ?
+            """,
+            (recovered_runs, root),
+        )
+    conn.execute(
+        "INSERT INTO state_schema_migrations(name, applied_at) VALUES (?, ?)",
+        (migration, time.time()),
+    )
+    conn.commit()
 
 
 def _store_campaign_native_fallback_event(cfg: AgentConfig, event: dict[str, Any], now_ts: float) -> None:

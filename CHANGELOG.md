@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.9.285 - 2026-08-06
+- Fixed: the first `recovered_runs` schema migration backfills the cumulative
+  counter once from retained durable fallback events. Upgrading from 0.9.283
+  through 0.9.284 no longer leaves a permanent canonical/reported telemetry
+  gap after a recovery event occurred before the new counter was installed.
+
 ## 0.9.284 - 2026-08-06
 - Fixed: campaign watchdog and priority timeout termination now signal the
   complete isolated process group. A stopped `flock` wrapper can no longer
