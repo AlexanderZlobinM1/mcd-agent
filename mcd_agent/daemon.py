@@ -2574,6 +2574,18 @@ def _split_campaign_circles(
     return priority, regular
 
 
+def _reconcile_campaign_rings(
+    old_priority: deque[int] | None,
+    old_regular: deque[int] | None,
+    priority_ids: list[int],
+    regular_ids: list[int],
+) -> tuple[deque[int], deque[int]]:
+    return (
+        _reconcile_ring(old_priority, priority_ids, new_to_front=True),
+        _reconcile_ring(old_regular, regular_ids),
+    )
+
+
 def _merge_campaign_trigger_audit_ids(due_ids: list[int], audit_ids: list[int]) -> list[int]:
     """Keep audit-discovered published campaigns in the trigger plan.
 
@@ -8471,10 +8483,24 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if not _partition_complete(campaign_rebuild_ids, reb_prio, reb_reg):
                         logging.warning("[%s] invalid campaign rebuild partition, forcing single ring", root)
                         reb_prio, reb_reg = [], sorted(list(dict.fromkeys(campaign_rebuild_ids)))
-                    campaign_trigger_prio_rings[root] = _reconcile_ring(campaign_trigger_prio_rings.get(root), trg_prio)
-                    campaign_trigger_reg_rings[root] = _reconcile_ring(campaign_trigger_reg_rings.get(root), trg_reg)
-                    campaign_rebuild_prio_rings[root] = _reconcile_ring(campaign_rebuild_prio_rings.get(root), reb_prio)
-                    campaign_rebuild_reg_rings[root] = _reconcile_ring(campaign_rebuild_reg_rings.get(root), reb_reg)
+                    (
+                        campaign_trigger_prio_rings[root],
+                        campaign_trigger_reg_rings[root],
+                    ) = _reconcile_campaign_rings(
+                        campaign_trigger_prio_rings.get(root),
+                        campaign_trigger_reg_rings.get(root),
+                        trg_prio,
+                        trg_reg,
+                    )
+                    (
+                        campaign_rebuild_prio_rings[root],
+                        campaign_rebuild_reg_rings[root],
+                    ) = _reconcile_campaign_rings(
+                        campaign_rebuild_prio_rings.get(root),
+                        campaign_rebuild_reg_rings.get(root),
+                        reb_prio,
+                        reb_reg,
+                    )
                     campaign_trigger_prio_sets[root] = set(trg_prio)
                     campaign_trigger_reg_sets[root] = set(trg_reg)
                     campaign_rebuild_prio_sets[root] = set(reb_prio)

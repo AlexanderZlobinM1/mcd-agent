@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.9.286 - 2026-08-06
+- Fixed: newly discovered campaigns in the priority lane are inserted ahead of
+  previously queued priority work for both rebuild and trigger scheduling. A
+  fresh campaign can no longer wait behind an existing shared-host ring before
+  its first MCD execution.
+- Regression: covers MauticFarm-02 campaign 27 entering the existing
+  `22/17/8/10` priority ring while preserving regular-ring round-robin order.
+
 ## 0.9.285 - 2026-08-06
 - Fixed: the first `recovered_runs` schema migration backfills the cumulative
   counter once from retained durable fallback events. Upgrading from 0.9.283
