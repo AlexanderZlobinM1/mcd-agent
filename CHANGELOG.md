@@ -1,5 +1,19 @@
 # MCD Changelog
 
+## 0.10.8 - 2026-08-06
+- Fixed: image deployment accepts a pre-existing instance parent only when it
+  is an empty directory, while non-empty or non-directory paths remain blocked.
+- Fixed: a failed image deployment rolls back only resources created for that
+  attempt: local mail, exact nginx entries, a dedicated certificate, webroot,
+  database and the convention-matched database user.
+- Fixed: full instance deletion removes an empty dedicated instance parent and
+  drops the matching MCD-image database user and dedicated single-domain
+  certificate; custom database users and shared certificates are never
+  inferred or removed.
+- Safety: image database users must not pre-exist and are created without
+  `IF NOT EXISTS`, preventing a stale account password from being paired with
+  newly generated Mautic credentials.
+
 ## 0.10.7 - 2026-08-06
 - Fixed: full instance deletion now disables any matching MCD-managed local
   mail domain before database, vhost or file removal. Missing local-mail state

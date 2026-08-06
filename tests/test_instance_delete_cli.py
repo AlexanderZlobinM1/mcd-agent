@@ -23,6 +23,42 @@ class _Inventory:
 
 
 class InstanceDeleteCliTests(unittest.TestCase):
+    def test_delete_removes_empty_parent_when_webroot_is_already_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            var_www = Path(tmp) / "var-www"
+            parent = var_www / "shop"
+            parent.mkdir(parents=True)
+            webroot = parent / "public_html"
+            plan = instance_delete.InstanceDeletePlan(
+                root=webroot,
+                local_php=None,
+                domains=[],
+                nginx_paths=[],
+                db_name="",
+                db_host="",
+                db_port="",
+                db_user="",
+                db_password="",
+                delete_files=True,
+                delete_vhost=False,
+                delete_db=False,
+            )
+            with (
+                patch.object(instance_delete, "build_delete_plan", return_value=plan),
+                patch.object(instance_delete, "_VAR_WWW", var_www),
+                patch.object(instance_delete.os, "geteuid", return_value=0),
+                patch("mcd_agent.inventory.InstanceInventory.rescan", return_value=0),
+            ):
+                result = instance_delete.delete_instance_artifacts(
+                    SimpleNamespace(state_db_path=str(Path(tmp) / "state.db")),
+                    root=str(webroot),
+                    delete_files=True,
+                    yes=True,
+                )
+
+        self.assertTrue(result["deleted"]["parent"])
+        self.assertFalse(parent.exists())
+
     def test_delete_blocks_before_mail_cleanup_when_nginx_preflight_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "public_html"

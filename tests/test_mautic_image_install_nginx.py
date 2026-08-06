@@ -28,6 +28,45 @@ if sys.modules.get("mcd_agent.inventory") is inventory_stub:
 
 
 class MauticImageInstallNginxTests(unittest.TestCase):
+    def test_prepare_instance_parent_accepts_existing_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / "shop"
+            parent.mkdir()
+
+            image_install._prepare_instance_parent(parent / "public_html")
+
+            self.assertTrue(parent.exists())
+
+    def test_prepare_instance_parent_rejects_nonempty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / "shop"
+            parent.mkdir()
+            (parent / "keep.txt").write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "not empty"):
+                image_install._prepare_instance_parent(parent / "public_html")
+
+    def test_failed_install_rollback_drops_only_created_database_resources(self) -> None:
+        plan = image_install.build_plan(
+            image_ref="default7",
+            domain="shop.sales-snap.com",
+            php_version="8.4",
+        )
+        sql: list[str] = []
+        with patch.object(image_install, "_mysql_exec", side_effect=lambda statement, **_kwargs: sql.append(statement)):
+            errors = image_install._rollback_failed_install(
+                SimpleNamespace(),
+                plan,
+                database_created=True,
+                user_created=True,
+                resources_started=False,
+                mail_requested=False,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sql[0], "DROP DATABASE IF EXISTS `baza_shop`")
+        self.assertEqual(sql[1], "DROP USER IF EXISTS 'korisnik_shop'@'localhost'")
+
     def test_composer_docroot_is_used_as_nginx_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "public_html"

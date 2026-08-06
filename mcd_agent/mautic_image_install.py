@@ -19,6 +19,11 @@ from mcd_agent.config import AgentConfig
 from mcd_agent.nginx_templates import render_nginx_template
 
 
+_LETSENCRYPT_LIVE = Path("/etc/letsencrypt/live")
+_LETSENCRYPT_RENEWAL = Path("/etc/letsencrypt/renewal")
+_LETSENCRYPT_MCD = Path("/etc/letsencrypt/mcd")
+
+
 @dataclass
 class ImageInstallPlan:
     image_ref: str
@@ -126,6 +131,15 @@ def _db_exists(name: str) -> bool:
     return bool(out.strip())
 
 
+def _db_user_exists(name: str) -> bool:
+    safe = name.replace("'", "''")
+    out = _mysql_exec(
+        "SELECT User FROM mysql.user "
+        f"WHERE User='{safe}' AND Host='localhost' LIMIT 1"
+    )
+    return bool(out.strip())
+
+
 def _quote_ident(value: str) -> str:
     return "`" + str(value).replace("`", "``") + "`"
 
@@ -164,18 +178,120 @@ def _preflight(plan: ImageInstallPlan) -> list[str]:
         problems.append(f"missing PHP-FPM socket: {php_sock}")
     if plan.webroot.exists():
         problems.append(f"webroot already exists: {plan.webroot}")
+    parent = plan.webroot.parent
+    if parent.exists():
+        if not parent.is_dir():
+            problems.append(f"instance parent is not a directory: {parent}")
+        else:
+            try:
+                if any(parent.iterdir()):
+                    problems.append(f"instance parent is not empty: {parent}")
+            except OSError as exc:
+                problems.append(f"instance parent cannot be inspected: {parent}: {exc}")
     site_avail = Path("/etc/nginx/sites-available") / f"{plan.domain}.conf"
     site_enabled = Path("/etc/nginx/sites-enabled") / f"{plan.domain}.conf"
     if site_avail.exists():
         problems.append(f"nginx vhost already exists: {site_avail}")
     if site_enabled.exists() or site_enabled.is_symlink():
         problems.append(f"nginx enabled symlink already exists: {site_enabled}")
+    if (_LETSENCRYPT_LIVE / plan.domain).exists() or (_LETSENCRYPT_RENEWAL / f"{plan.domain}.conf").exists():
+        problems.append(f"certificate already exists: {plan.domain}")
     try:
         if _db_exists(plan.db_name):
             problems.append(f"database already exists: {plan.db_name}")
+        if _db_user_exists(plan.db_user):
+            problems.append(f"database user already exists: {plan.db_user}@localhost")
     except Exception as exc:
         problems.append(f"database preflight failed: {exc}")
     return problems
+
+
+def _prepare_instance_parent(webroot: Path) -> None:
+    parent = webroot.parent
+    if parent.exists():
+        if not parent.is_dir():
+            raise RuntimeError(f"instance parent is not a directory: {parent}")
+        if any(parent.iterdir()):
+            raise RuntimeError(f"instance parent is not empty: {parent}")
+        return
+    parent.mkdir(parents=True, exist_ok=False)
+
+
+def _rollback_failed_install(
+    cfg: AgentConfig,
+    plan: ImageInstallPlan,
+    *,
+    database_created: bool,
+    user_created: bool,
+    resources_started: bool,
+    mail_requested: bool,
+) -> list[str]:
+    errors: list[str] = []
+    if mail_requested:
+        try:
+            from mcd_agent.local_mail import disable_local_mail
+
+            disable_local_mail(cfg, domain=plan.domain)
+        except Exception as exc:
+            errors.append(f"local mail: {exc}")
+
+    if resources_started:
+        for path in (
+            Path("/etc/nginx/sites-enabled") / f"{plan.domain}.conf",
+            Path("/etc/nginx/sites-available") / f"{plan.domain}.conf",
+        ):
+            try:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            except Exception as exc:
+                errors.append(f"nginx {path}: {exc}")
+
+        cert_dir = _LETSENCRYPT_LIVE / plan.domain
+        renewal = _LETSENCRYPT_RENEWAL / f"{plan.domain}.conf"
+        if cert_dir.exists() or renewal.exists():
+            rc, out = _run(
+                ["certbot", "delete", "--cert-name", plan.domain, "--non-interactive"],
+                timeout_sec=120,
+            )
+            if rc != 0:
+                errors.append(f"certificate: {out or 'certbot delete failed'}")
+            else:
+                safe_domain = re.sub(r"[^a-z0-9_.-]+", "_", plan.domain.lower()).strip("._-") or "domain"
+                credential = _LETSENCRYPT_MCD / f"dns-cloudflare-{safe_domain}.ini"
+                try:
+                    if credential.exists():
+                        credential.unlink()
+                except OSError as exc:
+                    errors.append(f"certificate credential: {exc}")
+
+        try:
+            if plan.webroot.exists():
+                shutil.rmtree(plan.webroot)
+            plan.webroot.parent.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"webroot: {exc}")
+
+        rc, out = _run(["nginx", "-t"], timeout_sec=30)
+        if rc == 0:
+            reload_rc, reload_out = _run(["systemctl", "reload", "nginx"], timeout_sec=30)
+            if reload_rc != 0:
+                errors.append(f"nginx reload: {reload_out}")
+        else:
+            errors.append(f"nginx validation: {out}")
+
+    if database_created:
+        try:
+            _mysql_exec(f"DROP DATABASE IF EXISTS {_quote_ident(plan.db_name)}")
+        except Exception as exc:
+            errors.append(f"database: {exc}")
+    if user_created:
+        try:
+            _mysql_exec(f"DROP USER IF EXISTS {_quote_sql(plan.db_user)}@'localhost'")
+        except Exception as exc:
+            errors.append(f"database user: {exc}")
+    return errors
 
 
 def _download(url: str, token: str, dst: Path) -> None:
@@ -658,7 +774,7 @@ def _certbot_cloudflare_credentials_path(cfg: AgentConfig, plan: ImageInstallPla
     if not token:
         raise RuntimeError("Cloudflare DNS credential has no API token")
     safe_domain = re.sub(r"[^a-z0-9_.-]+", "_", plan.domain.lower()).strip("._-") or "domain"
-    cred_dir = Path("/etc/letsencrypt/mcd")
+    cred_dir = _LETSENCRYPT_MCD
     cred_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(cred_dir, 0o700)
     path = cred_dir / f"dns-cloudflare-{safe_domain}.ini"
@@ -785,70 +901,92 @@ def install_from_image(
         print("Downloading image database")
         _download(_artifact_url(cfg, plan.image_ref, "db"), str(cfg.mcc_token), db_artifact)
 
-        print("Creating database and user")
-        _mysql_exec(f"CREATE DATABASE {_quote_ident(plan.db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-        _mysql_exec(
-            "CREATE USER IF NOT EXISTS "
-            + _quote_sql(plan.db_user)
-            + "@'localhost' IDENTIFIED BY "
-            + _quote_sql(plan.db_password)
-        )
-        _mysql_exec(f"GRANT ALL PRIVILEGES ON {_quote_ident(plan.db_name)}.* TO {_quote_sql(plan.db_user)}@'localhost'")
-        _mysql_exec("FLUSH PRIVILEGES")
-
-        print("Extracting files")
-        plan.webroot.parent.mkdir(parents=True, exist_ok=False)
-        plan.webroot.mkdir(parents=True, exist_ok=False)
-        with tarfile.open(files_tgz, "r:gz") as tf:
-            _safe_extract(tf, plan.webroot)
-
-        local_php = plan.webroot / "config" / "local.php"
-        if not local_php.exists():
-            local_php = plan.webroot / "app" / "config" / "local.php"
-        if not local_php.exists():
-            raise RuntimeError("local.php not found after extraction")
-        print("Patching Mautic local.php")
-        _patch_local_php(local_php, plan)
-
-        print("Importing database")
-        _mysql_import_artifact(cfg, db_artifact, plan.db_name)
-
-        print("Fixing permissions")
-        _run(["chown", "-R", "www-data:www-data", str(plan.webroot.parent)], timeout_sec=300)
-        for rel in ("var/cache", "var/logs"):
-            shutil.rmtree(plan.webroot / rel, ignore_errors=True)
-
-        print("Writing nginx vhost")
-        _write_nginx_vhost(plan)
-        rc, out = _run(["nginx", "-t"], timeout_sec=30)
-        if rc != 0:
-            raise RuntimeError("nginx -t failed: " + out)
-        _run(["systemctl", "reload", "nginx"], timeout_sec=30)
-
-        if run_certbot:
-            dns_ref = str(certbot_dns_credential_ref or "").strip()
-            if dns_ref:
-                print("Running certbot via Cloudflare DNS-01")
-                _run_certbot_cloudflare_dns01(cfg, plan, dns_ref)
-            else:
-                print("Running certbot via nginx HTTP-01")
-                _run_certbot_http01(plan)
-
-        if mail_profile_id:
-            print("Applying MCC mail profile")
-            from mcd_agent.mail_config import apply_mail_profile
-
-            apply_mail_profile(
-                cfg,
-                profile_id=str(mail_profile_id),
-                domain=plan.domain,
-                root=str(plan.webroot),
+        database_created = False
+        user_created = False
+        resources_started = False
+        mail_requested = bool(mail_profile_id or own_mail)
+        try:
+            print("Creating database and user")
+            _mysql_exec(f"CREATE DATABASE {_quote_ident(plan.db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            database_created = True
+            _mysql_exec(
+                "CREATE USER "
+                + _quote_sql(plan.db_user)
+                + "@'localhost' IDENTIFIED BY "
+                + _quote_sql(plan.db_password)
             )
-        elif own_mail:
-            print("Configuring per-instance own-host mail")
-            from mcd_agent.local_mail import configure_local_mail
+            user_created = True
+            _mysql_exec(f"GRANT ALL PRIVILEGES ON {_quote_ident(plan.db_name)}.* TO {_quote_sql(plan.db_user)}@'localhost'")
+            _mysql_exec("FLUSH PRIVILEGES")
 
-            configure_local_mail(cfg, domain=plan.domain, root=str(plan.webroot))
+            print("Extracting files")
+            _prepare_instance_parent(plan.webroot)
+            resources_started = True
+            plan.webroot.mkdir(parents=True, exist_ok=False)
+            with tarfile.open(files_tgz, "r:gz") as tf:
+                _safe_extract(tf, plan.webroot)
+
+            local_php = plan.webroot / "config" / "local.php"
+            if not local_php.exists():
+                local_php = plan.webroot / "app" / "config" / "local.php"
+            if not local_php.exists():
+                raise RuntimeError("local.php not found after extraction")
+            print("Patching Mautic local.php")
+            _patch_local_php(local_php, plan)
+
+            print("Importing database")
+            _mysql_import_artifact(cfg, db_artifact, plan.db_name)
+
+            print("Fixing permissions")
+            _run(["chown", "-R", "www-data:www-data", str(plan.webroot.parent)], timeout_sec=300)
+            for rel in ("var/cache", "var/logs"):
+                shutil.rmtree(plan.webroot / rel, ignore_errors=True)
+
+            print("Writing nginx vhost")
+            _write_nginx_vhost(plan)
+            rc, out = _run(["nginx", "-t"], timeout_sec=30)
+            if rc != 0:
+                raise RuntimeError("nginx -t failed: " + out)
+            reload_rc, reload_out = _run(["systemctl", "reload", "nginx"], timeout_sec=30)
+            if reload_rc != 0:
+                raise RuntimeError("nginx reload failed: " + reload_out)
+
+            if run_certbot:
+                dns_ref = str(certbot_dns_credential_ref or "").strip()
+                if dns_ref:
+                    print("Running certbot via Cloudflare DNS-01")
+                    _run_certbot_cloudflare_dns01(cfg, plan, dns_ref)
+                else:
+                    print("Running certbot via nginx HTTP-01")
+                    _run_certbot_http01(plan)
+
+            if mail_profile_id:
+                print("Applying MCC mail profile")
+                from mcd_agent.mail_config import apply_mail_profile
+
+                apply_mail_profile(
+                    cfg,
+                    profile_id=str(mail_profile_id),
+                    domain=plan.domain,
+                    root=str(plan.webroot),
+                )
+            elif own_mail:
+                print("Configuring per-instance own-host mail")
+                from mcd_agent.local_mail import configure_local_mail
+
+                configure_local_mail(cfg, domain=plan.domain, root=str(plan.webroot))
+        except Exception as exc:
+            rollback_errors = _rollback_failed_install(
+                cfg,
+                plan,
+                database_created=database_created,
+                user_created=user_created,
+                resources_started=resources_started,
+                mail_requested=mail_requested,
+            )
+            if rollback_errors:
+                raise RuntimeError(f"{exc}; rollback errors: {'; '.join(rollback_errors)}") from exc
+            raise
 
     from mcd_agent.inventory import InstanceInventory
 
