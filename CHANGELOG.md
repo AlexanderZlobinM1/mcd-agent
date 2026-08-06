@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.10.2 - 2026-08-06
+- Fixed: profile activation test mail reads both supported Mautic `local.php`
+  layouts: arrays returned by newer releases and the `$parameters = array(...)`
+  assignment used by older installations. The test no longer rolls back a
+  valid own-host configuration because it misread an existing Mautic config.
+- Regression: covers both local configuration layouts while retaining the
+  mandatory real-message test before profile activation.
+
 ## 0.10.1 - 2026-08-06
 - Fixed: own-host activation on an existing Sendmail host now uses an isolated
   loopback listener, generated configuration and dedicated queue. MCD no longer

@@ -50,6 +50,33 @@ _OPENDKIM_BEGIN = "# MCD LOCAL MAIL BEGIN"
 _OPENDKIM_END = "# MCD LOCAL MAIL END"
 _SENDMAIL_ISOLATED_PORT = 2525
 _SENDMAIL_SERVICE_NAME = "mcd-local-mail-sendmail"
+_MAIL_TEST_SCRIPT = r"""<?php
+require $argv[2];
+$included = include $argv[1];
+if (is_array($included)) {
+    $params = $included;
+} elseif (isset($parameters) && is_array($parameters)) {
+    $params = $parameters;
+} else {
+    $params = [];
+}
+if (isset($params['parameters']) && is_array($params['parameters'])) { $params = $params['parameters']; }
+$dsn = (string)($params['mailer_dsn'] ?? '');
+$from = (string)($params['mailer_from_email'] ?? '');
+$fromName = (string)($params['mailer_from_name'] ?? 'Sales Snap');
+$returnPath = (string)($params['mailer_return_path'] ?? $from);
+if ($dsn === '' || $from === '') { fwrite(STDERR, "mailer_dsn or mailer_from_email is missing\n"); exit(2); }
+$transport = Symfony\Component\Mailer\Transport::fromDsn($dsn);
+$mailer = new Symfony\Component\Mailer\Mailer($transport);
+$email = (new Symfony\Component\Mime\Email())
+    ->from(new Symfony\Component\Mime\Address($from, $fromName))
+    ->to($argv[3])
+    ->returnPath($returnPath)
+    ->subject('Sales Snap mail configuration test')
+    ->text('Mail configuration "'.$argv[4].'" was applied and tested successfully by MCC/MCD.');
+$mailer->send($email);
+echo "test message accepted\n";
+"""
 
 
 def _run(args: list[str], *, timeout_sec: int = 300, input_bytes: bytes | None = None) -> tuple[int, str]:
@@ -511,29 +538,9 @@ def _send_test_message(cfg: AgentConfig, *, root: str, recipient: str, profile_n
     autoload = next((path for path in autoload_candidates if path.exists()), None)
     if autoload is None:
         raise RuntimeError("Mautic vendor/autoload.php not found for mail test")
-    script = r"""<?php
-require $argv[2];
-$params = include $argv[1];
-if (isset($params['parameters']) && is_array($params['parameters'])) { $params = $params['parameters']; }
-$dsn = (string)($params['mailer_dsn'] ?? '');
-$from = (string)($params['mailer_from_email'] ?? '');
-$fromName = (string)($params['mailer_from_name'] ?? 'Sales Snap');
-$returnPath = (string)($params['mailer_return_path'] ?? $from);
-if ($dsn === '' || $from === '') { fwrite(STDERR, "mailer_dsn or mailer_from_email is missing\n"); exit(2); }
-$transport = Symfony\Component\Mailer\Transport::fromDsn($dsn);
-$mailer = new Symfony\Component\Mailer\Mailer($transport);
-$email = (new Symfony\Component\Mime\Email())
-    ->from(new Symfony\Component\Mime\Address($from, $fromName))
-    ->to($argv[3])
-    ->returnPath($returnPath)
-    ->subject('Sales Snap mail configuration test')
-    ->text('Mail configuration "'.$argv[4].'" was applied and tested successfully by MCC/MCD.');
-$mailer->send($email);
-echo "test message accepted\n";
-"""
     with tempfile.NamedTemporaryFile(prefix="mcd-mail-test-", suffix=".php", delete=False) as handle:
         script_path = Path(handle.name)
-        handle.write(script.encode("utf-8"))
+        handle.write(_MAIL_TEST_SCRIPT.encode("utf-8"))
     try:
         os.chmod(script_path, 0o644)
         rc, out = _run(

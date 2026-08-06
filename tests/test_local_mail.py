@@ -12,6 +12,12 @@ from mcd_agent import local_mail
 
 
 class LocalMailTests(unittest.TestCase):
+    def test_mail_test_supports_returned_and_assignment_style_local_php(self) -> None:
+        script = local_mail._MAIL_TEST_SCRIPT
+        self.assertIn("$included = include $argv[1]", script)
+        self.assertIn("is_array($included)", script)
+        self.assertIn("isset($parameters) && is_array($parameters)", script)
+
     def test_clean_host_installs_postfix_and_opendkim(self) -> None:
         installed = {
             "sendmail-bin": False,
