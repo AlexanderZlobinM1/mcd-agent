@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from mcd_agent.cli import _state_db_missing_only
+from mcd_agent.cli import _state_backend_config_and_status, _state_db_missing_only
 from mcd_agent.state_backend import mysql_state_enabled, state_backend_status
 
 
@@ -24,6 +24,26 @@ def _cfg(**overrides: object) -> SimpleNamespace:
 
 
 class StateBackendMysqlCredentialTests(unittest.TestCase):
+    def test_status_returns_effective_runtime_config_for_bootstrap(self) -> None:
+        cfg = _cfg(state_backend="sqlite")
+        cfg_eff = _cfg(state_mysql_user="mcd_state", state_mysql_password="secret")
+        status = {
+            "mode": "legacy",
+            "active_backend": "sqlite",
+            "reason": "mysql_schema_unavailable",
+        }
+
+        with (
+            patch("mcd_agent.cli.fetch_runtime_overrides", return_value={"status": "ok", "runtime_overrides": {"state_backend": "mysql_hybrid"}}),
+            patch("mcd_agent.cli.apply_remote_overrides", return_value={"config": cfg_eff}),
+            patch("mcd_agent.cli.state_backend_status", return_value=status) as backend_status,
+        ):
+            actual_cfg, actual_status = _state_backend_config_and_status(cfg)
+
+        self.assertIs(actual_cfg, cfg_eff)
+        self.assertEqual(actual_status, status)
+        backend_status.assert_called_once_with(cfg_eff, probe=True)
+
     def test_root_without_password_falls_back_to_sqlite(self) -> None:
         cfg = _cfg()
 

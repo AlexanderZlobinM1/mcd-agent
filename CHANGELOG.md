@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.10.16 - 2026-08-07
+
+- Fixed State DB bootstrap to use the same effective configuration, including
+  MCC runtime overrides, for status checks, database validation, connection
+  defaults, and schema creation. This prevents valid `mysql_hybrid` bootstrap
+  from being rejected when state settings are supplied by MCC rather than the
+  local TOML file.
+
 ## 0.10.15 - 2026-08-07
 - Fixed: explicit `state-db init` now accepts an existing state database whose
   MCD tables or schema-version record have not been initialized. This repairs

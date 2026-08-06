@@ -276,7 +276,7 @@ def _apt_service_postcheck() -> tuple[bool, list[str]]:
     return ok, lines
 
 
-def _state_backend_status_payload(cfg) -> dict[str, object]:
+def _state_backend_config_and_status(cfg) -> tuple[object, dict[str, object]]:
     cfg_eff = cfg
     # Status must reflect effective runtime (local config + MCC runtime overrides),
     # otherwise CLI can show legacy while daemon already runs in mysql_hybrid.
@@ -292,21 +292,26 @@ def _state_backend_status_payload(cfg) -> dict[str, object]:
     try:
         raw = state_backend_status(cfg_eff, probe=True)
         if isinstance(raw, dict):
-            return raw
+            return cfg_eff, raw
     except Exception as e:
-        return {
+        return cfg_eff, {
             "desired_backend": "unknown",
             "active_backend": "sqlite",
             "mode": "legacy",
             "reason": "status_error",
             "error": str(e),
         }
-    return {
+    return cfg_eff, {
         "desired_backend": "unknown",
         "active_backend": "sqlite",
         "mode": "legacy",
         "reason": "status_unavailable",
     }
+
+
+def _state_backend_status_payload(cfg) -> dict[str, object]:
+    _cfg_eff, status = _state_backend_config_and_status(cfg)
+    return status
 
 
 def _print_state_backend_status(cfg) -> dict[str, object]:
@@ -1401,8 +1406,8 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
             continue
         if choice == "6":
             while True:
-                st_backend = _state_backend_status_payload(cfg)
-                show_create_state_db = _state_db_missing_only(cfg, st_backend)
+                cfg_eff, st_backend = _state_backend_config_and_status(cfg)
+                show_create_state_db = _state_db_missing_only(cfg_eff, st_backend)
                 ipv6_disabled = _ipv6_disabled_now()
                 ipv6_toggle_to_disabled = not bool(ipv6_disabled)
                 ipv6_toggle_label = "Disable IPv6" if ipv6_toggle_to_disabled else "Enable IPv6"
@@ -1428,8 +1433,8 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                     _print_state_backend_status(cfg)
                     continue
                 if c3 == "3" and show_create_state_db:
-                    host_default = str(cfg.state_mysql_host or "localhost")
-                    port_default = int(cfg.state_mysql_port or 3306)
+                    host_default = str(cfg_eff.state_mysql_host or "localhost")
+                    port_default = int(cfg_eff.state_mysql_port or 3306)
                     admin_host = (_ask(f"DB admin host [{host_default}]: ").strip() or host_default)
                     admin_port_raw = _ask(f"DB admin port [{port_default}]: ").strip()
                     try:
@@ -1438,13 +1443,13 @@ def _run_interactive_hub(cfg, root: str | None, no_color: bool) -> int:
                         print("Invalid port")
                         continue
                     admin_user = (_ask("DB admin user [root]: ").strip() or "root")
-                    sock_default = str(cfg.state_mysql_unix_socket or "").strip()
+                    sock_default = str(cfg_eff.state_mysql_unix_socket or "").strip()
                     sock_prompt = f"DB admin unix socket [{sock_default or 'auto'}]: "
                     admin_sock = _ask(sock_prompt).strip() or sock_default or None
                     while True:
                         admin_pwd = getpass.getpass("DB admin password (empty allowed): ")
                         ok, msg, cfg_after = _bootstrap_state_db_with_admin(
-                            cfg,
+                            cfg_eff,
                             admin_user=admin_user,
                             admin_password=admin_pwd if admin_pwd != "" else None,
                             admin_host=admin_host,
@@ -3304,7 +3309,7 @@ def main() -> int:
         note = maybe_notify_update(cfg)
         if note:
             print(f"NOTICE: {note}")
-        st = _state_backend_status_payload(cfg)
+        cfg_eff, st = _state_backend_config_and_status(cfg)
         if args.op == "status":
             if args.json:
                 print(json.dumps(st, ensure_ascii=True, indent=2))
@@ -3323,7 +3328,7 @@ def main() -> int:
             return 0
 
         # op == init
-        if not _state_db_missing_only(cfg, st):
+        if not _state_db_missing_only(cfg_eff, st):
             out = {
                 "ok": False,
                 "reason": "state_db_init_allowed_only_in_legacy_missing_or_inaccessible_state",
@@ -3336,23 +3341,23 @@ def main() -> int:
                 print(json.dumps(st, ensure_ascii=True))
             return 1
 
-        host_default = str(args.admin_host or cfg.state_mysql_host or "localhost")
-        port_default = int(args.admin_port or cfg.state_mysql_port or 3306)
+        host_default = str(args.admin_host or cfg_eff.state_mysql_host or "localhost")
+        port_default = int(args.admin_port or cfg_eff.state_mysql_port or 3306)
         user_default = str(args.admin_user or "root")
-        sock_default = str(args.admin_unix_socket or cfg.state_mysql_unix_socket or "").strip()
+        sock_default = str(args.admin_unix_socket or cfg_eff.state_mysql_unix_socket or "").strip()
         if bool(args.admin_password_stdin):
             admin_pwd = sys.stdin.read().rstrip("\n")
         else:
             admin_pwd = getpass.getpass("DB admin password (empty allowed): ")
         ok, msg, cfg_after = _bootstrap_state_db_with_admin(
-            cfg,
+            cfg_eff,
             admin_user=user_default,
             admin_password=admin_pwd if admin_pwd != "" else None,
             admin_host=host_default,
             admin_port=port_default,
             admin_socket=sock_default or None,
         )
-        after = _state_backend_status_payload(cfg_after if ok else cfg)
+        after = _state_backend_status_payload(cfg_after if ok else cfg_eff)
         out = {"ok": bool(ok), "message": msg, "status": after}
         if args.json:
             print(json.dumps(out, ensure_ascii=True, indent=2))
