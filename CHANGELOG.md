@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 0.10.12 - 2026-08-06
+- Fixed: own-host mail runtime uses `datetime.timezone.utc` instead of the
+  Python 3.11-only `datetime.UTC` alias. MCD packages now pass pre-switch import
+  smoke on supported Python 3.10 hosts, including Booka.
+
 ## 0.10.11 - 2026-08-06
 - Added: mail-profile apply can preserve credentials from the active Mautic
   `mailer_dsn` while changing between `mautic+ses+api`, `ses+api` and

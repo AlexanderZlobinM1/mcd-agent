@@ -12,6 +12,12 @@ from mcd_agent import local_mail
 
 
 class LocalMailTests(unittest.TestCase):
+    def test_runtime_keeps_python_310_compatible_utc_import(self) -> None:
+        source = Path(local_mail.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("from datetime import UTC", source)
+        self.assertIn("datetime.now(timezone.utc)", source)
+
     def test_mail_test_supports_returned_and_assignment_style_local_php(self) -> None:
         script = local_mail._MAIL_TEST_SCRIPT
         self.assertIn("$included = include $argv[1]", script)

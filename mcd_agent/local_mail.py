@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses
@@ -601,7 +601,7 @@ def _quota_connection() -> sqlite3.Connection:
 
 
 def _periods(now: datetime | None = None) -> tuple[str, str]:
-    current = now or datetime.now(UTC)
+    current = now or datetime.now(timezone.utc)
     return current.strftime("%Y-%m-%d"), current.strftime("%Y-%m")
 
 
@@ -626,7 +626,7 @@ def _seed_quota(domain: str, material: dict[str, Any]) -> None:
             "VALUES(?,?,?,?,?,?) ON CONFLICT(domain) DO UPDATE SET daily_period=excluded.daily_period,"
             "daily_used=excluded.daily_used,monthly_period=excluded.monthly_period,"
             "monthly_used=excluded.monthly_used,updated_at=excluded.updated_at",
-            (domain, day, source_daily, month, source_monthly, datetime.now(UTC).isoformat()),
+            (domain, day, source_daily, month, source_monthly, datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -950,7 +950,7 @@ def _reserve_quota(domain: str, count: int, daily_limit: int, monthly_limit: int
             "VALUES(?,?,?,?,?,?) ON CONFLICT(domain) DO UPDATE SET daily_period=excluded.daily_period,"
             "daily_used=excluded.daily_used,monthly_period=excluded.monthly_period,"
             "monthly_used=excluded.monthly_used,updated_at=excluded.updated_at",
-            (domain, day, daily_used, month, monthly_used, datetime.now(UTC).isoformat()),
+            (domain, day, daily_used, month, monthly_used, datetime.now(timezone.utc).isoformat()),
         )
         conn.execute("COMMIT")
         return {"daily_period": day, "daily_used": daily_used, "monthly_period": month, "monthly_used": monthly_used}
@@ -964,7 +964,7 @@ def _release_quota(domain: str, count: int) -> None:
         conn.execute(
             "UPDATE counters SET daily_used=CASE WHEN daily_period=? THEN MAX(0,daily_used-?) ELSE daily_used END,"
             "monthly_used=CASE WHEN monthly_period=? THEN MAX(0,monthly_used-?) ELSE monthly_used END,updated_at=? WHERE domain=?",
-            (day, count, month, count, datetime.now(UTC).isoformat(), domain),
+            (day, count, month, count, datetime.now(timezone.utc).isoformat(), domain),
         )
 
 
