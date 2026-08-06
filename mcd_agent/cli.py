@@ -104,7 +104,13 @@ from mcd_agent.mautic6_core_patch import (
     revert_m6_plugin_update_metadata_patch,
 )
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
-from mcd_agent.local_mail import configure_local_mail, disable_local_mail, local_mail_status, submit_local_mail
+from mcd_agent.local_mail import (
+    configure_local_mail,
+    disable_local_mail,
+    local_mail_status,
+    receive_local_mail,
+    submit_local_mail,
+)
 from mcd_agent.mail_config import apply_mail_profile, preflight_mail_profile
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
 from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
@@ -1735,6 +1741,10 @@ def _build_parser() -> argparse.ArgumentParser:
     local_mail_submit.add_argument("--config", default=default_cfg)
     local_mail_submit.add_argument("--instance-domain", required=True)
     local_mail_submit.add_argument("sendmail_args", nargs=argparse.REMAINDER)
+    local_mail_receive = local_mail_sub.add_parser("receive")
+    local_mail_receive.add_argument("--config", default=default_cfg)
+    local_mail_receive.add_argument("--instance-domain", required=True)
+    local_mail_receive.add_argument("--kind", choices=["bounce", "feedback_loop"], required=True)
 
     mail_config = sub.add_parser("mail-config", help="Apply an MCC-stored instance mail profile")
     mail_config_sub = mail_config.add_subparsers(dest="mail_config_op", required=True)
@@ -2825,6 +2835,27 @@ def main() -> int:
                 sendmail_args=list(args.sendmail_args or []),
                 cfg=cfg,
             )
+        if args.op == "receive":
+            try:
+                message = sys.stdin.buffer.read(25 * 1024 * 1024 + 1)
+                result = receive_local_mail(
+                    cfg,
+                    domain=str(args.instance_domain),
+                    kind=str(args.kind),
+                    data=message,
+                )
+                logging.info(
+                    "own-host inbound domain=%s type=%s status=%s contacts=%s dnc_added=%s",
+                    result.get("instance_domain", "-"),
+                    result.get("type", "-"),
+                    result.get("status", "-"),
+                    result.get("contacts", 0),
+                    result.get("dnc_added", 0),
+                )
+                return 0
+            except Exception as exc:
+                print(f"own-host inbound processing failed: {exc}", file=sys.stderr)
+                return 75
         try:
             if args.op == "configure":
                 if not str(args.root or "").strip():

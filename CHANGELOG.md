@@ -1,5 +1,18 @@
 # MCD Changelog
 
+## 0.10.13 - 2026-08-07
+- Fixed: mail-profile test delivery no longer supplies an empty Symfony
+  return-path address when Mautic intentionally leaves the setting blank.
+- Added: own-host mail can receive delivery-status and feedback-loop reports
+  at exact `bounce@`, `fbl@` and `abuse@` addresses. MCD validates the managed
+  domain, parses the message and writes idempotent email DNC state directly to
+  the matching Mautic database.
+- Guarded: Sendmail keeps the pre-existing system relay and submission
+  settings while MCD owns a separately marked inbound listener and exact
+  virtual-address map. Unknown recipients are rejected, changes have persistent
+  baselines, and disabling the final own-host domain restores the original
+  MTA files and removes the receive helper.
+
 ## 0.10.12 - 2026-08-06
 - Fixed: own-host mail runtime uses `datetime.timezone.utc` instead of the
   Python 3.11-only `datetime.UTC` alias. MCD packages now pass pre-switch import

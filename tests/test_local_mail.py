@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -122,6 +123,57 @@ MAILER(`smtp')dnl
         self.assertEqual(result.count(local_mail._SENDMAIL_BEGIN), 1)
         self.assertLess(result.index(local_mail._SENDMAIL_BEGIN), result.index("MAILER(`smtp')dnl"))
 
+    def test_sendmail_inbound_transform_preserves_relay_and_opens_only_mta_listener(self) -> None:
+        source = """FEATURE(`no_default_msa')dnl
+DAEMON_OPTIONS(`Family=inet, Name=MTA-v4, Port=smtp, Addr=127.0.0.1')dnl
+DAEMON_OPTIONS(`Family=inet6, Name=MTA-v6, Port=25, Addr=::1')dnl
+DAEMON_OPTIONS(`Family=inet, Name=MSP-v4, Port=submission, Addr=127.0.0.1')dnl
+define(`SMART_HOST', `mail.sales-snap.com')dnl
+MAILER(`local')dnl
+MAILER(`smtp')dnl
+"""
+
+        result = local_mail._sendmail_inbound_text(source)
+        repeated = local_mail._sendmail_inbound_text(result)
+
+        self.assertIn("define(`SMART_HOST', `mail.sales-snap.com')dnl", result)
+        self.assertIn("Name=MCD-Inbound, Port=smtp", result)
+        self.assertIn("Port=submission, Addr=127.0.0.1", result)
+        self.assertIn("FEATURE(`virtusertable'", result)
+        self.assertEqual(repeated.count(local_mail._SENDMAIL_INBOUND_BEGIN), 1)
+        active = [line for line in result.splitlines() if not line.lstrip().startswith("dnl")]
+        self.assertFalse(any("Port=smtp" in line and "Addr=127.0.0.1" in line for line in active))
+        self.assertFalse(any("Port=25" in line and "Addr=::1" in line for line in active))
+
+    def test_receive_root_helper_restricts_mta_user_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            helper = Path(td) / "mcd-mail-receive-root"
+            wrapper = Path(td) / "mcd-mail-receive"
+            sudoers = Path(td) / "sudoers"
+            with patch.object(local_mail, "RECEIVE_ROOT_HELPER", helper), patch.object(
+                local_mail, "RECEIVE_WRAPPER", wrapper
+            ), patch.object(local_mail, "RECEIVE_SUDOERS", sudoers), patch.object(
+                local_mail.pwd, "getpwnam", return_value=object()
+            ), patch.object(local_mail, "_run", return_value=(0, "")):
+                local_mail._write_receive_wrapper()
+
+            text = helper.read_text(encoding="utf-8")
+            self.assertIn('[ "$#" -eq 2 ]', text)
+            self.assertIn("--instance-domain=*", text)
+            self.assertIn("--kind=bounce|--kind=feedback_loop", text)
+            self.assertNotIn('receive "$@"', text)
+
+    def test_inbound_routes_are_exact_and_reject_other_domain_mailboxes(self) -> None:
+        aliases, virtual = local_mail._inbound_route_lines({"app.sales-snap.com": {}})
+
+        self.assertEqual(len(aliases), 2)
+        self.assertTrue(any("--kind=bounce" in line for line in aliases))
+        self.assertTrue(any("--kind=feedback_loop" in line for line in aliases))
+        self.assertTrue(any(line.startswith("bounce@app.sales-snap.com ") for line in virtual))
+        self.assertTrue(any(line.startswith("fbl@app.sales-snap.com ") for line in virtual))
+        self.assertTrue(any(line.startswith("abuse@app.sales-snap.com ") for line in virtual))
+        self.assertIn("@app.sales-snap.com error:5.1.1:550 No such own-host mailbox", virtual)
+
     def test_sendmail_configuration_does_not_modify_system_config_or_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -207,6 +259,59 @@ MAILER(`smtp')dnl
 
     def test_mail_test_unescapes_symfony_percent_literals(self) -> None:
         self.assertIn("str_replace('%%', '%', $dsn)", local_mail._MAIL_TEST_SCRIPT)
+
+    def test_mail_test_omits_return_path_when_local_php_is_blank(self) -> None:
+        self.assertIn("if ($returnPath !== '') { $email->returnPath($returnPath); }", local_mail._MAIL_TEST_SCRIPT)
+        self.assertNotIn("->to($argv[3])\n    ->returnPath($returnPath)", local_mail._MAIL_TEST_SCRIPT)
+
+    def test_inbound_bounce_is_applied_directly_to_the_matching_instance(self) -> None:
+        raw = b"""From: MAILER-DAEMON@example.net
+To: bounce@app.sales-snap.com
+Subject: Delivery failure
+Content-Type: multipart/report; report-type=delivery-status; boundary=x
+
+--x
+Content-Type: text/plain
+
+Delivery failed.
+--x
+Content-Type: message/delivery-status
+
+Final-Recipient: rfc822; customer@example.com
+Action: failed
+Status: 5.1.1
+--x--
+"""
+        db = SimpleNamespace(add_dnc_for_emails=lambda *args, **kwargs: {"contacts": 1, "added": 1, "existing": 0})
+        install = SimpleNamespace(
+            primary_domain="app.sales-snap.com",
+            domains=["app.sales-snap.com"],
+            root="/var/www/app/public_html",
+            db=object(),
+        )
+        cfg = SimpleNamespace(
+            discovery_roots=["/var/www"],
+            exclude_path_contains=[],
+            supported_mautic_majors=[6],
+            custom_instances=[],
+        )
+        with patch.object(
+            local_mail,
+            "_load_domains",
+            return_value={"schema": 1, "domains": {"app.sales-snap.com": {"root": install.root}}},
+        ), patch("mcd_agent.discovery.discover_mautic", return_value=[install]), patch(
+            "mcd_agent.db.MauticDB", return_value=db
+        ):
+            result = local_mail.receive_local_mail(
+                cfg,
+                domain="app.sales-snap.com",
+                kind="bounce",
+                data=raw,
+            )
+
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["dnc_added"], 1)
+        self.assertEqual(result["contacts"], 1)
 
     def test_quota_counts_recipients_and_rolls_back_sendmail_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:

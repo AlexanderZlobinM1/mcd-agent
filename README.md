@@ -571,6 +571,12 @@ Important:
     after a matching contact is found and email DNC is present or inserted
   - `monitored_email_parser_whitelist = ["support@example.com"]` skips exact
     internal emails and removes existing email-DNC rows for those contacts
+- MCC-managed own-host mail uses `bounce@<instance>` as its return path and
+  accepts only `bounce@`, `fbl@` and `abuse@` on the instance MX. Delivery
+  reports and ARF complaints are parsed immediately into email DNC state for
+  that instance; no IMAP mailbox credentials are required. External SMTP,
+  Amazon SES and SendGrid profiles keep their Mautic return path unchanged,
+  including an intentionally empty value.
 
 ## Benchmark notes (current host)
 - Baseline standard command (scheduler paused):  
