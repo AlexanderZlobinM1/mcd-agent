@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.10.17 - 2026-08-07
+
+- Page-hit orphan cleanup now fails closed when the managed
+  `idx_mcd_ph_lead_date` index is absent. This prevents an unindexed cleanup
+  preview from scanning very large `page_hits` tables and blocking scheduler
+  reaping, import polling, and MCC user-task dispatch.
+
 ## 0.10.16 - 2026-08-07
 
 - Fixed State DB bootstrap to use the same effective configuration, including

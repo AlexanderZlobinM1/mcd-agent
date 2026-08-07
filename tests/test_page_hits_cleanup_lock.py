@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 
 from mcd_agent.db import MauticDB
 from mcd_agent.models import DBConfig
@@ -63,6 +64,20 @@ class PageHitsCleanupLockTests(unittest.TestCase):
 
         self.assertIsNone(token)
         self.assertTrue(conn.closed)
+
+    def test_cleanup_requires_managed_page_hits_index(self) -> None:
+        db = self._db()
+        check = Mock(return_value=True)
+        db._table_has_index = check  # type: ignore[method-assign]
+
+        self.assertTrue(db.orphan_page_hits_cleanup_index_ready())
+        check.assert_called_once_with("ss_page_hits", "idx_mcd_ph_lead_date")
+
+    def test_cleanup_is_not_ready_without_managed_page_hits_index(self) -> None:
+        db = self._db()
+        db._table_has_index = Mock(return_value=False)  # type: ignore[method-assign]
+
+        self.assertFalse(db.orphan_page_hits_cleanup_index_ready())
 
 
 if __name__ == "__main__":

@@ -698,6 +698,10 @@ class MauticDB:
             return "FORCE INDEX (`idx_mcd_ph_lead_date`)"
         return ""
 
+    def orphan_page_hits_cleanup_index_ready(self) -> bool:
+        table = self._safe_table(f"{self.cfg.table_prefix}page_hits")
+        return self._table_has_index(table, "idx_mcd_ph_lead_date")
+
     def _existing_table_columns(self, table: str) -> set[str] | None:
         try:
             with self._connect() as conn:

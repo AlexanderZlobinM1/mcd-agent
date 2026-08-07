@@ -10581,6 +10581,26 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     logging.warning("[%s] housekeeping plugin schedule failed: %s", root, e)
 
             if selected_service_cleanup == "page_hits_orphan_cleanup":
+                try:
+                    page_hits_index_ready = db.orphan_page_hits_cleanup_index_ready()
+                except Exception as e:
+                    page_hits_index_ready = False
+                    logging.warning("[%s] page_hits_orphan_cleanup index check failed: %s", root, e)
+                if not page_hits_index_ready:
+                    page_hits_orphan_cleanup_active[root] = False
+                    logging.warning(
+                        "[%s] page_hits_orphan_cleanup skipped: required index idx_mcd_ph_lead_date is missing",
+                        root,
+                    )
+                    if page_hits_cleanup_window_key:
+                        page_hits_orphan_cleanup_done_window_keys[root] = page_hits_cleanup_window_key
+                        page_hits_orphan_cleanup_window_counts[root] = (
+                            page_hits_orphan_cleanup_window_counts.get(root, 0) + 1
+                        )
+                    last_page_hits_orphan_cleanup_ts[root] = now
+                    selected_service_cleanup = ""
+
+            if selected_service_cleanup == "page_hits_orphan_cleanup":
                 page_hits_cleanup_lock = db.try_acquire_orphan_page_hits_cleanup_lock()
                 if page_hits_cleanup_lock is None:
                     logging.info("[%s] page_hits_orphan_cleanup skipped: cleanup lock is already held", root)
