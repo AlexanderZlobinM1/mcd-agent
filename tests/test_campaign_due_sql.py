@@ -11,6 +11,7 @@ from mcd_agent.config import (
     _import_pending_count_sql,
 )
 from mcd_agent.daemon import (
+    _SQL_CAMPAIGNS_ALL_PUBLISHED,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_no_action_due_exists_sql,
     _campaign_trigger_root_action_due_exists_sql,
@@ -18,6 +19,13 @@ from mcd_agent.daemon import (
 
 
 class CampaignDueSqlTests(unittest.TestCase):
+    def test_campaign_audit_ring_uses_mautic_utc_publish_window(self) -> None:
+        # Regression: at 14:14 UTC / 16:14 local, a campaign with publish_up
+        # 14:20 must not enter the audit ring before native Mautic sees it.
+        self.assertIn("c.publish_up <= '{now_utc}'", _SQL_CAMPAIGNS_ALL_PUBLISHED)
+        self.assertIn("c.publish_down >= '{now_utc}'", _SQL_CAMPAIGNS_ALL_PUBLISHED)
+        self.assertNotIn("{now_local}", _SQL_CAMPAIGNS_ALL_PUBLISHED)
+
     def test_import_pending_sql_only_counts_launchable_statuses(self) -> None:
         self.assertIn("status IN (1,7)", _DEFAULT_SQL_IMPORT_PENDING_COUNT)
         self.assertIn("'queued','pending','delayed'", _DEFAULT_SQL_IMPORT_PENDING_COUNT)

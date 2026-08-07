@@ -1,5 +1,12 @@
 # MCD Changelog
 
+## 0.10.18 - 2026-08-07
+
+- Fixed campaign audit-ring publication filtering to use Mautic's UTC database
+  timestamps. On hosts with a non-UTC timezone, a newly scheduled campaign can
+  no longer be rebuilt before `publish_up`, treated as already known, and then
+  delayed behind the existing ring when its real publication time arrives.
+
 ## 0.10.17 - 2026-08-07
 
 - Page-hit orphan cleanup now fails closed when the managed

@@ -224,8 +224,8 @@ _SQL_CAMPAIGNS_ALL_PUBLISHED = (
     "SELECT c.id "
     "FROM {prefix}campaigns c "
     "WHERE c.is_published = 1 "
-    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_local}') "
-    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_local}') "
+    "AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+    "AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
     "ORDER BY c.id"
 )
 
