@@ -796,6 +796,27 @@ def _published_segment_whitelist_ids(
     return db.fetch_ids(query, limit=len(ids), context=sql_ctx)
 
 
+def _published_campaign_whitelist_ids(
+    db: MauticDB,
+    whitelist: set[int],
+    sql_ctx: dict[str, str],
+) -> list[int]:
+    ids = sorted({int(x) for x in whitelist if int(x) > 0})
+    if not ids:
+        return []
+    id_sql = ",".join(str(x) for x in ids)
+    query = (
+        "SELECT c.id "
+        "FROM {prefix}campaigns c "
+        f"WHERE c.id IN ({id_sql}) "
+        "AND c.is_published = 1 "
+        "AND (c.publish_up IS NULL OR c.publish_up <= '{now_utc}') "
+        "AND (c.publish_down IS NULL OR c.publish_down >= '{now_utc}') "
+        "ORDER BY c.id ASC"
+    )
+    return db.fetch_ids(query, limit=len(ids), context=sql_ctx)
+
+
 def _ids_from_segment_whitelist_setting(raw: object) -> set[int]:
     if isinstance(raw, dict):
         if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
@@ -7025,6 +7046,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     priority_executor = _PriorityTaskExecutor()
     priority_trigger_last_checked: dict[str, float] = {}
     priority_trigger_checked_rebuild: dict[str, float] = {}
+    priority_campaign_whitelist_active: dict[str, set[int]] = {}
+    priority_campaign_whitelist_checked_at: dict[str, float] = {}
+    priority_campaign_whitelist_signature: dict[str, tuple[int, ...]] = {}
+    priority_campaign_whitelist_error_at: dict[str, float] = {}
     last_campaign_native_fallback_ts: dict[str, float] = {}
 
     def _priority_trigger_completed(root: str, campaign_id: int, db_cfg: object) -> None:
@@ -7236,7 +7261,43 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         },
                     )
                 segment_ids = _segment_whitelist_effective_setting(cfg, inst)
-                campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
+                configured_campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
+                configured_campaign_signature = tuple(sorted(configured_campaign_ids))
+                campaign_whitelist_now = time.time()
+                campaign_whitelist_refresh_sec = max(
+                    1,
+                    int(getattr(cfg, "campaign_trigger_audit_interval_sec", 60) or 60),
+                )
+                campaign_whitelist_refresh_due = (
+                    priority_campaign_whitelist_signature.get(root) != configured_campaign_signature
+                    or campaign_whitelist_now
+                    - float(priority_campaign_whitelist_checked_at.get(root, 0.0) or 0.0)
+                    >= campaign_whitelist_refresh_sec
+                )
+                if campaign_whitelist_refresh_due:
+                    try:
+                        campaign_ids = set(
+                            _published_campaign_whitelist_ids(
+                                MauticDB(inst.db),
+                                configured_campaign_ids,
+                                campaign_sql_time_context(
+                                    datetime.now(timezone.utc),
+                                    getattr(inst, "mautic_timezone", None),
+                                ),
+                            )
+                        )
+                        priority_campaign_whitelist_active[root] = campaign_ids
+                    except Exception as exc:
+                        campaign_ids = set()
+                        priority_campaign_whitelist_active[root] = set()
+                        last_error_at = float(priority_campaign_whitelist_error_at.get(root, 0.0) or 0.0)
+                        if campaign_whitelist_now - last_error_at >= 300.0:
+                            priority_campaign_whitelist_error_at[root] = campaign_whitelist_now
+                            logging.warning("[%s] campaign whitelist publish check failed: %s", root, exc)
+                    priority_campaign_whitelist_signature[root] = configured_campaign_signature
+                    priority_campaign_whitelist_checked_at[root] = campaign_whitelist_now
+                else:
+                    campaign_ids = set(priority_campaign_whitelist_active.get(root, set()))
                 for segment_id in sorted(segment_ids):
                     priority_executor.launch(
                         cfg,

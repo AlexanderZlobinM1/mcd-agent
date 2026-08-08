@@ -42,6 +42,7 @@ from mcd_agent.daemon import (
     _merge_campaign_trigger_audit_ids,
     _monitor_running,
     _plan_sql_segment_ring,
+    _published_campaign_whitelist_ids,
     _published_segment_whitelist_ids,
     _priority_campaign_due_check_needed,
     _priority_interleaved_dispatch_installs,
@@ -1717,6 +1718,32 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn("ll.is_published = 1", db.query)
         self.assertIn("ll.id IN (187,191)", db.query)
         self.assertEqual(db.context, {"root": "/var/www/site"})
+
+    def test_published_campaign_whitelist_ids_requires_native_publish_window(self) -> None:
+        class FakeDB:
+            def __init__(self) -> None:
+                self.query = ""
+                self.limit = 0
+                self.context = {}
+
+            def fetch_ids(self, query_template, limit, context=None):
+                self.query = query_template
+                self.limit = limit
+                self.context = context or {}
+                return [588]
+
+        db = FakeDB()
+        context = {"now_utc": "2026-08-08 07:15:00"}
+
+        ids = _published_campaign_whitelist_ids(db, {588, 558, -3, 0}, context)
+
+        self.assertEqual(ids, [588])
+        self.assertEqual(db.limit, 2)
+        self.assertIn("c.id IN (558,588)", db.query)
+        self.assertIn("c.is_published = 1", db.query)
+        self.assertIn("c.publish_up IS NULL OR c.publish_up <= '{now_utc}'", db.query)
+        self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_utc}'", db.query)
+        self.assertEqual(db.context, context)
 
 
 if __name__ == "__main__":

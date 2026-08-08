@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.19 - 2026-08-08
+
+- Fixed priority campaign-whitelist dispatch to follow native Mautic's active
+  publication window. Unpublished, not-yet-published, and expired campaign IDs
+  are removed from the priority rebuild/trigger lane within one audit interval
+  instead of being rebuilt indefinitely merely because they remain configured
+  in the whitelist.
+- Guarded the whitelist publication check to fail closed and rate-limit its
+  error log, preventing both unsafe launches and repetitive log noise when the
+  instance database cannot be checked.
+
 ## 0.10.18 - 2026-08-07
 
 - Fixed campaign audit-ring publication filtering to use Mautic's UTC database
