@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.10.20 - 2026-08-08
+
+- Fixed scheduled campaign event-log due checks to follow native timestamp
+  storage by Mautic generation: Mautic 4 keeps the validated instance-local
+  compatibility baseline, while Mautic 5, 6, and 7 compare Doctrine campaign
+  event-log timestamps in UTC.
+- Prevented modern Mautic exact triggers from running early and entering their
+  repeat cooldown before the event is actually due. This closes the observed
+  Hotelsunce campaign 35 gap where native fallback processed event 110/111
+  before MCD's next exact trigger pass.
+
 ## 0.10.19 - 2026-08-08
 
 - Fixed priority campaign-whitelist dispatch to follow native Mautic's active

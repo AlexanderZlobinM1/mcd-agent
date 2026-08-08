@@ -7283,6 +7283,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 campaign_sql_time_context(
                                     datetime.now(timezone.utc),
                                     getattr(inst, "mautic_timezone", None),
+                                    getattr(inst, "mautic_major", None),
                                 ),
                             )
                         )
@@ -7370,7 +7371,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             config=cfg,
                             root=root,
                             campaign_id=campaign_id,
-                            sql_ctx=campaign_sql_time_context(now_utc_priority, inst.mautic_timezone),
+                            sql_ctx=campaign_sql_time_context(
+                                now_utc_priority,
+                                inst.mautic_timezone,
+                                inst.mautic_major,
+                            ),
                         )
                     except Exception as exc:
                         logging.warning("[%s] priority campaign due check failed entity=%s: %s", root, campaign_id, exc)
@@ -8121,7 +8126,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
                 campaign_whitelist_for_inst = _campaign_whitelist_effective_setting(config, inst)
                 db = MauticDB(inst.db)
-                sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
+                sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone, inst.mautic_major)
                 sql_ring_enabled_for_root = bool(
                     config.segment_sql_ring_enabled and config.segment_mode != "classic_loop"
                 )
@@ -9195,7 +9200,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             campaign_whitelist_for_inst = _campaign_whitelist_effective_setting(config, inst)
             db = MauticDB(inst.db)
             now_utc = datetime.now(timezone.utc)
-            sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone)
+            sql_ctx = campaign_sql_time_context(now_utc, inst.mautic_timezone, inst.mautic_major)
             inst_now = mautic_local_datetime(now_utc, inst.mautic_timezone)
             seg_sql_long_ring = segment_sql_long_rings.setdefault(root, deque())
             seg_sql_long_rules = segment_sql_long_rules_by_root.setdefault(root, {})
