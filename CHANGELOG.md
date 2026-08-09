@@ -1,5 +1,30 @@
 # MCD Changelog
 
+## 0.10.22 - 2026-08-09
+
+- Capped the exclusive native campaign fallback at 30 minutes and restarted
+  its interval from completion, failure, or timeout. A looping native trigger
+  can no longer hold the campaign root lock for hours or relaunch immediately
+  after it is terminated.
+- Added one bounded retry for automatic exact campaign triggers when the host's
+  general task retry setting is `1`. Other automatic and manual task retry
+  behavior is unchanged.
+- Added regressions for the Alex Personal fallback lock incident that delayed
+  segment-backed rebuild and trigger work for campaigns 165 through 168.
+
+## 0.10.21 - 2026-08-09
+
+- Fixed campaign trigger priority so IDs returned by the narrow due query are
+  promoted ahead of recurring all-published audit entries. A large stale audit
+  ring can no longer reinsert completed campaigns at the front on every plan
+  refresh and starve a newly due campaign.
+- Extended the campaign trigger progress watchdog with campaign-scoped
+  `email_stats` progress. Long native sends are no longer killed while email
+  rows are advancing but Mautic has not yet committed matching event-log
+  updates.
+- Added production-shape regressions for Abelapharm campaigns 1065/1066 and
+  Hotelsunce campaign 57.
+
 ## 0.10.20 - 2026-08-08
 
 - Fixed scheduled campaign event-log due checks to follow native timestamp

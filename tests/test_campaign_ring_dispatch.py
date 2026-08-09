@@ -17,6 +17,7 @@ from mcd_agent.daemon import (
     SQLSegmentRule,
     TaskStore,
     _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT,
+    _CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC,
     _CAMPAIGN_REBUILD_FINISHED_AT,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _PriorityTaskExecutor,
@@ -26,8 +27,10 @@ from mcd_agent.daemon import (
     _campaign_dispatch_end,
     _campaign_fallback_end,
     _campaign_fallback_try_begin,
+    _campaign_native_fallback_last_run_after_completion,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
+    _campaign_trigger_email_progress_sql,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
     _campaign_trigger_progress_watchdog,
@@ -36,11 +39,13 @@ from mcd_agent.daemon import (
     _classify_import_monitor_row,
     _effective_segment_slot_limit,
     _fill_from_ring,
+    _force_due_campaigns_to_priority,
     _import_pending_poll_due,
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
     _monitor_running,
+    _move_ring_entities_to_front,
     _plan_sql_segment_ring,
     _published_campaign_whitelist_ids,
     _published_segment_whitelist_ids,
@@ -218,6 +223,33 @@ class CampaignRingDispatchTests(unittest.TestCase):
             )
         )
         _campaign_dispatch_end(root, "campaign_trigger")
+
+    def test_native_fallback_is_bounded_and_restarts_interval_after_completion(self) -> None:
+        self.assertEqual(_CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC, 30 * 60)
+        self.assertEqual(
+            _campaign_native_fallback_last_run_after_completion(
+                previous_run_ts=100.0,
+                completed_at=500.0,
+                rc=0,
+            ),
+            500.0,
+        )
+        self.assertEqual(
+            _campaign_native_fallback_last_run_after_completion(
+                previous_run_ts=100.0,
+                completed_at=500.0,
+                rc=None,
+            ),
+            500.0,
+        )
+        self.assertEqual(
+            _campaign_native_fallback_last_run_after_completion(
+                previous_run_ts=100.0,
+                completed_at=500.0,
+                rc=_TASK_LOCK_BUSY_RC,
+            ),
+            100.0,
+        )
 
     def test_priority_executor_has_separate_bounded_lane(self) -> None:
         executor = _PriorityTaskExecutor()
@@ -430,6 +462,44 @@ class CampaignRingDispatchTests(unittest.TestCase):
         store.finish.assert_called_once_with(7, state="done", rc=_TASK_LOCK_BUSY_RC, note="task_lock_busy")
         respawn.assert_not_called()
         self.assertNotIn(key, running)
+
+    def test_campaign_trigger_retry_uses_targeted_backoff_when_task_retry_max_is_one(self) -> None:
+        root = "/var/www/site"
+        key = _task_key(root, "campaign_trigger", 29)
+        task = RunningTask(
+            row_id=7,
+            root=root,
+            task_key=key,
+            task_type="campaign_trigger",
+            entity_id=29,
+            command_str="php|bin/console|mautic:campaigns:trigger|-i|29",
+            timeout_sec=0,
+            attempts=1,
+            started_at=time.time(),
+            pid=1234,
+        )
+        proc = Mock()
+        proc.poll.return_value = 1
+        store = Mock()
+        running = {key: task}
+        popens = {key: proc}
+
+        with patch.object(daemon_mod, "_respawn_task") as respawn:
+            _monitor_running(
+                config=SimpleNamespace(task_retry_max=1, task_retry_delay_sec=0),
+                store=store,
+                running=running,
+                popens=popens,
+            )
+
+        store.finish.assert_called_once_with(7, state="failed", rc=1, note="non_zero_exit")
+        respawn.assert_called_once()
+        self.assertIs(respawn.call_args.kwargs["store"], store)
+        self.assertIs(respawn.call_args.kwargs["running"], running)
+        self.assertIs(respawn.call_args.kwargs["popens"], popens)
+        self.assertIs(respawn.call_args.kwargs["task"], task)
+        self.assertEqual(respawn.call_args.kwargs["config"].task_retry_max, 1)
+        self.assertEqual(respawn.call_args.kwargs["config"].task_retry_delay_sec, 0)
 
     def test_campaign_whitelist_is_scoped_to_matching_instance(self) -> None:
         cfg = SimpleNamespace(
@@ -693,6 +763,78 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertGreater(until, 500.0)
         self.assertIn("Connection timed out", reason)
 
+    def test_campaign_trigger_progress_watchdog_keeps_active_email_send_running(self) -> None:
+        root = "/var/www/hotelsunce/public_html"
+        key = _task_key(root, "campaign_trigger", 57)
+        task = RunningTask(
+            row_id=44,
+            root=root,
+            task_key=key,
+            task_type="campaign_trigger",
+            entity_id=57,
+            command_str="php bin/console mautic:campaigns:trigger -i 57",
+            timeout_sec=0,
+            attempts=1,
+            started_at=100.0,
+            pid=999997,
+        )
+        previous = CampaignTriggerProgressSnapshot(
+            due_event_logs=1,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=1,
+            triggered_event_logs=3975,
+            max_triggered_at="2026-08-08 08:00:00",
+            sent_email_stats=3432,
+            max_email_sent_at="2026-08-08 08:30:00",
+        )
+        current = CampaignTriggerProgressSnapshot(
+            due_event_logs=1,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=1,
+            triggered_event_logs=3975,
+            max_triggered_at="2026-08-08 08:00:00",
+            sent_email_stats=5098,
+            max_email_sent_at="2026-08-08 08:31:00",
+        )
+        state = {
+            key: {
+                "last_check": 0.0,
+                "progress_key": previous.progress_key(),
+                "stable_checks": 1,
+            }
+        }
+        cfg = SimpleNamespace(
+            campaign_trigger_progress_watchdog_enabled=True,
+            campaign_trigger_progress_watchdog_grace_sec=1,
+            campaign_trigger_progress_watchdog_interval_sec=10,
+            campaign_trigger_progress_watchdog_stable_checks=2,
+            segment_kill_grace_sec=1,
+        )
+
+        with (
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=current),
+            patch.object(daemon_mod, "_kill_pid") as kill_pid,
+        ):
+            stopped = _campaign_trigger_progress_watchdog(
+                config=cfg,
+                store=Mock(),
+                running={key: task},
+                popens={},
+                task=task,
+                key=key,
+                db_configs_by_root={root: object()},
+                mautic_timezones_by_root={root: "Europe/Belgrade"},
+                state_by_key=state,
+                now_ts=500.0,
+            )
+
+        self.assertFalse(stopped)
+        kill_pid.assert_not_called()
+        self.assertEqual(state[key]["stable_checks"], 0)
+        self.assertEqual(state[key]["progress_key"], current.progress_key())
+
     def test_campaign_trigger_guard_skips_active_stuck_cooldown(self) -> None:
         root = "/var/www/site"
         _CAMPAIGN_TRIGGER_STUCK_UNTIL[(root, 136)] = (600.0, "smtp timeout")
@@ -748,6 +890,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
     def test_campaign_trigger_guard_counts_prescheduled_rows_as_due(self) -> None:
         due_sql = _campaign_trigger_event_log_due_exists_sql(21)
         progress_sql = _campaign_trigger_event_log_progress_sql(21)
+        email_progress_sql = _campaign_trigger_email_progress_sql(21)
 
         self.assertIn("el.is_scheduled = 1", due_sql)
         self.assertNotIn("el.date_triggered IS NULL", due_sql)
@@ -758,6 +901,10 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn("el.is_scheduled = 1", progress_sql)
         self.assertIn("SUM(CASE WHEN el.is_scheduled = 1 THEN 1 ELSE 0 END)", progress_sql)
         self.assertIn("pending_event_logs", progress_sql)
+        self.assertIn("es.source = 'campaign.event'", email_progress_sql)
+        self.assertIn("ce.id = es.source_id", email_progress_sql)
+        self.assertIn("ce.campaign_id = 21", email_progress_sql)
+        self.assertIn("MAX(es.date_sent)", email_progress_sql)
 
     def test_non_campaign_rings_keep_round_robin_rotation(self) -> None:
         ring = deque([3, 4, 5])
@@ -791,6 +938,31 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn(656, first_plan)
         self.assertIn(656, next_plan)
         self.assertEqual(first_plan.index(656), next_plan.index(656))
+
+    def test_due_campaign_stays_ahead_of_readded_stale_audit_ids(self) -> None:
+        due_id = 1065
+        stale_ids = list(range(900, 1020))
+        priority, regular = _force_due_campaigns_to_priority(
+            stale_ids,
+            [due_id],
+            [due_id],
+        )
+        self.assertEqual(priority[0], due_id)
+        self.assertNotIn(due_id, regular)
+
+        old_priority = deque([due_id])
+        refreshed_priority, _ = daemon_mod._reconcile_campaign_rings(
+            old_priority,
+            deque(),
+            priority,
+            regular,
+        )
+        self.assertNotEqual(refreshed_priority[0], due_id)
+
+        _move_ring_entities_to_front(refreshed_priority, [due_id])
+
+        self.assertEqual(refreshed_priority[0], due_id)
+        self.assertEqual(len(refreshed_priority), len(stale_ids) + 1)
 
     def test_campaign_trigger_waits_for_rebuild_after_plan(self) -> None:
         _CAMPAIGN_REBUILD_FINISHED_AT.clear()

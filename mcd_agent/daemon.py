@@ -128,6 +128,7 @@ _SEGMENT_STUCK_SPILLOVER_SEC = 2 * 3600
 _SEGMENT_FAILURE_COOLDOWN_SEC = 3600
 _SEGMENT_FAILURE_COOLDOWN_THRESHOLD = 3
 _SEGMENT_AUTOMATIC_RETRY_CAP = 3
+_CAMPAIGN_TRIGGER_AUTOMATIC_RETRY_CAP = 2
 _DB_DISPATCH_PAUSE_SEC = 120
 _DB_WATCHDOG_LONG_QUERIES_PAUSE_THRESHOLD = 50
 _DB_WATCHDOG_METADATA_LOCKS_PAUSE_THRESHOLD = 10
@@ -136,7 +137,7 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
-_CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC = 6 * 3600
+_CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC = 30 * 60
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 # Avoid spending an entire scheduler pass probing stale audit candidates.
@@ -194,6 +195,8 @@ class CampaignTriggerProgressSnapshot:
     pending_event_logs: int
     triggered_event_logs: int
     max_triggered_at: str
+    sent_email_stats: int = 0
+    max_email_sent_at: str = ""
 
     @property
     def due_total(self) -> int:
@@ -203,7 +206,7 @@ class CampaignTriggerProgressSnapshot:
             + max(0, int(self.due_no_action_branches or 0))
         )
 
-    def progress_key(self) -> tuple[int, int, int, int, int, str]:
+    def progress_key(self) -> tuple[int, int, int, int, int, str, int, str]:
         return (
             self.due_total,
             max(0, int(self.due_event_logs or 0)),
@@ -211,6 +214,8 @@ class CampaignTriggerProgressSnapshot:
             max(0, int(self.pending_event_logs or 0)),
             max(0, int(self.triggered_event_logs or 0)),
             str(self.max_triggered_at or ""),
+            max(0, int(self.sent_email_stats or 0)),
+            str(self.max_email_sent_at or ""),
         )
 
 
@@ -2611,6 +2616,35 @@ def _reconcile_campaign_rings(
     )
 
 
+def _force_due_campaigns_to_priority(
+    priority_ids: list[int],
+    regular_ids: list[int],
+    due_ids: list[int],
+) -> tuple[list[int], list[int]]:
+    planned = set(priority_ids) | set(regular_ids)
+    due = [cid for cid in dict.fromkeys(due_ids) if cid in planned]
+    if not due:
+        return priority_ids, regular_ids
+    due_set = set(due)
+    return (
+        due + [cid for cid in priority_ids if cid not in due_set],
+        [cid for cid in regular_ids if cid not in due_set],
+    )
+
+
+def _move_ring_entities_to_front(ring: deque[int], entity_ids: list[int]) -> None:
+    if not ring or not entity_ids:
+        return
+    ordered = list(ring)
+    present = set(ordered)
+    front = [eid for eid in dict.fromkeys(entity_ids) if eid in present]
+    if not front:
+        return
+    front_set = set(front)
+    ring.clear()
+    ring.extend(front + [eid for eid in ordered if eid not in front_set])
+
+
 def _merge_campaign_trigger_audit_ids(due_ids: list[int], audit_ids: list[int]) -> list[int]:
     """Keep audit-discovered published campaigns in the trigger plan.
 
@@ -2795,6 +2829,19 @@ def _campaign_trigger_event_log_progress_sql(campaign_id: int) -> str:
     )
 
 
+def _campaign_trigger_email_progress_sql(campaign_id: int) -> str:
+    cid = int(campaign_id)
+    return (
+        "SELECT "
+        "  COUNT(es.id) AS sent_email_stats, "
+        "  COALESCE(DATE_FORMAT(MAX(es.date_sent), '%Y-%m-%d %H:%i:%s'), '') AS max_email_sent_at "
+        "FROM {prefix}email_stats es "
+        "INNER JOIN {prefix}campaign_events ce ON ce.id = es.source_id "
+        "WHERE es.source = 'campaign.event' "
+        f"  AND ce.campaign_id = {cid}"
+    )
+
+
 def _campaign_trigger_latest_failed_reason_sql(campaign_id: int) -> str:
     cid = int(campaign_id)
     return (
@@ -2862,6 +2909,8 @@ def _campaign_trigger_progress_snapshot(
     due_no_action_branches = db.fetch_count(_campaign_trigger_no_action_due_exists_sql(cid), context=sql_ctx)
     rows = db.fetch_rows(_campaign_trigger_event_log_progress_sql(cid), limit=1, context=sql_ctx)
     row = rows[0] if rows else {}
+    email_rows = db.fetch_rows(_campaign_trigger_email_progress_sql(cid), limit=1, context=sql_ctx)
+    email_row = email_rows[0] if email_rows else {}
     return CampaignTriggerProgressSnapshot(
         due_event_logs=max(0, int(due_event_logs or 0)),
         due_root_actions=max(0, int(due_root_actions or 0)),
@@ -2869,6 +2918,8 @@ def _campaign_trigger_progress_snapshot(
         pending_event_logs=_row_int(row, "pending_event_logs"),
         triggered_event_logs=_row_int(row, "triggered_event_logs"),
         max_triggered_at=str(row.get("max_triggered_at") or ""),
+        sent_email_stats=_row_int(email_row, "sent_email_stats"),
+        max_email_sent_at=str(email_row.get("max_email_sent_at") or ""),
     )
 
 
@@ -5580,6 +5631,17 @@ def _campaign_native_fallback_metrics(db: MauticDB) -> dict[str, object]:
     return out
 
 
+def _campaign_native_fallback_last_run_after_completion(
+    *,
+    previous_run_ts: float,
+    completed_at: float,
+    rc: int | None,
+) -> float:
+    if rc == _TASK_LOCK_BUSY_RC:
+        return float(previous_run_ts or 0.0)
+    return max(float(previous_run_ts or 0.0), float(completed_at or 0.0))
+
+
 def _campaign_native_fallback_args(config: AgentConfig, root: str) -> list[str]:
     update = render_mautic_command(
         php_bin=config.php_bin,
@@ -6220,9 +6282,11 @@ def _respawn_task(
 ) -> bool:
     # task_retry_max semantics:
     # - <= 0 : unlimited retries
-    # - 1    : no retry (initial run only)
+    # - 1    : no retry (initial run only), unless a targeted campaign trigger override applies
     # - > 1  : bounded retries up to configured attempt cap
     retry_max = int(config.task_retry_max)
+    if task.manual_request_id is None and task.task_type == "campaign_trigger" and retry_max == 1:
+        retry_max = _CAMPAIGN_TRIGGER_AUTOMATIC_RETRY_CAP
     if task.manual_request_id is None and task.task_type == "segment" and task.entity_id is not None:
         if retry_max <= 0:
             retry_max = _SEGMENT_AUTOMATIC_RETRY_CAP
@@ -6391,10 +6455,13 @@ def _campaign_trigger_progress_watchdog(
     popens.pop(key, None)
     state_by_key.pop(key, None)
     logging.warning(
-        "[%s] campaign_trigger id=%s killed by progress watchdog: due=%s no DB progress for %s checks reason=%s",
+        "[%s] campaign_trigger id=%s killed by progress watchdog: due=%s sent_email_stats=%s "
+        "max_email_sent_at=%s no DB progress for %s checks reason=%s",
         task.root,
         task.entity_id,
         snapshot.due_total,
+        snapshot.sent_email_stats,
+        snapshot.max_email_sent_at or "-",
         stable_checks,
         reason or "-",
     )
@@ -6464,7 +6531,10 @@ def _monitor_running(
                 respawned = False
                 if rc != 0 and not lock_busy:
                     logging.warning("[%s] %s entity=%s failed rc=%s", task.root, task.task_type, task.entity_id, rc)
-                    retry_enabled = (config.task_retry_max <= 0) or (config.task_retry_max > 1)
+                    task_retry_max = int(config.task_retry_max)
+                    if task.manual_request_id is None and task.task_type == "campaign_trigger" and task_retry_max == 1:
+                        task_retry_max = _CAMPAIGN_TRIGGER_AUTOMATIC_RETRY_CAP
+                    retry_enabled = (task_retry_max <= 0) or (task_retry_max > 1)
                     if retry_enabled:
                         if config.task_retry_delay_sec > 0:
                             time.sleep(config.task_retry_delay_sec)
@@ -7164,8 +7234,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         scheduled_at: float = fallback_scheduled_at,
                     ) -> None:
                         try:
+                            completed_at = time.time()
+                            last_campaign_native_fallback_ts[root] = (
+                                _campaign_native_fallback_last_run_after_completion(
+                                    previous_run_ts=previous_run_ts,
+                                    completed_at=completed_at,
+                                    rc=rc,
+                                )
+                            )
                             if rc == _TASK_LOCK_BUSY_RC:
-                                last_campaign_native_fallback_ts[root] = previous_run_ts
                                 pusher.set_campaign_native_fallback_runtime(
                                     root,
                                     {
@@ -7209,6 +7286,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 ),
                                 "duration_sec": max(0, int(time.time() - started_at)),
                                 "schedule_delay_sec": schedule_delay_sec,
+                                "timeout_sec": _CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC,
                             }
                             pusher.add_campaign_native_fallback(event)
                             pusher.set_campaign_native_fallback_runtime(root, None)
@@ -8219,6 +8297,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     segment_ids = []
 
                 campaign_query_error: Exception | None = None
+                campaign_trigger_due_ids: list[int] = []
                 if cluster_cron_allowed:
                     try:
                         campaign_triggers_due_sql = _campaign_sql_for_major(
@@ -8226,6 +8305,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             inst.mautic_major,
                         )
                         campaign_trigger_ids = db.fetch_ids(campaign_triggers_due_sql, limit=5000, context=sql_ctx)
+                        campaign_trigger_due_ids = list(dict.fromkeys(campaign_trigger_ids or []))
                         audit_interval = max(0, int(getattr(config, "campaign_trigger_audit_interval_sec", 0) or 0))
                         if audit_interval > 0 and now - float(last_campaign_trigger_audit_ts.get(root, 0.0)) >= float(audit_interval):
                             audit_ids = db.fetch_ids(_SQL_CAMPAIGNS_ALL_PUBLISHED, limit=5000, context=sql_ctx)
@@ -8264,6 +8344,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         campaign_rebuild_ids = []
                 else:
                     campaign_trigger_ids = []
+                    campaign_trigger_due_ids = []
                     campaign_rebuild_ids = []
 
                 if campaign_trigger_ids is not None:
@@ -8681,6 +8762,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         config.campaign_priority_size,
                         latest_priority_ids,
                     )
+                    trg_prio, trg_reg = _force_due_campaigns_to_priority(
+                        trg_prio,
+                        trg_reg,
+                        campaign_trigger_due_ids,
+                    )
                     reb_prio, reb_reg = _split_campaign_circles(
                         campaign_rebuild_ids,
                         camp_w,
@@ -8705,6 +8791,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         campaign_trigger_reg_rings.get(root),
                         trg_prio,
                         trg_reg,
+                    )
+                    _move_ring_entities_to_front(
+                        campaign_trigger_prio_rings[root],
+                        campaign_trigger_due_ids,
                     )
                     (
                         campaign_rebuild_prio_rings[root],
