@@ -1458,7 +1458,13 @@ def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:
 
 
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
-    install_root, console = _pick_install(config, root)
+    inst = _pick_install_record(config, root)
+    if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
+        print(f"root={inst.root}")
+        print("runtime=docker")
+        print("next=image-managed")
+        return 0
+    install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _latest_same_branch(config, current)
     branch = _branch_key(current)
@@ -1486,6 +1492,10 @@ def run_upgrade_apply(
     allow_major: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
+    if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
+        raise RuntimeError(
+            "Docker Mautic upgrades are image-managed; activate a new platform image instead"
+        )
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _clean_target_version(target_override) or _latest_same_branch(config, current)

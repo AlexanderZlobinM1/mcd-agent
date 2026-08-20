@@ -7,9 +7,38 @@ from types import SimpleNamespace
 
 from mcd_agent.config import load_config
 from mcd_agent.daemon import _campaign_native_fallback_args, _campaign_native_fallback_metrics
+from mcd_agent.mode import SUPPORTED_PROFILE_NAMES
 
 
 class CampaignRuntimeConfigTests(unittest.TestCase):
+    def test_farm_profile_line_has_distinct_capacity_defaults(self) -> None:
+        expected = {
+            "farm-tiny": (2, 2, 1, 1),
+            "farm-mini": (2, 2, 2, 1),
+            "farm-midi": (3, 3, 4, 2),
+            "farm-maxi": (7, 4, 8, 4),
+            "farm-hiload": (11, 6, 12, 6),
+            "farm-ultra": (23, 12, 24, 12),
+        }
+
+        self.assertNotIn("farm", SUPPORTED_PROFILE_NAMES)
+        for profile, (segment_total, trigger_total, host_limit, instance_limit) in expected.items():
+            with self.subTest(profile=profile):
+                path = Path(tempfile.mkdtemp()) / "mcd.toml"
+                path.write_text(f'[profile]\nname = "{profile}"\n', encoding="utf-8")
+                cfg = load_config(str(path), allow_recover_from_mcc=False)
+                self.assertIn(profile, SUPPORTED_PROFILE_NAMES)
+                self.assertEqual(
+                    cfg.segment_priority_parallel_idle + cfg.segment_regular_parallel_idle,
+                    segment_total,
+                )
+                self.assertEqual(
+                    cfg.campaign_trigger_priority_parallel + cfg.campaign_trigger_regular_parallel,
+                    trigger_total,
+                )
+                self.assertEqual(cfg.scheduler_host_max_parallel, host_limit)
+                self.assertEqual(cfg.scheduler_instance_max_parallel, instance_limit)
+
     def test_default_campaign_limit_is_unlimited(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text("[runtime]\nprofile_name = \"midi\"\n", encoding="utf-8")
@@ -68,6 +97,10 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         cfg = load_config(str(path), allow_recover_from_mcc=False)
 
         self.assertEqual(cfg.scheduler_host_max_parallel, 6)
+        self.assertTrue(cfg.scheduler_elastic_slots_enabled)
+        self.assertEqual(cfg.scheduler_emergency_reserved_slots, 1)
+        self.assertEqual(cfg.scheduler_instance_max_parallel, 0)
+        self.assertEqual(cfg.scheduler_fairness_watchdog_sec, 300)
 
     def test_page_hits_sql_segments_default_to_quiet_window_only(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"

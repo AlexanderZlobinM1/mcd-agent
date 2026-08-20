@@ -119,6 +119,10 @@ jobs_max_workers = 2
 # Host cap applied independently to segment/import and campaign command lanes.
 # 0 keeps both lanes unlimited; MCC hardware profiles set this value.
 scheduler_host_max_parallel = 0
+scheduler_elastic_slots_enabled = true
+scheduler_emergency_reserved_slots = 1
+scheduler_instance_max_parallel = 0
+scheduler_fairness_watchdog_sec = 300
 
 # Segment ids forced to priority ring.
 segment_whitelist = []
@@ -126,11 +130,17 @@ segment_whitelist = []
 # "instance.example.com: 187 191"; old one-id-per-line files are converted once.
 segment_whitelist_file = "/etc/mcd/segment-whitelist.txt"
 # Per-instance segment whitelist overrides keyed by instance_uid/root/domain.
+# A setting may include a separately bounded realtime subset:
+# { segment_whitelist = [330], realtime = { ids = [332, 333], interval_sec = 15, parallel = 2 } }
 segment_whitelist_instance_settings = {}
 # Campaign ids forced to priority ring.
 campaign_whitelist = []
 # Path to campaign whitelist file (one id per line).
 campaign_whitelist_file = "/etc/mcd/campaign-whitelist.txt"
+# Per-instance campaign whitelist overrides. A realtime block accepts ids,
+# rebuild_interval_sec, trigger_interval_sec, rebuild_parallel and
+# trigger_parallel. Realtime capacity is independent for rebuild and trigger.
+campaign_whitelist_instance_settings = {}
 
 # Batch for mautic:segments:update.
 segment_batch_limit = 1000
@@ -292,17 +302,6 @@ page_hits_orphan_cleanup_grace_min = 60
 page_hits_orphan_cleanup_max_run_sec = 180
 page_hits_orphan_cleanup_instance_settings = {}
 
-# Leuchtfeuer Housekeeping plugin scheduling for Mautic 4/5/6/7 instances.
-housekeeping_plugin_enabled = false
-housekeeping_plugin_interval_sec = 86400
-housekeeping_plugin_quiet_hour = 3
-housekeeping_plugin_quiet_window_min = 120
-housekeeping_plugin_days_old = 365
-housekeeping_plugin_flags = []
-housekeeping_plugin_optimize_tables = false
-housekeeping_plugin_dry_run = true
-housekeeping_plugin_instance_settings = {}
-
 # Enable daily cache:clear task (MCD-managed, runtime-dynamic).
 enable_cache_clear = false
 # Minimum interval between cache:clear runs, sec.
@@ -321,14 +320,18 @@ cache_warm_quiet_hour = 8
 # Quiet window length in minutes.
 cache_warm_quiet_window_min = 60
 
-# Viber plugin stats task (MCD-managed, runtime-dynamic).
-# If an instance has a Viber plugin directory, active profiles run:
-#   viber:stats:update
-# Default interval is 10 minutes. Per-instance overrides are keyed by
-# instance_uid/root/domain and are normally written by MCC Web.
-viber_stats_enabled = true
-viber_stats_interval_sec = 600
-viber_stats_instance_settings = {}
+# Catalog-owned plugin operation definitions and their per-instance values are
+# supplied dynamically by MCC. Do not add plugin names, commands, defaults, or
+# cron match rules to this host-level template.
+plugin_operations = {}
+plugin_operation_instance_settings = {}
+
+# Mautic 5/6/7 database message queue consumer. Disabled by default so a new
+# agent cannot unexpectedly drain an accumulated queue. MCC writes the
+# per-instance switch and interval; legacy cron/[[jobs]] values are migrated.
+message_queue_enabled = false
+message_queue_interval_sec = 3600
+message_queue_instance_settings = {}
 
 # Monitored mailbox parser (MCD-managed replacement for mautic:email:fetch).
 # Per-instance overrides are keyed by instance_uid/root/domain and normally

@@ -12,13 +12,17 @@ from unittest.mock import Mock, patch
 
 from mcd_agent import daemon as daemon_mod
 from mcd_agent.daemon import (
+    CampaignWhitelistRealtimeSetting,
     CampaignTriggerProgressSnapshot,
     RunningTask,
     SQLSegmentRule,
     TaskStore,
     _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT,
+    _CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT,
     _CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC,
     _CAMPAIGN_REBUILD_FINISHED_AT,
+    _CAMPAIGN_TRIGGER_FUTURE_WAKE,
+    _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED,
     _CAMPAIGN_TRIGGER_STUCK_UNTIL,
     _PriorityTaskExecutor,
     _TASK_LOCK_BUSY_RC,
@@ -28,17 +32,23 @@ from mcd_agent.daemon import (
     _campaign_fallback_end,
     _campaign_fallback_try_begin,
     _campaign_native_fallback_last_run_after_completion,
+    _campaign_whitelist_realtime_setting,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
     _campaign_trigger_email_progress_sql,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
+    _campaign_trigger_after_rebuild_pending,
     _campaign_trigger_progress_watchdog,
     _campaign_trigger_should_skip_launch,
+    _campaign_trigger_skip_removes_from_ring,
     _campaign_trigger_waits_for_rebuild,
     _classify_import_monitor_row,
+    _dispatch_due_campaign_triggers,
     _effective_segment_slot_limit,
     _fill_from_ring,
+    _fairness_watchdog_dispatch_installs,
+    _fairness_promotion_log_due,
     _force_due_campaigns_to_priority,
     _import_pending_poll_due,
     _mark_campaign_rebuild_finished,
@@ -47,6 +57,7 @@ from mcd_agent.daemon import (
     _monitor_running,
     _move_ring_entities_to_front,
     _plan_sql_segment_ring,
+    _pending_import_first_dispatch_installs,
     _published_campaign_whitelist_ids,
     _published_segment_whitelist_ids,
     _priority_campaign_due_check_needed,
@@ -54,12 +65,16 @@ from mcd_agent.daemon import (
     _recover_orphaned_imports_if_safe,
     _remove_ring_entities,
     _rotated_dispatch_installs,
+    _root_has_live_campaign_process,
     _run_sql_segment_ring,
     _scheduler_host_slots_available,
+    _scheduler_instance_slots_available,
+    _set_scheduler_priority_pending_roots,
     _segment_sql_active_db_rebuild_query_count,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
+    _segment_whitelist_realtime_setting,
     _sync_segment_whitelist_file,
     _submit_import_if_segment_slot,
     _task_key,
@@ -73,7 +88,10 @@ from mcd_agent.ring_utils import advance_ring_after_launch
 class CampaignRingDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE.clear()
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED.clear()
         _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.clear()
+        _CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT.clear()
         _CAMPAIGN_REBUILD_FINISHED_AT.clear()
         daemon_mod._ENTITY_LAUNCH_GUARD.clear()
         with daemon_mod._SEGMENT_SQL_WORKERS_LOCK:
@@ -81,6 +99,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         with daemon_mod._CAMPAIGN_FALLBACK_COORDINATOR_LOCK:
             daemon_mod._CAMPAIGN_FALLBACK_ACTIVE_ROOTS.clear()
             daemon_mod._CAMPAIGN_DISPATCHING_ROOTS.clear()
+        _set_scheduler_priority_pending_roots(set())
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])
@@ -103,32 +122,53 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment"), 0)
 
-    def test_segment_and_campaign_host_slots_are_independent_in_both_directions(self) -> None:
+    def test_elastic_host_budget_keeps_one_emergency_slot_for_priority_work(self) -> None:
         cfg = SimpleNamespace(
             scheduler_host_max_parallel=6,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=1,
             segment_mode="id_weighted",
             segment_priority_parallel_idle=3,
             segment_regular_parallel_idle=1,
             campaign_total_parallel=2,
         )
         prodajadelova = "/var/www/prodajadelova/public_html"
-        segments_full = {
+        five_segments = {
             f"segment-{idx}": SimpleNamespace(root=f"/var/www/segment-{idx}", task_type="segment")
-            for idx in range(4)
+            for idx in range(5)
         }
-        campaigns_full = {
+        six_campaigns = {
             f"campaign-{campaign_id}": SimpleNamespace(
                 root=prodajadelova,
                 task_type="campaign_rebuild",
                 entity_id=campaign_id,
             )
-            for campaign_id in (22, 17)
+            for campaign_id in range(6)
         }
 
-        self.assertEqual(_scheduler_host_slots_available(cfg, segments_full, "segment"), 0)
-        self.assertEqual(_scheduler_host_slots_available(cfg, segments_full, "campaign_rebuild"), 2)
-        self.assertEqual(_scheduler_host_slots_available(cfg, campaigns_full, "campaign_rebuild"), 0)
-        self.assertEqual(_scheduler_host_slots_available(cfg, campaigns_full, "segment"), 4)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "segment"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "campaign_rebuild"), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "import"), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, six_campaigns, "campaign_rebuild"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, six_campaigns, "segment"), 0)
+
+    def test_farm_instance_limit_reserves_root_slot_when_priority_work_is_pending(self) -> None:
+        root = "/var/www/mensa/public_html"
+        cfg = SimpleNamespace(scheduler_instance_max_parallel=3)
+        two_segments = {
+            f"segment-{idx}": SimpleNamespace(root=root, task_type="segment")
+            for idx in range(2)
+        }
+        _set_scheduler_priority_pending_roots({root})
+
+        self.assertEqual(
+            _scheduler_instance_slots_available(cfg, two_segments, root=root, task_type="segment"),
+            0,
+        )
+        self.assertEqual(
+            _scheduler_instance_slots_available(cfg, two_segments, root=root, task_type="campaign_trigger"),
+            1,
+        )
 
     def test_dispatch_rotation_changes_first_instance_each_tick(self) -> None:
         installs = ["a", "b", "c"]
@@ -137,7 +177,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(_rotated_dispatch_installs(installs, 1), ["b", "c", "a"])
         self.assertEqual(_rotated_dispatch_installs(installs, 4), ["b", "c", "a"])
 
-    def test_priority_dispatch_is_revisited_between_regular_chunks(self) -> None:
+    def test_priority_dispatch_visits_each_instance_once_per_cycle(self) -> None:
         priority = SimpleNamespace(root="/priority", instance_uid="priority@host")
         regular = [SimpleNamespace(root=f"/regular-{idx}", instance_uid=f"regular-{idx}@host") for idx in range(5)]
         cfg = SimpleNamespace(
@@ -154,9 +194,88 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual([inst.root for inst in planned], [
             "/priority", "/regular-0", "/regular-1",
-            "/priority", "/regular-2", "/regular-3",
-            "/priority", "/regular-4",
+            "/regular-2", "/regular-3", "/regular-4",
         ])
+
+    def test_fairness_watchdog_promotes_an_overdue_root_and_deduplicates_input(self) -> None:
+        a = SimpleNamespace(root="/a")
+        b = SimpleNamespace(root="/b")
+        pending_since = {"/b": 100.0}
+
+        planned, promoted = _fairness_watchdog_dispatch_installs(
+            [a, a, b],
+            pending_roots={"/b"},
+            pending_since_by_root=pending_since,
+            now_ts=500.0,
+            watchdog_sec=300,
+        )
+
+        self.assertEqual([inst.root for inst in planned], ["/b", "/a"])
+        self.assertEqual(promoted, ["/b"])
+
+    def test_fairness_promotion_log_ignores_ring_reordering_until_hourly_refresh(self) -> None:
+        previous = frozenset({"/a", "/b"})
+
+        self.assertFalse(
+            _fairness_promotion_log_due(
+                ["/b", "/a"],
+                previous,
+                now_ts=200.0,
+                next_log_at=3600.0,
+            )
+        )
+        self.assertTrue(
+            _fairness_promotion_log_due(
+                ["/b", "/a"],
+                previous,
+                now_ts=3600.0,
+                next_log_at=3600.0,
+            )
+        )
+        self.assertTrue(
+            _fairness_promotion_log_due(
+                ["/a"],
+                frozenset(),
+                now_ts=1.0,
+                next_log_at=0.0,
+            )
+        )
+        self.assertFalse(
+            _fairness_promotion_log_due(
+                [],
+                previous,
+                now_ts=3600.0,
+                next_log_at=3600.0,
+            )
+        )
+
+    def test_pending_import_precedes_whitelist_segments_across_instances(self) -> None:
+        electronic = SimpleNamespace(root="/var/www/electronic/public_html")
+        mensa = SimpleNamespace(root="/var/www/mensa/public_html")
+        other = SimpleNamespace(root="/var/www/other/public_html")
+
+        planned = _pending_import_first_dispatch_installs(
+            [electronic, other, electronic, mensa],
+            {mensa.root: 1},
+        )
+
+        self.assertEqual(planned[0].root, mensa.root)
+        self.assertEqual([inst.root for inst in planned[1:]], [
+            electronic.root,
+            other.root,
+            electronic.root,
+        ])
+
+    def test_import_priority_preserves_rotation_when_no_import_is_pending(self) -> None:
+        installs = [
+            SimpleNamespace(root="/var/www/a"),
+            SimpleNamespace(root="/var/www/b"),
+        ]
+
+        self.assertEqual(
+            _pending_import_first_dispatch_installs(installs, {"/var/www/a": 0}),
+            installs,
+        )
 
     def test_campaign_rebuild_and_trigger_share_execution_lock(self) -> None:
         root = "/var/www/electronic/public_html"
@@ -251,6 +370,139 @@ class CampaignRingDispatchTests(unittest.TestCase):
             100.0,
         )
 
+    def test_due_campaign_priority_dispatch_ignores_saturated_segment_lane(self) -> None:
+        root = "/var/www/cvetana/public_html"
+        running = {
+            f"segment-{idx}": SimpleNamespace(
+                root=f"/var/www/segment-{idx}",
+                task_type="segment",
+                entity_id=idx,
+            )
+            for idx in range(8)
+        }
+        executor = Mock()
+        executor.is_active.return_value = False
+        executor.launch.return_value = True
+        cfg = SimpleNamespace(
+            campaign_trigger_min_repeat_sec=0,
+            campaign_trigger_audit_interval_sec=60,
+            campaign_trigger_priority_parallel=2,
+            php_bin="php",
+            mautic_run_as_user="www-data",
+            cmd_campaign_trigger_template="mautic:campaigns:trigger -i {id}",
+            campaign_limit=0,
+            campaign_batch_limit=100,
+        )
+
+        with patch.object(daemon_mod, "render_mautic_command", return_value=["php", "bin/console"]):
+            launched = _dispatch_due_campaign_triggers(
+                config=cfg,
+                root=root,
+                due_ids=[8, 11],
+                running=running,
+                priority_executor=executor,
+                on_success=Mock(),
+            )
+
+        self.assertEqual(launched, [8, 11])
+        self.assertEqual(executor.launch.call_count, 2)
+
+    def test_due_campaign_priority_dispatch_waits_for_same_campaign_rebuild(self) -> None:
+        root = "/var/www/cvetana/public_html"
+        running = {
+            "rebuild-8": SimpleNamespace(root=root, task_type="campaign_rebuild", entity_id=8),
+        }
+        executor = Mock()
+        executor.is_active.return_value = False
+        executor.launch.return_value = True
+        cfg = SimpleNamespace(
+            campaign_trigger_min_repeat_sec=0,
+            campaign_trigger_audit_interval_sec=60,
+            campaign_trigger_priority_parallel=2,
+            php_bin="php",
+            mautic_run_as_user="www-data",
+            cmd_campaign_trigger_template="mautic:campaigns:trigger -i {id}",
+            campaign_limit=0,
+            campaign_batch_limit=100,
+        )
+
+        with patch.object(daemon_mod, "render_mautic_command", return_value=["php", "bin/console"]):
+            launched = _dispatch_due_campaign_triggers(
+                config=cfg,
+                root=root,
+                due_ids=[8, 11],
+                running=running,
+                priority_executor=executor,
+                on_success=Mock(),
+            )
+
+        self.assertEqual(launched, [11])
+        self.assertEqual(executor.launch.call_args.kwargs["entity_id"], 11)
+
+    def test_due_realtime_campaign_uses_dedicated_trigger_capacity(self) -> None:
+        executor = Mock()
+        executor.is_active.return_value = False
+        executor.launch.return_value = True
+        cfg = SimpleNamespace(
+            campaign_trigger_min_repeat_sec=30,
+            campaign_trigger_audit_interval_sec=60,
+            campaign_trigger_priority_parallel=3,
+            php_bin="php",
+            mautic_run_as_user="www-data",
+            cmd_campaign_trigger_template="mautic:campaigns:trigger -i {id}",
+            campaign_limit=0,
+            campaign_batch_limit=100,
+        )
+        realtime = CampaignWhitelistRealtimeSetting(
+            ids=frozenset({1086, 1087}),
+            rebuild_interval_sec=15,
+            trigger_interval_sec=15,
+            rebuild_parallel=1,
+            trigger_parallel=1,
+        )
+
+        with patch.object(daemon_mod, "render_mautic_command", return_value=["php", "bin/console"]):
+            launched = _dispatch_due_campaign_triggers(
+                config=cfg,
+                root="/var/www/ss/public_html",
+                due_ids=[1086],
+                running={},
+                priority_executor=executor,
+                on_success=Mock(),
+                realtime=realtime,
+            )
+
+        self.assertEqual(launched, [1086])
+        kwargs = executor.launch.call_args.kwargs
+        self.assertEqual(kwargs["interval_sec"], 15)
+        self.assertEqual(kwargs["max_parallel"], 1)
+        self.assertEqual(kwargs["capacity_lane"], "campaign_trigger_realtime")
+        self.assertEqual(kwargs["log_label"], "realtime")
+
+    def test_live_campaign_process_scan_finds_untracked_native_child(self) -> None:
+        root = "/var/www/mautic"
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=f"42177 php {root}/bin/console mautic:campaigns:trigger -i 589\n",
+        )
+
+        with patch.object(daemon_mod.subprocess, "run", return_value=process):
+            self.assertTrue(_root_has_live_campaign_process(root, {}))
+
+    def test_live_campaign_process_scan_ignores_another_instance(self) -> None:
+        root = "/var/www/mautic"
+        process = SimpleNamespace(
+            returncode=0,
+            stdout="42177 php /var/www/other/bin/console mautic:campaigns:trigger -i 589\n",
+        )
+
+        with patch.object(daemon_mod.subprocess, "run", return_value=process):
+            self.assertFalse(_root_has_live_campaign_process(root, {}))
+
+    def test_live_campaign_process_scan_fails_closed(self) -> None:
+        with patch.object(daemon_mod.subprocess, "run", side_effect=OSError("ps unavailable")):
+            self.assertTrue(_root_has_live_campaign_process("/var/www/mautic", {}))
+
     def test_priority_executor_has_separate_bounded_lane(self) -> None:
         executor = _PriorityTaskExecutor()
         release = threading.Event()
@@ -293,6 +545,93 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertFalse(executor.is_active("/var/www/site", "segment", 23))
         self.assertGreater(executor.last_finished("/var/www/site", "segment", 23), 0)
+
+    def test_realtime_capacity_is_independent_from_normal_priority_capacity(self) -> None:
+        executor = _PriorityTaskExecutor()
+        release = threading.Event()
+        started = threading.Event()
+
+        def _run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            started.set()
+            release.wait(timeout=2)
+            return SimpleNamespace(pid=1234, wait=lambda timeout=None: 0)
+
+        cfg = SimpleNamespace(command_timeout_sec=0)
+        with patch.object(daemon_mod, "_spawn_command", side_effect=_run):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=330,
+                    args=["php", "bin/console"],
+                    interval_sec=300,
+                    max_parallel=1,
+                )
+            )
+            self.assertTrue(started.wait(timeout=1))
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=332,
+                    args=["php", "bin/console"],
+                    interval_sec=15,
+                    max_parallel=1,
+                    capacity_lane="segment_realtime",
+                    log_label="realtime",
+                )
+            )
+            release.set()
+
+    def test_realtime_repeat_overrides_normal_segment_cooldown(self) -> None:
+        executor = _PriorityTaskExecutor()
+        cfg = SimpleNamespace(command_timeout_sec=0, segment_full_scan_interval_sec=300)
+        completed = threading.Event()
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=100.0),
+            patch.object(
+                daemon_mod,
+                "_spawn_command",
+                return_value=SimpleNamespace(pid=1235, wait=lambda timeout=None: 0),
+            ),
+        ):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/ss/public_html",
+                    task_type="segment",
+                    entity_id=332,
+                    args=["php", "bin/console"],
+                    interval_sec=15,
+                    max_parallel=2,
+                    capacity_lane="segment_realtime",
+                    on_success=completed.set,
+                )
+            )
+            self.assertTrue(completed.wait(timeout=1))
+
+        self.assertTrue(
+            daemon_mod._launch_allowed(
+                cfg,
+                "/var/www/ss/public_html",
+                "segment",
+                332,
+                now_ts=115.0,
+                min_repeat_sec=15,
+            )
+        )
+        self.assertFalse(
+            daemon_mod._launch_allowed(
+                cfg,
+                "/var/www/ss/public_html",
+                "segment",
+                332,
+                now_ts=115.0,
+            )
+        )
 
     def test_priority_executor_updates_normal_scheduler_repeat_guard(self) -> None:
         executor = _PriorityTaskExecutor()
@@ -870,6 +1209,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         with (
             patch.object(daemon_mod.time, "time", return_value=1782817200.0),
             patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(daemon_mod, "_root_has_live_campaign_process", return_value=False),
             patch.object(
                 daemon_mod,
                 "repair_campaign_email_counters",
@@ -887,6 +1227,62 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertTrue(skipped)
         repair.assert_called_once_with(db, 557)
 
+    def test_campaign_trigger_guard_defers_counter_repair_while_native_trigger_is_live(self) -> None:
+        root = "/var/www/enoteka/public_html"
+        snapshot = CampaignTriggerProgressSnapshot(
+            due_event_logs=0,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=0,
+            triggered_event_logs=790,
+            max_triggered_at="2026-08-14 08:32:27",
+            sent_email_stats=679,
+            max_email_sent_at="2026-08-14 08:33:16",
+        )
+        db = Mock()
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1786696396.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(daemon_mod, "_root_has_live_campaign_process", return_value=True),
+            patch.object(daemon_mod, "repair_campaign_email_counters") as repair,
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=db,
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=25,
+                sql_ctx={},
+            )
+
+        self.assertTrue(skipped)
+        repair.assert_not_called()
+        self.assertNotIn((root, 25), _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT)
+        self.assertEqual(
+            _CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT[(root, 25)],
+            1786696396.0,
+        )
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1786696456.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=snapshot),
+            patch.object(daemon_mod, "_root_has_live_campaign_process", return_value=False),
+            patch.object(
+                daemon_mod,
+                "repair_campaign_email_counters",
+                return_value={"checked": 1, "mismatches": 1, "repaired": 1, "skipped": 0},
+            ) as repair_after_exit,
+        ):
+            _campaign_trigger_should_skip_launch(
+                db=db,
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=25,
+                sql_ctx={},
+            )
+
+        repair_after_exit.assert_called_once_with(db, 25)
+
     def test_campaign_trigger_guard_counts_prescheduled_rows_as_due(self) -> None:
         due_sql = _campaign_trigger_event_log_due_exists_sql(21)
         progress_sql = _campaign_trigger_event_log_progress_sql(21)
@@ -897,7 +1293,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertNotIn("el.date_triggered < el.trigger_date", due_sql)
         self.assertIn("el.trigger_date <= '{now_event_log}'", due_sql)
         self.assertIn("c.publish_down IS NULL OR c.publish_down >= '{now_utc}'", due_sql)
-
+        self.assertIn("AS next_scheduled_at", progress_sql)
         self.assertIn("el.is_scheduled = 1", progress_sql)
         self.assertIn("SUM(CASE WHEN el.is_scheduled = 1 THEN 1 ELSE 0 END)", progress_sql)
         self.assertIn("pending_event_logs", progress_sql)
@@ -905,6 +1301,153 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertIn("ce.id = es.source_id", email_progress_sql)
         self.assertIn("ce.campaign_id = 21", email_progress_sql)
         self.assertIn("MAX(es.date_sent)", email_progress_sql)
+
+    def test_campaign_trigger_guard_keeps_merkurosiguranje_future_date_action_until_due(self) -> None:
+        root = "/var/www/merkurosiguranje/public_html"
+        future = CampaignTriggerProgressSnapshot(
+            due_event_logs=0,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=468,
+            triggered_event_logs=468,
+            max_triggered_at="2026-08-07 14:33:37",
+            next_scheduled_at="2026-08-10 07:00:00",
+        )
+        due = CampaignTriggerProgressSnapshot(
+            due_event_logs=1,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=468,
+            triggered_event_logs=468,
+            max_triggered_at="2026-08-07 14:33:37",
+            next_scheduled_at="2026-08-10 07:00:00",
+        )
+        sql_ctx = {"now_event_log": "2026-08-10 06:59:46"}
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1000.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=future) as progress,
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=Mock(),
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=56,
+                sql_ctx=sql_ctx,
+            )
+
+        self.assertTrue(skipped)
+        progress.assert_called_once()
+        self.assertEqual(_CAMPAIGN_TRIGGER_FUTURE_WAKE[(root, 56)], (1013.0, "2026-08-10 07:00:00"))
+        self.assertEqual(_CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED[(root, 56)], "2026-08-10 07:00:00")
+        self.assertFalse(_campaign_trigger_skip_removes_from_ring(root, 56, set()))
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1005.0),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot") as progress,
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=Mock(),
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=56,
+                sql_ctx=sql_ctx,
+            )
+
+        self.assertTrue(skipped)
+        progress.assert_not_called()
+
+        with (
+            patch.object(daemon_mod.time, "time", return_value=1013.5),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=due),
+        ):
+            skipped = _campaign_trigger_should_skip_launch(
+                db=Mock(),
+                config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                root=root,
+                campaign_id=56,
+                sql_ctx=sql_ctx,
+            )
+
+        self.assertFalse(skipped)
+        self.assertNotIn((root, 56), _CAMPAIGN_TRIGGER_FUTURE_WAKE)
+        self.assertNotIn((root, 56), _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED)
+
+    def test_campaign_trigger_future_wake_log_is_deduplicated_across_rebuilds(self) -> None:
+        root = "/var/www/electronic/public_html"
+        future = CampaignTriggerProgressSnapshot(
+            due_event_logs=0,
+            due_root_actions=0,
+            due_no_action_branches=0,
+            pending_event_logs=24,
+            triggered_event_logs=24,
+            max_triggered_at="2026-08-10 06:00:00",
+            next_scheduled_at="2026-08-10 08:16:59",
+        )
+        sql_ctx = {"now_event_log": "2026-08-10 07:32:46"}
+
+        with (
+            patch.object(daemon_mod.time, "time", side_effect=(1000.0, 1001.0)),
+            patch.object(daemon_mod, "_campaign_trigger_progress_snapshot", return_value=future),
+            patch.object(daemon_mod.logging, "info") as info,
+        ):
+            self.assertTrue(
+                _campaign_trigger_should_skip_launch(
+                    db=Mock(),
+                    config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                    root=root,
+                    campaign_id=29,
+                    sql_ctx=sql_ctx,
+                )
+            )
+            _mark_campaign_rebuild_finished(root, 29, now_ts=1000.5)
+            self.assertTrue(
+                _campaign_trigger_should_skip_launch(
+                    db=Mock(),
+                    config=SimpleNamespace(campaign_trigger_due_guard_enabled=True),
+                    root=root,
+                    campaign_id=29,
+                    sql_ctx=sql_ctx,
+                )
+            )
+
+        self.assertEqual(info.call_count, 1)
+
+    def test_campaign_trigger_ring_preserves_future_wake_but_removes_complete_audit_id(self) -> None:
+        root = "/var/www/merkurosiguranje/public_html"
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE[(root, 56)] = (1013.0, "2026-08-10 07:00:00")
+        ring = deque([56, 19])
+
+        launched = _fill_from_ring(
+            ring=ring,
+            ring_limit=1,
+            total_limit=1,
+            root=root,
+            task_type="campaign_trigger",
+            running={},
+            ring_entities={19, 56},
+            config=Mock(),
+            store=Mock(),
+            popens={},
+            build_args=Mock(),
+            should_skip=lambda _: True,
+            remove_on_skip=lambda cid: _campaign_trigger_skip_removes_from_ring(root, cid, set()),
+        )
+
+        self.assertEqual(launched, 0)
+        self.assertEqual(list(ring), [56])
+
+    def test_campaign_trigger_after_rebuild_preempts_round_robin_rebuild(self) -> None:
+        root = "/var/www/frusketerme/public_html"
+        trigger_rings = (deque([13, 14]), deque())
+
+        self.assertFalse(_campaign_trigger_after_rebuild_pending(root, trigger_rings))
+
+        _mark_campaign_rebuild_finished(root, 13, now_ts=100.0)
+
+        self.assertTrue(_campaign_trigger_after_rebuild_pending(root, trigger_rings))
+        _mark_campaign_trigger_finished(root, 13)
+        self.assertFalse(_campaign_trigger_after_rebuild_pending(root, trigger_rings))
 
     def test_non_campaign_rings_keep_round_robin_rotation(self) -> None:
         ring = deque([3, 4, 5])
@@ -977,6 +1520,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
             )
         )
 
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE[(root, 656)] = (500.0, "2026-08-10 07:00:00")
         _mark_campaign_rebuild_finished(root, 656, now_ts=101.0)
 
         self.assertFalse(
@@ -987,6 +1531,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
                 running={},
             )
         )
+        self.assertNotIn((root, 656), _CAMPAIGN_TRIGGER_FUTURE_WAKE)
 
         _mark_campaign_trigger_finished(root, 656)
 
@@ -1782,6 +2327,101 @@ class CampaignRingDispatchTests(unittest.TestCase):
         )
 
         self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {187, 191})
+
+    def test_segment_realtime_subset_is_whitelisted_with_dedicated_limits(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[10],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={
+                "abelapharm.sales-snap.com": {
+                    "segment_whitelist": [330],
+                    "realtime": {"ids": [332, "333"], "interval_sec": 15, "parallel": 2},
+                },
+            },
+        )
+        inst = SimpleNamespace(
+            instance_uid="abelapharm.sales-snap.com",
+            root="/var/www/ss/public_html",
+            name="abelapharm.sales-snap.com",
+            primary_domain="abelapharm.sales-snap.com",
+            domains=["abelapharm.sales-snap.com"],
+        )
+
+        setting = _segment_whitelist_realtime_setting(cfg, inst)
+
+        self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {330, 332, 333})
+        self.assertEqual(setting.ids, frozenset({332, 333}))
+        self.assertEqual(setting.interval_sec, 15)
+        self.assertEqual(setting.parallel, 2)
+        self.assertTrue(setting.enabled)
+
+    def test_campaign_realtime_subset_has_independent_rebuild_and_trigger_slots(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            campaign_whitelist=[],
+            campaign_whitelist_file=None,
+            campaign_whitelist_instance_settings={
+                "/var/www/ss/public_html": {
+                    "campaign_whitelist": [],
+                    "realtime": {
+                        "ids": [1086, 1087],
+                        "rebuild_interval_sec": 15,
+                        "trigger_interval_sec": 15,
+                        "rebuild_parallel": 1,
+                        "trigger_parallel": 1,
+                    },
+                },
+            },
+        )
+        inst = SimpleNamespace(
+            instance_uid="abelapharm.sales-snap.com",
+            root="/var/www/ss/public_html",
+            name="abelapharm.sales-snap.com",
+            primary_domain="abelapharm.sales-snap.com",
+            domains=["abelapharm.sales-snap.com"],
+        )
+
+        setting = _campaign_whitelist_realtime_setting(cfg, inst)
+
+        self.assertEqual(_campaign_whitelist_effective_setting(cfg, inst), {1086, 1087})
+        self.assertEqual(setting.ids, frozenset({1086, 1087}))
+        self.assertEqual(setting.rebuild_interval_sec, 15)
+        self.assertEqual(setting.trigger_interval_sec, 15)
+        self.assertEqual(setting.rebuild_parallel, 1)
+        self.assertEqual(setting.trigger_parallel, 1)
+        self.assertTrue(setting.rebuild_enabled)
+        self.assertTrue(setting.trigger_enabled)
+
+    def test_realtime_subset_fails_closed_for_invalid_numeric_limits(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={
+                "abelapharm.sales-snap.com": {
+                    "realtime": {
+                        "ids": [332, 333],
+                        "interval_sec": "immediate",
+                        "parallel": {"invalid": True},
+                    },
+                },
+            },
+        )
+        inst = SimpleNamespace(
+            instance_uid="abelapharm.sales-snap.com",
+            root="/var/www/ss/public_html",
+            name="abelapharm.sales-snap.com",
+            primary_domain="abelapharm.sales-snap.com",
+            domains=["abelapharm.sales-snap.com"],
+        )
+
+        setting = _segment_whitelist_realtime_setting(cfg, inst)
+
+        self.assertEqual(setting.ids, frozenset({332, 333}))
+        self.assertEqual(setting.interval_sec, 0)
+        self.assertEqual(setting.parallel, 0)
+        self.assertFalse(setting.enabled)
 
     def test_segment_whitelist_accepts_mcc_host_qualified_instance_uid(self) -> None:
         cfg = SimpleNamespace(

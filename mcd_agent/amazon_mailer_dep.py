@@ -208,6 +208,62 @@ def _composer_has_package(project_root: str, composer_bin: str, package_name: st
     return proc.returncode == 0
 
 
+def _composer_update_targeted_package(
+    *,
+    project_root: str,
+    composer_bin: str,
+    package_name: str,
+    timeout_sec: int,
+) -> None:
+    """Install one package without resolving unrelated private VCS repositories."""
+    composer_json = Path(project_root) / "composer.json"
+    composer_lock = Path(project_root) / "composer.lock"
+    original_json = composer_json.read_bytes()
+    original_lock = composer_lock.read_bytes() if composer_lock.exists() else None
+    original_data = json.loads(original_json.decode("utf-8"))
+    completed = False
+    try:
+        data = original_data
+        repositories = data.get("repositories") if isinstance(data, dict) else None
+        if isinstance(repositories, list):
+            data["repositories"] = [
+                repo for repo in repositories
+                if "git.sales-snap.com" not in json.dumps(repo, ensure_ascii=False)
+            ]
+            composer_json.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        _run(
+            [composer_bin, "require", package_name, "--no-update", "--no-interaction", "--no-scripts", "--no-progress"],
+            cwd=project_root, as_www_data=True, timeout_sec=timeout_sec,
+        )
+        _run(
+            [composer_bin, "update", _composer_show_name(package_name), "--with-dependencies", "--no-interaction", "--no-scripts", "--no-progress"],
+            cwd=project_root, as_www_data=True, timeout_sec=timeout_sec,
+        )
+        updated_data = json.loads(composer_json.read_text(encoding="utf-8"))
+        if not isinstance(updated_data, dict):
+            raise RuntimeError("Composer did not leave a JSON object in composer.json")
+        if isinstance(repositories, list):
+            updated_data["repositories"] = repositories
+        elif isinstance(original_data, dict) and "repositories" not in original_data:
+            updated_data.pop("repositories", None)
+        composer_json.write_text(
+            json.dumps(updated_data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        completed = True
+    except Exception:
+        if original_lock is None:
+            composer_lock.unlink(missing_ok=True)
+        else:
+            composer_lock.write_bytes(original_lock)
+        raise
+    finally:
+        if not completed:
+            composer_json.write_bytes(original_json)
+
+
 def _normalize_console_path(project_root: str, console_path: str) -> str:
     if Path(console_path).is_absolute():
         return console_path
@@ -313,7 +369,7 @@ def installed_required_bundles(root: str) -> set[str]:
     return out
 
 
-def _ensure_mailer_packages(
+def _ensure_composer_packages(
     *,
     config: AgentConfig,
     root: str,
@@ -321,6 +377,7 @@ def _ensure_mailer_packages(
     required: set[str],
     reason: str,
     ensure_node: bool,
+    no_scripts: bool = False,
 ) -> bool:
     if not required:
         return False
@@ -329,14 +386,14 @@ def _ensure_mailer_packages(
     project_root = _resolve_project_root(root)
     if not _composer_project_is_mautic(project_root):
         logging.warning(
-            "[%s] skip mailer package composer preflight: %s/composer.json is not a valid Mautic composer project (%s)",
+            "[%s] skip composer package preflight: %s/composer.json is not a valid Mautic composer project (%s)",
             root,
             project_root,
             reason,
         )
         return False
     if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
-        raise RuntimeError(f"Mautic console is not healthy before mailer package preflight: {project_root}")
+        raise RuntimeError(f"Mautic console is not healthy before composer package preflight: {project_root}")
     composer_bin = _resolve_composer_bin()
     _verify_composer_as_www_data(project_root, composer_bin)
 
@@ -345,7 +402,7 @@ def _ensure_mailer_packages(
 
     missing = sorted([pkg for pkg in required if not _composer_has_package(project_root, composer_bin, pkg)])
     if not missing:
-        logging.info("[%s] mailer packages already installed required=%s (%s)", root, ",".join(sorted(required)), reason)
+        logging.info("[%s] composer packages already installed required=%s (%s)", root, ",".join(sorted(required)), reason)
         return False
 
     # For zip installs we also normalize Node.js runtime to v20 before composer require.
@@ -353,15 +410,15 @@ def _ensure_mailer_packages(
         _ensure_node20()
 
     for pkg in missing:
-        _run(
-            [composer_bin, "require", pkg, "--no-interaction"],
-            cwd=project_root,
-            as_www_data=True,
+        _composer_update_targeted_package(
+            project_root=project_root,
+            composer_bin=composer_bin,
+            package_name=pkg,
             timeout_sec=max(int(config.command_timeout_sec or 900), 900),
         )
 
     if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
-        raise RuntimeError(f"Mautic console is not healthy after mailer package composer require: {project_root}")
+        raise RuntimeError(f"Mautic console is not healthy after composer require: {project_root}")
     console_abs = _normalize_console_path(project_root, console_path)
     _run(
         [config.php_bin, console_abs, "cache:clear"],
@@ -370,12 +427,32 @@ def _ensure_mailer_packages(
         timeout_sec=max(int(config.command_timeout_sec or 900), 600),
     )
     logging.info(
-        "[%s] mailer packages installed=%s (%s)",
+        "[%s] composer packages installed=%s (%s)",
         root,
         ",".join(missing),
         reason,
     )
     return True
+
+
+def ensure_composer_runtime_packages(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    packages: set[str],
+    reason: str,
+    no_scripts: bool = True,
+) -> bool:
+    return _ensure_composer_packages(
+        config=config,
+        root=root,
+        console_path=console_path,
+        required=set(packages),
+        reason=reason,
+        ensure_node=False,
+        no_scripts=no_scripts,
+    )
 
 
 def ensure_mailer_packages_for_bundles(
@@ -387,7 +464,7 @@ def ensure_mailer_packages_for_bundles(
     reason: str,
 ) -> bool:
     required = _required_mailer_packages_from_bundles(bundles)
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
@@ -408,7 +485,7 @@ def ensure_amazon_mailer_for_bundles(
     targets = set(bundles).intersection(AMAZON_MAILER_REQUIRED_BUNDLES)
     if not targets:
         return False
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
@@ -429,7 +506,7 @@ def ensure_mailer_packages_for_sender_config(
     if not required:
         return False
 
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
@@ -446,7 +523,7 @@ def ensure_mailer_packages(
     packages: set[str],
     reason: str,
 ) -> bool:
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=str(Path(root) / "bin" / "console"),

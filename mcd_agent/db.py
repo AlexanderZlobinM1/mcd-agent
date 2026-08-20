@@ -206,6 +206,76 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def fetch_message_queue_snapshot(self) -> dict[str, Any]:
+        table = self._safe_table(f"{self.cfg.table_prefix}message_queue")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SHOW TABLES LIKE %s", (table,))
+                if cur.fetchone() is None:
+                    raise RuntimeError("message_queue_table_missing")
+                columns = self._table_columns(cur, table)
+
+                if "success" in columns:
+                    unsent = "COALESCE(`success`, 0) = 0"
+                elif "status" in columns:
+                    unsent = "COALESCE(`status`, 'pending') NOT IN ('sent', 'cancelled')"
+                else:
+                    raise RuntimeError("message_queue_state_columns_missing")
+
+                if "attempts" in columns and "max_attempts" in columns:
+                    processable = "COALESCE(`attempts`, 0) < COALESCE(`max_attempts`, 3)"
+                    exhausted = "COALESCE(`attempts`, 0) >= COALESCE(`max_attempts`, 3)"
+                elif "attempts" in columns:
+                    processable = "COALESCE(`attempts`, 0) < 3"
+                    exhausted = "COALESCE(`attempts`, 0) >= 3"
+                else:
+                    processable = "1 = 1"
+                    exhausted = "1 = 0"
+
+                if "scheduled_date" in columns:
+                    due = "(`scheduled_date` IS NULL OR `scheduled_date` <= UTC_TIMESTAMP())"
+                    future = "`scheduled_date` > UTC_TIMESTAMP()"
+                    next_scheduled = (
+                        f"MIN(CASE WHEN {unsent} AND {processable} AND {future} "
+                        "THEN `scheduled_date` ELSE NULL END)"
+                    )
+                else:
+                    due = "1 = 1"
+                    future = "1 = 0"
+                    next_scheduled = "NULL"
+
+                query = (
+                    "SELECT "
+                    f"SUM(CASE WHEN {unsent} THEN 1 ELSE 0 END) AS total, "
+                    f"SUM(CASE WHEN {unsent} AND {processable} AND {due} THEN 1 ELSE 0 END) AS due, "
+                    f"SUM(CASE WHEN {unsent} AND {exhausted} THEN 1 ELSE 0 END) AS exhausted, "
+                    f"SUM(CASE WHEN {unsent} AND {processable} AND {future} THEN 1 ELSE 0 END) AS future, "
+                    f"{next_scheduled} AS next_scheduled_at "
+                    f"FROM `{table}`"
+                )
+                cur.execute(query)
+                row = cur.fetchone() or {}
+
+        def _count(name: str) -> int:
+            try:
+                return max(0, int(row.get(name) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        next_value = row.get("next_scheduled_at")
+        if isinstance(next_value, datetime):
+            next_text: str | None = next_value.replace(tzinfo=timezone.utc).isoformat()
+        else:
+            next_text = str(next_value).strip() if next_value else None
+        return {
+            "total": _count("total"),
+            "due": _count("due"),
+            "exhausted": _count("exhausted"),
+            "future": _count("future"),
+            "next_scheduled_at": next_text,
+            "error": "",
+        }
+
     def fetch_segment_definitions(self, segment_ids: list[int]) -> list[dict[str, Any]]:
         ids = list(dict.fromkeys(int(x) for x in segment_ids if int(x) > 0))
         if not ids:
@@ -247,6 +317,98 @@ class MauticDB:
             if isinstance(row, dict):
                 out.append(row)
         return out
+
+    def fetch_all_segment_filters(self) -> list[dict[str, Any]]:
+        prefix = str(self.cfg.table_prefix or "")
+        table_segments = self._safe_table(f"{prefix}lead_lists")
+        query = (
+            f"SELECT id, name, is_published, filters "
+            f"FROM `{table_segments}` "
+            f"ORDER BY id ASC"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def disable_segments(
+        self,
+        segment_ids: list[int],
+        *,
+        issue_id: str,
+        reason: str,
+        actor: str,
+        segment_contexts: dict[int, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        ids = list(dict.fromkeys(int(x) for x in segment_ids if int(x) > 0))
+        if not ids:
+            raise ValueError("no segment IDs supplied")
+        prefix = str(self.cfg.table_prefix or "")
+        table_segments = self._safe_table(f"{prefix}lead_lists")
+        placeholders = ",".join(["%s"] * len(ids))
+        remediation_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        contexts = segment_contexts if isinstance(segment_contexts, dict) else {}
+
+        def marker_for(segment_id: int) -> str:
+            context = contexts.get(segment_id) if isinstance(contexts.get(segment_id), dict) else {}
+            return (
+                "[MCD safety {ts}; issue={issue}; actor={actor}] {reason}"
+            ).format(
+                ts=remediation_ts,
+                issue=str(context.get("issue_id") or issue_id or "logical_issue")[:255],
+                actor=str(actor or "Emmy Starwell")[:120],
+                reason=str(context.get("reason") or reason or "logical issue")[:1500],
+            )
+
+        markers: dict[int, str] = {}
+        conn = self._connect()
+        try:
+            conn.begin()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id,name,description,is_published,date_modified "
+                    f"FROM `{table_segments}` WHERE id IN ({placeholders}) FOR UPDATE",
+                    tuple(ids),
+                )
+                before = [dict(row) for row in (cur.fetchall() or []) if isinstance(row, dict)]
+                found = {int(row.get("id") or 0) for row in before}
+                missing = sorted(set(ids) - found)
+                if missing:
+                    raise ValueError("segments disappeared before remediation: " + ",".join(map(str, missing)))
+                for row in before:
+                    segment_id = int(row.get("id") or 0)
+                    if int(row.get("is_published") or 0) == 0:
+                        continue
+                    marker = marker_for(segment_id)
+                    markers[segment_id] = marker
+                    description = str(row.get("description") or "").rstrip()
+                    if marker not in description:
+                        description = (description + "\n\n" + marker).strip()
+                    cur.execute(
+                        f"UPDATE `{table_segments}` "
+                        f"SET is_published=0,description=%s,date_modified=UTC_TIMESTAMP() "
+                        f"WHERE id=%s AND is_published=1",
+                        (description, segment_id),
+                    )
+                cur.execute(
+                    f"SELECT id,name,description,is_published,date_modified "
+                    f"FROM `{table_segments}` WHERE id IN ({placeholders}) ORDER BY id ASC",
+                    tuple(ids),
+                )
+                after = [dict(row) for row in (cur.fetchall() or []) if isinstance(row, dict)]
+            conn.commit()
+            return {
+                "before": before,
+                "after": after,
+                "marker": markers.get(ids[0], "") if len(ids) == 1 else "",
+                "markers": markers,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def fetch_lead_columns(self) -> set[str]:
         prefix = str(self.cfg.table_prefix or "")

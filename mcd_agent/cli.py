@@ -57,6 +57,7 @@ from mcd_agent.cluster_routing import (
     cluster_route_for_command,
     cluster_route_targets,
 )
+from mcd_agent.contact_count_report import collect_contact_count_report
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
@@ -76,7 +77,8 @@ from mcd_agent.executor import (
     command_task_type,
     execute_mautic_command,
 )
-from mcd_agent.fs_permissions import ensure_instance_permissions
+from mcd_agent.fs_permissions import effective_guard_identity, ensure_instance_permissions
+from mcd_agent.runtime_descriptor import descriptor_for_root
 from mcd_agent.instance_delete import delete_instance_artifacts
 from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.instance_migrate import (
@@ -95,6 +97,13 @@ from mcd_agent.instance_migrate import (
 )
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.install_type import detect_install_type
+from mcd_agent.hardware_profile import (
+    read_memory_kib,
+    read_profile_selection,
+    reconcile_hardware_profile,
+    recommended_profile,
+    write_profile_selection,
+)
 from mcd_agent.mautic_composer_move import move_zip_to_composer
 from mcd_agent.mautic_image_install import install_from_image
 from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive
@@ -111,9 +120,20 @@ from mcd_agent.local_mail import (
     receive_local_mail,
     submit_local_mail,
 )
+from mcd_agent.logical_issues import (
+    read_logical_issues_snapshot,
+    remediate_logical_issue,
+    remediate_logical_issues,
+    scan_install_logical_issues,
+)
 from mcd_agent.mail_config import apply_mail_profile, preflight_mail_profile
 from mcd_agent.maintenance_mode import collect_maintenance_state, restore_cron_service_if_needed, stop_cron_service
-from mcd_agent.mode import _resolve_mutable_config_path, profile_set, profile_status
+from mcd_agent.mode import (
+    _resolve_mutable_config_path,
+    profile_set,
+    profile_status,
+    reconcile_managed_cron,
+)
 from mcd_agent.nginx_baseline import ensure_nginx_baseline
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.runtime_overrides import (
@@ -158,9 +178,9 @@ def _to_bool(value: object) -> bool:
     return bool(value)
 
 
-def _push_state_after_change(cfg, reason: str) -> None:
+def _push_state_after_change(cfg, reason: str, *, runtime_store=None) -> None:
     try:
-        ok, msg = push_state_now(cfg, include_signals=False)
+        ok, msg = push_state_now(cfg, include_signals=False, runtime_store=runtime_store)
         if ok:
             logging.info("MCC immediate push (%s): %s", reason, msg)
         else:
@@ -887,7 +907,12 @@ def _prepare_cache_permissions(cfg, root: str) -> tuple[bool, str]:
 
 
 def _run_permissions_fix(cfg, root: str, run_as_user: str | None = None) -> tuple[int, str]:
-    user = str(run_as_user or cfg.mautic_run_as_user or "www-data").strip() or "www-data"
+    runtime = descriptor_for_root(root)
+    user = str(run_as_user or "").strip() or effective_guard_identity(
+        runtime="docker" if runtime is not None else "host",
+        runtime_user=runtime.container_user if runtime is not None else None,
+        host_user=cfg.mautic_run_as_user,
+    )
     try:
         res = ensure_instance_permissions(
             root=root,
@@ -1658,6 +1683,39 @@ def _build_parser() -> argparse.ArgumentParser:
     lock_cleanup.add_argument("--max-rows", type=int, default=20)
     lock_cleanup.add_argument("--json", action="store_true")
 
+    logical_issues = sub.add_parser("logical-issues", help="Inspect and remediate instance logical errors")
+    logical_issues_sub = logical_issues.add_subparsers(dest="logical_issues_cmd", required=True)
+    logical_scan = logical_issues_sub.add_parser("scan", help="Scan one instance and persist current logical errors")
+    logical_scan.add_argument("--config", default=default_cfg)
+    logical_scan.add_argument("--root", help="Mautic root or instance uid")
+    logical_scan.add_argument("--json", action="store_true")
+    logical_status = logical_issues_sub.add_parser("status", help="Read the persisted logical error snapshot")
+    logical_status.add_argument("--config", default=default_cfg)
+    logical_status.add_argument("--root", help="Mautic root or instance uid")
+    logical_status.add_argument("--json", action="store_true")
+    logical_remediate = logical_issues_sub.add_parser(
+        "remediate", help="Apply a guarded remediation to one active logical error"
+    )
+    logical_remediate.add_argument("--config", default=default_cfg)
+    logical_remediate.add_argument("--root", help="Mautic root or instance uid")
+    logical_remediate.add_argument("--issue-id")
+    logical_remediate.add_argument(
+        "--segment-id",
+        action="append",
+        type=int,
+        default=[],
+        help="Disable only this affected segment ID; repeat to select more segments",
+    )
+    logical_remediate.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help="Batch target in ISSUE_ID=SEGMENT_ID[,SEGMENT_ID] form; repeat per issue",
+    )
+    logical_remediate.add_argument("--action", choices=["disable_segments"], required=True)
+    logical_remediate.add_argument("--actor", default="Emmy Starwell")
+    logical_remediate.add_argument("--json", action="store_true")
+
     email_counters = sub.add_parser(
         "email-counters",
         help="Audit/repair Mautic email sent_count drift after campaign trigger completion",
@@ -1680,6 +1738,14 @@ def _build_parser() -> argparse.ArgumentParser:
     email_activity.add_argument("--contact-mode", choices=["all", "fresh", "old"], default="all")
     email_activity.add_argument("--contact-age-days", type=int, default=30)
     email_activity.add_argument("--json", action="store_true")
+
+    contact_count = sub.add_parser(
+        "report:contact-count",
+        help="Count Mautic contacts that have a non-empty email or mobile field",
+    )
+    contact_count.add_argument("--config", default=default_cfg)
+    contact_count.add_argument("--root", help="Mautic root, instance uid, name, or domain")
+    contact_count.add_argument("--json", action="store_true")
 
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
@@ -1926,7 +1992,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
     profile = sub.add_parser("profile", help="Switch MCD profile (single source of state)")
     profile.add_argument("--config", default=default_cfg)
-    profile.add_argument("op", choices=["status", "passive", "tiny", "mini", "midi", "maxi", "hiload", "custom"])
+    profile.add_argument(
+        "op",
+        choices=[
+            "status",
+            "auto",
+            "passive",
+            "tiny",
+            "mini",
+            "midi",
+            "maxi",
+            "hiload",
+            "ultra",
+            "farm-tiny",
+            "farm-mini",
+            "farm-midi",
+            "farm-maxi",
+            "farm-hiload",
+            "farm-ultra",
+            "custom",
+        ],
+    )
     profile.add_argument("--yes", action="store_true")
 
     tcheck = sub.add_parser("time-check", help="Timezone diagnostics for OS/PHP/MySQL/Mautic")
@@ -2155,7 +2241,32 @@ def main() -> int:
         return 0
 
     if args.cmd == "run":
+        selection = reconcile_hardware_profile(config_path=args.config, install_dir="/opt/mcd")
         cfg = load_config(args.config)
+        if selection.changed:
+            cron_result = reconcile_managed_cron(profile_name=selection.profile, install_dir="/opt/mcd")
+            if not cron_result.ok:
+                logging.warning("hardware profile cron reconcile failed: %s", "; ".join(cron_result.lines))
+            try:
+                queue_profile_event(
+                    cfg,
+                    source="mcd",
+                    initiated_by_user=selection.previous_profile != "farm",
+                    old_profile=selection.previous_profile or None,
+                    new_profile=selection.profile,
+                    reason=(
+                        "hardware_profile_farm_migration"
+                        if selection.previous_profile == "farm"
+                        else "hardware_profile_auto"
+                    ),
+                    details={
+                        "selection_mode": selection.mode,
+                        "cpu_count": selection.cpu_count,
+                        "memory_kib": selection.memory_kib,
+                    },
+                )
+            except Exception as e:
+                logging.warning("hardware profile event enqueue failed: %s", e)
         note = maybe_notify_update(cfg)
         if note:
             logging.info(note)
@@ -2163,7 +2274,32 @@ def main() -> int:
         return 0
 
     if args.cmd == "run-once":
+        selection = reconcile_hardware_profile(config_path=args.config, install_dir="/opt/mcd")
         cfg = load_config(args.config)
+        if selection.changed:
+            cron_result = reconcile_managed_cron(profile_name=selection.profile, install_dir="/opt/mcd")
+            if not cron_result.ok:
+                logging.warning("hardware profile cron reconcile failed: %s", "; ".join(cron_result.lines))
+            try:
+                queue_profile_event(
+                    cfg,
+                    source="mcd",
+                    initiated_by_user=selection.previous_profile != "farm",
+                    old_profile=selection.previous_profile or None,
+                    new_profile=selection.profile,
+                    reason=(
+                        "hardware_profile_farm_migration"
+                        if selection.previous_profile == "farm"
+                        else "hardware_profile_auto"
+                    ),
+                    details={
+                        "selection_mode": selection.mode,
+                        "cpu_count": selection.cpu_count,
+                        "memory_kib": selection.memory_kib,
+                    },
+                )
+            except Exception as e:
+                logging.warning("hardware profile event enqueue failed: %s", e)
         note = maybe_notify_update(cfg)
         if note:
             logging.info(note)
@@ -2238,6 +2374,85 @@ def main() -> int:
         if rc == 0:
             _push_state_after_change(cfg, "permissions-fix")
         return rc
+
+    if args.cmd == "logical-issues":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        try:
+            root = _select_root_for_ops(cfg, args.root)
+        except Exception as e:
+            print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            return 2
+        runtime_store = TaskStore(cfg.state_db_path, cfg)
+        try:
+            if args.logical_issues_cmd == "status":
+                payload = read_logical_issues_snapshot(cfg.state_db_path, root, runtime_store=runtime_store)
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+                return 0 if str(payload.get("status") or "") != "error" else 1
+            inventory = InstanceInventory(cfg.state_db_path)
+            ensure_seeded(inventory, cfg)
+            install = next((item for item in inventory.list_instances() if str(item.root) == root), None)
+            if install is None:
+                print(
+                    json.dumps(
+                        {"status": "error", "reason": "instance not found in local inventory", "root": root},
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+                return 2
+            try:
+                if args.logical_issues_cmd == "scan":
+                    payload = scan_install_logical_issues(cfg, install, runtime_store=runtime_store)
+                    _push_state_after_change(cfg, "logical-issues-scan", runtime_store=runtime_store)
+                else:
+                    if args.target:
+                        if len(args.target) > 100:
+                            raise ValueError("logical issue remediation is limited to 100 targets")
+                        targets: list[dict[str, object]] = []
+                        for raw_target in args.target:
+                            issue_id, separator, raw_ids = str(raw_target or "").partition("=")
+                            raw_segment_ids = [value.strip() for value in raw_ids.split(",")]
+                            if (
+                                not separator
+                                or not issue_id.strip()
+                                or not raw_segment_ids
+                                or any(not value.isdigit() or int(value) <= 0 for value in raw_segment_ids)
+                            ):
+                                raise ValueError("logical issue target must use ISSUE_ID=SEGMENT_ID[,SEGMENT_ID]")
+                            segment_ids = [int(value) for value in raw_segment_ids]
+                            targets.append({"issue_id": issue_id.strip(), "segment_ids": segment_ids})
+                        payload = remediate_logical_issues(
+                            cfg,
+                            install,
+                            targets=targets,
+                            action=args.action,
+                            actor=args.actor,
+                            runtime_store=runtime_store,
+                        )
+                    else:
+                        if not str(args.issue_id or "").strip():
+                            raise ValueError("--issue-id or at least one --target is required")
+                        payload = remediate_logical_issue(
+                            cfg,
+                            install,
+                            issue_id=args.issue_id,
+                            action=args.action,
+                            actor=args.actor,
+                            segment_ids=list(args.segment_id or []) or None,
+                            runtime_store=runtime_store,
+                        )
+                    _push_state_after_change(cfg, "logical-issue-remediation", runtime_store=runtime_store)
+            except Exception as e:
+                payload = {"status": "error", "reason": str(e), "root": root}
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+                return 1
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if str(payload.get("status") or "") != "error" else 1
+        finally:
+            runtime_store.close()
 
     if args.cmd == "instance-delete":
         cfg = load_config(args.config)
@@ -2602,6 +2817,42 @@ def main() -> int:
             )
         return 0
 
+    if args.cmd == "report:contact-count":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        try:
+            inst = _select_instance_for_ops(cfg, getattr(args, "root", None))
+            if not inst.db:
+                raise RuntimeError(f"Mautic install has no DB config: {inst.root}")
+            payload = collect_contact_count_report(MauticDB(inst.db))
+            payload["root"] = inst.root
+            payload["instance_uid"] = inst.instance_uid
+            payload["name"] = inst.name
+            payload["primary_domain"] = inst.primary_domain
+        except Exception as e:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"status": "error", "reason": str(e)}, ensure_ascii=True, indent=2))
+            else:
+                print(f"contact count report failed: {e}")
+            return 1
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            print(
+                "contact-count: root={root} real={real} email_only={email_only} "
+                "mobile_only={mobile_only} both={both} excluded={excluded}".format(
+                    root=str(payload.get("root") or ""),
+                    real=int(payload.get("real_contacts", 0) or 0),
+                    email_only=int(payload.get("email_only", 0) or 0),
+                    mobile_only=int(payload.get("mobile_only", 0) or 0),
+                    both=int(payload.get("email_and_mobile", 0) or 0),
+                    excluded=int(payload.get("excluded_without_email_or_mobile", 0) or 0),
+                )
+            )
+        return 0
+
     if args.cmd == "exec":
         cfg = load_config(args.config)
         note = maybe_notify_update(cfg)
@@ -2770,9 +3021,11 @@ def main() -> int:
                 if not domains and i.primary_domain:
                     domains = [str(i.primary_domain).strip()]
                 domains_cell = ",".join(domains)
-                install_type = detect_install_type(i.root)
+                runtime = str(getattr(i, "runtime", "host") or "host")
+                install_type = runtime if runtime != "host" else detect_install_type(i.root)
                 print(
-                    f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}\tdomains={domains_cell}\tinstall_type={install_type}"
+                    f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}"
+                    f"\tdomains={domains_cell}\truntime={runtime}\tinstall_type={install_type}"
                 )
             return 0
         if args.op == "rescan":
@@ -3900,12 +4153,73 @@ def main() -> int:
             )
             for line in res.lines:
                 print(line)
+            selection = read_profile_selection("/opt/mcd")
+            cpus = max(1, int(os.cpu_count() or 1))
+            memory_kib = read_memory_kib()
+            print(f"selection_mode={selection.get('mode', 'auto')}")
+            print(
+                "hardware_recommendation="
+                + recommended_profile(cpu_count=cpus, memory_kib=memory_kib)
+            )
+            print(f"hardware_cpu_count={cpus}")
+            print(f"hardware_memory_kib={memory_kib}")
+            return 0
+        if args.op == "auto":
+            previous_selection = read_profile_selection("/opt/mcd")
+            write_profile_selection(
+                "/opt/mcd",
+                mode="auto",
+                profile=old_profile_name or "passive",
+            )
+            result = reconcile_hardware_profile(
+                config_path=args.config,
+                install_dir="/opt/mcd",
+            )
+            cfg_after = load_config(args.config)
+            if result.changed:
+                cron_result = reconcile_managed_cron(profile_name=result.profile, install_dir="/opt/mcd")
+                if not cron_result.ok:
+                    print("profile auto: managed cron reconcile failed: " + "; ".join(cron_result.lines))
+                    return 1
+                try:
+                    queue_profile_event(
+                        cfg_after,
+                        source="mcd",
+                        initiated_by_user=True,
+                        old_profile=result.previous_profile or None,
+                        new_profile=result.profile,
+                        reason="hardware_profile_auto",
+                        details={
+                            "selection_mode": "auto",
+                            "previous_selection_mode": str(previous_selection.get("mode") or "auto"),
+                            "cpu_count": result.cpu_count,
+                            "memory_kib": result.memory_kib,
+                        },
+                    )
+                except Exception as e:
+                    logging.warning("hardware profile event enqueue failed: %s", e)
+                proc = subprocess.run(
+                    ["systemctl", "restart", "mcd"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    error = (proc.stderr or proc.stdout or "unknown error").strip()
+                    print(f"profile auto: service restart failed: {error}")
+                    return 1
+            _push_state_after_change(cfg_after, "hardware-profile-auto")
+            print(
+                f"profile auto: selected={result.profile} changed={str(result.changed).lower()} "
+                f"cpu={result.cpu_count} memory_kib={result.memory_kib}"
+            )
             return 0
         if not args.yes:
             ans = _ask(f"Switch profile to {args.op}? [y/N]: ").strip().lower()
             if ans not in {"y", "yes"}:
                 print("Cancelled")
                 return 1
+        write_profile_selection("/opt/mcd", mode="manual", profile=args.op)
         res = profile_set(
             profile=args.op,
             pause_flag_path=cfg.scheduler_pause_flag_path,

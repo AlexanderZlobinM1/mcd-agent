@@ -71,6 +71,12 @@ class InstanceInventory:
               db_user TEXT,
               db_password TEXT,
               db_table_prefix TEXT,
+              runtime TEXT NOT NULL DEFAULT 'host',
+              runtime_id TEXT,
+              runtime_root TEXT,
+              runtime_user TEXT,
+              runtime_php_bin TEXT,
+              runtime_image_ref TEXT,
               updated_at REAL NOT NULL
             )
             """
@@ -89,6 +95,16 @@ class InstanceInventory:
             self.conn.execute("ALTER TABLE instances ADD COLUMN primary_domain TEXT")
         if "domains_json" not in names:
             self.conn.execute("ALTER TABLE instances ADD COLUMN domains_json TEXT")
+        for column, sql_type in {
+            "runtime": "TEXT NOT NULL DEFAULT 'host'",
+            "runtime_id": "TEXT",
+            "runtime_root": "TEXT",
+            "runtime_user": "TEXT",
+            "runtime_php_bin": "TEXT",
+            "runtime_image_ref": "TEXT",
+        }.items():
+            if column not in names:
+                self.conn.execute(f"ALTER TABLE instances ADD COLUMN {column} {sql_type}")
         # Migration from legacy schema where name was PRIMARY KEY.
         if name_is_pk:
             self._migrate_instances_legacy_pk_name()
@@ -152,6 +168,12 @@ class InstanceInventory:
               db_user TEXT,
               db_password TEXT,
               db_table_prefix TEXT,
+              runtime TEXT NOT NULL DEFAULT 'host',
+              runtime_id TEXT,
+              runtime_root TEXT,
+              runtime_user TEXT,
+              runtime_php_bin TEXT,
+              runtime_image_ref TEXT,
               updated_at REAL NOT NULL
             )
             """
@@ -160,11 +182,13 @@ class InstanceInventory:
             """
             INSERT OR REPLACE INTO instances(
               instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
-              db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
+              db_host, db_port, db_name, db_user, db_password, db_table_prefix,
+              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref, updated_at
             )
             SELECT
               NULL, name, root, NULL, NULL, console_path, local_php_path, mautic_timezone, mautic_major, source,
-              db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
+              db_host, db_port, db_name, db_user, db_password, db_table_prefix,
+              'host', NULL, NULL, NULL, NULL, NULL, updated_at
             FROM instances_legacy
             ORDER BY updated_at ASC
             """
@@ -188,8 +212,9 @@ class InstanceInventory:
             """
             INSERT INTO instances(
               instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
-              db_host, db_port, db_name, db_user, db_password, db_table_prefix, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              db_host, db_port, db_name, db_user, db_password, db_table_prefix,
+              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(root) DO UPDATE SET
               instance_uid=excluded.instance_uid,
               name=excluded.name,
@@ -207,6 +232,12 @@ class InstanceInventory:
               db_user=excluded.db_user,
               db_password=excluded.db_password,
               db_table_prefix=excluded.db_table_prefix,
+              runtime=excluded.runtime,
+              runtime_id=excluded.runtime_id,
+              runtime_root=excluded.runtime_root,
+              runtime_user=excluded.runtime_user,
+              runtime_php_bin=excluded.runtime_php_bin,
+              runtime_image_ref=excluded.runtime_image_ref,
               updated_at=excluded.updated_at
             """,
             (
@@ -226,6 +257,12 @@ class InstanceInventory:
                 db.user if db else None,
                 self._encrypt_password(db.password) if db else None,
                 db.table_prefix if db else None,
+                str(inst.runtime or "host"),
+                inst.runtime_id,
+                inst.runtime_root,
+                inst.runtime_user,
+                inst.runtime_php_bin,
+                inst.runtime_image_ref,
                 time.time(),
             ),
         )
@@ -263,6 +300,14 @@ class InstanceInventory:
                         if str(r["domains_json"] or "").strip()
                         else ([str(r["primary_domain"]).strip().lower()] if r["primary_domain"] else [])
                     ),
+                    runtime=str(r["runtime"] or "host"),
+                    runtime_id=str(r["runtime_id"]) if r["runtime_id"] else None,
+                    runtime_root=str(r["runtime_root"]) if r["runtime_root"] else None,
+                    runtime_user=str(r["runtime_user"]) if r["runtime_user"] else None,
+                    runtime_php_bin=str(r["runtime_php_bin"]) if r["runtime_php_bin"] else None,
+                    runtime_image_ref=(
+                        str(r["runtime_image_ref"]) if r["runtime_image_ref"] else None
+                    ),
                 )
             )
         return out
@@ -279,9 +324,13 @@ class InstanceInventory:
             config.custom_instances,
         )
         if preserve_manual:
-            self.conn.execute("DELETE FROM instances WHERE source='autodiscovery'")
+            self.conn.execute(
+                "DELETE FROM instances WHERE source IN ('autodiscovery','runtime-descriptor')"
+            )
         else:
-            self.conn.execute("DELETE FROM instances WHERE source IN ('autodiscovery','manual')")
+            self.conn.execute(
+                "DELETE FROM instances WHERE source IN ('autodiscovery','manual','runtime-descriptor')"
+            )
         for inst in installs:
             self._upsert_install(inst, source=inst.source or "autodiscovery")
         self.conn.commit()

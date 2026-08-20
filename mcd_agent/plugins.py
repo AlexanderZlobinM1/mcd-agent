@@ -23,7 +23,7 @@ import uuid
 import zipfile
 
 from mcd_agent import __version__
-from mcd_agent.amazon_mailer_dep import ensure_mailer_packages_for_bundles
+from mcd_agent.amazon_mailer_dep import ensure_composer_runtime_packages, ensure_mailer_packages_for_bundles
 from mcd_agent.cluster_routing import cluster_local_identity_values, cluster_route_targets
 from mcd_agent.config import AgentConfig
 from mcd_agent.db import MauticDB
@@ -57,6 +57,7 @@ _CLUSTER_PLUGIN_ACTIVE_PHASES = {
 _CLUSTER_PLUGIN_STALE_SEC = 3 * 60 * 60
 _PLUGIN_SYNC_IGNORED_NAMES = {".DS_Store", "__MACOSX", ".stfolder", ".stversions"}
 _PLUGIN_SYNC_IGNORED_RE = re.compile(r"(sync-conflict|\.sync-conflict|\.syncthing\..*\.tmp$|\.tmp$|\.part$)", re.IGNORECASE)
+_MAUTIC7_PLUGIN_RUNTIME_PACKAGES = {"nikic/php-parser:^5.0"}
 _GALERA_DANGEROUS_SQL_RE = re.compile(
     r"^\s*(ALTER|CREATE|DROP|RENAME|TRUNCATE|OPTIMIZE|ANALYZE|CHECK|REPAIR|LOCK|UNLOCK)\b",
     re.IGNORECASE,
@@ -1023,6 +1024,62 @@ def _resolve_plugins_dir(root: str, create: bool = False) -> Path:
     return candidates[0]
 
 
+def _registered_plugin_bundles(install) -> set[str] | None:
+    if not getattr(install, "db", None):
+        return None
+    try:
+        rows = MauticDB(install.db).fetch_rows(
+            "SELECT bundle FROM {prefix}plugins WHERE is_missing = 0",
+            limit=5000,
+        )
+    except Exception as exc:
+        logging.warning("[%s] plugin registration lookup failed: %s", install.root, exc)
+        return None
+    return {
+        str(row.get("bundle") or "").strip()
+        for row in rows
+        if str(row.get("bundle") or "").strip()
+    }
+
+
+def _registration_aware_status(
+    status: str,
+    reason: str,
+    install_bundle: str,
+    registered_bundles: set[str] | None,
+) -> tuple[str, str]:
+    if status == "OK" and registered_bundles is not None and install_bundle not in registered_bundles:
+        return "BROKEN", "files installed but Mautic registration is missing"
+    return status, reason
+
+
+def _assert_plugin_bundles_registered(install, bundles: set[str]) -> None:
+    expected = {str(bundle or "").strip() for bundle in bundles if str(bundle or "").strip()}
+    if not expected or not getattr(install, "db", None):
+        return
+    registered = _registered_plugin_bundles(install)
+    if registered is None:
+        raise RuntimeError("unable to verify Mautic plugin registration")
+    missing = sorted(expected - registered)
+    if missing:
+        raise RuntimeError(
+            "Mautic plugin registration incomplete after plugin install: " + ", ".join(missing)
+        )
+
+
+def _ensure_plugin_reload_runtime_packages(config: AgentConfig, install) -> bool:
+    if int(getattr(install, "mautic_major", 0) or 0) != 7:
+        return False
+    return ensure_composer_runtime_packages(
+        config=config,
+        root=install.root,
+        console_path=install.console_path,
+        packages=_MAUTIC7_PLUGIN_RUNTIME_PACKAGES,
+        reason="mautic7-plugin-registration",
+        no_scripts=True,
+    )
+
+
 def _build_plugin_rows(
     *,
     config: AgentConfig,
@@ -1072,6 +1129,7 @@ def _build_plugin_rows(
     local_bundles = {d.name for d in local_dirs}
     all_bundles = sorted(set(local_bundles) | set(manifest_by_bundle.keys()), key=lambda x: x.lower())
     interaction_context = _plugin_interaction_context(install_root, plugins_dir)
+    registered_bundles = _registered_plugin_bundles(install)
 
     rows: list[dict[str, Any]] = []
     selectable_idx = 1
@@ -1106,6 +1164,12 @@ def _build_plugin_rows(
             item,
             config.plugins_state_filename,
             install_bundle=install_bundle,
+        )
+        status, reason = _registration_aware_status(
+            status,
+            reason,
+            install_bundle,
+            registered_bundles,
         )
         exclusive_with = sorted(_exclusive_counterparts(bundle, item, context=interaction_context))
         rows.append(
@@ -1370,11 +1434,12 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
     raise RuntimeError(f"mautic:plugin:install failed: {out}")
 
 
-def _run_post_steps(config: AgentConfig, install) -> None:
+def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | None = None) -> None:
     if config.plugins_post_cache_clear:
         _run_plugin_cache_clear(config, install)
     if config.plugins_post_install:
         _run_plugin_install_reload(config, install)
+        _assert_plugin_bundles_registered(install, set(expected_bundles or set()))
 
 
 def _run_manifest_sql_fixes(config: AgentConfig, install, selected_rows: list[dict[str, Any]]) -> None:
@@ -1741,6 +1806,7 @@ def _apply_plugin_file_changes(
                 )
                 print(f"Auto-removed conflicting plugin: {conflict_bundle} ({', '.join(removed_paths)})")
 
+    plugin_runtime_preflight_done = False
     for row in selected:
         item = row["item"]
         bundle = row["bundle"]
@@ -1773,7 +1839,7 @@ def _apply_plugin_file_changes(
         if action == "install":
             should_apply = True
         elif action == "update":
-            should_apply = status in {"UPDATE", "MISSING"}
+            should_apply = status in {"UPDATE", "MISSING", "BROKEN"}
         elif action == "reinstall":
             should_apply = True
         else:
@@ -1782,6 +1848,10 @@ def _apply_plugin_file_changes(
         if not should_apply:
             logging.info("[%s] plugin %s skip action=%s status=%s", install_root, bundle, action, status)
             continue
+
+        if not plugin_runtime_preflight_done:
+            _ensure_plugin_reload_runtime_packages(config, install)
+            plugin_runtime_preflight_done = True
 
         mailer_preflight_names = {
             bundle,
@@ -1846,7 +1916,16 @@ def _apply_plugin_file_changes(
             extra_conflicts=auto_remove_bundles,
         )
         if run_post_steps:
-            _run_post_steps(config, install)
+            expected_bundles = (
+                set()
+                if action == "remove"
+                else {
+                    str(row.get("install_bundle") or row.get("bundle") or "").strip()
+                    for row in selected
+                    if isinstance(row.get("item"), dict)
+                }
+            )
+            _run_post_steps(config, install, expected_bundles=expected_bundles)
     return changed or compatibility_changed
 
 

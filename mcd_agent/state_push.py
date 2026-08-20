@@ -35,8 +35,10 @@ from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.instance_size import collect_instance_sizes
 from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
+from mcd_agent.logical_issues import read_logical_issues_snapshot
 from mcd_agent.maintenance_mode import collect_maintenance_state
 from mcd_agent.mautic_version_cache import collect_mautic_version
+from mcd_agent.message_queue import collect_message_queue_snapshot
 from mcd_agent.runtime_overrides import local_runtime_overrides
 from mcd_agent.state_backend import (
     mark_outbound_event_mysql,
@@ -1655,8 +1657,9 @@ def _detect_sender_profile(root: str, plugins: list[dict[str, str]]) -> dict[str
 
 
 class MCCStatePusher:
-    def __init__(self, cfg: AgentConfig) -> None:
+    def __init__(self, cfg: AgentConfig, runtime_store: Any | None = None) -> None:
         self.cfg = cfg
+        self.runtime_store = runtime_store
         self.last_push_ts = 0.0
         self.last_alert_poll_ts = 0.0
         self.last_hash = ""
@@ -2142,6 +2145,12 @@ class MCCStatePusher:
                     "sender_key": str(sender.get("sender_key", "") or "").strip() or "unknown",
                     "sender_title": str(sender.get("sender_title", "") or "").strip(),
                     "sender_config": sender.get("sender_config") if isinstance(sender.get("sender_config"), dict) else {},
+                    "logical_issues": read_logical_issues_snapshot(
+                        self.cfg.state_db_path,
+                        i.root,
+                        runtime_store=self.runtime_store,
+                    ),
+                    "message_queue": collect_message_queue_snapshot(i),
                 }
             )
         instances.sort(key=lambda x: str(x["instance_uid"]))
@@ -2292,29 +2301,43 @@ def push_state_now(
     *,
     profile_name: str | None = None,
     include_signals: bool = False,
+    runtime_store: Any | None = None,
 ) -> tuple[bool, str]:
-    pusher = MCCStatePusher(cfg)
-    if not pusher.enabled():
-        return False, "push disabled"
+    owned_runtime_store = None
+    if runtime_store is None:
+        # Imported lazily because daemon imports this module for its regular
+        # pusher. One shared store keeps MySQL authoritative and avoids opening
+        # one SQLite connection per instance during manual pushes.
+        from mcd_agent.daemon import TaskStore
 
-    inv = InstanceInventory(cfg.state_db_path)
-    ensure_seeded(inv, cfg)
-    installs = inv.list_instances()
-    now_ts = datetime.now(timezone.utc).timestamp()
-    profile_event = read_pending_profile_event(cfg)
-    payload = pusher.build_payload(
-        installs=installs,
-        profile_name=(profile_name if profile_name is not None else cfg.profile_name),
-        now_ts=now_ts,
-        include_signals=include_signals,
-        profile_event=profile_event,
-    )
-    ok, msg = pusher.send(payload)
-    if profile_event:
-        clear_pending_profile_event(
-            cfg,
-            event_id=str(profile_event.get("event_id", "")).strip() or None,
-            delivered=bool(ok),
-            error=None if ok else str(msg),
+        owned_runtime_store = TaskStore(cfg.state_db_path, cfg)
+        runtime_store = owned_runtime_store
+    try:
+        pusher = MCCStatePusher(cfg, runtime_store=runtime_store)
+        if not pusher.enabled():
+            return False, "push disabled"
+
+        inv = InstanceInventory(cfg.state_db_path)
+        ensure_seeded(inv, cfg)
+        installs = inv.list_instances()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        profile_event = read_pending_profile_event(cfg)
+        payload = pusher.build_payload(
+            installs=installs,
+            profile_name=(profile_name if profile_name is not None else cfg.profile_name),
+            now_ts=now_ts,
+            include_signals=include_signals,
+            profile_event=profile_event,
         )
-    return ok, msg
+        ok, msg = pusher.send(payload)
+        if profile_event:
+            clear_pending_profile_event(
+                cfg,
+                event_id=str(profile_event.get("event_id", "")).strip() or None,
+                delivered=bool(ok),
+                error=None if ok else str(msg),
+            )
+        return ok, msg
+    finally:
+        if owned_runtime_store is not None:
+            owned_runtime_store.close()

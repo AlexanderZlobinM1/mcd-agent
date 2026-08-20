@@ -4,8 +4,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from mcd_agent.amazon_mailer_dep import _composer_project_is_mautic
+from mcd_agent.amazon_mailer_dep import (
+    _composer_project_is_mautic,
+    _composer_update_targeted_package,
+    _ensure_composer_packages,
+    ensure_composer_runtime_packages,
+)
 
 
 class MailerComposerSafetyTests(unittest.TestCase):
@@ -26,6 +33,115 @@ class MailerComposerSafetyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertTrue(_composer_project_is_mautic(str(root)))
+
+    def test_runtime_package_wrapper_disables_composer_scripts(self) -> None:
+        cfg = SimpleNamespace()
+        with patch("mcd_agent.amazon_mailer_dep._ensure_composer_packages", return_value=True) as ensure:
+            changed = ensure_composer_runtime_packages(
+                config=cfg,
+                root="/var/www/mautic",
+                console_path="/var/www/mautic/bin/console",
+                packages={"nikic/php-parser:^5.0"},
+                reason="plugin-registration",
+            )
+
+        self.assertTrue(changed)
+        ensure.assert_called_once_with(
+            config=cfg,
+            root="/var/www/mautic",
+            console_path="/var/www/mautic/bin/console",
+            required={"nikic/php-parser:^5.0"},
+            reason="plugin-registration",
+            ensure_node=False,
+            no_scripts=True,
+        )
+
+    def test_runtime_composer_require_uses_no_scripts(self) -> None:
+        cfg = SimpleNamespace(php_bin="php", command_timeout_sec=900)
+        with (
+            patch("mcd_agent.amazon_mailer_dep._resolve_project_root", return_value="/var/www/mautic"),
+            patch("mcd_agent.amazon_mailer_dep._composer_project_is_mautic", return_value=True),
+            patch("mcd_agent.amazon_mailer_dep._mautic_console_healthy", side_effect=[True, True]),
+            patch("mcd_agent.amazon_mailer_dep._resolve_composer_bin", return_value="/usr/local/bin/composer"),
+            patch("mcd_agent.amazon_mailer_dep._verify_composer_as_www_data"),
+            patch("mcd_agent.amazon_mailer_dep._composer_has_package", return_value=False),
+            patch("mcd_agent.amazon_mailer_dep._composer_update_targeted_package") as targeted,
+            patch("mcd_agent.amazon_mailer_dep._run", return_value=Mock(returncode=0)),
+        ):
+            changed = _ensure_composer_packages(
+                config=cfg,
+                root="/var/www/mautic",
+                console_path="/var/www/mautic/bin/console",
+                required={"nikic/php-parser:^5.0"},
+                reason="plugin-registration",
+                ensure_node=False,
+                no_scripts=True,
+            )
+
+        self.assertTrue(changed)
+        targeted.assert_called_once_with(
+            project_root="/var/www/mautic",
+            composer_bin="/usr/local/bin/composer",
+            package_name="nikic/php-parser:^5.0",
+            timeout_sec=900,
+        )
+
+    def test_targeted_update_restores_private_repositories(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = {
+                "repositories": [{"type": "vcs", "url": "https://git.sales-snap.com/private.git"}],
+                "require": {"mautic/core-lib": "^7.0"},
+            }
+            (root / "composer.json").write_text(json.dumps(original), encoding="utf-8")
+            (root / "composer.lock").write_text("original", encoding="utf-8")
+
+            def fake_run(cmd, **kwargs):
+                if cmd[1] == "require":
+                    data = json.loads((root / "composer.json").read_text(encoding="utf-8"))
+                    data.setdefault("require", {})["nikic/php-parser"] = "^5.0"
+                    (root / "composer.json").write_text(json.dumps(data), encoding="utf-8")
+                if cmd[1] == "update":
+                    (root / "composer.lock").write_text("updated", encoding="utf-8")
+                return Mock(returncode=0)
+
+            with patch("mcd_agent.amazon_mailer_dep._run", side_effect=fake_run) as run:
+                _composer_update_targeted_package(
+                    project_root=str(root), composer_bin="composer",
+                    package_name="nikic/php-parser:^5.0", timeout_sec=30,
+                )
+
+            updated = json.loads((root / "composer.json").read_text())
+            self.assertEqual(updated["repositories"], original["repositories"])
+            self.assertEqual(updated["require"]["mautic/core-lib"], "^7.0")
+            self.assertEqual(updated["require"]["nikic/php-parser"], "^5.0")
+            self.assertEqual((root / "composer.lock").read_text(), "updated")
+            self.assertEqual(run.call_count, 2)
+
+    def test_targeted_update_restores_json_and_lock_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original_json = '{"repositories":[{"type":"vcs","url":"https://git.sales-snap.com/private.git"}]}\n'
+            (root / "composer.json").write_text(original_json, encoding="utf-8")
+            (root / "composer.lock").write_text("original", encoding="utf-8")
+
+            def fail_run(cmd, **kwargs):
+                if cmd[1] == "require":
+                    (root / "composer.json").write_text('{"require":{"nikic/php-parser":"^5.0"}}', encoding="utf-8")
+                if cmd[1] == "update":
+                    (root / "composer.lock").write_text("partial", encoding="utf-8")
+                    raise RuntimeError("update failed")
+                return Mock(returncode=0)
+
+            with patch("mcd_agent.amazon_mailer_dep._run", side_effect=fail_run):
+                with self.assertRaises(RuntimeError):
+                    _composer_update_targeted_package(
+                        project_root=str(root), composer_bin="composer",
+                        package_name="nikic/php-parser:^5.0", timeout_sec=30,
+                    )
+
+            self.assertEqual((root / "composer.json").read_text(encoding="utf-8"), original_json)
+            self.assertEqual((root / "composer.lock").read_text(encoding="utf-8"), "original")
 
 
 if __name__ == "__main__":

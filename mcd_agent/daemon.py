@@ -14,7 +14,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ from mcd_agent.config import (
     runtime_effective_map,
     upsert_runtime_values,
 )
-from mcd_agent.install_type import plugin_dir_candidates
+from mcd_agent.hardware_profile import write_profile_selection
 from mcd_agent.backup import (
     backup_lock_active,
     backup_profile_sync_from_config,
@@ -58,7 +58,8 @@ from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
 from mcd_agent.email_counters import repair_campaign_email_counters
 from mcd_agent.executor import render_mautic_command
-from mcd_agent.fs_permissions import ensure_instance_permissions
+from mcd_agent.fail2ban_guard import ensure_nginx_4xx_browser_icon_guard
+from mcd_agent.fs_permissions import effective_guard_identity, ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.instance_runtime import apply_instance_runtime
@@ -67,11 +68,34 @@ from mcd_agent.grapesjs_ckeditor_patch import ensure_grapesjs_ckeditor_gpl_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_version_cache import retire_zabbix_mautic_version_userparameter
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
+from mcd_agent.logical_issues import (
+    logical_issue_blocked_segment_ids,
+    prune_logical_issue_snapshots,
+    read_logical_issues_snapshot,
+    scan_install_logical_issues,
+)
+from mcd_agent.message_queue import (
+    DEFAULT_INTERVAL_SEC as MESSAGE_QUEUE_DEFAULT_INTERVAL_SEC,
+    effective_message_queue_setting,
+    instance_setting_keys as message_queue_instance_setting_keys,
+    normalize_interval as normalize_message_queue_interval,
+    supports_message_queue,
+)
 from mcd_agent.mode import (
     reconcile_empty_leads_cleanup_cron,
     reconcile_managed_cron,
     reconcile_mautic_email_fetch_cron,
-    reconcile_viber_stats_cron,
+    reconcile_mautic_message_queue_cron,
+    reconcile_plugin_operation_cron,
+)
+from mcd_agent.plugin_operations import (
+    command_template as plugin_operation_command_template,
+    effective_values as plugin_operation_effective_values,
+    instance_runtime_keys as plugin_operation_instance_runtime_keys,
+    legacy_cron_rules as plugin_operation_legacy_cron_rules,
+    operations_for_instance as plugin_operations_for_instance,
+    schedule_due as plugin_operation_schedule_due,
+    scheduled_tasks as plugin_operation_scheduled_tasks,
 )
 from mcd_agent.monitored_email import (
     ALLOWED_TYPES as MONITORED_EMAIL_ALLOWED_TYPES,
@@ -137,9 +161,11 @@ _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_GRACE_SEC = 180
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_INTERVAL_SEC = 60
 _CAMPAIGN_TRIGGER_PROGRESS_WATCHDOG_STABLE_CHECKS = 2
 _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
+_CAMPAIGN_TRIGGER_FUTURE_WAKE_EARLY_SEC = 1.0
 _CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC = 30 * 60
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
+_CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_SEC = 15 * 60
 # Avoid spending an entire scheduler pass probing stale audit candidates.
 _CAMPAIGN_TRIGGER_STALE_SCAN_CAP = 8
 _PRIORITY_DISPATCH_REGULAR_CHUNK = 8
@@ -151,7 +177,10 @@ _CAMPAIGN_FALLBACK_COORDINATOR_LOCK = threading.RLock()
 _CAMPAIGN_FALLBACK_ACTIVE_ROOTS: set[str] = set()
 _CAMPAIGN_DISPATCHING_ROOTS: dict[str, int] = {}
 _CAMPAIGN_TRIGGER_STUCK_UNTIL: dict[tuple[str, int], tuple[float, str]] = {}
+_CAMPAIGN_TRIGGER_FUTURE_WAKE: dict[tuple[str, int], tuple[float, str]] = {}
+_CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED: dict[tuple[str, int], str] = {}
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT: dict[tuple[str, int], float] = {}
+_CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FINISHED_AT: dict[tuple[str, int], float] = {}
 _CAMPAIGN_REBUILD_FINISHED_AT: dict[tuple[str, int], float] = {}
 _SEGMENT_FILTER_WARN_TS: dict[tuple[str, str], float] = {}
@@ -195,6 +224,7 @@ class CampaignTriggerProgressSnapshot:
     pending_event_logs: int
     triggered_event_logs: int
     max_triggered_at: str
+    next_scheduled_at: str = ""
     sent_email_stats: int = 0
     max_email_sent_at: str = ""
 
@@ -206,7 +236,7 @@ class CampaignTriggerProgressSnapshot:
             + max(0, int(self.due_no_action_branches or 0))
         )
 
-    def progress_key(self) -> tuple[int, int, int, int, int, str, int, str]:
+    def progress_key(self) -> tuple[int, int, int, int, int, str, str, int, str]:
         return (
             self.due_total,
             max(0, int(self.due_event_logs or 0)),
@@ -214,6 +244,7 @@ class CampaignTriggerProgressSnapshot:
             max(0, int(self.pending_event_logs or 0)),
             max(0, int(self.triggered_event_logs or 0)),
             str(self.max_triggered_at or ""),
+            str(self.next_scheduled_at or ""),
             max(0, int(self.sent_email_stats or 0)),
             str(self.max_email_sent_at or ""),
         )
@@ -289,10 +320,13 @@ _BACKUP_STABLE_RUNTIME_KEYS = {
     "backup_cluster_authority_role",
     "backup_cluster_authority_host",
 }
-_VIBER_STATS_STABLE_RUNTIME_KEYS = {
-    "viber_stats_enabled",
-    "viber_stats_interval_sec",
-    "viber_stats_instance_settings",
+_PLUGIN_OPERATION_STABLE_RUNTIME_KEYS = {
+    "plugin_operation_instance_settings",
+}
+_MESSAGE_QUEUE_STABLE_RUNTIME_KEYS = {
+    "message_queue_enabled",
+    "message_queue_interval_sec",
+    "message_queue_instance_settings",
 }
 _SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS = {
     "segment_whitelist_instance_settings",
@@ -319,17 +353,6 @@ _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS = {
     "page_hits_orphan_cleanup_max_run_sec",
     "page_hits_orphan_cleanup_instance_settings",
 }
-_HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS = {
-    "housekeeping_plugin_enabled",
-    "housekeeping_plugin_interval_sec",
-    "housekeeping_plugin_quiet_hour",
-    "housekeeping_plugin_quiet_window_min",
-    "housekeeping_plugin_days_old",
-    "housekeeping_plugin_flags",
-    "housekeeping_plugin_optimize_tables",
-    "housekeeping_plugin_dry_run",
-    "housekeeping_plugin_instance_settings",
-}
 _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS = {
     "monitored_email_parser_enabled",
     "monitored_email_parser_interval_sec",
@@ -354,18 +377,17 @@ _CLUSTER_STABLE_RUNTIME_KEYS = {
 }
 _STABLE_RUNTIME_KEYS = (
     _BACKUP_STABLE_RUNTIME_KEYS
-    | _VIBER_STATS_STABLE_RUNTIME_KEYS
+    | _PLUGIN_OPERATION_STABLE_RUNTIME_KEYS
+    | _MESSAGE_QUEUE_STABLE_RUNTIME_KEYS
     | _SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS
     | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
     | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
-    | _HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS
     | _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS
     | _CLUSTER_STABLE_RUNTIME_KEYS
 )
 _SERVICE_CLEANUP_RUNTIME_KEYS = (
     _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
     | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
-    | _HOUSEKEEPING_PLUGIN_STABLE_RUNTIME_KEYS
     | _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS
 )
 
@@ -426,6 +448,7 @@ def _mark_campaign_rebuild_finished(root: str, campaign_id: int | None, now_ts: 
     if cid <= 0:
         return
     _CAMPAIGN_REBUILD_FINISHED_AT[(str(root), cid)] = float(now_ts or time.time())
+    _CAMPAIGN_TRIGGER_FUTURE_WAKE.pop((str(root), cid), None)
 
 
 def _mark_campaign_trigger_finished(root: str, campaign_id: int | None) -> None:
@@ -438,6 +461,18 @@ def _mark_campaign_trigger_finished(root: str, campaign_id: int | None) -> None:
     if cid <= 0:
         return
     _CAMPAIGN_REBUILD_FINISHED_AT.pop((str(root), cid), None)
+
+
+def _campaign_trigger_after_rebuild_pending(
+    root: str,
+    rings: tuple[deque[int], ...],
+) -> bool:
+    root_key = str(root)
+    return any(
+        (root_key, int(campaign_id)) in _CAMPAIGN_REBUILD_FINISHED_AT
+        for ring in rings
+        for campaign_id in ring
+    )
 
 
 def _campaign_trigger_waits_for_rebuild(
@@ -561,25 +596,7 @@ def _cluster_files_producer_allowed(config: AgentConfig) -> bool:
     return bool(local & expected)
 
 
-def _instance_has_viber_plugin(inst: object) -> bool:
-    root = str(getattr(inst, "root", "") or "").strip()
-    if not root:
-        return False
-    for plugins_dir in plugin_dir_candidates(root):
-        if not plugins_dir.exists() or not plugins_dir.is_dir():
-            continue
-        try:
-            for row in plugins_dir.iterdir():
-                if row.name.startswith(".") or not row.is_dir():
-                    continue
-                if "viber" in row.name.lower():
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def _viber_stats_setting_keys(inst: object) -> list[str]:
+def _instance_setting_keys(inst: object) -> list[str]:
     raw = [
         getattr(inst, "instance_uid", None),
         getattr(inst, "root", None),
@@ -600,32 +617,125 @@ def _viber_stats_setting_keys(inst: object) -> list[str]:
     return out
 
 
-def _viber_stats_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int]:
-    enabled = bool(getattr(config, "viber_stats_enabled", True))
-    interval = max(60, int(getattr(config, "viber_stats_interval_sec", 600) or 600))
-    settings = getattr(config, "viber_stats_instance_settings", {})
+def _instance_scoped_whitelist_entry(settings: object, inst: object) -> tuple[bool, object]:
     if not isinstance(settings, dict):
-        return enabled, interval
-    for key in _viber_stats_setting_keys(inst):
-        if key not in settings:
-            continue
-        raw = settings.get(key)
-        if isinstance(raw, dict):
-            if "enabled" in raw:
-                enabled = _to_boolish(raw.get("enabled"), enabled)
-            if "interval_sec" in raw:
-                try:
-                    interval = max(60, int(raw.get("interval_sec") or interval))
-                except Exception:
-                    pass
-            return enabled, interval
-        if isinstance(raw, bool):
-            return bool(raw), interval
-        try:
-            return enabled, max(60, int(raw or interval))
-        except Exception:
-            return enabled, interval
-    return enabled, interval
+        return False, None
+
+    instance_keys = _instance_setting_keys(inst)
+    qualified_keys: list[str] = []
+    instance_key_set = set(instance_keys)
+    for raw_key in settings:
+        key = str(raw_key or "").strip()
+        base_key, separator, _host_name = key.partition("@")
+        if separator and base_key in instance_key_set and key not in instance_key_set:
+            qualified_keys.append(key)
+
+    for key in instance_keys + qualified_keys + ["default"]:
+        if key in settings:
+            return True, settings.get(key)
+    return False, None
+
+
+def _whitelist_realtime_block(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        return {}
+    block = raw.get("realtime", {})
+    if not isinstance(block, dict) or not _to_boolish(block.get("enabled"), True):
+        return {}
+    return block
+
+
+def _whitelist_realtime_int(
+    block: dict[str, object],
+    key: str,
+    *,
+    maximum: int | None = None,
+) -> int:
+    try:
+        value = max(0, int(block.get(key, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+    return min(value, maximum) if maximum is not None else value
+
+
+@dataclass(frozen=True)
+class SegmentWhitelistRealtimeSetting:
+    ids: frozenset[int] = frozenset()
+    interval_sec: int = 0
+    parallel: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.ids and self.interval_sec > 0 and self.parallel > 0)
+
+
+@dataclass(frozen=True)
+class CampaignWhitelistRealtimeSetting:
+    ids: frozenset[int] = frozenset()
+    rebuild_interval_sec: int = 0
+    trigger_interval_sec: int = 0
+    rebuild_parallel: int = 0
+    trigger_parallel: int = 0
+
+    @property
+    def rebuild_enabled(self) -> bool:
+        return bool(self.ids and self.rebuild_interval_sec > 0 and self.rebuild_parallel > 0)
+
+    @property
+    def trigger_enabled(self) -> bool:
+        return bool(self.ids and self.trigger_interval_sec > 0 and self.trigger_parallel > 0)
+
+
+def _plugin_operation_guard_matches(db: MauticDB, guard: object, now_local: datetime) -> bool:
+    if not isinstance(guard, dict) or str(guard.get("type", "") or "") != "mautic_db_count":
+        return False
+    query = str(guard.get("query", "") or "").strip()
+    if not re.match(r"(?is)^select\s+count\s*\(", query):
+        return False
+    context: dict[str, str] = {}
+    raw_context = guard.get("context") if isinstance(guard.get("context"), dict) else {}
+    for key, source in raw_context.items():
+        if str(source or "") == "instance.now_local":
+            context[str(key)] = now_local.strftime("%Y-%m-%d %H:%M:%S")
+    positive = db.fetch_count(query, context=context) > 0
+    return positive if bool(guard.get("positive", True)) else not positive
+
+
+def _plugin_operation_bootstrap_digest(root: str, operation_key: str, task_id: str) -> str:
+    payload = "\0".join((str(root), str(operation_key), str(task_id)))
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _plugin_operation_bootstrap_state_key(digest: str) -> str:
+    return f"plugin_operation_bootstrap:{digest}"
+
+
+def _plugin_operation_bootstrap_completed(store: "TaskStore", digest: str) -> bool:
+    state = store.get_runtime_sync(_plugin_operation_bootstrap_state_key(digest)) or {}
+    return bool(state.get("completed"))
+
+
+def _mark_plugin_operation_bootstrap_completed(
+    store: "TaskStore",
+    digest: str,
+    *,
+    reason: str,
+) -> None:
+    store.put_runtime_sync(
+        _plugin_operation_bootstrap_state_key(digest),
+        {
+            "completed": True,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason or "completed"),
+        },
+    )
+
+
+def _plugin_operation_bootstrap_digest_from_task(task: "RunningTask") -> str:
+    prefix = "job:plugin_operation_bootstrap:"
+    task_type = str(task.task_type or "")
+    digest = task_type[len(prefix) :] if task_type.startswith(prefix) else ""
+    return digest if re.fullmatch(r"[a-f0-9]{24}", digest) else ""
 
 
 def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> set[int]:
@@ -639,38 +749,50 @@ def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> s
         )
 
     settings = getattr(config, "segment_whitelist_instance_settings", {})
-    if not isinstance(settings, dict):
+    found, raw = _instance_scoped_whitelist_entry(settings, inst)
+    if not found:
         return global_segment_ids()
+    if isinstance(raw, dict):
+        if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
+            return set()
+        if _to_boolish(raw.get("disable_whitelist"), False):
+            return set()
+        ids_raw = raw.get("segment_whitelist", raw.get("segments", raw.get("ids", raw.get("whitelist", []))))
+        ids = set(_to_int_list(ids_raw))
+        ids.update(_to_int_list(_whitelist_realtime_block(raw).get("ids", [])))
+        file_raw = str(raw.get("segment_whitelist_file", "") or "").strip()
+        if file_raw:
+            ids |= _load_segment_whitelist_file(file_raw, inst)
+        return ids
+    if isinstance(raw, bool):
+        return global_segment_ids() if raw else set()
+    return set(_to_int_list(raw))
 
-    instance_keys = _viber_stats_setting_keys(inst)
-    qualified_keys: list[str] = []
-    instance_key_set = set(instance_keys)
-    for raw_key in settings:
-        key = str(raw_key or "").strip()
-        base_key, separator, _host_name = key.partition("@")
-        if separator and base_key in instance_key_set and key not in instance_key_set:
-            qualified_keys.append(key)
 
-    for key in instance_keys + qualified_keys + ["default"]:
-        if key not in settings:
-            continue
-        raw = settings.get(key)
-        if isinstance(raw, dict):
-            if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
-                return set()
-            if _to_boolish(raw.get("disable_whitelist"), False):
-                return set()
-            ids_raw = raw.get("segment_whitelist", raw.get("segments", raw.get("ids", raw.get("whitelist", []))))
-            ids = set(_to_int_list(ids_raw))
-            file_raw = str(raw.get("segment_whitelist_file", "") or "").strip()
-            if file_raw:
-                ids |= _load_segment_whitelist_file(file_raw, inst)
-            return ids
-        if isinstance(raw, bool):
-            return global_segment_ids() if raw else set()
-        return set(_to_int_list(raw))
-
-    return global_segment_ids()
+def _segment_whitelist_realtime_setting(
+    config: AgentConfig,
+    inst: object,
+) -> SegmentWhitelistRealtimeSetting:
+    if bool(getattr(config, "disable_whitelist", False)):
+        return SegmentWhitelistRealtimeSetting()
+    found, raw = _instance_scoped_whitelist_entry(
+        getattr(config, "segment_whitelist_instance_settings", {}),
+        inst,
+    )
+    if not found or not isinstance(raw, dict):
+        return SegmentWhitelistRealtimeSetting()
+    if ("enabled" in raw and not _to_boolish(raw.get("enabled"), True)) or _to_boolish(
+        raw.get("disable_whitelist"),
+        False,
+    ):
+        return SegmentWhitelistRealtimeSetting()
+    block = _whitelist_realtime_block(raw)
+    ids = frozenset(x for x in _to_int_list(block.get("ids", [])) if x > 0)
+    return SegmentWhitelistRealtimeSetting(
+        ids=ids,
+        interval_sec=_whitelist_realtime_int(block, "interval_sec"),
+        parallel=_whitelist_realtime_int(block, "parallel", maximum=16),
+    )
 
 
 def _campaign_whitelist_effective_setting(config: AgentConfig, inst: object) -> set[int]:
@@ -681,36 +803,52 @@ def _campaign_whitelist_effective_setting(config: AgentConfig, inst: object) -> 
         getattr(config, "campaign_whitelist_file", None)
     )
     settings = getattr(config, "campaign_whitelist_instance_settings", {})
-    if not isinstance(settings, dict):
+    found, raw = _instance_scoped_whitelist_entry(settings, inst)
+    if not found:
         return global_ids
+    if isinstance(raw, dict):
+        if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
+            return set()
+        if _to_boolish(raw.get("disable_whitelist"), False):
+            return set()
+        ids_raw = raw.get(
+            "campaign_whitelist",
+            raw.get("campaigns", raw.get("ids", raw.get("whitelist", []))),
+        )
+        ids = set(_to_int_list(ids_raw))
+        ids.update(_to_int_list(_whitelist_realtime_block(raw).get("ids", [])))
+        return ids
+    if isinstance(raw, bool):
+        return global_ids if raw else set()
+    return set(_to_int_list(raw))
 
-    instance_keys = _viber_stats_setting_keys(inst)
-    qualified_keys: list[str] = []
-    instance_key_set = set(instance_keys)
-    for raw_key in settings:
-        key = str(raw_key or "").strip()
-        base_key, separator, _host_name = key.partition("@")
-        if separator and base_key in instance_key_set and key not in instance_key_set:
-            qualified_keys.append(key)
 
-    for key in instance_keys + qualified_keys + ["default"]:
-        if key not in settings:
-            continue
-        raw = settings.get(key)
-        if isinstance(raw, dict):
-            if "enabled" in raw and not _to_boolish(raw.get("enabled"), True):
-                return set()
-            if _to_boolish(raw.get("disable_whitelist"), False):
-                return set()
-            ids_raw = raw.get(
-                "campaign_whitelist",
-                raw.get("campaigns", raw.get("ids", raw.get("whitelist", []))),
-            )
-            return set(_to_int_list(ids_raw))
-        if isinstance(raw, bool):
-            return global_ids if raw else set()
-        return set(_to_int_list(raw))
-    return global_ids
+def _campaign_whitelist_realtime_setting(
+    config: AgentConfig,
+    inst: object,
+) -> CampaignWhitelistRealtimeSetting:
+    if bool(getattr(config, "disable_whitelist", False)):
+        return CampaignWhitelistRealtimeSetting()
+    found, raw = _instance_scoped_whitelist_entry(
+        getattr(config, "campaign_whitelist_instance_settings", {}),
+        inst,
+    )
+    if not found or not isinstance(raw, dict):
+        return CampaignWhitelistRealtimeSetting()
+    if ("enabled" in raw and not _to_boolish(raw.get("enabled"), True)) or _to_boolish(
+        raw.get("disable_whitelist"),
+        False,
+    ):
+        return CampaignWhitelistRealtimeSetting()
+    block = _whitelist_realtime_block(raw)
+    ids = frozenset(x for x in _to_int_list(block.get("ids", [])) if x > 0)
+    return CampaignWhitelistRealtimeSetting(
+        ids=ids,
+        rebuild_interval_sec=_whitelist_realtime_int(block, "rebuild_interval_sec"),
+        trigger_interval_sec=_whitelist_realtime_int(block, "trigger_interval_sec"),
+        rebuild_parallel=_whitelist_realtime_int(block, "rebuild_parallel", maximum=16),
+        trigger_parallel=_whitelist_realtime_int(block, "trigger_parallel", maximum=16),
+    )
 
 
 def _segment_whitelist_file_key_for_instance(inst: object) -> str:
@@ -718,7 +856,7 @@ def _segment_whitelist_file_key_for_instance(inst: object) -> str:
         value = str(getattr(inst, attr, "") or "").strip()
         if value:
             return value
-    keys = _viber_stats_setting_keys(inst)
+    keys = _instance_setting_keys(inst)
     return keys[0] if keys else "default"
 
 
@@ -769,7 +907,7 @@ def _load_segment_whitelist_file(path: str | None, inst: object) -> set[int]:
     scoped, legacy = _parse_segment_whitelist_file(path)
     if not scoped:
         return legacy
-    keys = set(_viber_stats_setting_keys(inst))
+    keys = set(_instance_setting_keys(inst))
     exact_ids: set[int] = set()
     exact_seen = False
     for key, ids in scoped.items():
@@ -910,7 +1048,7 @@ def _monitored_email_parser_effective_setting(config: AgentConfig, inst: object)
     whitelist = _normalize_monitored_email_whitelist(getattr(config, "monitored_email_parser_whitelist", []))
     settings = getattr(config, "monitored_email_parser_instance_settings", {})
     if isinstance(settings, dict):
-        for key in _viber_stats_setting_keys(inst) + ["default"]:
+        for key in _instance_setting_keys(inst) + ["default"]:
             if key not in settings:
                 continue
             raw = settings.get(key)
@@ -991,6 +1129,68 @@ def _is_mautic_email_fetch_template(template: str) -> bool:
     return bool(re.search(r"\bmautic:emails?:fetch\b", str(template or "")))
 
 
+def _is_mautic_message_send_template(template: str) -> bool:
+    return bool(re.search(r"\bmautic:messages:send\b", str(template or "")))
+
+
+def _legacy_message_queue_job_setting(config: AgentConfig) -> tuple[bool, int] | None:
+    for job in config.scheduled_jobs:
+        if _is_mautic_message_send_template(job.command_template):
+            return bool(job.enabled), normalize_message_queue_interval(job.interval_sec)
+    return None
+
+
+def _adopt_message_queue_settings(
+    config: AgentConfig,
+    installs: list[object],
+    cron_migrations: dict[str, int],
+) -> tuple[dict[str, object], list[tuple[str, bool, int, str]]]:
+    current = getattr(config, "message_queue_instance_settings", {})
+    next_settings: dict[str, object] = dict(current) if isinstance(current, dict) else {}
+    legacy_job_setting = _legacy_message_queue_job_setting(config)
+    normalized_cron_migrations = {
+        str(Path(str(root or "/")).resolve()): normalize_message_queue_interval(interval)
+        for root, interval in cron_migrations.items()
+        if str(root or "").strip()
+    }
+    added: list[tuple[str, bool, int, str]] = []
+
+    for inst in installs:
+        if not supports_message_queue(inst):
+            continue
+        keys = message_queue_instance_setting_keys(inst)
+        if not keys or any(key in next_settings for key in [*keys, "default"]):
+            continue
+        normalized_root = str(Path(str(getattr(inst, "root", "") or "/")).resolve())
+        if normalized_root in normalized_cron_migrations:
+            enabled = True
+            interval_sec = normalized_cron_migrations[normalized_root]
+            source = "cron"
+        elif legacy_job_setting is not None:
+            enabled, interval_sec = legacy_job_setting
+            source = "legacy_jobs"
+        else:
+            enabled = bool(getattr(config, "message_queue_enabled", False))
+            interval_sec = normalize_message_queue_interval(
+                getattr(config, "message_queue_interval_sec", MESSAGE_QUEUE_DEFAULT_INTERVAL_SEC)
+            )
+            source = "default"
+        next_settings[keys[0]] = {
+            "enabled": bool(enabled),
+            "interval_sec": int(interval_sec),
+        }
+        added.append((keys[0], bool(enabled), int(interval_sec), source))
+    return next_settings, added
+
+
+def _with_message_queue_instance_settings(
+    config: AgentConfig,
+    settings: dict[str, object],
+) -> AgentConfig:
+    """Return updated runtime config without mutating the frozen dataclass."""
+    return replace(config, message_queue_instance_settings=settings)
+
+
 def _monitored_email_fetch_replaces_mautic(config: AgentConfig, inst: object) -> bool:
     setting = _monitored_email_parser_effective_setting(config, inst)
     return bool(setting.enabled and setting.disable_mautic_fetch)
@@ -1028,7 +1228,7 @@ def _empty_leads_cleanup_effective_setting(
             window_end,
             max_runs_per_window,
         )
-    for key in _viber_stats_setting_keys(inst) + ["default"]:
+    for key in _instance_setting_keys(inst) + ["default"]:
         if key not in settings:
             continue
         raw = settings.get(key)
@@ -1139,7 +1339,7 @@ def _page_hits_orphan_cleanup_effective_setting(
     settings = getattr(config, "page_hits_orphan_cleanup_instance_settings", {})
     if not isinstance(settings, dict):
         return enabled, interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
-    for key in _viber_stats_setting_keys(inst) + ["default"]:
+    for key in _instance_setting_keys(inst) + ["default"]:
         if key not in settings:
             continue
         raw = settings.get(key)
@@ -1194,68 +1394,6 @@ def _page_hits_orphan_cleanup_effective_setting(
         if isinstance(raw, bool):
             return bool(raw), interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
     return enabled, interval, schedule_type, cron_expr, window_min, window_start, window_end, batch_size, batches, sleep_sec, grace_min, max_run_sec
-
-
-_HOUSEKEEPING_ALLOWED_FLAGS = {
-    "campaign_lead": "--campaign-lead",
-    "email_stats": "--email-stats",
-    "email_stats_tokens": "--email-stats-tokens",
-    "lead": "--lead",
-    "page_hits": "--page-hits",
-}
-
-
-def _housekeeping_plugin_installed(root: str) -> bool:
-    for p in plugin_dir_candidates(root):
-        if (p / "LeuchtfeuerHousekeepingBundle").is_dir():
-            return True
-    return False
-
-
-def _housekeeping_plugin_effective_setting(config: AgentConfig, inst: object) -> tuple[bool, int, int, int, int, list[str], bool, bool]:
-    enabled = bool(getattr(config, "housekeeping_plugin_enabled", False))
-    interval = max(60, int(getattr(config, "housekeeping_plugin_interval_sec", 86400) or 86400))
-    quiet_hour = max(0, min(23, int(getattr(config, "housekeeping_plugin_quiet_hour", 3) or 3)))
-    window_min = max(1, min(720, int(getattr(config, "housekeeping_plugin_quiet_window_min", 120) or 120)))
-    days_old = max(1, int(getattr(config, "housekeeping_plugin_days_old", 365) or 365))
-    flags = [str(x).strip() for x in (getattr(config, "housekeeping_plugin_flags", []) or []) if str(x).strip()]
-    optimize = bool(getattr(config, "housekeeping_plugin_optimize_tables", False))
-    dry_run = bool(getattr(config, "housekeeping_plugin_dry_run", True))
-    settings = getattr(config, "housekeeping_plugin_instance_settings", {})
-    if not isinstance(settings, dict):
-        return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
-    for key in _viber_stats_setting_keys(inst) + ["default"]:
-        if key not in settings:
-            continue
-        raw = settings.get(key)
-        if isinstance(raw, dict):
-            if "enabled" in raw:
-                enabled = _to_boolish(raw.get("enabled"), enabled)
-            for field in ("interval_sec", "quiet_hour", "quiet_window_min", "days_old"):
-                if field not in raw:
-                    continue
-                try:
-                    value = int(raw.get(field))
-                except Exception:
-                    continue
-                if field == "interval_sec":
-                    interval = max(60, value)
-                elif field == "quiet_hour":
-                    quiet_hour = max(0, min(23, value))
-                elif field == "quiet_window_min":
-                    window_min = max(1, min(720, value))
-                elif field == "days_old":
-                    days_old = max(1, value)
-            if isinstance(raw.get("flags"), list):
-                flags = [str(x).strip() for x in raw.get("flags", []) if str(x).strip()]
-            if "optimize_tables" in raw:
-                optimize = _to_boolish(raw.get("optimize_tables"), optimize)
-            if "dry_run" in raw:
-                dry_run = _to_boolish(raw.get("dry_run"), dry_run)
-            return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
-        if isinstance(raw, bool):
-            return bool(raw), interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
-    return enabled, interval, quiet_hour, window_min, days_old, flags, optimize, dry_run
 
 
 def _migrate_empty_leads_cleanup_runtime(config: AgentConfig, lines: list[str]) -> bool:
@@ -1557,6 +1695,10 @@ def _segment_sql_worker_total_count() -> int:
 
 _SCHEDULER_SEGMENT_TASK_TYPES = frozenset({"segment", "segment_sql", "import"})
 _SCHEDULER_CAMPAIGN_TASK_TYPES = frozenset({"campaign_update", "campaign_trigger", "campaign_rebuild"})
+_SCHEDULER_BACKGROUND_TASK_TYPES = frozenset({"segment", "segment_sql"})
+_SCHEDULER_WORK_TASK_TYPES = _SCHEDULER_SEGMENT_TASK_TYPES | _SCHEDULER_CAMPAIGN_TASK_TYPES
+_SCHEDULER_RESERVED_SAFETY_TASK_TYPES = frozenset({"job:plugin_operation_safety"})
+_SCHEDULER_PRIORITY_PENDING_ROOTS: frozenset[str] = frozenset()
 
 
 def _scheduler_task_lane(task_type: str | None) -> str | None:
@@ -1614,10 +1756,55 @@ def _scheduler_host_slots_available(
     running: dict[str, "RunningTask"],
     task_type: str | None = None,
 ) -> int | None:
+    if str(task_type or "").strip().lower() in _SCHEDULER_RESERVED_SAFETY_TASK_TYPES:
+        return None
+    normalized = str(task_type or "").strip().lower()
+    host_limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
+    if (
+        bool(getattr(config, "scheduler_elastic_slots_enabled", True))
+        and host_limit > 0
+        and normalized in _SCHEDULER_WORK_TASK_TYPES
+    ):
+        effective_limit = host_limit
+        if normalized in _SCHEDULER_BACKGROUND_TASK_TYPES and host_limit > 1:
+            reserve = max(0, int(getattr(config, "scheduler_emergency_reserved_slots", 1) or 0))
+            effective_limit = max(1, host_limit - min(host_limit - 1, reserve))
+        running_total = sum(
+            1 for task in running.values() if str(task.task_type or "").strip().lower() in _SCHEDULER_WORK_TASK_TYPES
+        ) + _segment_sql_worker_total_count()
+        return max(0, effective_limit - running_total)
     limit = _scheduler_host_lane_limit(config, task_type)
     if limit <= 0:
         return None
     return max(0, limit - _scheduler_host_running_count(running, task_type))
+
+
+def _set_scheduler_priority_pending_roots(roots: set[str]) -> None:
+    global _SCHEDULER_PRIORITY_PENDING_ROOTS
+    _SCHEDULER_PRIORITY_PENDING_ROOTS = frozenset(str(root) for root in roots if str(root))
+
+
+def _scheduler_instance_slots_available(
+    config: AgentConfig,
+    running: dict[str, "RunningTask"],
+    *,
+    root: str,
+    task_type: str,
+) -> int | None:
+    normalized = str(task_type or "").strip().lower()
+    if normalized not in _SCHEDULER_WORK_TASK_TYPES:
+        return None
+    limit = max(0, int(getattr(config, "scheduler_instance_max_parallel", 0) or 0))
+    if limit <= 0:
+        return None
+    if normalized in _SCHEDULER_BACKGROUND_TASK_TYPES and root in _SCHEDULER_PRIORITY_PENDING_ROOTS:
+        limit = max(0, limit - 1)
+    running_total = sum(
+        1
+        for task in running.values()
+        if task.root == root and str(task.task_type or "").strip().lower() in _SCHEDULER_WORK_TASK_TYPES
+    ) + _segment_sql_worker_count(root)
+    return max(0, limit - running_total)
 
 
 def _segment_sql_running_state_ids(
@@ -1944,6 +2131,14 @@ def _run_sql_segment_ring(
     host_slots = _scheduler_host_slots_available(config, running, "segment_sql")
     if host_slots is not None and host_slots <= 0:
         return 0
+    instance_slots = _scheduler_instance_slots_available(
+        config,
+        running,
+        root=root,
+        task_type="segment_sql",
+    )
+    if instance_slots is not None and instance_slots <= 0:
+        return 0
     if async_worker and max(
         _segment_sql_worker_count(root),
         _segment_sql_running_state_count(store=store, root=root, config=config, now_ts=now_ts),
@@ -1955,6 +2150,14 @@ def _run_sql_segment_ring(
     while scans > 0 and launched < limit:
         host_slots = _scheduler_host_slots_available(config, running, "segment_sql")
         if host_slots is not None and host_slots <= 0:
+            break
+        instance_slots = _scheduler_instance_slots_available(
+            config,
+            running,
+            root=root,
+            task_type="segment_sql",
+        )
+        if instance_slots is not None and instance_slots <= 0:
             break
         sid = int(ring[0])
         scans -= 1
@@ -2728,8 +2931,7 @@ def _campaign_trigger_root_action_due_exists_sql(campaign_id: int) -> str:
         "        OR ce.trigger_mode IS NULL "
         "        OR ("
         "          ce.trigger_mode = 'date' "
-        "          AND ce.trigger_date IS NOT NULL "
-        "          AND ce.trigger_date <= '{now_utc}'"
+        "          AND (ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}')"
         "        )"
         "      ) "
         "      AND NOT EXISTS ("
@@ -2792,8 +2994,7 @@ def _campaign_trigger_no_action_due_exists_sql(campaign_id: int) -> str:
         "        OR ce.trigger_mode IS NULL "
         "        OR ("
         "          ce.trigger_mode = 'date' "
-        "          AND ce.trigger_date IS NOT NULL "
-        "          AND ce.trigger_date <= '{now_utc}'"
+        "          AND (ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}')"
         "        ) "
         "        OR ("
         "          ce.trigger_mode = 'interval' "
@@ -2823,7 +3024,10 @@ def _campaign_trigger_event_log_progress_sql(campaign_id: int) -> str:
         "SELECT "
         "  SUM(CASE WHEN el.is_scheduled = 1 THEN 1 ELSE 0 END) AS pending_event_logs, "
         "  SUM(CASE WHEN el.date_triggered IS NOT NULL THEN 1 ELSE 0 END) AS triggered_event_logs, "
-        "  COALESCE(DATE_FORMAT(MAX(el.date_triggered), '%Y-%m-%d %H:%i:%s'), '') AS max_triggered_at "
+        "  COALESCE(DATE_FORMAT(MAX(el.date_triggered), '%Y-%m-%d %H:%i:%s'), '') AS max_triggered_at, "
+        "  COALESCE(DATE_FORMAT(MIN(CASE "
+        "    WHEN el.is_scheduled = 1 THEN el.trigger_date ELSE NULL "
+        "  END), '%Y-%m-%d %H:%i:%s'), '') AS next_scheduled_at "
         "FROM {prefix}campaign_lead_event_log el "
         f"WHERE el.campaign_id = {cid}"
     )
@@ -2918,6 +3122,7 @@ def _campaign_trigger_progress_snapshot(
         pending_event_logs=_row_int(row, "pending_event_logs"),
         triggered_event_logs=_row_int(row, "triggered_event_logs"),
         max_triggered_at=str(row.get("max_triggered_at") or ""),
+        next_scheduled_at=str(row.get("next_scheduled_at") or ""),
         sent_email_stats=_row_int(email_row, "sent_email_stats"),
         max_email_sent_at=str(email_row.get("max_email_sent_at") or ""),
     )
@@ -2935,6 +3140,26 @@ def _campaign_email_counter_reconcile(
         return None
     key = (str(root), int(campaign_id))
     now_ts = time.time()
+    # Native Mautic updates the denormalized emails.sent_count at the end of a
+    # trigger transaction, after email_stats rows may already be visible. A
+    # concurrent repair can therefore be added to Mautic's pending increment.
+    # Fail closed for every campaign process on the same root, including
+    # untracked native/fallback children, and retry after the process exits.
+    if _root_has_live_campaign_process(str(root), {}):
+        last_log_ts = float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT.get(key, 0.0) or 0.0)
+        if last_log_ts <= 0 or now_ts - last_log_ts >= float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_SEC):
+            _CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_AT[key] = now_ts
+            logging.info(
+                "[%s] email counter reconcile deferred campaign_id=%s reason=%s guard=campaign_process_active",
+                root,
+                int(campaign_id),
+                reason,
+            )
+        return {
+            "status": "deferred",
+            "campaign_id": int(campaign_id),
+            "reason": "campaign_process_active",
+        }
     if not force:
         last_ts = float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_AT.get(key, 0.0) or 0.0)
         if last_ts > 0 and now_ts - last_ts < float(_CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC):
@@ -2975,6 +3200,9 @@ def _campaign_trigger_should_skip_launch(
     cooldown_key = (str(root), int(campaign_id))
     cooldown = _CAMPAIGN_TRIGGER_STUCK_UNTIL.get(cooldown_key)
     now_ts = time.time()
+    future_wake = _CAMPAIGN_TRIGGER_FUTURE_WAKE.get(cooldown_key)
+    if future_wake is not None and now_ts < float(future_wake[0]):
+        return True
     if cooldown is not None:
         until_ts, reason = cooldown
         if now_ts < float(until_ts):
@@ -2993,7 +3221,29 @@ def _campaign_trigger_should_skip_launch(
         logging.warning("[%s] campaign_trigger due guard failed id=%s: %s", root, campaign_id, e)
         return False
     if snapshot.due_total > 0:
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE.pop(cooldown_key, None)
+        _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED.pop(cooldown_key, None)
         return False
+    next_scheduled_at = str(snapshot.next_scheduled_at or "").strip()
+    next_scheduled_ts = _parse_mysql_datetime_ts(next_scheduled_at)
+    now_event_log_ts = _parse_mysql_datetime_ts(str(sql_ctx.get("now_event_log") or ""))
+    if snapshot.pending_event_logs > 0 and next_scheduled_ts is not None and now_event_log_ts is not None:
+        delay_sec = float(next_scheduled_ts) - float(now_event_log_ts)
+        if delay_sec > 0:
+            wake_at = now_ts + max(0.25, delay_sec - _CAMPAIGN_TRIGGER_FUTURE_WAKE_EARLY_SEC)
+            _CAMPAIGN_TRIGGER_FUTURE_WAKE[cooldown_key] = (wake_at, next_scheduled_at)
+            if _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED.get(cooldown_key) != next_scheduled_at:
+                _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED[cooldown_key] = next_scheduled_at
+                logging.info(
+                    "[%s] campaign_trigger scheduled wake id=%s at=%s pending_logs=%s",
+                    root,
+                    int(campaign_id),
+                    next_scheduled_at,
+                    snapshot.pending_event_logs,
+                )
+            return True
+    _CAMPAIGN_TRIGGER_FUTURE_WAKE.pop(cooldown_key, None)
+    _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED.pop(cooldown_key, None)
     logging.info(
         "[%s] campaign_trigger skipped stale id=%s pending_logs=%s triggered_logs=%s max_triggered=%s",
         root,
@@ -3010,6 +3260,17 @@ def _campaign_trigger_should_skip_launch(
             reason="stale-complete-skip",
         )
     return True
+
+
+def _campaign_trigger_skip_removes_from_ring(
+    root: str,
+    campaign_id: int,
+    whitelist: set[int],
+) -> bool:
+    cid = int(campaign_id)
+    if cid in whitelist:
+        return False
+    return (str(root), cid) not in _CAMPAIGN_TRIGGER_FUTURE_WAKE
 
 
 def _is_db_dispatch_pause_error(exc: Exception) -> bool:
@@ -3511,6 +3772,18 @@ class TaskStore:
             if self._mysql_available(force_probe=True) and self._migrate_sqlite_to_mysql_once():
                 self._sqlite_prune_for_failover()
 
+    def close(self) -> None:
+        try:
+            if self._mysql_conn is not None:
+                self._mysql_conn.close()
+        except Exception:
+            pass
+        self._mysql_conn = None
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
     def _is_local_host_alias(self, host_name: str | None) -> bool:
         host_lc = str(host_name or "").strip().lower()
         return bool(host_lc and host_lc in self._node_aliases_lc)
@@ -3677,11 +3950,14 @@ class TaskStore:
             self.conn.execute("DELETE FROM tasks WHERE state!='running'")
             self.conn.execute("DELETE FROM manual_requests WHERE status NOT IN ('pending','launched')")
             self.conn.execute("DELETE FROM weight_cache")
-            # Keep runtime_sync only for migration marker and local runtime hints.
+            # Keep only bounded current-state keys needed for failover. Logical
+            # issues use one overwritten key per instance, never an append-only
+            # journal in the legacy shadow.
             self.conn.execute(
                 """
                 DELETE FROM runtime_sync
                 WHERE key NOT IN ('taskstore_mysql_migrated_v1', 'local_runtime', 'mcc_runtime')
+                  AND key NOT LIKE 'logical_issues:v1:%'
                 """
             )
             self.conn.commit()
@@ -4689,6 +4965,29 @@ class TaskStore:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def delete_runtime_sync(self, keys: list[str]) -> int:
+        clean = list(dict.fromkeys(str(key or "").strip() for key in keys if str(key or "").strip()))
+        if not clean:
+            return 0
+        if self._mysql_mode:
+            table = self._mysql_tables.get("runtime_sync", "")
+            if table and self._mysql_available():
+                try:
+                    placeholders = ",".join(["%s"] * len(clean))
+                    self._mysql_exec(
+                        f"DELETE FROM `{table}` WHERE host_name=%s AND `key` IN ({placeholders})",
+                        (self._node_id, *clean),
+                    )
+                except Exception:
+                    pass
+        placeholders = ",".join(["?"] * len(clean))
+        cur = self.conn.execute(
+            f"DELETE FROM runtime_sync WHERE key IN ({placeholders})",
+            tuple(clean),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     def list_runtime_sync(self, prefix: str = "") -> list[tuple[str, dict[str, object]]]:
         key_prefix = str(prefix or "")
         out: dict[str, dict[str, object]] = {}
@@ -5435,7 +5734,7 @@ def _task_locked_args(
 
 class _PriorityTaskExecutor:
     def __init__(self) -> None:
-        self._active: dict[str, tuple[str, str]] = {}
+        self._active: dict[str, tuple[str, str, str]] = {}
         self._last_started: dict[str, float] = {}
         self._last_finished: dict[str, float] = {}
         self._guard = threading.Lock()
@@ -5449,12 +5748,15 @@ class _PriorityTaskExecutor:
         with self._guard:
             return any(
                 active_root == root and active_type.startswith("campaign_")
-                for active_root, active_type in self._active.values()
+                for active_root, active_type, _capacity_lane in self._active.values()
             )
 
     def has_active_task_type(self, task_type: str) -> bool:
         with self._guard:
-            return any(active_type == task_type for _active_root, active_type in self._active.values())
+            return any(
+                active_type == task_type
+                for _active_root, active_type, _capacity_lane in self._active.values()
+            )
 
     def last_finished(self, root: str, task_type: str, entity_id: int) -> float:
         key = _task_key(root, task_type, entity_id)
@@ -5481,9 +5783,14 @@ class _PriorityTaskExecutor:
         on_start: Callable[[int], None] | None = None,
         timeout_sec: int | None = None,
         log_lifecycle: bool = True,
+        capacity_lane: str | None = None,
+        log_label: str = "priority",
     ) -> bool:
         key = _task_key(root, task_type, entity_id)
         now = time.time()
+        interval = max(1, int(interval_sec or 1))
+        lane = str(capacity_lane or task_type).strip() or task_type
+        lifecycle_label = str(log_label or "priority").strip() or "priority"
         if not _campaign_dispatch_begin(root, task_type):
             return False
         admitted = False
@@ -5492,17 +5799,24 @@ class _PriorityTaskExecutor:
                 previous = float(self._last_started.get(key, 0.0) or 0.0)
                 active_for_lane = sum(
                     1
-                    for active_root, active_type in self._active.values()
-                    if active_root == root and active_type == task_type
+                    for active_root, _active_type, active_lane in self._active.values()
+                    if active_root == root and active_lane == lane
                 )
                 admitted = (
                     key not in self._active
-                    and _launch_allowed(config, root, task_type, entity_id, now_ts=now)
-                    and not (previous > 0 and now - previous < max(1, int(interval_sec or 1)))
+                    and _launch_allowed(
+                        config,
+                        root,
+                        task_type,
+                        entity_id,
+                        now_ts=now,
+                        min_repeat_sec=interval,
+                    )
+                    and not (previous > 0 and now - previous < interval)
                     and active_for_lane < max(1, int(max_parallel or 1))
                 )
                 if admitted:
-                    self._active[key] = (root, task_type)
+                    self._active[key] = (root, task_type, lane)
                     self._last_started[key] = now
                     _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, task_type, entity_id)] = now
         finally:
@@ -5514,7 +5828,7 @@ class _PriorityTaskExecutor:
             lock_key = _task_execution_lock_key(root, task_type, entity_id)
             locked_args = _task_locked_args(lock_key, args, root=root, task_type=task_type)
             if log_lifecycle:
-                logging.info("[%s] priority spawned %s entity=%s", root, task_type, entity_id)
+                logging.info("[%s] %s spawned %s entity=%s", root, lifecycle_label, task_type, entity_id)
             completed = False
             rc: int | None = None
             proc: subprocess.Popen[bytes] | None = None
@@ -5533,22 +5847,36 @@ class _PriorityTaskExecutor:
                 rc = int(proc.wait(timeout=timeout if timeout > 0 else None) or 0)
                 if rc == _TASK_LOCK_BUSY_RC:
                     if log_lifecycle:
-                        logging.info("[%s] priority lock busy %s entity=%s", root, task_type, entity_id)
+                        logging.info("[%s] %s lock busy %s entity=%s", root, lifecycle_label, task_type, entity_id)
                 elif rc == 0:
                     completed = True
                     if log_lifecycle:
-                        logging.info("[%s] priority finished %s entity=%s rc=0", root, task_type, entity_id)
+                        logging.info("[%s] %s finished %s entity=%s rc=0", root, lifecycle_label, task_type, entity_id)
                 else:
                     if log_lifecycle:
-                        logging.warning("[%s] priority failed %s entity=%s rc=%s", root, task_type, entity_id, rc)
+                        logging.warning(
+                            "[%s] %s failed %s entity=%s rc=%s",
+                            root,
+                            lifecycle_label,
+                            task_type,
+                            entity_id,
+                            rc,
+                        )
             except subprocess.TimeoutExpired:
                 if proc is not None:
                     _kill_pid(proc.pid, int(getattr(config, "segment_kill_grace_sec", 10) or 10))
                 if log_lifecycle:
-                    logging.warning("[%s] priority timeout %s entity=%s", root, task_type, entity_id)
+                    logging.warning("[%s] %s timeout %s entity=%s", root, lifecycle_label, task_type, entity_id)
             except Exception as exc:
                 if log_lifecycle:
-                    logging.warning("[%s] priority error %s entity=%s: %s", root, task_type, entity_id, exc)
+                    logging.warning(
+                        "[%s] %s error %s entity=%s: %s",
+                        root,
+                        lifecycle_label,
+                        task_type,
+                        entity_id,
+                        exc,
+                    )
             finally:
                 if completed and on_success is not None:
                     try:
@@ -5579,7 +5907,11 @@ class _PriorityTaskExecutor:
                             exc,
                         )
 
-        threading.Thread(target=_run, name=f"mcd-priority-{task_type}-{entity_id}", daemon=True).start()
+        threading.Thread(
+            target=_run,
+            name=f"mcd-{lifecycle_label}-{task_type}-{entity_id}",
+            daemon=True,
+        ).start()
         return True
 
 
@@ -5680,6 +6012,67 @@ def _priority_campaign_due_check_needed(
     return now_ts - last_checked_ts >= max(1, int(interval_sec or 1))
 
 
+def _dispatch_due_campaign_triggers(
+    *,
+    config: AgentConfig,
+    root: str,
+    due_ids: list[int],
+    running: dict[str, RunningTask],
+    priority_executor: _PriorityTaskExecutor,
+    on_success: Callable[[int], None],
+    realtime: CampaignWhitelistRealtimeSetting | None = None,
+) -> list[int]:
+    launched: list[int] = []
+    trigger_interval = max(
+        1,
+        int(config.campaign_trigger_min_repeat_sec or 0),
+        int(config.campaign_trigger_audit_interval_sec or 0),
+    )
+    for campaign_id in dict.fromkeys(int(value) for value in due_ids if int(value) > 0):
+        if (
+            _is_running(running, root, "campaign_rebuild", campaign_id)
+            or _is_running(running, root, "campaign_trigger", campaign_id)
+            or priority_executor.is_active(root, "campaign_rebuild", campaign_id)
+            or priority_executor.is_active(root, "campaign_trigger", campaign_id)
+        ):
+            continue
+        realtime_trigger = bool(
+            realtime is not None
+            and realtime.trigger_enabled
+            and campaign_id in realtime.ids
+        )
+        effective_interval = realtime.trigger_interval_sec if realtime_trigger else trigger_interval
+        effective_parallel = (
+            realtime.trigger_parallel
+            if realtime_trigger
+            else max(1, int(config.campaign_trigger_priority_parallel or 1))
+        )
+        started = priority_executor.launch(
+            config,
+            root=root,
+            task_type="campaign_trigger",
+            entity_id=campaign_id,
+            args=render_mautic_command(
+                php_bin=config.php_bin,
+                run_as_user=config.mautic_run_as_user,
+                root=root,
+                template=config.cmd_campaign_trigger_template,
+                id=campaign_id,
+                campaign_limit=config.campaign_limit,
+                batch_limit=config.campaign_batch_limit,
+            ),
+            interval_sec=effective_interval,
+            max_parallel=effective_parallel,
+            on_success=lambda campaign_id=campaign_id: on_success(campaign_id),
+            capacity_lane="campaign_trigger_realtime" if realtime_trigger else None,
+            log_label="realtime" if realtime_trigger else "priority",
+        )
+        if started:
+            launched.append(campaign_id)
+            logging.info("[%s] due campaign trigger dispatched entity=%s", root, campaign_id)
+    return launched
+
+
 def _task_repeat_interval_sec(config: AgentConfig, task_type: str) -> int:
     if task_type == "segment":
         return max(0, int(getattr(config, "segment_full_scan_interval_sec", 0) or 0))
@@ -5704,8 +6097,19 @@ def _entity_launch_guard_key(root: str, task_type: str, entity_id: int | None) -
     return f"{_task_key(root, task_type, entity_id)}|launch"
 
 
-def _launch_allowed(config: AgentConfig, root: str, task_type: str, entity_id: int | None, now_ts: float | None = None) -> bool:
-    min_repeat = _task_repeat_interval_sec(config, task_type)
+def _launch_allowed(
+    config: AgentConfig,
+    root: str,
+    task_type: str,
+    entity_id: int | None,
+    now_ts: float | None = None,
+    min_repeat_sec: int | None = None,
+) -> bool:
+    min_repeat = (
+        _task_repeat_interval_sec(config, task_type)
+        if min_repeat_sec is None
+        else max(0, int(min_repeat_sec or 0))
+    )
     if min_repeat <= 0:
         return True
     ts = float(now_ts if now_ts is not None else time.time())
@@ -5770,6 +6174,33 @@ def _root_has_live_import_process(root: str, running: dict[str, RunningTask]) ->
             continue
         lower = line.lower()
         if "mautic:import" not in lower:
+            continue
+        if console in line or f" {root} " in line:
+            return True
+    return False
+
+
+def _root_has_live_campaign_process(root: str, running: dict[str, RunningTask]) -> bool:
+    if _running_campaign_total(running, root) > 0:
+        return True
+    console = str(Path(root) / "bin" / "console")
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return True
+    if proc.returncode != 0:
+        return True
+    commands = (
+        "mautic:campaigns:update",
+        "mautic:campaigns:rebuild",
+        "mautic:campaigns:trigger",
+    )
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if not any(command in lower for command in commands):
             continue
         if console in line or f" {root} " in line:
             return True
@@ -5940,14 +6371,73 @@ def _priority_interleaved_dispatch_installs(
         return list(installs)
     priority_roots = {str(getattr(inst, "root", "") or "") for inst in priority}
     regular = [inst for inst in installs if str(getattr(inst, "root", "") or "") not in priority_roots]
-    if not regular:
-        return priority
-    out: list[object] = []
-    chunk_size = max(1, int(regular_chunk or 1))
-    for start in range(0, len(regular), chunk_size):
-        out.extend(priority)
-        out.extend(regular[start : start + chunk_size])
-    return out
+    _ = regular_chunk
+    return priority + regular
+
+
+def _fairness_watchdog_dispatch_installs(
+    installs: list[object],
+    *,
+    pending_roots: set[str],
+    pending_since_by_root: dict[str, float],
+    now_ts: float,
+    watchdog_sec: int,
+) -> tuple[list[object], list[str]]:
+    unique: list[object] = []
+    seen: set[str] = set()
+    for inst in installs:
+        root = str(getattr(inst, "root", "") or "").strip()
+        if not root or root in seen:
+            continue
+        seen.add(root)
+        unique.append(inst)
+
+    pending = {str(root) for root in pending_roots if str(root) in seen}
+    for root in list(pending_since_by_root):
+        if root not in pending:
+            pending_since_by_root.pop(root, None)
+    for root in pending:
+        pending_since_by_root.setdefault(root, float(now_ts))
+
+    threshold = max(30, int(watchdog_sec or 300))
+    promoted_roots = {
+        root
+        for root, started_at in pending_since_by_root.items()
+        if root in pending and float(now_ts) - float(started_at) >= float(threshold)
+    }
+    promoted = [inst for inst in unique if str(getattr(inst, "root", "") or "").strip() in promoted_roots]
+    regular = [inst for inst in unique if str(getattr(inst, "root", "") or "").strip() not in promoted_roots]
+    return promoted + regular, [str(getattr(inst, "root", "") or "").strip() for inst in promoted]
+
+
+def _fairness_promotion_log_due(
+    promoted_roots: list[str],
+    previous_promoted_roots: frozenset[str],
+    *,
+    now_ts: float,
+    next_log_at: float,
+) -> bool:
+    if not promoted_roots:
+        return False
+    return not previous_promoted_roots or float(now_ts) >= float(next_log_at or 0.0)
+
+
+def _pending_import_first_dispatch_installs(
+    installs: list[object],
+    pending_by_root: dict[str, int],
+) -> list[object]:
+    if not installs or not pending_by_root:
+        return list(installs)
+    pending: list[object] = []
+    remaining: list[object] = []
+    for inst in installs:
+        root = str(getattr(inst, "root", "") or "")
+        try:
+            has_pending_import = int(pending_by_root.get(root, 0) or 0) > 0
+        except (TypeError, ValueError):
+            has_pending_import = False
+        (pending if has_pending_import else remaining).append(inst)
+    return pending + remaining
 
 
 def _campaign_pressure_active(
@@ -6240,6 +6730,14 @@ def _submit_if_slot_uncoordinated(
     host_slots = _scheduler_host_slots_available(config, running, task_type)
     if host_slots is not None and host_slots <= 0:
         return False
+    instance_slots = _scheduler_instance_slots_available(
+        config,
+        running,
+        root=root,
+        task_type=task_type,
+    )
+    if instance_slots is not None and instance_slots <= 0:
+        return False
     if not ignore_limit and _running_count(running, root, task_type) >= max_parallel_for_type:
         return False
 
@@ -6526,6 +7024,13 @@ def _monitor_running(
                         )
                 if rc == 0 and task.task_type == "import":
                     _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
+                bootstrap_digest = _plugin_operation_bootstrap_digest_from_task(task)
+                if rc == 0 and bootstrap_digest:
+                    _mark_plugin_operation_bootstrap_completed(
+                        store,
+                        bootstrap_digest,
+                        reason="successful_bootstrap_command",
+                    )
                 running.pop(key, None)
                 popens.pop(key, None)
                 respawned = False
@@ -6957,6 +7462,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     logging.info("MCD loop started")
     base_config = config
 
+    try:
+        fail2ban_guard = ensure_nginx_4xx_browser_icon_guard()
+        if bool(fail2ban_guard.get("changed", False)):
+            logging.info("Fail2ban browser icon false-positive guard applied")
+        elif str(fail2ban_guard.get("status", "")) == "error":
+            logging.warning("Fail2ban browser icon false-positive guard failed: %s", fail2ban_guard.get("reason", "unknown"))
+    except Exception as exc:
+        logging.warning("Fail2ban browser icon false-positive guard failed: %s", exc)
+
     campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
     if config.disable_whitelist:
         campaign_whitelist = set()
@@ -7015,6 +7529,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_parents_by_root: dict[str, dict[int, set[int]]] = {}
     segment_invalid_filter_sets: dict[str, set[int]] = {}
     segment_failure_blocked_sets: dict[str, set[int]] = {}
+    segment_logical_issue_blocked_sets: dict[str, set[int]] = {}
+    last_logical_issue_scan_ts: dict[str, float] = {}
     segment_prio_rings: dict[str, deque[int]] = {}
     segment_reg_rings: dict[str, deque[int]] = {}
     campaign_trigger_prio_rings: dict[str, deque[int]] = {}
@@ -7046,7 +7562,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     page_hits_orphan_cleanup_window_counts: dict[str, int] = {}
     page_hits_orphan_cleanup_window_keys: dict[str, str] = {}
     page_hits_orphan_cleanup_done_window_keys: dict[str, str] = {}
-    last_housekeeping_plugin_ts: dict[str, float] = {}
     last_empty_leads_cleanup_ts: dict[str, float] = {}
     last_empty_leads_cleanup_idle_ts: dict[str, float] = {}
     last_empty_leads_cleanup_skip_ts: dict[str, float] = {}
@@ -7094,7 +7609,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     next_backup_storage_probe_at = 0.0
     next_runtime_overrides_poll_at = 0.0
     next_managed_cron_reconcile_at = 0.0
-    next_viber_cron_reconcile_at = 0.0
+    next_plugin_operation_cron_reconcile_at = 0.0
+    next_message_queue_cron_reconcile_at = 0.0
+    message_queue_settings_push_pending: dict[str, object] | None = None
     next_email_fetch_cron_reconcile_at = 0.0
     next_empty_leads_cleanup_cron_reconcile_at = 0.0
     next_cluster_assets_guard_at = 0.0
@@ -7111,7 +7628,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_monitor_signals_push_error = ""
     last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
     dispatch_instance_cursor = 0
-    pusher = MCCStatePusher(config)
+    scheduler_pending_since_by_root: dict[str, float] = {}
+    scheduler_last_promoted_roots: frozenset[str] = frozenset()
+    scheduler_next_fairness_log_at = 0.0
+    pusher = MCCStatePusher(config, runtime_store=store)
 
     priority_executor = _PriorityTaskExecutor()
     priority_trigger_last_checked: dict[str, float] = {}
@@ -7120,6 +7640,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     priority_campaign_whitelist_checked_at: dict[str, float] = {}
     priority_campaign_whitelist_signature: dict[str, tuple[int, ...]] = {}
     priority_campaign_whitelist_error_at: dict[str, float] = {}
+    priority_campaign_due_ids: dict[str, list[int]] = {}
+    priority_campaign_due_scanned_at: dict[str, float] = {}
+    priority_campaign_due_error_at: dict[str, float] = {}
     last_campaign_native_fallback_ts: dict[str, float] = {}
 
     def _priority_trigger_completed(root: str, campaign_id: int, db_cfg: object) -> None:
@@ -7153,6 +7676,64 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 root = str(getattr(inst, "root", "") or "").strip()
                 if not root:
                     continue
+                segment_ids = _segment_whitelist_effective_setting(cfg, inst)
+                segment_realtime = _segment_whitelist_realtime_setting(cfg, inst)
+                configured_campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
+                campaign_realtime = _campaign_whitelist_realtime_setting(cfg, inst)
+                due_scan_now = time.time()
+                due_scan_interval = max(
+                    5,
+                    min(30, int(getattr(cfg, "campaign_trigger_audit_interval_sec", 60) or 60)),
+                )
+                if (
+                    due_scan_now - float(priority_campaign_due_scanned_at.get(root, 0.0) or 0.0)
+                    >= due_scan_interval
+                ):
+                    try:
+                        due_sql = _campaign_sql_for_major(
+                            cfg.sql_campaign_triggers_due,
+                            getattr(inst, "mautic_major", None),
+                        )
+                        due_ids = MauticDB(inst.db).fetch_ids(
+                            due_sql,
+                            limit=5000,
+                            context=campaign_sql_time_context(
+                                datetime.now(timezone.utc),
+                                getattr(inst, "mautic_timezone", None),
+                                getattr(inst, "mautic_major", None),
+                            ),
+                        )
+                        priority_campaign_due_ids[root] = list(dict.fromkeys(due_ids or []))
+                    except Exception as exc:
+                        priority_campaign_due_ids[root] = []
+                        last_error_at = float(priority_campaign_due_error_at.get(root, 0.0) or 0.0)
+                        if due_scan_now - last_error_at >= 300.0:
+                            priority_campaign_due_error_at[root] = due_scan_now
+                            logging.warning("[%s] due campaign priority scan failed: %s", root, exc)
+                    priority_campaign_due_scanned_at[root] = due_scan_now
+                pending_due_ids = list(priority_campaign_due_ids.get(root, []))
+                if pending_due_ids:
+                    launched_due_ids = set(
+                        _dispatch_due_campaign_triggers(
+                            config=cfg,
+                            root=root,
+                            due_ids=pending_due_ids,
+                            running=running,
+                            priority_executor=priority_executor,
+                            on_success=lambda campaign_id, root=root, db_cfg=inst.db: _priority_trigger_completed(
+                                root,
+                                campaign_id,
+                                db_cfg,
+                            ),
+                            realtime=campaign_realtime,
+                        )
+                    )
+                    if launched_due_ids:
+                        priority_campaign_due_ids[root] = [
+                            campaign_id
+                            for campaign_id in pending_due_ids
+                            if int(campaign_id) not in launched_due_ids
+                        ]
                 if root not in last_campaign_native_fallback_ts:
                     last_campaign_native_fallback_ts[root] = pusher.campaign_native_fallback_last_run_ts(root)
                 fallback_interval = max(300, int(getattr(cfg, "campaign_native_fallback_interval_sec", 3600) or 3600))
@@ -7173,6 +7754,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     fallback_block_reason = "priority_campaign_active"
                 elif fallback_due and priority_executor.has_active_task_type("campaign_native_fallback"):
                     fallback_block_reason = "host_fallback_active"
+                elif fallback_due and _root_has_live_campaign_process(root, running):
+                    fallback_block_reason = "campaign_process_active"
                 if fallback_due and not fallback_block_reason:
                     reserved = _campaign_fallback_try_begin(
                         root,
@@ -7181,6 +7764,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     )
                     if not reserved:
                         fallback_block_reason = "campaign_dispatch_race"
+                    elif _root_has_live_campaign_process(root, running):
+                        _campaign_fallback_end(root)
+                        fallback_block_reason = "campaign_process_active"
                 if fallback_due and fallback_block_reason:
                     pusher.set_campaign_native_fallback_runtime(
                         root,
@@ -7338,14 +7924,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "delay_sec": max(0, int((time.time() - fallback_scheduled_at) // 60) * 60),
                         },
                     )
-                segment_ids = _segment_whitelist_effective_setting(cfg, inst)
-                configured_campaign_ids = _campaign_whitelist_effective_setting(cfg, inst)
                 configured_campaign_signature = tuple(sorted(configured_campaign_ids))
                 campaign_whitelist_now = time.time()
                 campaign_whitelist_refresh_sec = max(
                     1,
                     int(getattr(cfg, "campaign_trigger_audit_interval_sec", 60) or 60),
                 )
+                if campaign_realtime.rebuild_enabled:
+                    campaign_whitelist_refresh_sec = min(
+                        campaign_whitelist_refresh_sec,
+                        campaign_realtime.rebuild_interval_sec,
+                    )
                 campaign_whitelist_refresh_due = (
                     priority_campaign_whitelist_signature.get(root) != configured_campaign_signature
                     or campaign_whitelist_now
@@ -7378,6 +7967,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 else:
                     campaign_ids = set(priority_campaign_whitelist_active.get(root, set()))
                 for segment_id in sorted(segment_ids):
+                    segment_is_realtime = segment_realtime.enabled and segment_id in segment_realtime.ids
                     priority_executor.launch(
                         cfg,
                         root=root,
@@ -7391,16 +7981,30 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             id=int(segment_id),
                             batch_limit=cfg.segment_batch_limit,
                         ),
-                        interval_sec=max(1, int(cfg.segment_full_scan_interval_sec or 60)),
-                        max_parallel=max(1, int(cfg.segment_priority_parallel_idle or 1)),
+                        interval_sec=(
+                            segment_realtime.interval_sec
+                            if segment_is_realtime
+                            else max(1, int(cfg.segment_full_scan_interval_sec or 60))
+                        ),
+                        max_parallel=(
+                            segment_realtime.parallel
+                            if segment_is_realtime
+                            else max(1, int(cfg.segment_priority_parallel_idle or 1))
+                        ),
                         on_success=lambda root=root, segment_id=int(segment_id): _mark_segment_finished(
                             root,
                             segment_id,
                         ),
+                        capacity_lane="segment_realtime" if segment_is_realtime else None,
+                        log_label="realtime" if segment_is_realtime else "priority",
                     )
 
                 for campaign_id in sorted(campaign_ids):
                     campaign_id = int(campaign_id)
+                    rebuild_is_realtime = (
+                        campaign_realtime.rebuild_enabled
+                        and campaign_id in campaign_realtime.ids
+                    )
                     priority_executor.launch(
                         cfg,
                         root=root,
@@ -7413,12 +8017,22 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             template=cfg.cmd_campaign_rebuild_template,
                             id=campaign_id,
                         ),
-                        interval_sec=max(1, int(cfg.campaign_rebuild_min_repeat_sec or 60)),
-                        max_parallel=max(1, int(cfg.campaign_rebuild_priority_parallel or 1)),
+                        interval_sec=(
+                            campaign_realtime.rebuild_interval_sec
+                            if rebuild_is_realtime
+                            else max(1, int(cfg.campaign_rebuild_min_repeat_sec or 60))
+                        ),
+                        max_parallel=(
+                            campaign_realtime.rebuild_parallel
+                            if rebuild_is_realtime
+                            else max(1, int(cfg.campaign_rebuild_priority_parallel or 1))
+                        ),
                         on_success=lambda root=root, campaign_id=campaign_id: _mark_campaign_rebuild_finished(
                             root,
                             campaign_id,
                         ),
+                        capacity_lane="campaign_rebuild_realtime" if rebuild_is_realtime else None,
+                        log_label="realtime" if rebuild_is_realtime else "priority",
                     )
                     if priority_executor.is_active(root, "campaign_rebuild", campaign_id):
                         continue
@@ -7428,10 +8042,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     rebuild_finished = priority_executor.last_finished(root, "campaign_rebuild", campaign_id)
                     last_checked = float(priority_trigger_last_checked.get(trigger_key, 0.0) or 0.0)
                     checked_rebuild = float(priority_trigger_checked_rebuild.get(trigger_key, 0.0) or 0.0)
-                    trigger_interval = max(
-                        1,
-                        int(cfg.campaign_trigger_min_repeat_sec or 0),
-                        int(cfg.campaign_trigger_audit_interval_sec or 0),
+                    trigger_is_realtime = (
+                        campaign_realtime.trigger_enabled
+                        and campaign_id in campaign_realtime.ids
+                    )
+                    trigger_interval = (
+                        campaign_realtime.trigger_interval_sec
+                        if trigger_is_realtime
+                        else max(
+                            1,
+                            int(cfg.campaign_trigger_min_repeat_sec or 0),
+                            int(cfg.campaign_trigger_audit_interval_sec or 0),
+                        )
                     )
                     if not _priority_campaign_due_check_needed(
                         now_ts=now_priority,
@@ -7476,12 +8098,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 batch_limit=cfg.campaign_batch_limit,
                             ),
                             interval_sec=trigger_interval,
-                            max_parallel=max(1, int(cfg.campaign_trigger_priority_parallel or 1)),
+                            max_parallel=(
+                                campaign_realtime.trigger_parallel
+                                if trigger_is_realtime
+                                else max(1, int(cfg.campaign_trigger_priority_parallel or 1))
+                            ),
                             on_success=lambda root=root, campaign_id=campaign_id, db_cfg=inst.db: _priority_trigger_completed(
                                 root,
                                 campaign_id,
                                 db_cfg,
                             ),
+                            capacity_lane="campaign_trigger_realtime" if trigger_is_realtime else None,
+                            log_label="realtime" if trigger_is_realtime else "priority",
                         )
             time.sleep(1.0)
 
@@ -7649,7 +8277,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         empty_leads_cleanup_window_counts.clear()
                         empty_leads_cleanup_window_keys.clear()
                         empty_leads_cleanup_done_window_keys.clear()
-                        last_housekeeping_plugin_ts.clear()
                         last_monitored_email_parser_ts.clear()
                         maintenance_cleanup_rr_index.clear()
                         logging.info("runtime-overrides cleanup schedules refreshed for immediate scheduler apply")
@@ -8119,6 +8746,44 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         )
                 except Exception as e:
                     logging.warning("[%s] Mautic 7 GrapesJS CKEditor GPL patch check failed: %s", inst.root, e)
+            # Logical validation is inventory health, not scheduler work. Run
+            # it for passive hosts too so MCC can report and remediate broken
+            # configurations even when native cron owns execution.
+            for inst in installs:
+                root = str(getattr(inst, "root", "") or "").strip()
+                if not root or getattr(inst, "db", None) is None:
+                    continue
+                try:
+                    logical_scan_due = now - float(last_logical_issue_scan_ts.get(root, 0.0)) >= 300.0
+                    if logical_scan_due:
+                        logical_snapshot = scan_install_logical_issues(config, inst, runtime_store=store)
+                        last_logical_issue_scan_ts[root] = now
+                    else:
+                        logical_snapshot = read_logical_issues_snapshot(
+                            config.state_db_path,
+                            root,
+                            runtime_store=store,
+                        )
+                    logical_blocked_ids = logical_issue_blocked_segment_ids(logical_snapshot)
+                    segment_logical_issue_blocked_sets[root] = logical_blocked_ids
+                    if logical_blocked_ids and logical_scan_due:
+                        logging.warning(
+                            "[%s] logical issue guard blocked segment ids=%s",
+                            root,
+                            ",".join(str(x) for x in sorted(logical_blocked_ids)[:100]),
+                        )
+                except Exception as e:
+                    logging.warning("[%s] logical issue scan failed: %s", root, e)
+            try:
+                removed_logical_snapshots = prune_logical_issue_snapshots(
+                    config.state_db_path,
+                    [str(getattr(inst, "root", "") or "") for inst in installs],
+                    runtime_store=store,
+                )
+                if removed_logical_snapshots:
+                    logging.info("logical issue state pruned stale instances=%s", removed_logical_snapshots)
+            except Exception as e:
+                logging.warning("logical issue state prune failed: %s", e)
             logging.info("Instance inventory count: %d", len(installs))
             if (config.profile_name or "").strip().lower() == "passive":
                 for inst in installs:
@@ -8354,6 +9019,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         if stale_id not in planned_trigger_ids:
                             trigger_plan_started_at.pop(stale_id, None)
                             _CAMPAIGN_REBUILD_FINISHED_AT.pop((str(root), stale_id), None)
+                            _CAMPAIGN_TRIGGER_FUTURE_WAKE.pop((str(root), stale_id), None)
+                            _CAMPAIGN_TRIGGER_FUTURE_WAKE_LOGGED.pop((str(root), stale_id), None)
                     for cid in planned_trigger_ids:
                         trigger_plan_started_at.setdefault(cid, now)
                     if config.enable_campaign_rebuild and campaign_rebuild_ids is not None:
@@ -8877,9 +9544,14 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 if last_ts > 0 and now - last_ts < guard_interval_sec:
                     continue
                 try:
+                    permission_identity = effective_guard_identity(
+                        runtime=inst.runtime,
+                        runtime_user=inst.runtime_user,
+                        host_user=config.mautic_run_as_user,
+                    )
                     res = ensure_instance_permissions(
                         root=root,
-                        run_as_user=config.mautic_run_as_user or "www-data",
+                        run_as_user=permission_identity,
                         guard_paths=config.fs_permissions_guard_paths,
                         fix_console_exec=bool(config.fs_permissions_guard_fix_console_exec),
                         console_relpath=config.fs_permissions_guard_console_relpath,
@@ -9094,6 +9766,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             note,
                         )
                         config = load_config(config.config_file_path, allow_recover_from_mcc=False)
+                        if desired_profile and desired_profile != old_profile:
+                            write_profile_selection(
+                                "/opt/mcd",
+                                mode="manual",
+                                profile=(config.profile_name or desired_profile),
+                            )
                         base_config = config
                         pusher.cfg = config
                         next_plan_refresh_at = 0.0
@@ -9144,24 +9822,194 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 logging.warning("managed cron reconcile failed: %s", e)
             next_managed_cron_reconcile_at = now + 60
 
-        if now >= next_viber_cron_reconcile_at:
+        if now >= next_plugin_operation_cron_reconcile_at:
             try:
-                vcron = reconcile_viber_stats_cron(
+                plugin_cron = reconcile_plugin_operation_cron(
                     profile_name=(config.profile_name or ""),
                     install_dir="/opt/mcd",
+                    rules=plugin_operation_legacy_cron_rules(config, installs),
                 )
                 changed = [
                     line
-                    for line in vcron.lines
-                    if "commented viber stats" in line or "restored managed cron" in line
+                    for line in plugin_cron.lines
+                    if "catalog plugin cron reconciled" in line
                 ]
                 if changed:
-                    logging.info("viber stats cron reconcile: %s", "; ".join(changed))
-                elif not vcron.ok:
-                    logging.warning("viber stats cron reconcile failed: %s", "; ".join(vcron.lines))
+                    logging.info("plugin operation cron reconcile: %s", "; ".join(changed))
+                current_settings = getattr(config, "plugin_operation_instance_settings", {})
+                next_settings = dict(current_settings) if isinstance(current_settings, dict) else {}
+                changed_settings = False
+                operation_instance_keys: dict[tuple[str, str], list[str]] = {}
+
+                def _has_canonical_operation(keys: list[str], operation_key: str) -> bool:
+                    for key in [*keys, "default"]:
+                        block = next_settings.get(key)
+                        if isinstance(block, dict) and isinstance(block.get(operation_key), dict):
+                            return True
+                    return False
+
+                for inst in installs:
+                    instance_keys = plugin_operation_instance_runtime_keys(inst)
+                    if not instance_keys:
+                        continue
+                    instance_key = instance_keys[0]
+                    for plugin_item in plugin_operations_for_instance(config, inst):
+                        operation_key = str(plugin_item.get("operation_key", "") or "")
+                        if not operation_key:
+                            continue
+                        operation_instance_keys[(instance_key, operation_key)] = instance_keys
+                        legacy_values = plugin_item.get("legacy_values")
+                        if not isinstance(legacy_values, dict) or not legacy_values:
+                            continue
+                        if _has_canonical_operation(instance_keys, operation_key):
+                            continue
+                        operation = (
+                            plugin_item.get("operation")
+                            if isinstance(plugin_item.get("operation"), dict)
+                            else {}
+                        )
+                        values = {
+                            str(field.get("id")): field.get("default")
+                            for field in list(operation.get("fields") or [])
+                            if isinstance(field, dict) and str(field.get("id", "") or "")
+                        }
+                        for field_id in list(values):
+                            if field_id in legacy_values:
+                                values[field_id] = legacy_values[field_id]
+                        block = (
+                            dict(next_settings.get(instance_key) or {})
+                            if isinstance(next_settings.get(instance_key), dict)
+                            else {}
+                        )
+                        block[operation_key] = values
+                        next_settings[instance_key] = block
+                        changed_settings = True
+
+                for line in plugin_cron.lines:
+                    prefix = "MCD_PLUGIN_OPERATION_MIGRATE_JSON="
+                    if not str(line).startswith(prefix):
+                        continue
+                    try:
+                        migrated = json.loads(str(line)[len(prefix):])
+                    except Exception:
+                        continue
+                    instance_key = str(migrated.get("instance_key", "") or "")
+                    operation_key = str(migrated.get("operation_key", "") or "")
+                    interval_sec = int(migrated.get("interval_sec", 0) or 0)
+                    enabled_field = str(migrated.get("enabled_field", "enabled") or "enabled")
+                    interval_field = str(migrated.get("interval_field", "interval_sec") or "interval_sec")
+                    if instance_key and operation_key and bool(migrated.get("cron_found", False)):
+                        instance_keys = operation_instance_keys.get((instance_key, operation_key), [instance_key])
+                        if _has_canonical_operation(instance_keys, operation_key):
+                            continue
+                        migrated_values: dict[str, object] = {enabled_field: True}
+                        if interval_sec > 0:
+                            migrated_values[interval_field] = max(60, interval_sec)
+                        block = (
+                            dict(next_settings.get(instance_key) or {})
+                            if isinstance(next_settings.get(instance_key), dict)
+                            else {}
+                        )
+                        block[operation_key] = migrated_values
+                        next_settings[instance_key] = block
+                        changed_settings = True
+                if changed_settings:
+                    pushed = push_runtime_overrides(
+                        config,
+                        {"plugin_operation_instance_settings": next_settings},
+                        merge=True,
+                        target="desired",
+                    )
+                    if str(pushed.get("status", "")).lower() == "ok":
+                        config.plugin_operation_instance_settings = next_settings
+                    else:
+                        logging.warning("plugin operation settings migration push failed: %s", pushed.get("reason", "unknown"))
+                if not plugin_cron.ok:
+                    logging.warning("plugin operation cron reconcile failed: %s", "; ".join(plugin_cron.lines))
             except Exception as e:
-                logging.warning("viber stats cron reconcile failed: %s", e)
-            next_viber_cron_reconcile_at = now + 60
+                logging.warning("plugin operation cron reconcile failed: %s", e)
+            next_plugin_operation_cron_reconcile_at = now + 60
+
+        if now >= next_message_queue_cron_reconcile_at:
+            try:
+                supported_installs = [inst for inst in installs if supports_message_queue(inst)]
+                queue_cron = reconcile_mautic_message_queue_cron(
+                    profile_name=(config.profile_name or ""),
+                    install_dir="/opt/mcd",
+                    managed_roots=[inst.root for inst in supported_installs],
+                )
+                changed = [
+                    line
+                    for line in queue_cron.lines
+                    if "mautic message queue cron lines" in line
+                ]
+                if changed:
+                    logging.info("mautic message queue cron reconcile: %s", "; ".join(changed))
+
+                cron_migrations: dict[str, int] = {}
+                migration_prefix = "MCD_MESSAGE_QUEUE_MIGRATE_JSON="
+                for line in queue_cron.lines:
+                    if not str(line).startswith(migration_prefix):
+                        continue
+                    try:
+                        migrated = json.loads(str(line)[len(migration_prefix):])
+                    except Exception:
+                        continue
+                    root_key = str(migrated.get("root", "") or "").strip()
+                    if not root_key or not bool(migrated.get("enabled", False)):
+                        continue
+                    cron_migrations[root_key] = normalize_message_queue_interval(
+                        migrated.get("interval_sec", MESSAGE_QUEUE_DEFAULT_INTERVAL_SEC)
+                    )
+
+                next_settings, added = _adopt_message_queue_settings(
+                    config,
+                    supported_installs,
+                    cron_migrations,
+                )
+
+                settings_to_push = message_queue_settings_push_pending
+                if added:
+                    # Keep cron/legacy behavior continuous even when MCC is
+                    # temporarily unreachable; marker state makes this
+                    # adoption repeatable after a daemon restart.
+                    config = _with_message_queue_instance_settings(config, next_settings)
+                    settings_to_push = next_settings
+                if settings_to_push is not None:
+                    pushed = push_runtime_overrides(
+                        config,
+                        {"message_queue_instance_settings": settings_to_push},
+                        merge=True,
+                        target="desired",
+                    )
+                    if str(pushed.get("status", "")).lower() == "ok":
+                        config = _with_message_queue_instance_settings(config, settings_to_push)
+                        message_queue_settings_push_pending = None
+                        if added:
+                            logging.info(
+                                "mautic message queue settings adopted: %s",
+                                ", ".join(
+                                    f"{key}=enabled:{str(enabled).lower()}/interval:{interval_sec}/source:{source}"
+                                    for key, enabled, interval_sec, source in added
+                                ),
+                            )
+                        else:
+                            logging.info("mautic message queue pending settings synchronized to MCC")
+                    else:
+                        config = _with_message_queue_instance_settings(config, settings_to_push)
+                        message_queue_settings_push_pending = settings_to_push
+                        logging.warning(
+                            "mautic message queue settings migration push failed; local behavior retained: %s",
+                            pushed.get("reason", "unknown"),
+                        )
+                if not queue_cron.ok:
+                    logging.warning(
+                        "mautic message queue cron reconcile failed: %s",
+                        "; ".join(queue_cron.lines),
+                    )
+            except Exception as e:
+                logging.warning("mautic message queue cron reconcile failed: %s", e)
+            next_message_queue_cron_reconcile_at = now + 60
 
         if now >= next_email_fetch_cron_reconcile_at:
             try:
@@ -9274,9 +10122,83 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         cluster_import_allowed = cluster_route_allows(config, "import")
         cluster_cache_allowed = cluster_route_allows(config, "cache")
 
-        dispatch_installs = _priority_interleaved_dispatch_installs(
-            _rotated_dispatch_installs(installs, dispatch_instance_cursor),
-            config,
+        priority_pending_roots = {
+            root
+            for root in {str(getattr(inst, "root", "") or "").strip() for inst in installs}
+            if root
+            and (
+                max(0, int(import_pending_cache.get(root, 0) or 0)) > 0
+                or bool(campaign_trigger_prio_rings.get(root))
+                or bool(campaign_trigger_reg_rings.get(root))
+                or bool(campaign_rebuild_prio_rings.get(root))
+                or bool(campaign_rebuild_reg_rings.get(root))
+            )
+        }
+        pending_roots = set(priority_pending_roots)
+        pending_roots.update(
+            root
+            for root in {str(getattr(inst, "root", "") or "").strip() for inst in installs}
+            if root
+            and (
+                bool(segment_sql_long_rings.get(root))
+                or bool(segment_sql_rings.get(root))
+                or bool(segment_resume_rings.get(root))
+                or bool(segment_prio_rings.get(root))
+                or bool(segment_reg_rings.get(root))
+            )
+        )
+        _set_scheduler_priority_pending_roots(priority_pending_roots)
+        dispatch_installs = _pending_import_first_dispatch_installs(
+            _priority_interleaved_dispatch_installs(
+                _rotated_dispatch_installs(installs, dispatch_instance_cursor),
+                config,
+            ),
+            import_pending_cache,
+        )
+        dispatch_installs, promoted_roots = _fairness_watchdog_dispatch_installs(
+            dispatch_installs,
+            pending_roots=pending_roots,
+            pending_since_by_root=scheduler_pending_since_by_root,
+            now_ts=now,
+            watchdog_sec=int(getattr(config, "scheduler_fairness_watchdog_sec", 300) or 300),
+        )
+        promoted_signature = frozenset(promoted_roots)
+        oldest_wait_sec = max(
+            [max(0, int(now - started_at)) for started_at in scheduler_pending_since_by_root.values()],
+            default=0,
+        )
+        if _fairness_promotion_log_due(
+            promoted_roots,
+            scheduler_last_promoted_roots,
+            now_ts=now,
+            next_log_at=scheduler_next_fairness_log_at,
+        ):
+            logging.warning(
+                "scheduler fairness watchdog promoted roots count=%s oldest_wait_sec=%s sample=%s",
+                len(promoted_roots),
+                oldest_wait_sec,
+                ",".join(promoted_roots[:3]),
+            )
+            scheduler_next_fairness_log_at = now + 3600
+        elif not promoted_signature:
+            scheduler_next_fairness_log_at = 0.0
+        scheduler_last_promoted_roots = promoted_signature
+        store.put_runtime_sync(
+            "scheduler_fairness_state",
+            {
+                "version": 1,
+                "updated_at": float(now),
+                "host_limit": max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0)),
+                "emergency_reserved_slots": max(
+                    0,
+                    int(getattr(config, "scheduler_emergency_reserved_slots", 1) or 0),
+                ),
+                "instance_limit": max(0, int(getattr(config, "scheduler_instance_max_parallel", 0) or 0)),
+                "pending_roots": sorted(pending_roots),
+                "priority_pending_roots": sorted(priority_pending_roots),
+                "promoted_roots": promoted_roots,
+                "oldest_wait_sec": oldest_wait_sec,
+            },
         )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
@@ -9323,6 +10245,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             )
             segment_blocked_ids |= set(segment_invalid_filter_sets.get(root, set()))
             segment_blocked_ids |= set(segment_failure_blocked_sets.get(root, set()))
+            segment_blocked_ids |= set(segment_logical_issue_blocked_sets.get(root, set()))
             dependency_parents_for_root = segment_parents_by_root.get(root, {})
             dependency_children_for_root = segment_dependencies_by_root.get(root, {})
 
@@ -10031,8 +10954,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if next_trigger_id is not None and _trigger_waits_for_rebuild(int(next_trigger_id)):
                         next_trigger_id = None
                     if next_trigger_id is not None and _trigger_has_no_due_work(int(next_trigger_id)):
-                        _advance_ring_after_launch(trg_prio_ring, next_trigger_id, remove_on_launch=True)
-                        _advance_ring_after_launch(trg_reg_ring, next_trigger_id, remove_on_launch=True)
+                        remove_skipped = _campaign_trigger_skip_removes_from_ring(
+                            root,
+                            int(next_trigger_id),
+                            campaign_whitelist_for_inst,
+                        )
+                        _advance_ring_after_launch(trg_prio_ring, next_trigger_id, remove_on_launch=remove_skipped)
+                        _advance_ring_after_launch(trg_reg_ring, next_trigger_id, remove_on_launch=remove_skipped)
                         next_trigger_id = None
 
                     if next_trigger_id is not None:
@@ -10150,7 +11078,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 max(0, int(config.campaign_trigger_priority_parallel))
                 + max(0, int(config.campaign_trigger_regular_parallel))
             ) > 0
-            prefer_rebuild = bool(config.enable_campaign_rebuild and trigger_lane_configured and (rr % 2 == 1))
+            trigger_after_rebuild_pending = _campaign_trigger_after_rebuild_pending(
+                root,
+                (trg_prio_ring, trg_reg_ring),
+            )
+            prefer_rebuild = bool(
+                config.enable_campaign_rebuild
+                and trigger_lane_configured
+                and (rr % 2 == 1)
+                and not trigger_after_rebuild_pending
+            )
 
             def _campaign_shared_available() -> int | None:
                 if shared_campaign_cap <= 0:
@@ -10195,7 +11132,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     ),
                     dynamic_blocked=_trigger_waits_for_rebuild,
                     should_skip=_trigger_has_no_due_work,
-                    remove_on_skip=lambda cid: cid not in campaign_whitelist_for_inst,
+                    remove_on_skip=lambda cid: _campaign_trigger_skip_removes_from_ring(
+                        root,
+                        int(cid),
+                        campaign_whitelist_for_inst,
+                    ),
                     remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                     on_launch=_mark_campaign_trigger_cycle,
                 )
@@ -10222,6 +11163,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         ),
                         dynamic_blocked=_trigger_waits_for_rebuild,
                         should_skip=_trigger_has_no_due_work,
+                        remove_on_skip=lambda cid: _campaign_trigger_skip_removes_from_ring(
+                            root,
+                            int(cid),
+                            campaign_whitelist_for_inst,
+                        ),
                         remove_on_launch=True,
                         on_launch=_mark_campaign_trigger_cycle,
                     )
@@ -10251,6 +11197,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             ),
                             dynamic_blocked=_trigger_waits_for_rebuild,
                             should_skip=_trigger_has_no_due_work,
+                            remove_on_skip=lambda cid: _campaign_trigger_skip_removes_from_ring(
+                                root,
+                                int(cid),
+                                campaign_whitelist_for_inst,
+                            ),
                             remove_on_launch=True,
                             on_launch=_mark_campaign_trigger_cycle,
                         )
@@ -10277,7 +11228,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             ),
                             dynamic_blocked=_trigger_waits_for_rebuild,
                             should_skip=_trigger_has_no_due_work,
-                            remove_on_skip=lambda cid: cid not in campaign_whitelist_for_inst,
+                            remove_on_skip=lambda cid: _campaign_trigger_skip_removes_from_ring(
+                                root,
+                                int(cid),
+                                campaign_whitelist_for_inst,
+                            ),
                             remove_on_launch=lambda cid: cid not in campaign_whitelist_for_inst,
                             on_launch=_mark_campaign_trigger_cycle,
                         )
@@ -10600,37 +11555,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 )
 
             (
-                housekeeping_enabled,
-                housekeeping_interval,
-                housekeeping_quiet_hour,
-                housekeeping_window_min,
-                housekeeping_days_old,
-                housekeeping_flags,
-                housekeeping_optimize,
-                housekeeping_dry_run,
-            ) = _housekeeping_plugin_effective_setting(config, inst)
-            last_housekeeping = last_housekeeping_plugin_ts.get(root, 0.0)
-            housekeeping_in_quiet = _in_daily_quiet_window(
-                dt,
-                housekeeping_quiet_hour,
-                housekeeping_window_min,
-            )
-            housekeeping_due = (
-                housekeeping_enabled
-                and cluster_cron_allowed
-                and housekeeping_in_quiet
-                and (last_housekeeping == 0.0 or now - last_housekeeping >= housekeeping_interval)
-                and int(getattr(inst, "mautic_major", 0) or 0) in {4, 5, 6, 7}
-                and _housekeeping_plugin_installed(root)
-            )
-            housekeeping_selected_flags = [
-                _HOUSEKEEPING_ALLOWED_FLAGS[x]
-                for x in housekeeping_flags
-                if x in _HOUSEKEEPING_ALLOWED_FLAGS
-            ]
-            housekeeping_due = bool(housekeeping_due and housekeeping_selected_flags)
-
-            (
                 empty_cleanup_enabled,
                 empty_cleanup_interval,
                 empty_cleanup_mode,
@@ -10690,51 +11614,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 and not backup_dispatch_pause
             ):
                 service_cleanup_candidates.append("empty_leads_cleanup")
-            if housekeeping_due:
-                service_cleanup_candidates.append("housekeeping")
             selected_service_cleanup, selected_service_cleanup_idx = _select_fair_cleanup_task(
                 service_cleanup_candidates,
                 maintenance_cleanup_rr_index.get(root, -1),
             )
             if selected_service_cleanup:
                 maintenance_cleanup_rr_index[root] = selected_service_cleanup_idx
-
-            if selected_service_cleanup == "housekeeping":
-                template = "leuchtfeuer:housekeeping --days-old {days_old} " + " ".join(housekeeping_selected_flags)
-                if housekeeping_optimize:
-                    template += " --optimize-tables"
-                if housekeeping_dry_run:
-                    template += " --dry-run"
-                try:
-                    args = render_mautic_command(
-                        php_bin=config.php_bin,
-                        run_as_user=config.mautic_run_as_user,
-                        root=root,
-                        template=template,
-                        days_old=housekeeping_days_old,
-                    )
-                    launched = _submit_if_slot(
-                        config=config,
-                        store=store,
-                        running=running,
-                        root=root,
-                        task_type="housekeeping",
-                        entity_id=None,
-                        args=args,
-                        timeout_sec=config.command_timeout_sec,
-                        max_parallel_for_type=1,
-                        popens=popens,
-                    )
-                    if launched:
-                        last_housekeeping_plugin_ts[root] = now
-                        logging.info(
-                            "[%s] housekeeping plugin queued fair_queue=%s flags=%s",
-                            root,
-                            "shared" if len(service_cleanup_candidates) > 1 else "solo",
-                            ",".join(housekeeping_selected_flags),
-                        )
-                except Exception as e:
-                    logging.warning("[%s] housekeeping plugin schedule failed: %s", root, e)
 
             if selected_service_cleanup == "page_hits_orphan_cleanup":
                 try:
@@ -10935,35 +11820,146 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 ):
                     last_cache_warm_ts[root] = now
 
-            if cluster_cron_allowed and _instance_has_viber_plugin(inst):
-                viber_enabled, viber_interval = _viber_stats_effective_setting(config, inst)
-                viber_job_name = "viber:stats:update"
-                prev = jobs_last_run.get((root, viber_job_name), 0.0)
-                if viber_enabled and (prev <= 0 or now - prev >= max(60, viber_interval)):
+            if cluster_cron_allowed and supports_message_queue(inst):
+                queue_enabled, queue_interval = effective_message_queue_setting(config, inst)
+                queue_job_name = "mautic:messages:send"
+                previous = jobs_last_run.get((root, queue_job_name), 0.0)
+                if queue_enabled and (previous <= 0 or now - previous >= queue_interval):
                     args = render_mautic_command(
                         php_bin=config.php_bin,
                         run_as_user=config.mautic_run_as_user,
                         root=root,
-                        template=viber_job_name,
+                        template=queue_job_name,
                     )
                     if _submit_if_slot(
                         config=config,
                         store=store,
                         running=running,
                         root=root,
-                        task_type="job:viber_stats_update",
+                        task_type="job:mautic_messages_send",
                         entity_id=None,
                         args=args,
                         timeout_sec=config.command_timeout_sec,
                         max_parallel_for_type=1,
                         popens=popens,
                     ):
-                        jobs_last_run[(root, viber_job_name)] = now
+                        jobs_last_run[(root, queue_job_name)] = now
 
+            if cluster_cron_allowed:
+                for plugin_item in plugin_operations_for_instance(config, inst):
+                    operation = plugin_item.get("operation") if isinstance(plugin_item.get("operation"), dict) else {}
+                    if str(operation.get("mode", "") or "") != "scheduled":
+                        continue
+                    operation_key = str(plugin_item.get("operation_key", "") or "")
+                    values = plugin_operation_effective_values(config, inst, plugin_item)
+                    for plugin_task in plugin_operation_scheduled_tasks(plugin_item):
+                        task_id = str(plugin_task.get("id", "") or "")
+                        run_key = f"{operation_key}:{task_id}"
+                        previous = jobs_last_run.get((root, run_key), 0.0)
+                        try:
+                            if not plugin_operation_schedule_due(
+                                plugin_item,
+                                values,
+                                now_epoch=now,
+                                now_local=dt,
+                                last_epoch=previous,
+                                task=plugin_task,
+                            ):
+                                continue
+                            guard = plugin_task.get("guard")
+                            if guard is not None and not _plugin_operation_guard_matches(db, guard, inst_now):
+                                jobs_last_run[(root, run_key)] = now
+                                continue
+                            selected_command = (
+                                plugin_task.get("command")
+                                if isinstance(plugin_task.get("command"), dict)
+                                else {}
+                            )
+                            task_type = (
+                                "job:plugin_operation_safety"
+                                if str(plugin_task.get("task_class", "standard") or "standard") == "safety"
+                                else "job:plugin_operation"
+                            )
+                            bootstrap = (
+                                plugin_task.get("bootstrap")
+                                if isinstance(plugin_task.get("bootstrap"), dict)
+                                else None
+                            )
+                            if bootstrap is not None:
+                                digest = _plugin_operation_bootstrap_digest(root, operation_key, task_id)
+                                completed = _plugin_operation_bootstrap_completed(store, digest)
+                                try:
+                                    if _plugin_operation_guard_matches(
+                                        db,
+                                        bootstrap.get("complete_when"),
+                                        inst_now,
+                                    ):
+                                        if not completed:
+                                            _mark_plugin_operation_bootstrap_completed(
+                                                store,
+                                                digest,
+                                                reason="adopted_existing_plugin_data",
+                                            )
+                                        completed = True
+                                    else:
+                                        # A previous completion marker must not suppress
+                                        # bootstrap after the plugin data was removed or
+                                        # the bundle was reinstalled into the same root.
+                                        completed = False
+                                except Exception as exc:
+                                    logging.warning(
+                                        "[%s] plugin operation %s/%s bootstrap probe failed: %s",
+                                        root,
+                                        operation_key,
+                                        task_id,
+                                        exc,
+                                    )
+                                if not completed:
+                                    selected_command = (
+                                        bootstrap.get("command")
+                                        if isinstance(bootstrap.get("command"), dict)
+                                        else selected_command
+                                    )
+                                    task_type = f"job:plugin_operation_bootstrap:{digest}"
+                            template = plugin_operation_command_template(
+                                plugin_item,
+                                values,
+                                task=plugin_task,
+                                command=selected_command,
+                            )
+                            args = render_mautic_command(
+                                php_bin=config.php_bin,
+                                run_as_user=config.mautic_run_as_user,
+                                root=root,
+                                template=template,
+                            )
+                            if _submit_if_slot(
+                                config=config,
+                                store=store,
+                                running=running,
+                                root=root,
+                                task_type=task_type,
+                                entity_id=None,
+                                args=args,
+                                timeout_sec=config.command_timeout_sec,
+                                max_parallel_for_type=1,
+                                popens=popens,
+                            ):
+                                jobs_last_run[(root, run_key)] = now
+                        except Exception as exc:
+                            logging.warning(
+                                "[%s] plugin operation %s/%s schedule failed: %s",
+                                root,
+                                operation_key,
+                                task_id,
+                                exc,
+                            )
             for job in config.scheduled_jobs:
                 if not cluster_cron_allowed:
                     break
                 if not job.enabled:
+                    continue
+                if supports_message_queue(inst) and _is_mautic_message_send_template(job.command_template):
                     continue
                 if _is_mautic_email_fetch_template(job.command_template) and _monitored_email_fetch_replaces_mautic(config, inst):
                     continue

@@ -168,6 +168,27 @@ class CampaignDueSqlTests(unittest.TestCase):
         self.assertIn("NOT EXISTS (", root_bootstrap_branch)
         self.assertIn("{prefix}campaign_lead_event_log el0", root_bootstrap_branch)
 
+    def test_trigger_due_catches_root_date_action_with_null_trigger_date(self) -> None:
+        # Native Mautic's DateTime scheduler executes this malformed-but-valid
+        # shape immediately from the campaign comparison time. Najboljamama
+        # campaign 16 used it and was incorrectly rejected as stale by MCD.
+        root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.rsplit("UNION", 1)[1]
+        guard_sql = _campaign_trigger_root_action_due_exists_sql(16)
+
+        date_due = "ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}'"
+        self.assertIn(date_due, root_bootstrap_branch)
+        self.assertIn(date_due, guard_sql)
+        self.assertNotIn("ce.trigger_date IS NOT NULL", root_bootstrap_branch)
+        self.assertNotIn("ce.trigger_date IS NOT NULL", guard_sql)
+
+    def test_trigger_due_catches_no_branch_date_action_with_null_trigger_date(self) -> None:
+        no_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 2)[1]
+        guard_sql = _campaign_trigger_no_action_due_exists_sql(16)
+
+        date_due = "ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}'"
+        self.assertIn(date_due, no_branch)
+        self.assertIn(date_due, guard_sql)
+
     def test_trigger_due_catches_root_condition_campaign_leads_without_event_log(self) -> None:
         root_bootstrap_branch = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.split("UNION", 1)[1]
 
@@ -381,6 +402,17 @@ class CampaignDueSqlTests(unittest.TestCase):
             "AND NOT EXISTS ( SELECT 1 FROM {prefix}campaign_lead_event_log el0 "
             "WHERE el0.campaign_id = cld.campaign_id AND el0.lead_id = cld.lead_id "
             "AND el0.event_id = ce.id AND el0.rotation <=> cld.rotation LIMIT 1 ) LIMIT 1 ) ) q"
+        )
+
+        self.assertEqual(
+            _campaign_triggers_due_sql({"campaign_triggers_due": previous}),
+            _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE,
+        )
+
+    def test_trigger_sql_without_native_null_date_semantics_is_migrated(self) -> None:
+        previous = _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE.replace(
+            "AND (ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}')",
+            "AND ce.trigger_date IS NOT NULL AND ce.trigger_date <= '{now_utc}'",
         )
 
         self.assertEqual(

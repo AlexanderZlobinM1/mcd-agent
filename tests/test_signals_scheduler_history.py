@@ -111,6 +111,17 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
                     now,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO runtime_sync(key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "scheduler_fairness_state",
+                    '{"host_limit":6,"emergency_reserved_slots":1,"promoted_roots":["/var/www/mensa"]}',
+                    now,
+                ),
+            )
             conn.commit()
             conn.close()
 
@@ -119,6 +130,9 @@ class SignalsSchedulerHistoryTests(unittest.TestCase):
 
         self.assertEqual(payload["tracked_total"], 1)
         self.assertEqual(payload["sample"][0]["entity_id"], 61)
+        self.assertEqual(payload["fairness"]["host_limit"], 6)
+        self.assertEqual(payload["fairness"]["emergency_reserved_slots"], 1)
+        self.assertEqual(payload["fairness"]["promoted_roots"], ["/var/www/mensa"])
         self.assertEqual(payload["recent"][0]["entity_id"], 110)
         self.assertEqual(payload["recent"][0]["rc"], 0)
         self.assertEqual(payload["planned"][0]["root"], "/var/www/mautic")

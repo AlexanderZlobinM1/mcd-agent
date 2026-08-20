@@ -18,6 +18,9 @@ from mcd_agent.plugins import (
     _cluster_plugin_reference_host,
     _cluster_plugin_row_signature,
     _cluster_plugin_wait_file_sync,
+    _assert_plugin_bundles_registered,
+    _ensure_plugin_reload_runtime_packages,
+    _registration_aware_status,
     _run_cluster_plugin_operation,
     _run_plugin_install_reload,
     _plugin_selection_digest,
@@ -33,6 +36,65 @@ from mcd_agent.plugins import (
 
 
 class PluginConflictPathTests(unittest.TestCase):
+    def test_unregistered_plugin_files_are_reported_broken(self) -> None:
+        status, reason = _registration_aware_status(
+            "OK",
+            "version+sha match",
+            "OracleHospitalityBundle",
+            {"AdvancedReportsBundle"},
+        )
+
+        self.assertEqual(status, "BROKEN")
+        self.assertIn("registration is missing", reason)
+
+    def test_registered_plugin_keeps_package_status(self) -> None:
+        status, reason = _registration_aware_status(
+            "OK",
+            "version+sha match",
+            "OracleHospitalityBundle",
+            {"OracleHospitalityBundle"},
+        )
+
+        self.assertEqual((status, reason), ("OK", "version+sha match"))
+
+    def test_registration_assertion_rejects_missing_bundle(self) -> None:
+        install = SimpleNamespace(root="/var/www/mautic", db={"driver": "pdo_mysql"})
+        db = SimpleNamespace(fetch_rows=Mock(return_value=[{"bundle": "OtherBundle"}]))
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db):
+            with self.assertRaisesRegex(RuntimeError, "OracleHospitalityBundle"):
+                _assert_plugin_bundles_registered(install, {"OracleHospitalityBundle"})
+
+    def test_m7_plugin_preflight_installs_php_parser_without_scripts(self) -> None:
+        cfg = SimpleNamespace()
+        install = SimpleNamespace(
+            root="/var/www/mautic",
+            console_path="/var/www/mautic/bin/console",
+            mautic_major=7,
+        )
+
+        with patch("mcd_agent.plugins.ensure_composer_runtime_packages", return_value=True) as ensure:
+            changed = _ensure_plugin_reload_runtime_packages(cfg, install)
+
+        self.assertTrue(changed)
+        ensure.assert_called_once_with(
+            config=cfg,
+            root=install.root,
+            console_path=install.console_path,
+            packages={"nikic/php-parser:^5.0"},
+            reason="mautic7-plugin-registration",
+            no_scripts=True,
+        )
+
+    def test_m6_plugin_preflight_does_not_change_composer(self) -> None:
+        install = SimpleNamespace(root="/var/www/mautic", console_path="bin/console", mautic_major=6)
+
+        with patch("mcd_agent.plugins.ensure_composer_runtime_packages") as ensure:
+            changed = _ensure_plugin_reload_runtime_packages(SimpleNamespace(), install)
+
+        self.assertFalse(changed)
+        ensure.assert_not_called()
+
     def test_plugin_status_treats_custom_patch_version_as_current(self) -> None:
         with TemporaryDirectory() as tmp:
             plugins_dir = Path(tmp)
@@ -551,7 +613,61 @@ class PluginConflictPathTests(unittest.TestCase):
 
         self.assertTrue(changed)
         prealign.assert_called_once_with(install, selected)
-        post_steps.assert_called_once_with(cfg, install)
+        post_steps.assert_called_once_with(cfg, install, expected_bundles={"DemoBundle"})
+
+    def test_update_action_repairs_broken_plugin_registration(self) -> None:
+        cfg = SimpleNamespace(
+            plugins_post_cache_clear=True,
+            plugins_post_install=True,
+            mcc_token="",
+            plugins_state_filename=".mcd-plugin.json",
+        )
+        install = SimpleNamespace(
+            root="/tmp/missing-root",
+            console_path="/tmp/missing-root/bin/console",
+            db=None,
+            mautic_major=7,
+        )
+        selected = [
+            {
+                "bundle": "OracleHospitalityBundle",
+                "install_bundle": "OracleHospitalityBundle",
+                "item": {"bundle": "OracleHospitalityBundle", "version": "1.0.0"},
+                "package": "OracleHospitalityBundle.tar.gz",
+                "status": "BROKEN",
+            }
+        ]
+
+        with (
+            patch("mcd_agent.plugins._ensure_plugin_reload_runtime_packages"),
+            patch("mcd_agent.plugins.ensure_mailer_packages_for_bundles"),
+            patch("mcd_agent.plugins._install_or_replace_plugin") as install_plugin,
+            patch("mcd_agent.plugins._apply_plugin_config_metadata_patch", return_value=False),
+            patch("mcd_agent.plugins._prealign_metadataless_plugin_versions", return_value=False),
+            patch("mcd_agent.plugins._run_manifest_sql_fixes"),
+            patch("mcd_agent.plugins._cleanup_conflicting_plugin_rows"),
+            patch("mcd_agent.plugins._run_post_steps") as post_steps,
+        ):
+            changed = _apply_plugin_file_changes(
+                config=cfg,
+                install=install,
+                install_root=install.root,
+                manifest_dir="https://mcc.example/plugins/",
+                fallback_ip=None,
+                action="update",
+                selected=selected,
+                auto_remove_bundles=[],
+                rows_by_bundle={},
+                run_post_steps=True,
+            )
+
+        self.assertTrue(changed)
+        install_plugin.assert_called_once()
+        post_steps.assert_called_once_with(
+            cfg,
+            install,
+            expected_bundles={"OracleHospitalityBundle"},
+        )
 
     def test_cluster_node_status_is_written_to_node_scoped_runtime_row(self) -> None:
         calls = []
