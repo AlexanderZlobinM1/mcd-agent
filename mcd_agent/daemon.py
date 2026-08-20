@@ -103,6 +103,7 @@ from mcd_agent.monitored_email import (
     monitored_email_state_key,
     process_monitored_email,
 )
+from mcd_agent.form_embed import sync_form_embed_settings
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
     consume_poll_trigger,
@@ -364,6 +365,9 @@ _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS = {
     "monitored_email_parser_whitelist",
     "monitored_email_parser_instance_settings",
 }
+_FORM_EMBED_STABLE_RUNTIME_KEYS = {
+    "form_embed_instance_settings",
+}
 _CLUSTER_STABLE_RUNTIME_KEYS = {
     "cluster_id",
     "cluster_name",
@@ -383,6 +387,7 @@ _STABLE_RUNTIME_KEYS = (
     | _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS
     | _PAGE_HITS_ORPHAN_CLEANUP_STABLE_RUNTIME_KEYS
     | _MONITORED_EMAIL_PARSER_STABLE_RUNTIME_KEYS
+    | _FORM_EMBED_STABLE_RUNTIME_KEYS
     | _CLUSTER_STABLE_RUNTIME_KEYS
 )
 _SERVICE_CLEANUP_RUNTIME_KEYS = (
@@ -1481,6 +1486,19 @@ def _persist_stable_backup_runtime_to_config(
         or "segment_whitelist_file" in stable_keys
     ):
         _sync_segment_whitelist_file(config, installs)
+    if "form_embed_instance_settings" in stable_keys:
+        try:
+            result = sync_form_embed_settings(config, list(installs or []))
+            observed = result.get("instances", {}) if isinstance(result, dict) else {}
+            pushed = push_runtime_overrides(
+                config,
+                {"form_embed_instance_status": observed if isinstance(observed, dict) else {}},
+                merge=True,
+            )
+            if str(pushed.get("status", "")).lower() != "ok":
+                logging.warning("form embed status push failed: %s", pushed.get("reason", "unknown"))
+        except Exception as e:
+            logging.warning("form embed settings sync failed: %s", e)
 
 
 def _to_int_list(value: object) -> list[int]:

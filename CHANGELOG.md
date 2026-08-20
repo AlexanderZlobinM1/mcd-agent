@@ -1,5 +1,17 @@
 # MCD Changelog
 
+## 0.11.23 - 2026-08-20
+
+- Added a standard managed Nginx `/form/` route to new Mautic image installs
+  and completed instance migrations. The secure default permits only
+  `frame-ancestors 'self'` and does not enable browser CORS.
+- Added an opt-in per-instance form embedding policy. MCC can set exact HTTPS
+  domain origins separately for CSP `frame-ancestors` and CORS; the agent
+  validates, tests and reloads Nginx atomically before applying it.
+- Protected custom form routes: an existing unmanaged `location /form/` is
+  reported as blocked and remains untouched. Failed Nginx validation or reload
+  restores every modified vhost from a timestamped backup.
+
 ## 0.11.22 - 2026-08-20
 
 - Added opt-in per-instance realtime subsets inside segment and campaign

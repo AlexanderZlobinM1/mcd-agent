@@ -303,6 +303,8 @@ class InstanceMigrateProbeTests(unittest.TestCase):
         self.assertIn("listen 443 ssl", content)
         self.assertIn(f"ssl_certificate {cert_live / 'fullchain.pem'};", content)
         self.assertIn(f"ssl_certificate_key {cert_live / 'privkey.pem'};", content)
+        self.assertIn("# BEGIN MCD managed form embed", content)
+        self.assertIn("frame-ancestors 'self'", content)
 
     def test_target_finalize_blocks_dns_cutover_without_current_certificate(self) -> None:
         db = DBConfig(

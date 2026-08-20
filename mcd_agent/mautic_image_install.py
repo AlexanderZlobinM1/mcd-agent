@@ -16,6 +16,7 @@ from urllib import request
 from urllib.parse import urlencode
 
 from mcd_agent.config import AgentConfig
+from mcd_agent.form_embed import render_form_embed_location
 from mcd_agent.nginx_templates import render_nginx_template
 
 
@@ -709,6 +710,11 @@ def _http_root_location(*, ssl_enabled: bool) -> str:
     }"""
 
 
+def _indented_form_embed_location(fastcgi_pass: str) -> str:
+    rendered = render_form_embed_location(fastcgi_pass=fastcgi_pass)
+    return "\n".join(("    " + line) if line else "" for line in rendered.splitlines())
+
+
 def _ssl_server_block(plan: ImageInstallPlan, web_root: Path) -> str:
     cert_dir = Path("/etc/letsencrypt/live") / plan.domain
     return f"""server {{
@@ -725,6 +731,8 @@ def _ssl_server_block(plan: ImageInstallPlan, web_root: Path) -> str:
         try_files $uri /index.php$is_args$args;
     }}
 
+{_indented_form_embed_location(_php_fpm_fastcgi_pass(plan.php_version))}
+
 {_mautic_nginx_locations(plan)}
 }}
 """
@@ -739,6 +747,9 @@ def _write_nginx_vhost(plan: ImageInstallPlan, *, ssl_enabled: bool = False) -> 
         DOMAIN=plan.domain,
         WEB_ROOT=web_root,
         HTTP_ROOT_LOCATION=_http_root_location(ssl_enabled=ssl_enabled),
+        FORM_EMBED_HTTP_LOCATION=(
+            "" if ssl_enabled else _indented_form_embed_location(_php_fpm_fastcgi_pass(plan.php_version))
+        ),
         MAUTIC_DENY_LOCATIONS=_mautic_nginx_locations(plan),
         SSL_SERVER_BLOCK=_ssl_server_block(plan, web_root) if ssl_enabled else "",
     )

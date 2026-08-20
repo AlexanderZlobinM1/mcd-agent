@@ -99,6 +99,11 @@ class MauticImageInstallNginxTests(unittest.TestCase):
         )
         self.assertIn("try_files $uri =404;", template)
 
+    def test_new_image_template_has_standard_form_embed_placeholder(self) -> None:
+        template = resources.files("mcd_agent.templates.nginx").joinpath("mautic_image_vhost.conf").read_text(encoding="utf-8")
+
+        self.assertLess(template.index("{{FORM_EMBED_HTTP_LOCATION}}"), template.index("{{MAUTIC_DENY_LOCATIONS}}"))
+
     def test_cloudflare_dns01_certbot_does_not_put_token_on_command_line(self) -> None:
         plan = image_install.build_plan(image_ref="default7", domain="example.sales-snap.com", php_version="8.4")
         cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="agent-token")

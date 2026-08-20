@@ -23,6 +23,7 @@ from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_image_install import _mysql_admin_base, _mysql_exec, _quote_ident, _quote_sql
+from mcd_agent.form_embed import render_form_embed_location
 from mcd_agent.models import DBConfig
 from mcd_agent.models import MauticInstall
 from mcd_agent.nginx_baseline import (
@@ -884,6 +885,10 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
         WEB_ROOT=web_root,
         SSL_BLOCK=ssl_block,
         FASTCGI_SOCKET=sock,
+        FORM_EMBED_LOCATION="\n".join(
+            ("    " + line) if line else ""
+            for line in render_form_embed_location(fastcgi_pass=f"unix:{sock}").splitlines()
+        ),
     )
     content = ensure_mautic_public_app_asset_locations(content)
     content = normalize_legacy_http2_listen(content, modern_http2=_nginx_supports_http2_directive())

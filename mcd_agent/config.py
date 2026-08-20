@@ -617,6 +617,7 @@ class AgentConfig:
     monitored_email_parser_types: list[str]
     monitored_email_parser_whitelist: list[str]
     monitored_email_parser_instance_settings: dict[str, Any]
+    form_embed_instance_settings: dict[str, Any]
     empty_leads_cleanup_enabled: bool
     empty_leads_cleanup_interval_sec: int
     empty_leads_cleanup_batch_size: int
@@ -2186,6 +2187,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "monitored_email_parser_types": "monitored_email_parser_types",
     "monitored_email_parser_whitelist": "monitored_email_parser_whitelist",
     "monitored_email_parser_instance_settings": "monitored_email_parser_instance_settings",
+    "form_embed_instance_settings": "form_embed_instance_settings",
     "inventory_auto_rescan_enabled": "inventory_auto_rescan_enabled",
     "inventory_auto_rescan_interval_sec": "inventory_auto_rescan_interval_sec",
     "empty_leads_cleanup_enabled": "empty_leads_cleanup_enabled",
@@ -3063,6 +3065,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         monitored_email_parser_instance_settings=(
             dict(runtime.get("monitored_email_parser_instance_settings", {}))
             if isinstance(runtime.get("monitored_email_parser_instance_settings", {}), dict)
+            else {}
+        ),
+        form_embed_instance_settings=(
+            dict(runtime.get("form_embed_instance_settings", {}))
+            if isinstance(runtime.get("form_embed_instance_settings", {}), dict)
             else {}
         ),
         empty_leads_cleanup_enabled=bool(runtime.get("empty_leads_cleanup_enabled", False)),
