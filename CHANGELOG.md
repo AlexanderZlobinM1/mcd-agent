@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.11.25 - 2026-08-20
+
+- Fixed Nginx vhost parsing when a location regex contains `#`, which is valid
+  Nginx syntax. MCD now reaches the PHP FastCGI handler and can safely add the
+  managed `/form/` route instead of reporting a false missing-upstream block.
+
 ## 0.11.24 - 2026-08-20
 
 - Added safe adoption of compatible existing Nginx form locations. When MCC

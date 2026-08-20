@@ -46,6 +46,52 @@ class FormEmbedTests(unittest.TestCase):
         self.assertIn('add_header Vary "Origin" always;', rendered)
         self.assertNotIn("Access-Control-Allow-Origin *", rendered)
 
+    def test_sync_handles_hash_inside_nginx_location_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "var" / "www" / "example" / "public_html"
+            docroot = root / "docroot"
+            docroot.mkdir(parents=True)
+            available = base / "sites-available"
+            enabled = base / "sites-enabled"
+            available.mkdir()
+            enabled.mkdir()
+            site = available / "example.conf"
+            site.write_text(
+                """server {
+    listen 443 ssl;
+    server_name example.sales-snap.com;
+    root %s;
+    location ~* (^#.*#|\\.(bak|conf|log))$ {
+        return 403;
+    }
+    location / {
+        try_files $uri /index.php?$query_string;
+    }
+    location ~ \\.php$ {
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+    }
+}
+"""
+                % docroot,
+                encoding="utf-8",
+            )
+            (enabled / site.name).symlink_to(site)
+            cfg = SimpleNamespace(form_embed_instance_settings={"form-example": {"enabled": True}})
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with (
+                patch.object(form_embed, "NGINX_SITES_ENABLED", enabled),
+                patch.object(form_embed, "BACKUP_ROOT", base / "backups"),
+                patch.object(form_embed, "STATE_PATH", base / "state.json"),
+                patch.object(form_embed.subprocess, "run", return_value=completed),
+            ):
+                result = form_embed.sync_form_embed_settings(cfg, [_install(root)])
+
+            rendered = site.read_text(encoding="utf-8")
+            self.assertEqual(result["instances"]["form-example"]["status"], "applied")
+            self.assertIn("# BEGIN MCD managed form embed", rendered)
+            self.assertIn("fastcgi_pass unix:/run/php/php8.4-fpm.sock;", rendered)
+
     def test_sync_inserts_managed_block_and_adopts_compatible_custom_form_headers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

@@ -284,7 +284,9 @@ def _brace_end(text: str, opening: int) -> int | None:
             elif char == quote:
                 quote = ""
             continue
-        if char == "#":
+        # Nginx permits an unquoted '#' inside a location regex such as
+        # '^#.*#'. Treat only whitespace-led hashes as actual comments.
+        if char == "#" and (index == 0 or text[index - 1].isspace()):
             comment = True
             continue
         if char in {"'", '"'}:
