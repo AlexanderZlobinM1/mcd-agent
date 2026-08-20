@@ -20,17 +20,47 @@ STATE_PATH = Path("/opt/mcd/var/state/form-embed.json")
 
 _MANAGED_BEGIN = "# BEGIN MCD managed form embed"
 _MANAGED_END = "# END MCD managed form embed"
+_MANAGED_HEADERS_BEGIN = "# BEGIN MCD managed form embed headers"
+_MANAGED_HEADERS_END = "# END MCD managed form embed headers"
 _MANAGED_BLOCK_RE = re.compile(
     rf"(?ms)^[ \t]*{re.escape(_MANAGED_BEGIN)}\n.*?^[ \t]*{re.escape(_MANAGED_END)}\n?"
+)
+_MANAGED_HEADERS_BLOCK_RE = re.compile(
+    rf"(?ms)^[ \t]*{re.escape(_MANAGED_HEADERS_BEGIN)}\n.*?^[ \t]*{re.escape(_MANAGED_HEADERS_END)}\n?"
 )
 _SERVER_START_RE = re.compile(r"(?m)^\s*server\s*\{")
 _SERVER_NAME_RE = re.compile(r"(?m)^\s*server_name\s+([^;]+);")
 _ROOT_RE = re.compile(r"(?m)^\s*root\s+([^;]+);")
 _FORM_LOCATION_RE = re.compile(r"(?m)^\s*location\s+\^~\s+/form/\s*\{")
+_ANY_FORM_LOCATION_RE = re.compile(r"(?m)^\s*location\b[^{\n]*(?:/form(?:/|\b)|\\?/form)")
 _LOCATION_RE = re.compile(r"(?m)^\s*location\s+")
 _FASTCGI_PASS_RE = re.compile(r"(?m)^\s*fastcgi_pass\s+([^;]+);")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _SAFE_UPSTREAM_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
+_FORM_SECURITY_HEADERS = (
+    "Content-Security-Policy",
+    "X-Frame-Options",
+    "Access-Control-Allow-Origin",
+    "Access-Control-Allow-Credentials",
+    "Access-Control-Allow-Methods",
+    "Access-Control-Allow-Headers",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+    "Strict-Transport-Security",
+    "Cache-Control",
+)
+_FORM_SECURITY_HEADER_NAMES = "|".join(re.escape(name) for name in _FORM_SECURITY_HEADERS)
+_FORM_SECURITY_HEADER_LINE_RE = re.compile(
+    rf"(?m)^[ \t]*(?:(?:fastcgi|proxy)_hide_header[ \t]+(?:Content-Security-Policy|X-Frame-Options)[^\n;]*;[^\n]*(?:\n|$)"
+    rf"|add_header[ \t]+(?:{_FORM_SECURITY_HEADER_NAMES})\b[^\n;]*;[^\n]*(?:\n|$))"
+)
+_FORM_SECURITY_DIRECTIVE_RE = re.compile(
+    rf"(?m)^[ \t]*(?:(?:fastcgi|proxy)_hide_header[ \t]+(?:Content-Security-Policy|X-Frame-Options)\b"
+    rf"|add_header[ \t]+(?:{_FORM_SECURITY_HEADER_NAMES})\b)"
+)
+_FORM_OPTIONS_IF_RE = re.compile(r"(?m)\bif\s*\(\s*\$request_method\s*=\s*OPTIONS\s*\)\s*\{")
+_FORM_ORIGIN_IF_RE = re.compile(r"(?m)\bif\s*\(\s*\$http_origin\b")
 
 
 class FormEmbedError(ValueError):
@@ -128,64 +158,17 @@ def render_form_embed_location(
 ) -> str:
     """Render a self-contained, ordinary-Mautic `/form/` FastCGI location."""
     upstream = _safe_fastcgi_pass(fastcgi_pass)
-    frames = normalize_origins(list(frame_ancestors or []))
-    cors = normalize_origins(list(cors_origins or []))
-    csp = "frame-ancestors 'self'" + (" " + " ".join(frames) if frames else "")
     lines = [
         _MANAGED_BEGIN,
         "location ^~ /form/ {",
-        "    fastcgi_hide_header Content-Security-Policy;",
-        "    fastcgi_hide_header X-Frame-Options;",
-        f'    add_header Content-Security-Policy "{csp}" always;',
-        '    add_header X-Content-Type-Options "nosniff" always;',
-        '    add_header Referrer-Policy "strict-origin-when-cross-origin" always;',
-        '    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;',
-        '    add_header Strict-Transport-Security "max-age=31536000" always;',
-        '    add_header Cache-Control "max-age=0, no-cache, no-store, must-revalidate" always;',
-        '    add_header Vary "Origin" always;',
     ]
-    if cors:
-        lines.extend(
-            [
-                '    set $mcd_form_cors_origin "";',
-                '    set $mcd_form_cors_credentials "";',
-                '    set $mcd_form_cors_methods "";',
-                '    set $mcd_form_cors_headers "";',
-            ]
-        )
-        for origin in cors:
-            lines.extend(
-                [
-                    f'    if ($http_origin = "{origin}") {{',
-                    '        set $mcd_form_cors_origin $http_origin;',
-                    '        set $mcd_form_cors_credentials "true";',
-                    '        set $mcd_form_cors_methods "GET, POST, OPTIONS";',
-                    '        set $mcd_form_cors_headers "Content-Type, Origin, Accept, X-Requested-With";',
-                    "    }",
-                ]
-            )
-        lines.extend(
-            [
-                '    add_header Access-Control-Allow-Origin $mcd_form_cors_origin always;',
-                '    add_header Access-Control-Allow-Credentials $mcd_form_cors_credentials always;',
-                '    add_header Access-Control-Allow-Methods $mcd_form_cors_methods always;',
-                '    add_header Access-Control-Allow-Headers $mcd_form_cors_headers always;',
-                "",
-                "    if ($request_method = OPTIONS) {",
-                "        return 204;",
-                "    }",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "",
-                "    # No CORS origins are configured for this instance.",
-                "    if ($request_method = OPTIONS) {",
-                "        return 403;",
-                "    }",
-            ]
-        )
+    lines.extend(
+        f"    {line}" if line else ""
+        for line in render_form_embed_headers(
+            frame_ancestors=frame_ancestors,
+            cors_origins=cors_origins,
+        ).splitlines()
+    )
     lines.extend(
         [
             "",
@@ -201,6 +184,73 @@ def render_form_embed_location(
             _MANAGED_END,
         ]
     )
+    return "\n".join(lines)
+
+
+def render_form_embed_headers(
+    *,
+    frame_ancestors: list[str] | tuple[str, ...] | None = None,
+    cors_origins: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Render managed security headers for an existing form route."""
+    frames = normalize_origins(list(frame_ancestors or []))
+    cors = normalize_origins(list(cors_origins or []))
+    csp = "frame-ancestors 'self'" + (" " + " ".join(frames) if frames else "")
+    lines = [
+        _MANAGED_HEADERS_BEGIN,
+        "fastcgi_hide_header Content-Security-Policy;",
+        "fastcgi_hide_header X-Frame-Options;",
+        f'add_header Content-Security-Policy "{csp}" always;',
+        'add_header X-Content-Type-Options "nosniff" always;',
+        'add_header Referrer-Policy "strict-origin-when-cross-origin" always;',
+        'add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;',
+        'add_header Strict-Transport-Security "max-age=31536000" always;',
+        'add_header Cache-Control "max-age=0, no-cache, no-store, must-revalidate" always;',
+        'add_header Vary "Origin" always;',
+    ]
+    if cors:
+        lines.extend(
+            [
+                'set $mcd_form_cors_origin "";',
+                'set $mcd_form_cors_credentials "";',
+                'set $mcd_form_cors_methods "";',
+                'set $mcd_form_cors_headers "";',
+            ]
+        )
+        for origin in cors:
+            lines.extend(
+                [
+                    f'if ($http_origin = "{origin}") {{',
+                    '    set $mcd_form_cors_origin $http_origin;',
+                    '    set $mcd_form_cors_credentials "true";',
+                    '    set $mcd_form_cors_methods "GET, POST, OPTIONS";',
+                    '    set $mcd_form_cors_headers "Content-Type, Origin, Accept, X-Requested-With";',
+                    "}",
+                ]
+            )
+        lines.extend(
+            [
+                'add_header Access-Control-Allow-Origin $mcd_form_cors_origin always;',
+                'add_header Access-Control-Allow-Credentials $mcd_form_cors_credentials always;',
+                'add_header Access-Control-Allow-Methods $mcd_form_cors_methods always;',
+                'add_header Access-Control-Allow-Headers $mcd_form_cors_headers always;',
+                "",
+                "if ($request_method = OPTIONS) {",
+                "    return 204;",
+                "}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "# No CORS origins are configured for this instance.",
+                "if ($request_method = OPTIONS) {",
+                "    return 403;",
+                "}",
+            ]
+        )
+    lines.append(_MANAGED_HEADERS_END)
     return "\n".join(lines)
 
 
@@ -321,6 +371,96 @@ def _insert_before_first_location(block: str, rendered: str) -> str | None:
     return block[: match.start()] + indented + "\n\n" + block[match.start() :]
 
 
+def _line_indent(text: str, index: int) -> str:
+    start = text.rfind("\n", 0, index) + 1
+    return re.match(r"[ \t]*", text[start:]).group(0)
+
+
+def _indent_block(text: str, prefix: str) -> str:
+    return "\n".join((prefix + line) if line else "" for line in text.splitlines())
+
+
+def _form_location_blocks(block: str) -> list[tuple[int, int, int]]:
+    locations: list[tuple[int, int, int]] = []
+    for match in _FORM_LOCATION_RE.finditer(block):
+        opening = block.find("{", match.start(), match.end())
+        if opening < 0:
+            continue
+        ending = _brace_end(block, opening)
+        if ending is not None:
+            locations.append((match.start(), opening, ending))
+    return locations
+
+
+def _strip_replaceable_form_security(location: str) -> tuple[str | None, str]:
+    result = _FORM_SECURITY_HEADER_LINE_RE.sub("", location)
+    if _FORM_SECURITY_DIRECTIVE_RE.search(result):
+        return None, "blocked_custom_form_security_directive"
+
+    while True:
+        match = _FORM_OPTIONS_IF_RE.search(result)
+        if match is None:
+            break
+        opening = result.find("{", match.start(), match.end())
+        ending = _brace_end(result, opening) if opening >= 0 else None
+        if ending is None:
+            return None, "blocked_custom_form_options_invalid"
+        body = result[opening + 1 : ending - 1]
+        if not re.fullmatch(r"\s*(?:#.*\n\s*)*return\s+(?:204|403)\s*;\s*", body):
+            return None, "blocked_custom_form_options_complex"
+        result = result[: match.start()] + result[ending:]
+
+    if _FORM_ORIGIN_IF_RE.search(result):
+        return None, "blocked_custom_form_origin_logic"
+    if re.search(r"(?m)^[ \t]*set\s+\$mcd_form_cors_", result):
+        return None, "blocked_custom_form_cors_variables"
+    return result, ""
+
+
+def _rewrite_custom_form_location(
+    location: str,
+    *,
+    location_start: int,
+    opening: int,
+    setting: dict[str, Any],
+) -> tuple[str, str]:
+    markers = list(_MANAGED_HEADERS_BLOCK_RE.finditer(location))
+    if len(markers) > 1:
+        return location, "blocked_custom_form_multiple_managed_blocks"
+    if markers:
+        if not bool(setting.get("enabled", False)):
+            return location, "blocked_custom_form_disable_requires_manual_restore"
+        marker = markers[0]
+        replacement = _indent_block(
+            render_form_embed_headers(
+                frame_ancestors=setting.get("frame_ancestors", []),
+                cors_origins=setting.get("cors_origins", []),
+            ),
+            _line_indent(location, marker.start()),
+        )
+        return location[: marker.start()] + replacement + location[marker.end() :], "managed_custom_headers"
+
+    if not bool(setting.get("enabled", False)):
+        return location, "disabled"
+    if _fastcgi_pass_in(location) is None:
+        return location, "blocked_custom_form_fastcgi_missing"
+    stripped, reason = _strip_replaceable_form_security(location)
+    if stripped is None:
+        return location, reason
+
+    opening = stripped.find("{", max(0, opening - location_start))
+    if opening < 0:
+        return location, "blocked_custom_form_invalid"
+    replacement = _indent_block(
+        render_form_embed_headers(
+            frame_ancestors=setting.get("frame_ancestors", []),
+            cors_origins=setting.get("cors_origins", []),
+        ),
+        _line_indent(stripped, location_start) + "    ",
+    )
+    return stripped[: opening + 1] + "\n" + replacement + stripped[opening + 1 :], "managed_custom_headers"
+
+
 def _rewrite_vhost(text: str, inst: MauticInstall, setting: dict[str, Any]) -> tuple[str, str]:
     enabled = bool(setting.get("enabled", False))
     result = text
@@ -346,18 +486,36 @@ def _rewrite_vhost(text: str, inst: MauticInstall, setting: dict[str, Any]) -> t
             cursor = marker.end()
         pieces.append(result[cursor:])
         return "".join(pieces), "managed"
-    if not enabled:
-        return text, "disabled"
-
     replacements: list[tuple[int, int, str]] = []
     matched = False
+    custom_headers = False
     for start, end in _server_blocks(text):
         block = text[start:end]
         if not _server_matches_instance(block, inst):
             continue
         matched = True
-        if _FORM_LOCATION_RE.search(block):
-            return text, "blocked_custom_form_location"
+        form_locations = _form_location_blocks(block)
+        if form_locations:
+            all_form_locations = list(_ANY_FORM_LOCATION_RE.finditer(block))
+            if len(form_locations) != 1 or len(all_form_locations) != len(form_locations):
+                return text, "blocked_custom_form_location_unsupported"
+            loc_start, opening, loc_end = form_locations[0]
+            replacement_location, outcome = _rewrite_custom_form_location(
+                block[loc_start:loc_end],
+                location_start=0,
+                opening=opening - loc_start,
+                setting=setting,
+            )
+            if outcome.startswith("blocked_"):
+                return text, outcome
+            if replacement_location != block[loc_start:loc_end]:
+                replacements.append((start, end, block[:loc_start] + replacement_location + block[loc_end:]))
+            custom_headers = custom_headers or outcome == "managed_custom_headers"
+            continue
+        if _ANY_FORM_LOCATION_RE.search(block):
+            return text, "blocked_custom_form_location_unsupported"
+        if not enabled:
+            continue
         upstream = _fastcgi_pass_in(block)
         if not upstream:
             continue
@@ -374,10 +532,12 @@ def _rewrite_vhost(text: str, inst: MauticInstall, setting: dict[str, Any]) -> t
     if not matched:
         return text, "blocked_vhost_not_found"
     if not replacements:
-        return text, "blocked_fastcgi_not_found"
+        if custom_headers:
+            return text, "managed_custom_headers"
+        return text, "disabled" if not enabled else "blocked_fastcgi_not_found"
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
-    return text, "managed"
+    return text, "managed_custom_headers" if custom_headers else "managed"
 
 
 def _instance_setting_keys(inst: MauticInstall) -> list[str]:
@@ -443,6 +603,7 @@ def sync_form_embed_settings(config: Any, installs: list[MauticInstall]) -> dict
                 row.update({"status": "blocked", "reason": "nginx_vhost_not_found"})
                 statuses[instance_key] = row
                 continue
+            planned: list[tuple[Path, str, str]] = []
             for path in paths:
                 original = path.read_text(encoding="utf-8", errors="ignore")
                 rendered, outcome = _rewrite_vhost(original, inst, setting)
@@ -451,18 +612,23 @@ def sync_form_embed_settings(config: Any, installs: list[MauticInstall]) -> dict
                     row.update({"status": "blocked", "reason": outcome})
                     break
                 if rendered != original:
-                    if path not in snapshots:
-                        snapshots[path] = original
-                    backup = backup_dir / path.as_posix().lstrip("/")
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    if not backup.exists():
-                        shutil.copy2(path, backup)
-                    tmp = path.with_name(path.name + ".mcd-form.tmp")
-                    tmp.write_text(rendered, encoding="utf-8")
-                    os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
-                    os.replace(tmp, path)
-                    changed = True
-                    row["status"] = "applied"
+                    planned.append((path, original, rendered))
+            if row.get("status") == "blocked":
+                statuses[instance_key] = row
+                continue
+            for path, original, rendered in planned:
+                if path not in snapshots:
+                    snapshots[path] = original
+                backup = backup_dir / path.as_posix().lstrip("/")
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                if not backup.exists():
+                    shutil.copy2(path, backup)
+                tmp = path.with_name(path.name + ".mcd-form.tmp")
+                tmp.write_text(rendered, encoding="utf-8")
+                os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
+                os.replace(tmp, path)
+                changed = True
+                row["status"] = "applied"
             statuses[instance_key] = row
 
         if changed:

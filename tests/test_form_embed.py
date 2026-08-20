@@ -46,7 +46,7 @@ class FormEmbedTests(unittest.TestCase):
         self.assertIn('add_header Vary "Origin" always;', rendered)
         self.assertNotIn("Access-Control-Allow-Origin *", rendered)
 
-    def test_sync_inserts_managed_block_and_keeps_existing_custom_form_untouched(self) -> None:
+    def test_sync_inserts_managed_block_and_adopts_compatible_custom_form_headers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             root = base / "var" / "www" / "example" / "public_html"
@@ -104,6 +104,15 @@ class FormEmbedTests(unittest.TestCase):
     server_name example.sales-snap.com;
     root %s;
     location ^~ /form/ {
+        fastcgi_hide_header Content-Security-Policy;
+        fastcgi_hide_header X-Frame-Options;
+        add_header Content-Security-Policy "frame-ancestors 'self' https://legacy.example.com" always;
+        add_header Access-Control-Allow-Origin "https://legacy.example.com" always;
+        add_header Access-Control-Allow-Credentials "true" always;
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+        include fastcgi_params;
         fastcgi_pass unix:/run/php/custom-form.sock;
     }
     location / {
@@ -122,9 +131,56 @@ class FormEmbedTests(unittest.TestCase):
                 patch.object(form_embed.subprocess, "run", return_value=completed) as run,
             ):
                 result = form_embed.sync_form_embed_settings(cfg, [_install(root)])
+            adopted = site.read_text(encoding="utf-8")
+            self.assertEqual(result["instances"]["form-example"]["status"], "applied")
+            self.assertIn("# BEGIN MCD managed form embed headers", adopted)
+            self.assertIn("https://embed.example.com", adopted)
+            self.assertIn("https://app.example.com", adopted)
+            self.assertNotIn("legacy.example.com", adopted)
+            self.assertIn("fastcgi_pass unix:/run/php/custom-form.sock;", adopted)
+            self.assertEqual(run.call_args_list[0].args[0], ["nginx", "-t"])
+            self.assertEqual(run.call_args_list[1].args[0], ["systemctl", "reload", "nginx"])
+
+            updated_cfg = SimpleNamespace(
+                form_embed_instance_settings={
+                    "form-example": {
+                        "enabled": True,
+                        "frame_ancestors": ["https://updated.example.com"],
+                        "cors_origins": ["https://updated-api.example.com"],
+                    }
+                }
+            )
+            with (
+                patch.object(form_embed, "NGINX_SITES_ENABLED", enabled),
+                patch.object(form_embed, "BACKUP_ROOT", base / "backups-updated"),
+                patch.object(form_embed, "STATE_PATH", base / "state-updated.json"),
+                patch.object(form_embed.subprocess, "run", return_value=completed),
+            ):
+                result = form_embed.sync_form_embed_settings(updated_cfg, [_install(root)])
+            updated = site.read_text(encoding="utf-8")
+            self.assertEqual(result["instances"]["form-example"]["status"], "applied")
+            self.assertIn("https://updated.example.com", updated)
+            self.assertIn("https://updated-api.example.com", updated)
+            self.assertNotIn("https://embed.example.com", updated)
+            self.assertNotIn("https://app.example.com", updated)
+
+            unsafe_custom = original_custom.replace(
+                'add_header Access-Control-Allow-Credentials "true" always;',
+                'if ($http_origin = "https://legacy.example.com") {\n'
+                '            set $legacy_form_origin $http_origin;\n'
+                '        }',
+            )
+            site.write_text(unsafe_custom, encoding="utf-8")
+            with (
+                patch.object(form_embed, "NGINX_SITES_ENABLED", enabled),
+                patch.object(form_embed, "BACKUP_ROOT", base / "backups-three"),
+                patch.object(form_embed, "STATE_PATH", base / "state-three.json"),
+                patch.object(form_embed.subprocess, "run", return_value=completed) as run,
+            ):
+                result = form_embed.sync_form_embed_settings(cfg, [_install(root)])
             self.assertEqual(result["instances"]["form-example"]["status"], "blocked")
-            self.assertEqual(result["instances"]["form-example"]["reason"], "blocked_custom_form_location")
-            self.assertEqual(site.read_text(encoding="utf-8"), original_custom)
+            self.assertEqual(result["instances"]["form-example"]["reason"], "blocked_custom_form_origin_logic")
+            self.assertEqual(site.read_text(encoding="utf-8"), unsafe_custom)
             run.assert_not_called()
 
     def test_sync_rolls_back_every_vhost_when_nginx_test_fails(self) -> None:

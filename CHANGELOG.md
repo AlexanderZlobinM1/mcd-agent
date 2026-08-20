@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.11.24 - 2026-08-20
+
+- Added safe adoption of compatible existing Nginx form locations. When MCC
+  supplies an allowed HTTPS origin, MCD replaces only the known CSP and CORS
+  directives inside that form location with a marked managed header block;
+  the form handler and unrelated directives stay unchanged.
+- Unsupported form locations, custom origin logic, multiline security
+  directives, missing FastCGI handlers and ambiguous routes are reported as
+  blocked without touching the vhost. Each instance is planned fully before
+  any of its vhosts is written.
+
 ## 0.11.23 - 2026-08-20
 
 - Added a standard managed Nginx `/form/` route to new Mautic image installs
