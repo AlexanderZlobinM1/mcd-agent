@@ -143,6 +143,30 @@ class MauticUpgradeTargetTests(unittest.TestCase):
                 self.assertFalse(pause_flag.exists())
                 restore_cron.assert_called_once_with(cfg)
 
+    def test_upgrade_maintenance_guard_allows_clean_race_after_stop_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            pause_flag = Path(td) / "scheduler.pause"
+            cfg = SimpleNamespace(scheduler_pause_flag_path=str(pause_flag))
+            with (
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_cron_service",
+                    return_value={"ok": True, "unit": "cron", "was_active": True},
+                ),
+                patch(
+                    "mcd_agent.mautic_upgrade.stop_running_tasks_for_maintenance",
+                    return_value={
+                        "ok": False,
+                        "stopped": 2,
+                        "stop_failed": 4,
+                        "managed_running": 0,
+                        "mautic_console_total": 0,
+                    },
+                ),
+            ):
+                guard = _enter_upgrade_maintenance(cfg)
+                self.assertEqual(guard.stop_failed, 4)
+                self.assertTrue(pause_flag.exists())
+
     def test_hard_clear_prod_cache_recreates_prod(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

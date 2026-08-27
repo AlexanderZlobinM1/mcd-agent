@@ -202,7 +202,12 @@ def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
             consoles=int(stop_result.get("mautic_console_total") or 0),
         )
     )
-    if stop_failed > 0:
+    # A stop attempt can race with a short-lived console process: the kill
+    # helper may report a failure even though the final process snapshot is
+    # already clean. Only live processes make the maintenance guard unsafe.
+    managed_remaining = int(stop_result.get("managed_running") or 0)
+    console_remaining = int(stop_result.get("mautic_console_total") or 0)
+    if managed_remaining > 0 or console_remaining > 0:
         if owned_cron_stop:
             try:
                 restore_cron_service_if_needed(config)
@@ -210,7 +215,11 @@ def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
                 pass
         if owned_pause_flag and pause_flag.exists():
             pause_flag.unlink()
-        raise RuntimeError("Maintenance guard failed: unable to stop all running Mautic tasks")
+        raise RuntimeError(
+            "Maintenance guard failed: unable to stop all running Mautic tasks "
+            f"(stop_failed={stop_failed} managed_remaining={managed_remaining} "
+            f"console_remaining={console_remaining})"
+        )
 
     return UpgradeMaintenanceGuard(
         pause_flag=pause_flag,
