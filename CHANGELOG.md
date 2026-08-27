@@ -1,6 +1,12 @@
 # MCD Changelog
 
-## 0.11.25 - 2026-08-20
+## 0.11.38 - 2026-08-27
+
+- Ensure Mautic 6 to 7 upgrades install or update `MauticLocaleFixBundle`,
+  publish its integration, and enable Gmail image-proxy counting.
+- Preserve all other Locale Fix integration settings during the migration.
+
+## 0.11.37 - 2026-08-27
 
 - Fixed Nginx vhost parsing when a location regex contains `#`, which is valid
   Nginx syntax. MCD now reaches the PHP FastCGI handler and can safely add the

@@ -35,6 +35,8 @@ from mcd_agent.amazon_mailer_dep import (
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import write_mautic_version_cache
+from mcd_agent.executor import execute_mautic_command_template
+from mcd_agent.plugins import run_plugins_interactive
 
 
 CORE_PLUGIN_BUNDLES = {
@@ -84,6 +86,7 @@ PHP84_PACKAGE_SUFFIXES = [
 
 PHP_CUSTOM_INI_NAMES = {"60-custom.ini", "90-redis-sessions.ini"}
 PHP_CUSTOM_INI_HINTS = ("custom", "mcd", "sales-snap", "redis-session", "redis_sessions")
+MAUTIC7_LOCALE_FIX_BUNDLE = "MauticLocaleFixBundle"
 
 
 @dataclass(slots=True)
@@ -1488,6 +1491,45 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     return 0
 
 
+def _ensure_mautic7_locale_fix(config: AgentConfig, root: str) -> None:
+    """Install/update Locale Fix and force only the two Mautic 7 safeguards."""
+    run_plugins_interactive(
+        config=config,
+        root=root,
+        selection=None,
+        bundles=[MAUTIC7_LOCALE_FIX_BUNDLE],
+        plugin_uids=None,
+        action="auto",
+        no_color=True,
+        yes=True,
+    )
+    refreshed = _pick_install_record(config, root)
+    if int(refreshed.mautic_major or 0) != 7:
+        raise RuntimeError("Mautic Locale Fix activation requires Mautic 7")
+    rc, out = execute_mautic_command_template(
+        php_bin=config.php_bin,
+        run_as_user=config.mautic_run_as_user,
+        root=root,
+        template=(
+            "mautic:locale-fix:configure --published=1 "
+            "--gmail-image-proxy-open=1 --no-interaction"
+        ),
+        timeout_sec=config.command_timeout_sec,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Mautic Locale Fix activation failed: {out}")
+    rc, out = execute_mautic_command_template(
+        php_bin=config.php_bin,
+        run_as_user=config.mautic_run_as_user,
+        root=root,
+        template="cache:clear",
+        timeout_sec=config.command_timeout_sec,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Mautic Locale Fix cache clear failed: {out}")
+    print("Mautic 7 Locale Fix ready: published=1 gmail_image_proxy_open=1; other settings preserved")
+
+
 def run_upgrade_apply(
     *,
     config: AgentConfig,
@@ -1566,6 +1608,9 @@ def run_upgrade_apply(
             bundles=installed_required_bundles(install_root),
             reason="mautic-upgrade",
         )
+
+        if _parse_semver(current)[0] != 7 and _parse_semver(target)[0] == 7:
+            _ensure_mautic7_locale_fix(config, install_root)
 
         _post_upgrade_verify(config, inst)
 
