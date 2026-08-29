@@ -11,6 +11,35 @@
 - Added release regression coverage for direct workers, wrapper scripts,
   marker recovery and mixed managed cron content.
 
+## 0.11.42 - 2026-08-28
+
+- Restricted direct external SMTP from unprivileged host processes and blocked
+  forwarded/container SMTP while own-host mail is enabled. Mautic continues to
+  submit through the local managed MTA, and the MTA retains outbound delivery.
+
+## 0.11.41 - 2026-08-28
+
+- Aligned the managed public Sendmail SMTP greeting/HELO identity with the
+  configured own-host mail hostname and PTR without changing the OS hostname.
+
+## 0.11.40 - 2026-08-28
+
+- Fixed own-host mail FCrDNS validation to query public DNS resolvers before
+  the host resolver, preventing `/etc/hosts` or local resolver aliases from
+  producing a false PTR mismatch.
+
+## 0.11.39 - 2026-08-28
+
+- Hardened own-host mail identity: activation now requires forward-confirmed
+  IPv4 reverse DNS for the host MTA name, and runtime status reports the
+  resolved A/PTR identity.
+- Restricted managed outbound Sendmail and Postfix delivery to IPv4 until a
+  separately validated IPv6 mail identity is configured.
+- Disabled SMTP AUTH advertisement on the public Sendmail listener used only
+  for managed bounce and feedback-loop reception.
+- Fixed activation on valid Mautic installations whose `local.php` parameters
+  array does not yet contain mailer keys.
+
 ## 0.11.38 - 2026-08-27
 
 - Ensure Mautic 6 to 7 upgrades install or update `MauticLocaleFixBundle`,

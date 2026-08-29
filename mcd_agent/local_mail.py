@@ -79,6 +79,8 @@ _SENDMAIL_ISOLATED_PORT = 2525
 _SENDMAIL_SERVICE_NAME = "mcd-local-mail-sendmail"
 _SMTP_FIREWALL_SERVICE_NAME = "mcd-local-mail-firewall"
 _SMTP_FIREWALL_COMMENT = "MCD own-host inbound SMTP"
+_SMTP_EGRESS_COMMENT = "MCD own-host outbound SMTP via MTA only"
+_SMTP_FORWARD_COMMENT = "MCD own-host block forwarded SMTP"
 _MAIL_TEST_SCRIPT = r"""<?php
 require $argv[2];
 $included = include $argv[1];
@@ -352,6 +354,21 @@ def _smtp_firewall_rule(iptables: str, operation: str) -> list[str]:
     ]
 
 
+def _smtp_egress_rule(iptables: str, operation: str) -> list[str]:
+    return [
+        iptables, "-w", operation, "OUTPUT", "-p", "tcp", "!", "-d", "127.0.0.0/8",
+        "--dport", "25", "-m", "owner", "!", "--uid-owner", "0", "-m", "comment",
+        "--comment", _SMTP_EGRESS_COMMENT, "-j", "REJECT", "--reject-with", "tcp-reset",
+    ]
+
+
+def _smtp_forward_rule(iptables: str, operation: str) -> list[str]:
+    return [
+        iptables, "-w", operation, "FORWARD", "-p", "tcp", "--dport", "25", "-m", "comment",
+        "--comment", _SMTP_FORWARD_COMMENT, "-j", "REJECT", "--reject-with", "tcp-reset",
+    ]
+
+
 def _configure_smtp_firewall() -> None:
     iptables = shutil.which("iptables")
     if not iptables:
@@ -360,14 +377,26 @@ def _configure_smtp_firewall() -> None:
 set -eu
 IPTABLES={shlex.quote(iptables)}
 COMMENT={shlex.quote(_SMTP_FIREWALL_COMMENT)}
+EGRESS_COMMENT={shlex.quote(_SMTP_EGRESS_COMMENT)}
+FORWARD_COMMENT={shlex.quote(_SMTP_FORWARD_COMMENT)}
 case "${{1:-}}" in
   allow)
     "$IPTABLES" -w -C INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null ||
       "$IPTABLES" -w -I INPUT 1 -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT
+    "$IPTABLES" -w -C OUTPUT -p tcp ! -d 127.0.0.0/8 --dport 25 -m owner ! --uid-owner 0 -m comment --comment "$EGRESS_COMMENT" -j REJECT --reject-with tcp-reset 2>/dev/null ||
+      "$IPTABLES" -w -I OUTPUT 1 -p tcp ! -d 127.0.0.0/8 --dport 25 -m owner ! --uid-owner 0 -m comment --comment "$EGRESS_COMMENT" -j REJECT --reject-with tcp-reset
+    "$IPTABLES" -w -C FORWARD -p tcp --dport 25 -m comment --comment "$FORWARD_COMMENT" -j REJECT --reject-with tcp-reset 2>/dev/null ||
+      "$IPTABLES" -w -I FORWARD 1 -p tcp --dport 25 -m comment --comment "$FORWARD_COMMENT" -j REJECT --reject-with tcp-reset
     ;;
   deny)
     while "$IPTABLES" -w -C INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
       "$IPTABLES" -w -D INPUT -p tcp --dport 25 -m comment --comment "$COMMENT" -j ACCEPT
+    done
+    while "$IPTABLES" -w -C OUTPUT -p tcp ! -d 127.0.0.0/8 --dport 25 -m owner ! --uid-owner 0 -m comment --comment "$EGRESS_COMMENT" -j REJECT --reject-with tcp-reset 2>/dev/null; do
+      "$IPTABLES" -w -D OUTPUT -p tcp ! -d 127.0.0.0/8 --dport 25 -m owner ! --uid-owner 0 -m comment --comment "$EGRESS_COMMENT" -j REJECT --reject-with tcp-reset
+    done
+    while "$IPTABLES" -w -C FORWARD -p tcp --dport 25 -m comment --comment "$FORWARD_COMMENT" -j REJECT --reject-with tcp-reset 2>/dev/null; do
+      "$IPTABLES" -w -D FORWARD -p tcp --dport 25 -m comment --comment "$FORWARD_COMMENT" -j REJECT --reject-with tcp-reset
     done
     ;;
   *) exit 64 ;;
@@ -377,7 +406,7 @@ esac
     _write_atomic(
         SMTP_FIREWALL_SERVICE,
         f"""[Unit]
-Description=MCD own-host inbound SMTP firewall rule
+Description=MCD own-host SMTP firewall rules
 After=network-pre.target
 Before=network.target sendmail.service postfix.service
 
@@ -407,15 +436,16 @@ def _remove_smtp_firewall() -> None:
     _run(["systemctl", "disable", "--now", _SMTP_FIREWALL_SERVICE_NAME], timeout_sec=90)
     iptables = shutil.which("iptables")
     if iptables:
-        for _attempt in range(32):
-            rc, _out = _run(_smtp_firewall_rule(iptables, "-C"), timeout_sec=15)
-            if rc != 0:
-                break
-            rc, out = _run(_smtp_firewall_rule(iptables, "-D"), timeout_sec=15)
-            if rc != 0:
-                raise RuntimeError("own-host SMTP firewall cleanup failed: " + out)
-        else:
-            raise RuntimeError("own-host SMTP firewall cleanup exceeded the duplicate-rule limit")
+        for rule in (_smtp_firewall_rule, _smtp_egress_rule, _smtp_forward_rule):
+            for _attempt in range(32):
+                rc, _out = _run(rule(iptables, "-C"), timeout_sec=15)
+                if rc != 0:
+                    break
+                rc, out = _run(rule(iptables, "-D"), timeout_sec=15)
+                if rc != 0:
+                    raise RuntimeError("own-host SMTP firewall cleanup failed: " + out)
+            else:
+                raise RuntimeError("own-host SMTP firewall cleanup exceeded the duplicate-rule limit")
     SMTP_FIREWALL_SERVICE.unlink(missing_ok=True)
     SMTP_FIREWALL_HELPER.unlink(missing_ok=True)
     _run(["systemctl", "daemon-reload"], timeout_sec=30)
@@ -454,6 +484,8 @@ def _apt_install() -> str:
         packages.append("opendkim")
     if not _package_installed("opendkim-tools"):
         packages.append("opendkim-tools")
+    if shutil.which("dig") is None:
+        packages.append("dnsutils")
     if shutil.which("sudo") is None:
         packages.append("sudo")
     if not packages:
@@ -480,7 +512,7 @@ def _apt_install() -> str:
         raise RuntimeError("mail package installation failed: " + out)
     missing_tools = [
         name
-        for name in ("sendmail", "opendkim", "opendkim-testkey", "sudo")
+        for name in ("sendmail", "opendkim", "opendkim-testkey", "sudo", "dig")
         if shutil.which(name) is None
     ]
     if missing_tools:
@@ -505,6 +537,7 @@ def _sendmail_direct_text(text: str, mail_hostname: str) -> str:
         r"^\s*QUEUE_DIR\(",
         r"^\s*define\(\s*`QUEUE_DIR'",
         r"^\s*define\(\s*`confPID_FILE'",
+        r"^\s*CLIENT_OPTIONS\(",
     )
     lines: list[str] = []
     domain_replaced = False
@@ -520,6 +553,7 @@ def _sendmail_direct_text(text: str, mail_hostname: str) -> str:
     managed_block = [
         _SENDMAIL_BEGIN,
         f"DAEMON_OPTIONS(`Family=inet, Name=MCD, Port={_SENDMAIL_ISOLATED_PORT}, Addr=127.0.0.1')dnl",
+        "CLIENT_OPTIONS(`Family=inet, Address=0.0.0.0')dnl",
         f"define(`QUEUE_DIR', `{SENDMAIL_ISOLATED_QUEUE}')dnl",
         "define(`confPID_FILE', `/run/mcd-local-mail-sendmail.pid')dnl",
         "INPUT_MAIL_FILTER(`opendkim', `S=inet:8891@localhost, F=T, T=R:2m')dnl",
@@ -594,15 +628,20 @@ WantedBy=multi-user.target
         raise RuntimeError("systemd reload failed for isolated Sendmail: " + out)
 
 
-def _sendmail_inbound_text(text: str) -> str:
+def _sendmail_inbound_text(text: str, mail_hostname: str) -> str:
     base = _strip_block(text, _SENDMAIL_INBOUND_BEGIN, _SENDMAIL_INBOUND_END)
     lines: list[str] = []
+    domain_replaced = False
     for line in base.splitlines():
         active_mta = (
             re.search(r"^\s*DAEMON_OPTIONS\(", line, re.IGNORECASE)
             and re.search(r"Port\s*=\s*(?:smtp|25)(?:[,`'\)])", line, re.IGNORECASE)
             and not re.search(r"Port\s*=\s*submission", line, re.IGNORECASE)
         )
+        if re.search(r"^\s*define\(\s*`confDOMAIN_NAME'", line, re.IGNORECASE):
+            lines.append(f"define(`confDOMAIN_NAME', `{mail_hostname}')dnl")
+            domain_replaced = True
+            continue
         lines.append("dnl MCD inbound replaced: " + line if active_mta else line)
     has_virtusertable = any(
         re.search(r"^\s*FEATURE\(\s*`virtusertable'", line, re.IGNORECASE)
@@ -610,7 +649,8 @@ def _sendmail_inbound_text(text: str) -> str:
     )
     managed = [
         _SENDMAIL_INBOUND_BEGIN,
-        "DAEMON_OPTIONS(`Family=inet, Name=MCD-Inbound, Port=smtp')dnl",
+        *([] if domain_replaced else [f"define(`confDOMAIN_NAME', `{mail_hostname}')dnl"]),
+        "DAEMON_OPTIONS(`Family=inet, Name=MCD-Inbound, Port=smtp, M=A')dnl",
     ]
     if not has_virtusertable:
         managed.append("FEATURE(`virtusertable', `hash -o /etc/mail/virtusertable.db')dnl")
@@ -667,7 +707,9 @@ def _configure_sendmail_inbound(domains: dict[str, Any]) -> None:
         raise RuntimeError("own-host inbound virtusertable build failed: " + out)
     current = SENDMAIL_MC.read_text(encoding="utf-8", errors="replace")
     stat = SENDMAIL_MC.stat()
-    _write_atomic(SENDMAIL_MC, _sendmail_inbound_text(current), mode=stat.st_mode & 0o777)
+    primary_domain = sorted(domains)[0]
+    mail_hostname = str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+    _write_atomic(SENDMAIL_MC, _sendmail_inbound_text(current, mail_hostname), mode=stat.st_mode & 0o777)
     os.chown(SENDMAIL_MC, stat.st_uid, stat.st_gid)
     proc = subprocess.run(
         ["m4", str(SENDMAIL_MC)],
@@ -733,6 +775,7 @@ def _configure_postfix(mail_hostname: str) -> None:
     settings = {
         "myhostname": mail_hostname,
         "myorigin": "$myhostname",
+        "inet_protocols": "ipv4",
         "inet_interfaces": "loopback-only",
         "mydestination": "$myhostname, localhost.$mydomain, localhost",
         "relayhost": "",
@@ -1039,6 +1082,66 @@ def _push_status(cfg: AgentConfig, domain: str, *, status: str, error: str = "")
     )
 
 
+def _public_dns_short(dig: str, record_type: str, name: str) -> tuple[int, str]:
+    last_rc, last_out = 1, ""
+    for resolver in ("1.1.1.1", "8.8.8.8", ""):
+        command = [dig]
+        if resolver:
+            command.append(f"@{resolver}")
+        command.extend(["+short", record_type, name])
+        rc, out = _run(command, timeout_sec=15)
+        last_rc, last_out = rc, out
+        if rc == 0 and out.strip():
+            return rc, out
+    return last_rc, last_out
+
+
+def _mail_identity(mail_hostname: str) -> dict[str, Any]:
+    hostname = str(mail_hostname or "").strip().rstrip(".").lower()
+    result: dict[str, Any] = {
+        "hostname": hostname,
+        "ipv4": [],
+        "ptr": {},
+        "fcrdns": False,
+        "error": "",
+    }
+    if not hostname:
+        result["error"] = "mail hostname is empty"
+        return result
+    dig = shutil.which("dig")
+    if not dig:
+        result["error"] = "dig is not available for authoritative mail identity checks"
+        return result
+    rc, out = _public_dns_short(dig, "A", hostname)
+    addresses = sorted(
+        {
+            line.strip()
+            for line in out.splitlines()
+            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", line.strip())
+        }
+    )
+    if rc != 0 or not addresses:
+        result["error"] = "mail hostname has no public IPv4 address"
+        return result
+    result["ipv4"] = addresses
+    ptr: dict[str, str] = {}
+    mismatches: list[str] = []
+    for address in addresses:
+        rc, out = _public_dns_short(dig, "-x", address)
+        reverse = next((line.strip().rstrip(".").lower() for line in out.splitlines() if line.strip()), "")
+        if rc != 0 or not reverse:
+            mismatches.append(f"{address} has no PTR")
+            continue
+        ptr[address] = reverse
+        if reverse != hostname:
+            mismatches.append(f"{address} PTR is {reverse}, expected {hostname}")
+    result["ptr"] = ptr
+    result["fcrdns"] = bool(addresses) and not mismatches
+    if mismatches:
+        result["error"] = "; ".join(mismatches)
+    return result
+
+
 def configure_local_mail(
     cfg: AgentConfig,
     *,
@@ -1058,11 +1161,6 @@ def configure_local_mail(
     local_php_path = _local_php(root)
     local_php_before = local_php_path.read_text(encoding="utf-8", errors="replace")
     local_php_stat = local_php_path.stat()
-    mta = _apt_install()
-    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    os.chmod(CONFIG_ROOT, 0o700)
-    os.chmod(STATE_ROOT, 0o700)
     payload = _load_domains()
     payload_before = json.loads(json.dumps(payload))
     domains = payload["domains"]
@@ -1070,11 +1168,29 @@ def configure_local_mail(
     inbound_was_managed = INBOUND_BASELINE_MANIFEST.exists()
     firewall_was_managed = SMTP_FIREWALL_SERVICE.exists()
     selector = str(material.get("selector") or "mcd").strip()
+    requested_mail_hostname = str(material.get("mail_hostname") or "mail." + clean)
+    proposed_domains = dict(domains)
+    proposed_domains[clean] = {"mail_hostname": requested_mail_hostname}
+    primary_domain = sorted(proposed_domains)[0]
+    primary_mail_hostname = str(
+        proposed_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain
+    )
+    mta = _apt_install()
+    identity = _mail_identity(primary_mail_hostname)
+    if not bool(identity.get("fcrdns")):
+        raise RuntimeError(
+            "own-host mail identity is not forward-confirmed: "
+            + str(identity.get("error") or "unknown error")
+        )
+    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_ROOT, 0o700)
+    os.chmod(STATE_ROOT, 0o700)
     key_path = _write_key(clean, selector, str(material.get("private_key_pem") or ""))
     domains[clean] = {
         "instance_domain": clean,
         "root": str(Path(root)),
-        "mail_hostname": str(material.get("mail_hostname") or "mail." + clean),
+        "mail_hostname": requested_mail_hostname,
         "selector": selector,
         "key_path": str(key_path),
         "daily_limit": int(material.get("daily_limit") or 100),
@@ -1089,8 +1205,6 @@ def configure_local_mail(
         _configure_opendkim(domains, mta=mta)
         if first_activation and mta == "postfix":
             _run(["systemctl", "stop", "postfix"], timeout_sec=90)
-        primary_domain = sorted(domains)[0]
-        primary_mail_hostname = str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
         _configure_mta(mta, primary_mail_hostname)
         _configure_inbound(domains, mta=mta)
         _configure_smtp_firewall()
@@ -1515,6 +1629,16 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
     service_status: dict[str, str] = {}
     errors: list[str] = []
     mta = str(item.get("mta") or "sendmail").strip().lower()
+    domains = payload.get("domains") if isinstance(payload.get("domains"), dict) else {}
+    primary_domain = sorted(domains)[0] if domains else clean
+    primary_item = domains.get(primary_domain) if isinstance(domains.get(primary_domain), dict) else item
+    primary_mail_hostname = str(primary_item.get("mail_hostname") or "mail." + primary_domain)
+    identity = _mail_identity(primary_mail_hostname)
+    if not bool(identity.get("fcrdns")):
+        errors.append(
+            "mail identity is not forward-confirmed: "
+            + str(identity.get("error") or "unknown error")
+        )
     required_services = (_delivery_service(mta), "opendkim", _SMTP_FIREWALL_SERVICE_NAME)
     for service in required_services:
         rc, out = _run(["systemctl", "is-active", service], timeout_sec=15)
@@ -1530,9 +1654,15 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
     if not iptables:
         errors.append("iptables is not available")
     else:
-        rc, _out = _run(_smtp_firewall_rule(iptables, "-C"), timeout_sec=15)
-        if rc != 0:
-            errors.append("own-host inbound SMTP firewall rule is missing")
+        firewall_checks = (
+            (_smtp_firewall_rule, "own-host inbound SMTP firewall rule is missing"),
+            (_smtp_egress_rule, "own-host outbound SMTP process restriction is missing"),
+            (_smtp_forward_rule, "own-host forwarded SMTP restriction is missing"),
+        )
+        for rule, message in firewall_checks:
+            rc, _out = _run(rule(iptables, "-C"), timeout_sec=15)
+            if rc != 0:
+                errors.append(message)
     status = "ok" if not errors else "error"
     if push:
         _push_status(cfg, clean, status=status, error="; ".join(errors))
@@ -1541,6 +1671,7 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
         "instance_domain": clean,
         "mail_hostname": str(item.get("mail_hostname") or ""),
         "mta": mta,
+        "mail_identity": identity,
         "daily_limit": int(item.get("daily_limit") or 100),
         "monthly_limit": int(item.get("monthly_limit") or 1000),
         "services": service_status,

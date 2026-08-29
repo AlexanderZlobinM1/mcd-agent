@@ -42,8 +42,8 @@ class LocalMailTests(unittest.TestCase):
             if args == ["debconf-set-selections"] or args[:2] == ["apt-get", "update"]:
                 return 0, ""
             if args[:4] == ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install"]:
-                self.assertEqual(args[4:], ["-y", "postfix", "opendkim", "opendkim-tools", "sudo"])
-                installed.update({"postfix": True, "opendkim": True, "opendkim-tools": True, "sudo": True})
+                self.assertEqual(args[4:], ["-y", "postfix", "opendkim", "opendkim-tools", "dnsutils", "sudo"])
+                installed.update({"postfix": True, "opendkim": True, "opendkim-tools": True, "sudo": True, "dnsutils": True})
                 return 0, ""
             self.fail(f"unexpected command: {args}")
 
@@ -56,6 +56,8 @@ class LocalMailTests(unittest.TestCase):
                 return "/usr/sbin/opendkim-testkey"
             if name == "sudo" and installed["sudo"]:
                 return "/usr/bin/sudo"
+            if name == "dig" and installed.get("dnsutils"):
+                return "/usr/bin/dig"
             return None
 
         with patch.object(local_mail, "_run", side_effect=fake_run), patch.object(
@@ -85,6 +87,8 @@ class LocalMailTests(unittest.TestCase):
                 return "/usr/bin/sudo"
             if name == "sendmail" or installed.get("opendkim" if name == "opendkim" else "opendkim-tools"):
                 return "/usr/sbin/" + name
+            if name == "dig":
+                return "/usr/bin/dig"
             return None
 
         with patch.object(local_mail, "_run", side_effect=fake_run), patch.object(
@@ -119,6 +123,7 @@ MAILER(`smtp')dnl
         self.assertFalse(any("MASQUERADE" in line for line in active))
         self.assertIn("define(`confDOMAIN_NAME', `mail.app.sales-snap.com')dnl", result)
         self.assertIn("Port=2525, Addr=127.0.0.1", result)
+        self.assertIn("CLIENT_OPTIONS(`Family=inet, Address=0.0.0.0')dnl", result)
         self.assertIn("define(`QUEUE_DIR', `/var/spool/mqueue-mcd')", result)
         self.assertEqual(result.count(local_mail._SENDMAIL_BEGIN), 1)
         self.assertLess(result.index(local_mail._SENDMAIL_BEGIN), result.index("MAILER(`smtp')dnl"))
@@ -133,17 +138,61 @@ MAILER(`local')dnl
 MAILER(`smtp')dnl
 """
 
-        result = local_mail._sendmail_inbound_text(source)
-        repeated = local_mail._sendmail_inbound_text(result)
+        result = local_mail._sendmail_inbound_text(source, "mail.nikola.sales-snap.com")
+        repeated = local_mail._sendmail_inbound_text(result, "mail.nikola.sales-snap.com")
 
         self.assertIn("define(`SMART_HOST', `mail.sales-snap.com')dnl", result)
         self.assertIn("Name=MCD-Inbound, Port=smtp", result)
+        self.assertIn("Name=MCD-Inbound, Port=smtp, M=A", result)
+        self.assertIn("define(`confDOMAIN_NAME', `mail.nikola.sales-snap.com')dnl", result)
+        self.assertEqual(result.count("define(`confDOMAIN_NAME'"), 1)
         self.assertIn("Port=submission, Addr=127.0.0.1", result)
         self.assertIn("FEATURE(`virtusertable'", result)
         self.assertEqual(repeated.count(local_mail._SENDMAIL_INBOUND_BEGIN), 1)
         active = [line for line in result.splitlines() if not line.lstrip().startswith("dnl")]
         self.assertFalse(any("Port=smtp" in line and "Addr=127.0.0.1" in line for line in active))
         self.assertFalse(any("Port=25" in line and "Addr=::1" in line for line in active))
+
+    def test_mail_identity_requires_forward_confirmed_reverse_dns(self) -> None:
+        with patch.object(local_mail.shutil, "which", return_value="/usr/bin/dig"), patch.object(
+            local_mail,
+            "_run",
+            side_effect=[(0, "46.62.129.237\n"), (0, "mail.nikola.sales-snap.com.\n")],
+        ):
+            result = local_mail._mail_identity("mail.nikola.sales-snap.com")
+
+        self.assertTrue(result["fcrdns"])
+        self.assertEqual(result["ipv4"], ["46.62.129.237"])
+        self.assertEqual(result["ptr"]["46.62.129.237"], "mail.nikola.sales-snap.com")
+        self.assertEqual(result["error"], "")
+
+    def test_mail_identity_reports_mismatched_ptr(self) -> None:
+        with patch.object(local_mail.shutil, "which", return_value="/usr/bin/dig"), patch.object(
+            local_mail,
+            "_run",
+            side_effect=[(0, "46.62.129.237\n"), (0, "static.example.net.\n")],
+        ):
+            result = local_mail._mail_identity("mail.nikola.sales-snap.com")
+
+        self.assertFalse(result["fcrdns"])
+        self.assertIn("expected mail.nikola.sales-snap.com", result["error"])
+
+    def test_public_dns_short_ignores_local_resolver_when_public_dns_answers(self) -> None:
+        with patch.object(
+            local_mail,
+            "_run",
+            side_effect=[(0, "mail.nikola.sales-snap.com.\n")],
+        ) as run:
+            rc, out = local_mail._public_dns_short(
+                "/usr/bin/dig", "-x", "46.62.129.237"
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "mail.nikola.sales-snap.com.\n")
+        run.assert_called_once_with(
+            ["/usr/bin/dig", "@1.1.1.1", "+short", "-x", "46.62.129.237"],
+            timeout_sec=15,
+        )
 
     def test_receive_root_helper_restricts_mta_user_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -186,6 +235,11 @@ MAILER(`smtp')dnl
             self.assertIn("-C INPUT", helper_text)
             self.assertIn("-I INPUT 1", helper_text)
             self.assertIn("-D INPUT", helper_text)
+            self.assertIn("-C OUTPUT", helper_text)
+            self.assertIn("! --uid-owner 0", helper_text)
+            self.assertIn("-C FORWARD", helper_text)
+            self.assertIn(local_mail._SMTP_EGRESS_COMMENT, helper_text)
+            self.assertIn(local_mail._SMTP_FORWARD_COMMENT, helper_text)
             self.assertIn("RemainAfterExit=yes", service.read_text(encoding="utf-8"))
             self.assertIn(["systemctl", "enable", "--now", local_mail._SMTP_FIREWALL_SERVICE_NAME], calls)
 
