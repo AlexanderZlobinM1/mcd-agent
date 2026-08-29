@@ -337,6 +337,43 @@ MAILER(`smtp')dnl
             self.assertIn("'mailer_return_path'=>'bounce@app.sales-snap.com'", result)
             self.assertNotIn("/.mcd/", result)
 
+    def test_mautic_patch_adds_missing_mail_parameters_to_return_style_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "local.php"
+            path.write_text(
+                "<?php return ['parameters'=>['db_driver'=>'pdo_mysql','db_name'=>'app']];\n",
+                encoding="utf-8",
+            )
+            with patch.object(local_mail, "_local_php", return_value=path):
+                local_mail._configure_mautic("/var/www/app/public_html", "app.sales-snap.com")
+            result = path.read_text(encoding="utf-8")
+
+        self.assertIn("'parameters'=>[", result)
+        self.assertIn("'mailer_dsn' =>", result)
+        self.assertIn("'mailer_from_email' => 'mailer@app.sales-snap.com'", result)
+        self.assertIn("'mailer_return_path' => 'bounce@app.sales-snap.com'", result)
+        self.assertIn("'db_driver'=>'pdo_mysql'", result)
+
+    def test_mautic_patch_adds_missing_mail_parameters_to_assignment_style_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "local.php"
+            path.write_text(
+                "<?php\n$parameters = array(\n    'db_driver' => 'pdo_mysql',\n);\n",
+                encoding="utf-8",
+            )
+            with patch.object(local_mail, "_local_php", return_value=path):
+                local_mail._configure_mautic("/var/www/app/public_html", "app.sales-snap.com")
+            result = path.read_text(encoding="utf-8")
+
+        self.assertIn("$parameters = array(\n    'mailer_return_path'", result)
+        self.assertIn("'mailer_dsn' =>", result)
+        self.assertIn("'mailer_from_email' => 'mailer@app.sales-snap.com'", result)
+        self.assertIn("'db_driver' => 'pdo_mysql'", result)
+
+    def test_mautic_patch_rejects_unsupported_existing_mail_parameter(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unsupported value: mailer_dsn"):
+            local_mail._set_php_parameter("<?php return ['parameters'=>['mailer_dsn'=>[]]];", "mailer_dsn", "x")
+
     def test_mail_test_unescapes_symfony_percent_literals(self) -> None:
         self.assertIn("str_replace('%%', '%', $dsn)", local_mail._MAIL_TEST_SCRIPT)
 

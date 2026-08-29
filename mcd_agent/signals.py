@@ -677,24 +677,38 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
     return payload
 
 
-def collect_monitor_signals(cfg: AgentConfig | None = None) -> dict[str, object]:
+def collect_monitor_signals(
+    cfg: AgentConfig | None = None,
+    *,
+    mail_queue_metrics: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
     console_rows = _ps_console_processes()
     scheduler_shadow = _shadow_running_tasks(cfg, live_console_rows=console_rows)
+    details: dict[str, object] = {
+        "scheduler": {
+            "tracked_total": int(scheduler_shadow.get("tracked_total", 0) or 0),
+            "duplicate_task_keys": int(scheduler_shadow.get("duplicate_task_keys", 0) or 0),
+            "by_type": scheduler_shadow.get("by_type", {}),
+            "sample": scheduler_shadow.get("sample", []),
+            "recent": scheduler_shadow.get("recent", []),
+            "planned": scheduler_shadow.get("planned", []),
+            "fairness": scheduler_shadow.get("fairness", {}),
+        },
+        "php_console_recent": console_rows[:20],
+    }
+    if isinstance(mail_queue_metrics, dict):
+        details["mail_queue"] = {
+            "instances": {
+                str(root): dict(metrics)
+                for root, metrics in mail_queue_metrics.items()
+                if isinstance(metrics, dict)
+            },
+            "updated_at_ts": time.time(),
+        }
     return {
         "monitor_only": True,
         "collected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "details": {
-            "scheduler": {
-                "tracked_total": int(scheduler_shadow.get("tracked_total", 0) or 0),
-                "duplicate_task_keys": int(scheduler_shadow.get("duplicate_task_keys", 0) or 0),
-                "by_type": scheduler_shadow.get("by_type", {}),
-                "sample": scheduler_shadow.get("sample", []),
-                "recent": scheduler_shadow.get("recent", []),
-                "planned": scheduler_shadow.get("planned", []),
-                "fairness": scheduler_shadow.get("fairness", {}),
-            },
-            "php_console_recent": console_rows[:20],
-        },
+        "details": details,
     }
 
 

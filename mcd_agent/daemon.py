@@ -196,6 +196,28 @@ _SQL_IMPORT_PENDING_STATUS_COUNT = (
     "AND (date_started IS NULL "
     "OR CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(properties, '$.line')), '0') AS UNSIGNED) < line_count)"
 )
+# Read-only queue observability. The configured sql_mail_queue_count remains
+# the scheduler throttle policy; these queries report total and sendable-now
+# rows independently to MCC.
+_MAIL_QUEUE_TOTAL_COUNT = (
+    "SELECT COUNT(*) AS cnt FROM {prefix}message_queue "
+    "WHERE success = 0 AND date_sent IS NULL "
+    "AND status IN ('pending', 'rescheduled')"
+)
+_MAIL_QUEUE_AVAILABLE_COUNT = (
+    "SELECT COUNT(*) AS cnt FROM {prefix}message_queue "
+    "WHERE success = 0 AND date_sent IS NULL AND status = 'pending' "
+    "AND attempts < max_attempts "
+    "AND (scheduled_date IS NULL OR scheduled_date <= '{now_utc}')"
+)
+_MAILRU_POSTMASTER_LATEST_ROWS = (
+    "SELECT domain, stat_date, messages_sent, spam_percent, "
+    "probably_spam_percent, synced_at "
+    "FROM {prefix}mailru_postmaster_stats "
+    "WHERE is_tracked = 1 AND messages_sent > 0 "
+    "ORDER BY domain ASC, stat_date DESC, synced_at DESC"
+)
+_MAILRU_POSTMASTER_SPAM_STOP_PERCENT = 3.0
 _SQL_IMPORT_MONITOR_ROWS = (
     "SELECT id, status, date_added, date_started, date_ended "
     "FROM {prefix}imports "
@@ -215,6 +237,58 @@ _SQL_IMPORT_MONITOR_ROWS = (
     "COALESCE(date_started, date_added, date_ended) DESC, id DESC "
     "LIMIT 80"
 )
+
+
+def _mailru_postmaster_metrics(db: MauticDB, *, now_ts: float) -> dict[str, object]:
+    """Return the newest visible status for each tracked DKIM domain."""
+    try:
+        rows = db.fetch_rows(_MAILRU_POSTMASTER_LATEST_ROWS, limit=5000)
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc)[:300],
+            "updated_at_ts": float(now_ts),
+        }
+
+    latest: dict[str, dict[str, object]] = {}
+    for row in rows:
+        domain = str(row.get("domain") or "").strip().lower().rstrip(".")
+        if not domain or not re.fullmatch(r"[a-z0-9.-]+", domain) or domain in latest:
+            continue
+        try:
+            spam_percent = float(row.get("spam_percent") or 0.0)
+        except (TypeError, ValueError):
+            spam_percent = 0.0
+        try:
+            probably_spam_percent = float(row.get("probably_spam_percent") or 0.0)
+        except (TypeError, ValueError):
+            probably_spam_percent = 0.0
+        blocked = spam_percent >= _MAILRU_POSTMASTER_SPAM_STOP_PERCENT
+        latest[domain] = {
+            "domain": domain,
+            "stat_date": str(row.get("stat_date") or ""),
+            "messages_sent": max(0, int(row.get("messages_sent") or 0)),
+            "spam_percent": spam_percent,
+            "probably_spam_percent": probably_spam_percent,
+            "synced_at": str(row.get("synced_at") or ""),
+            "state": "blocked" if blocked else "eligible",
+            "reason": (
+                f"spam_percent >= {_MAILRU_POSTMASTER_SPAM_STOP_PERCENT:.2f}%"
+                if blocked
+                else "spam_percent below stop threshold"
+            ),
+        }
+
+    domains = sorted(latest.values(), key=lambda item: str(item.get("domain") or ""))
+    blocked_count = sum(1 for item in domains if item.get("state") == "blocked")
+    return {
+        "available": True,
+        "threshold_percent": _MAILRU_POSTMASTER_SPAM_STOP_PERCENT,
+        "domains": domains,
+        "blocked_count": blocked_count,
+        "eligible_count": max(0, len(domains) - blocked_count),
+        "updated_at_ts": float(now_ts),
+    }
 
 
 @dataclass(frozen=True)
@@ -7565,6 +7639,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     segment_resume_rings: dict[str, deque[int]] = {}
     monitor_cycle_done: dict[tuple[str, str], set[int]] = {}
     queue_samples: dict[str, deque[tuple[float, int]]] = {}
+    mail_queue_metrics: dict[str, dict[str, object]] = {}
     throttled: dict[str, bool] = {}
     last_import_poll_ts: dict[str, float] = {}
     last_import_activity_ts: dict[str, float] = {}
@@ -8706,6 +8781,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         if pusher.enabled() and should_poll_alert(now, pusher.last_alert_poll_ts, config.mcc_push_alert_poll_interval_sec):
             try:
                 signals_payload = collect_signals(window_min=config.mcc_push_alert_window_min, cfg=config)
+                if mail_queue_metrics:
+                    details_raw = signals_payload.get("details")
+                    details = dict(details_raw) if isinstance(details_raw, dict) else {}
+                    details["mail_queue"] = {
+                        "instances": {
+                            str(root): dict(metrics)
+                            for root, metrics in mail_queue_metrics.items()
+                            if isinstance(metrics, dict)
+                        },
+                        "updated_at_ts": float(now),
+                    }
+                    signals_payload["details"] = details
                 pusher.set_signals(signals_payload, now)
             except Exception as e:
                 logging.warning("signals collect failed: %s", e)
@@ -9523,6 +9610,26 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 trg_reg_set = campaign_trigger_reg_sets.setdefault(root, set(trg_reg_ring))
                 reb_prio_set = campaign_rebuild_prio_sets.setdefault(root, set(reb_prio_ring))
                 reb_reg_set = campaign_rebuild_reg_sets.setdefault(root, set(reb_reg_ring))
+
+                previous_metrics = mail_queue_metrics.get(root)
+                current_metrics = dict(previous_metrics) if isinstance(previous_metrics, dict) else {}
+                try:
+                    queue_total = db.fetch_count(_MAIL_QUEUE_TOTAL_COUNT, context=sql_ctx)
+                    queue_available = db.fetch_count(_MAIL_QUEUE_AVAILABLE_COUNT, context=sql_ctx)
+                    current_metrics.update(
+                        {
+                            "total": max(0, int(queue_total)),
+                            "available": max(0, int(queue_available)),
+                            "collected_at_ts": float(now),
+                        }
+                    )
+                    current_metrics.pop("error", None)
+                except Exception as e:
+                    logging.warning("[%s] mail queue visibility query failed: %s", root, e)
+                    current_metrics["error"] = str(e)[:300]
+                    current_metrics["collected_at_ts"] = float(now)
+                current_metrics["postmaster"] = _mailru_postmaster_metrics(db, now_ts=now)
+                mail_queue_metrics[root] = current_metrics
 
                 q_samples = queue_samples.setdefault(root, deque())
                 if not cluster_cron_allowed:
@@ -12023,7 +12130,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
         if pusher.enabled():
             try:
-                monitor_signals = collect_monitor_signals(config)
+                monitor_signals = collect_monitor_signals(
+                    config,
+                    mail_queue_metrics=mail_queue_metrics,
+                )
                 if pusher.should_push_monitor_signals(time.time(), monitor_signals):
                     ok, msg = pusher.send_signals(monitor_signals)
                     if ok:

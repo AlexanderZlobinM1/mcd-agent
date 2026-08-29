@@ -10,6 +10,8 @@
   remain unchanged.
 - Added release regression coverage for direct workers, wrapper scripts,
   marker recovery and mixed managed cron content.
+- Reconciled the previously divergent public package before release, retaining
+  fresh-install mail parameter creation and MCC queue/Postmaster telemetry.
 
 ## 0.11.42 - 2026-08-28
 

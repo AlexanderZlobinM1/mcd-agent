@@ -933,16 +933,39 @@ def _symfony_config_escape(value: str) -> str:
 def _set_php_parameter(text: str, key: str, value: str) -> str:
     pattern = rf"(['\"]{re.escape(key)}['\"]\s*=>\s*)(?:['\"][^'\"]*['\"]|null)"
     updated, count = re.subn(pattern, lambda match: match.group(1) + _php_quote(value), text)
-    if not count:
-        raise RuntimeError(f"Mautic local.php parameter is missing: {key}")
-    return updated
+    if count:
+        return updated
+
+    # Fresh and partially migrated Mautic installations can have a valid
+    # local.php with database parameters only. Add a new mail parameter only
+    # to an explicit Mautic parameters array; do not guess at arbitrary PHP.
+    if re.search(rf"['\"]{re.escape(key)}['\"]\s*=>", text):
+        raise RuntimeError(f"Mautic local.php parameter has an unsupported value: {key}")
+    return _insert_php_parameter(text, key, value)
+
+
+def _insert_php_parameter(text: str, key: str, value: str) -> str:
+    containers = (
+        r"['\"]parameters['\"]\s*=>\s*array\s*\(",
+        r"['\"]parameters['\"]\s*=>\s*\[",
+        r"\$parameters\s*=\s*array\s*\(",
+        r"\$parameters\s*=\s*\[",
+    )
+    for pattern in containers:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        base_indent = re.match(r"[ \t]*", text[line_start:match.start()]).group(0)
+        entry = f"\n{base_indent}    {_php_quote(key)} => {_php_quote(value)},"
+        return text[: match.end()] + entry + text[match.end() :]
+    raise RuntimeError(f"Mautic local.php parameters array is missing: cannot add {key}")
 
 
 def _set_php_parameter_if_present(text: str, key: str, value: str) -> str:
-    try:
-        return _set_php_parameter(text, key, value)
-    except RuntimeError:
+    if not re.search(rf"['\"]{re.escape(key)}['\"]\s*=>", text):
         return text
+    return _set_php_parameter(text, key, value)
 
 
 def _configure_mautic(root: str, domain: str, settings: dict[str, Any] | None = None) -> None:
