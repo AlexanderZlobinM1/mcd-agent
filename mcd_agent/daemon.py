@@ -117,7 +117,7 @@ from mcd_agent.ring_utils import advance_ring_after_launch as _advance_ring_afte
 from mcd_agent.ring_utils import mark_ring_entity_executed as _mark_ring_entity_executed
 from mcd_agent.ring_utils import reconcile_ring as _reconcile_ring
 from mcd_agent.service_profiles import service_profiles_apply_once
-from mcd_agent.self_update import maybe_auto_update
+from mcd_agent.self_update import _ensure_mcd_service_kill_mode, maybe_auto_update
 from mcd_agent.segment_filter_safety import format_segment_filter_issues, segment_invalid_filter_issues
 from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
 from mcd_agent.segment_dependencies import (
@@ -7571,6 +7571,12 @@ def _apply_instance_runtime_guard(installs: list[MauticInstall], *, reason: str)
 def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     logging.info("MCD loop started")
     base_config = config
+
+    try:
+        if _ensure_mcd_service_kill_mode():
+            logging.info("MCD systemd unit migrated to KillMode=control-group")
+    except Exception as exc:
+        logging.warning("MCD systemd unit migration failed: %s", exc)
 
     try:
         fail2ban_guard = ensure_nginx_4xx_scan_safety()

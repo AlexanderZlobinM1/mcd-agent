@@ -20,6 +20,11 @@ def _cfg(tmp: str) -> SimpleNamespace:
 
 
 class SelfUpdateVersionReportingTests(unittest.TestCase):
+    def test_daemon_startup_runs_service_unit_migration(self) -> None:
+        daemon_source = Path(self_update.__file__).with_name("daemon.py").read_text(encoding="utf-8")
+
+        self.assertIn("if _ensure_mcd_service_kill_mode():", daemon_source)
+
     def test_existing_service_unit_is_migrated_to_control_group(self) -> None:
         with TemporaryDirectory() as tmp:
             unit = Path(tmp) / "mcd.service"

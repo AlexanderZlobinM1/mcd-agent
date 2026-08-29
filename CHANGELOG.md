@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.11.46 - 2026-08-29
+
+- Run the existing-unit `KillMode=control-group` migration at daemon startup,
+  after the updated source is active. This fixes the updater bootstrap case in
+  which the previous running version cannot execute newly downloaded code.
+
 ## 0.11.45 - 2026-08-29
 
 - Migrated existing `mcd.service` units from `KillMode=process` to
