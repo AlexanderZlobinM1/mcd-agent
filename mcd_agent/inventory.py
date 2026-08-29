@@ -77,6 +77,9 @@ class InstanceInventory:
               runtime_user TEXT,
               runtime_php_bin TEXT,
               runtime_image_ref TEXT,
+              install_type TEXT,
+              runtime_capabilities_json TEXT,
+              runtime_adapter TEXT,
               updated_at REAL NOT NULL
             )
             """
@@ -102,6 +105,9 @@ class InstanceInventory:
             "runtime_user": "TEXT",
             "runtime_php_bin": "TEXT",
             "runtime_image_ref": "TEXT",
+            "install_type": "TEXT",
+            "runtime_capabilities_json": "TEXT",
+            "runtime_adapter": "TEXT",
         }.items():
             if column not in names:
                 self.conn.execute(f"ALTER TABLE instances ADD COLUMN {column} {sql_type}")
@@ -174,6 +180,9 @@ class InstanceInventory:
               runtime_user TEXT,
               runtime_php_bin TEXT,
               runtime_image_ref TEXT,
+              install_type TEXT,
+              runtime_capabilities_json TEXT,
+              runtime_adapter TEXT,
               updated_at REAL NOT NULL
             )
             """
@@ -183,12 +192,13 @@ class InstanceInventory:
             INSERT OR REPLACE INTO instances(
               instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix,
-              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref, updated_at
+              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref,
+              install_type, runtime_capabilities_json, runtime_adapter, updated_at
             )
             SELECT
               NULL, name, root, NULL, NULL, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix,
-              'host', NULL, NULL, NULL, NULL, NULL, updated_at
+              'host', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, updated_at
             FROM instances_legacy
             ORDER BY updated_at ASC
             """
@@ -213,8 +223,9 @@ class InstanceInventory:
             INSERT INTO instances(
               instance_uid, name, root, primary_domain, domains_json, console_path, local_php_path, mautic_timezone, mautic_major, source,
               db_host, db_port, db_name, db_user, db_password, db_table_prefix,
-              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              runtime, runtime_id, runtime_root, runtime_user, runtime_php_bin, runtime_image_ref,
+              install_type, runtime_capabilities_json, runtime_adapter, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(root) DO UPDATE SET
               instance_uid=excluded.instance_uid,
               name=excluded.name,
@@ -238,6 +249,9 @@ class InstanceInventory:
               runtime_user=excluded.runtime_user,
               runtime_php_bin=excluded.runtime_php_bin,
               runtime_image_ref=excluded.runtime_image_ref,
+              install_type=excluded.install_type,
+              runtime_capabilities_json=excluded.runtime_capabilities_json,
+              runtime_adapter=excluded.runtime_adapter,
               updated_at=excluded.updated_at
             """,
             (
@@ -263,6 +277,9 @@ class InstanceInventory:
                 inst.runtime_user,
                 inst.runtime_php_bin,
                 inst.runtime_image_ref,
+                inst.install_type,
+                json.dumps(sorted(set(inst.runtime_capabilities or [])), ensure_ascii=True),
+                inst.runtime_adapter,
                 time.time(),
             ),
         )
@@ -308,6 +325,13 @@ class InstanceInventory:
                     runtime_image_ref=(
                         str(r["runtime_image_ref"]) if r["runtime_image_ref"] else None
                     ),
+                    install_type=str(r["install_type"]) if r["install_type"] else None,
+                    runtime_capabilities=(
+                        [str(x) for x in json.loads(str(r["runtime_capabilities_json"] or "[]"))]
+                        if str(r["runtime_capabilities_json"] or "").strip()
+                        else []
+                    ),
+                    runtime_adapter=str(r["runtime_adapter"]) if r["runtime_adapter"] else None,
                 )
             )
         return out

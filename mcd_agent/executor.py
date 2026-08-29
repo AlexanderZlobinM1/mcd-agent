@@ -110,6 +110,8 @@ def render_mautic_command(
         parts = _strip_option(parts, "--campaign-limit")
     runtime = descriptor_for_root(root)
     if runtime is not None:
+        if not runtime.has_capability("console"):
+            raise ValueError("runtime descriptor does not allow Mautic console execution")
         cmd = runtime.docker_exec_prefix() + parts + ["--no-interaction"]
     else:
         cmd = [php_bin, console] + parts + ["--no-interaction"]

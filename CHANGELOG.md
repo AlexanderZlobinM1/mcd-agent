@@ -1,5 +1,22 @@
 # MCD Changelog
 
+## 1.0.0 - 2026-08-30
+
+- Introduced the two-axis Mautic runtime matrix: host or Docker runtime,
+  independently combined with ZIP or Composer installation layout.
+- Added root-owned Docker descriptors with explicit capabilities, plugin and
+  Composer metadata paths, exact image references and a trusted migration
+  adapter contract. Console jobs, plugin operations, dependency checks,
+  backups and migrations now route or fail closed from that contract instead
+  of guessing host paths.
+- Added Docker-to-compatible-Docker migration relay support. Target selection
+  requires a running Docker daemon, the exact trusted adapter and a locally
+  synchronized source image; adapter validation happens before any requested
+  target cleanup.
+- Added host readiness reporting for Docker and an explicit, opt-in Docker
+  service profile. Docker remains optional for ordinary host-native Mautic
+  hosts.
+
 ## 0.11.47 - 2026-08-29
 
 - Extended the startup service migration to `mcd.service.d/*.conf` drop-ins,

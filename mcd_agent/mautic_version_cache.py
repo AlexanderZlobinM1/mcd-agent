@@ -11,6 +11,7 @@ from typing import Any
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.models import MauticInstall
+from mcd_agent.runtime_descriptor import descriptor_for_root
 
 _SEMVER_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _VERSION_CACHE_ROOT = Path("/opt/mcd/generated/mautic-version")
@@ -140,6 +141,29 @@ def _read_version_from_mcd_source(
     *,
     run_as_user: str | None = "www-data",
 ) -> str | None:
+    try:
+        descriptor = descriptor_for_root(str(root))
+    except (OSError, ValueError):
+        descriptor = None
+    if descriptor is not None:
+        for arguments in (["--version"], ["about", "--no-interaction"]):
+            try:
+                proc = subprocess.run(
+                    [*descriptor.docker_exec_prefix(), *arguments],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except Exception:
+                continue
+            match = _SEMVER_RE.search((proc.stdout or "") + "\n" + (proc.stderr or ""))
+            if proc.returncode == 0 and match:
+                return match.group(1)
+        if descriptor.host_composer_lock_path is not None:
+            return _read_version_from_composer_lock(descriptor.host_composer_lock_path.parent)
+        return None
     console = _console_path_for_root(root, console_path)
     if not console:
         return None

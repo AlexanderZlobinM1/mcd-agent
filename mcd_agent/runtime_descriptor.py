@@ -17,6 +17,9 @@ _CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 _USER_RE = re.compile(r"^[0-9]{1,10}(?::[0-9]{1,10})?$")
 _DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _DB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:%_-]{0,254}$")
+_INSTALL_TYPE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
+_ADAPTER_RE = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +39,12 @@ class RuntimeDescriptor:
     primary_domain: str | None
     domains: list[str]
     mautic_major: int | None
+    install_type: str | None
+    capabilities: frozenset[str]
+    host_plugins_path: Path | None
+    runtime_plugins_path: str | None
+    host_composer_lock_path: Path | None
+    migration_adapter: str | None
 
     def docker_exec_prefix(self) -> list[str]:
         return [
@@ -49,6 +58,9 @@ class RuntimeDescriptor:
             self.php_bin,
             self.console_path,
         ]
+
+    def has_capability(self, name: str) -> bool:
+        return str(name or "").strip().lower() in self.capabilities
 
 
 def _absolute_path(value: object, *, field: str) -> Path:
@@ -106,6 +118,47 @@ def load_runtime_descriptor(path: Path, *, require_root_owner: bool = True) -> R
     if not _USER_RE.fullmatch(runtime_user):
         raise ValueError("runtime descriptor container_user must be a numeric uid[:gid]")
     image_ref = str(raw.get("image_ref") or "").strip() or None
+    install_type = str(raw.get("install_type") or "").strip().lower() or None
+    if install_type and not _INSTALL_TYPE_RE.fullmatch(install_type):
+        raise ValueError("runtime descriptor has invalid install_type")
+    capabilities = frozenset(
+        value
+        for value in (str(item or "").strip().lower() for item in raw.get("capabilities") or [])
+        if value and _CAPABILITY_RE.fullmatch(value)
+    )
+    migration_adapter = str(raw.get("migration_adapter") or "").strip().lower() or None
+    if migration_adapter and not _ADAPTER_RE.fullmatch(migration_adapter):
+        raise ValueError("runtime descriptor has invalid migration_adapter")
+
+    host_plugins_path: Path | None = None
+    runtime_plugins_path: str | None = None
+    host_composer_lock_path: Path | None = None
+    if raw.get("host_plugins_path") is not None or raw.get("runtime_plugins_path") is not None:
+        if raw.get("host_plugins_path") is None or raw.get("runtime_plugins_path") is None:
+            raise ValueError("runtime descriptor plugin paths must be declared together")
+        host_plugins_path = _absolute_path(raw.get("host_plugins_path"), field="host_plugins_path")
+        try:
+            host_plugins_path.relative_to(host_root)
+        except ValueError as exc:
+            raise ValueError("runtime descriptor host_plugins_path must be below host_root") from exc
+        runtime_plugins_path = _absolute_runtime_path(
+            raw.get("runtime_plugins_path"), field="runtime_plugins_path"
+        )
+        if not runtime_plugins_path.startswith(runtime_root.rstrip("/") + "/"):
+            raise ValueError("runtime descriptor runtime_plugins_path must be below runtime_root")
+        if "plugin-write" in capabilities and not host_plugins_path.is_dir():
+            raise ValueError("runtime descriptor writable plugin path is missing")
+
+    if raw.get("host_composer_lock_path") is not None:
+        host_composer_lock_path = _absolute_path(
+            raw.get("host_composer_lock_path"), field="host_composer_lock_path"
+        )
+        try:
+            host_composer_lock_path.relative_to(host_root)
+        except ValueError as exc:
+            raise ValueError("runtime descriptor host_composer_lock_path must be below host_root") from exc
+        if not host_composer_lock_path.is_file():
+            raise ValueError("runtime descriptor composer lock metadata is missing")
     host_db_host = str(raw.get("host_db_host") or "").strip() or None
     if host_db_host and not _DB_HOST_RE.fullmatch(host_db_host):
         raise ValueError("runtime descriptor has invalid host_db_host")
@@ -145,6 +198,12 @@ def load_runtime_descriptor(path: Path, *, require_root_owner: bool = True) -> R
         primary_domain=primary,
         domains=domains,
         mautic_major=major,
+        install_type=install_type,
+        capabilities=capabilities,
+        host_plugins_path=host_plugins_path,
+        runtime_plugins_path=runtime_plugins_path,
+        host_composer_lock_path=host_composer_lock_path,
+        migration_adapter=migration_adapter,
     )
 
 
@@ -232,6 +291,9 @@ def discover_runtime_instances(
                 runtime_user=descriptor.container_user,
                 runtime_php_bin=descriptor.php_bin,
                 runtime_image_ref=descriptor.image_ref,
+                install_type=descriptor.install_type,
+                runtime_capabilities=sorted(descriptor.capabilities),
+                runtime_adapter=descriptor.migration_adapter,
             )
         )
     return installs

@@ -35,6 +35,7 @@ from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.instance_size import collect_instance_sizes
 from mcd_agent.install_type import detect_install_type, is_complete_plugin_bundle, plugin_dir_candidates
+from mcd_agent.runtime_matrix import build_runtime_profile
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.logical_issues import read_logical_issues_snapshot
 from mcd_agent.maintenance_mode import collect_maintenance_state
@@ -2136,6 +2137,12 @@ class MCCStatePusher:
         for i in installs:
             plugins = _collect_installed_plugins(i.root)
             sender = _detect_sender_profile(i.root, plugins)
+            install_type = str(i.install_type or detect_install_type(i.root)).strip().lower() or "unknown"
+            runtime_profile = build_runtime_profile(
+                runtime=i.runtime,
+                install_type=install_type,
+                capabilities=i.runtime_capabilities,
+            )
             instances.append(
                 {
                     "instance_uid": i.instance_uid,
@@ -2151,7 +2158,12 @@ class MCCStatePusher:
                         run_as_user=self.cfg.mautic_run_as_user,
                         expected_major=i.mautic_major,
                     ),
-                    "install_type": detect_install_type(i.root),
+                    "runtime": str(i.runtime or "host").strip().lower() or "host",
+                    "install_type": install_type,
+                    "runtime_capabilities": sorted(runtime_profile.capabilities),
+                    "runtime_adapter": str(i.runtime_adapter or ""),
+                    "runtime_image_ref": str(i.runtime_image_ref or ""),
+                    "runtime_profile": runtime_profile.safe_dict(),
                     "plugins": plugins,
                     "sender_type": str(sender.get("sender_type", "") or "").strip() or "unknown",
                     "sender_key": str(sender.get("sender_key", "") or "").strip() or "unknown",

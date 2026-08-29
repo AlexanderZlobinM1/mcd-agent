@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from mcd_agent.executor import build_mautic_exec_args
 from mcd_agent.inventory import InstanceInventory
@@ -30,6 +33,14 @@ $parameters = array(
 """,
         encoding="utf-8",
     )
+    plugins = root / "plugins"
+    plugins.mkdir()
+    metadata = root / "runtime-metadata"
+    metadata.mkdir()
+    (metadata / "composer.lock").write_text(
+        json.dumps({"packages": [{"name": "mautic/core-lib", "version": "7.0.0"}]}),
+        encoding="utf-8",
+    )
     payload = {
         "schema": 1,
         "runtime": "docker",
@@ -47,6 +58,12 @@ $parameters = array(
         "php_bin": "/usr/bin/php8.4",
         "image_ref": "default7",
         "mautic_major": 7,
+        "install_type": "composer",
+        "capabilities": ["console", "database", "plugin-read", "plugin-write"],
+        "host_plugins_path": str(plugins),
+        "runtime_plugins_path": "/opt/mautic/docroot/plugins",
+        "host_composer_lock_path": str(metadata / "composer.lock"),
+        "migration_adapter": "mauticrfp-docker-v1",
     }
     descriptor_root = tmp_path / "descriptors"
     descriptor_root.mkdir()
@@ -75,6 +92,9 @@ def test_runtime_descriptor_discovers_db_and_runtime(tmp_path: Path) -> None:
     assert install.runtime == "docker"
     assert install.runtime_id == "mauticrfp-newlook"
     assert install.runtime_image_ref == "default7"
+    assert install.install_type == "composer"
+    assert install.runtime_capabilities == ["console", "database", "plugin-read", "plugin-write"]
+    assert install.runtime_adapter == "mauticrfp-docker-v1"
     assert install.db is not None and install.db.name == "baza_newlook"
     assert install.db.host == "127.0.0.1"
 
@@ -110,6 +130,21 @@ def test_executor_routes_console_through_scoped_docker_exec(tmp_path: Path) -> N
     assert "sudo" not in command
 
 
+def test_executor_fails_closed_without_console_capability(tmp_path: Path) -> None:
+    central, _marker = _descriptor(tmp_path)
+    descriptor = replace(
+        load_runtime_descriptor(central, require_root_owner=False), capabilities=frozenset({"database"})
+    )
+    with patch("mcd_agent.executor.descriptor_for_root", return_value=descriptor):
+        with pytest.raises(ValueError, match="does not allow Mautic console"):
+            build_mautic_exec_args(
+                php_bin="/usr/bin/php",
+                root=str(descriptor.host_root),
+                command="segments:update",
+                instance_id=None,
+            )
+
+
 def test_inventory_persists_runtime_metadata(tmp_path: Path) -> None:
     central, _marker = _descriptor(tmp_path)
     install = discover_runtime_instances(
@@ -125,6 +160,9 @@ def test_inventory_persists_runtime_metadata(tmp_path: Path) -> None:
     assert restored.runtime_id == "mauticrfp-newlook"
     assert restored.runtime_root == "/opt/mautic"
     assert restored.runtime_image_ref == "default7"
+    assert restored.install_type == "composer"
+    assert restored.runtime_capabilities == ["console", "database", "plugin-read", "plugin-write"]
+    assert restored.runtime_adapter == "mauticrfp-docker-v1"
 
 
 def test_rescan_removes_instance_after_runtime_descriptor_is_deleted(tmp_path: Path) -> None:

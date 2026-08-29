@@ -1895,6 +1895,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "mysql",
             "apt",
             "wazuh",
+            "docker",
             "mautic_db_indexes",
             "mautic-db-indexes",
             "db_indexes",
@@ -2059,6 +2060,10 @@ def _build_parser() -> argparse.ArgumentParser:
     inst_migrate.add_argument("--target-db-password")
     inst_migrate.add_argument("--domains-json", default="[]")
     inst_migrate.add_argument("--php-version")
+    inst_migrate.add_argument("--runtime-adapter")
+    inst_migrate.add_argument("--runtime")
+    inst_migrate.add_argument("--install-type")
+    inst_migrate.add_argument("--image-ref")
     inst_migrate.add_argument("--wipe-target", action="store_true")
     inst_migrate.add_argument("--wipe-target-db", action="store_true")
     inst_migrate.add_argument("--json", action="store_true")
@@ -3022,7 +3027,7 @@ def main() -> int:
                     domains = [str(i.primary_domain).strip()]
                 domains_cell = ",".join(domains)
                 runtime = str(getattr(i, "runtime", "host") or "host")
-                install_type = runtime if runtime != "host" else detect_install_type(i.root)
+                install_type = str(i.install_type or detect_install_type(i.root)).strip().lower() or "unknown"
                 print(
                     f"{i.name}\t{i.root}\t{i.source}\tmajor={i.mautic_major}\tuid={i.instance_uid}"
                     f"\tdomains={domains_cell}\truntime={runtime}\tinstall_type={install_type}"
@@ -3258,10 +3263,10 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
         if args.op == "fetch":
-            if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
+            if comp not in {"php_fpm", "php-fpm", "mysql", "apt", "wazuh", "docker", "mautic_db_indexes", "mautic-db-indexes", "db_indexes", "db-indexes"}:
                 print(json.dumps({"status": "error", "reason": f"unsupported component: {comp}"}, ensure_ascii=True))
                 return 2
-            if comp.replace("-", "_") in {"mautic_db_indexes", "db_indexes"}:
+            if comp.replace("-", "_") in {"docker", "mautic_db_indexes", "db_indexes"}:
                 res = service_profiles_apply_once(
                     cfg,
                     component=comp,
@@ -3895,6 +3900,11 @@ def main() -> int:
                 target_db_name=str(args.target_db_name or "").strip(),
                 wipe_target_root=bool(args.wipe_target),
                 wipe_target_db=bool(args.wipe_target_db),
+                runtime_adapter=str(args.runtime_adapter or "").strip() or None,
+                runtime=str(args.runtime or "").strip() or None,
+                install_type=str(args.install_type or "").strip() or None,
+                image_ref=str(args.image_ref or "").strip() or None,
+                domains_json=str(args.domains_json or "[]"),
             )
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0 if bool(payload.get("ok", False)) else 1
@@ -3955,6 +3965,10 @@ def main() -> int:
                 target_db_password=target_db_password,
                 domains_json=str(args.domains_json or "[]"),
                 php_version=str(args.php_version or "").strip() or None,
+                runtime_adapter=str(args.runtime_adapter or "").strip() or None,
+                runtime=str(args.runtime or "").strip() or None,
+                image_ref=str(args.image_ref or "").strip() or None,
+                install_type=str(args.install_type or "").strip() or None,
             )
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0 if bool(payload.get("ok", False)) and bool(payload.get("catchup_ok", False)) else 1

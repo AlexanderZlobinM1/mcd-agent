@@ -16,6 +16,21 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   filesystem repair preserves the numeric container owner; host-native
   instances retain the original path. Descriptor removal is reconciled on the
   next inventory rescan.
+- Two independent instance dimensions are recorded and evaluated for every
+  operation: runtime (`host` or `docker`) and installation layout (`zip` or
+  `composer`). The four matrix cells have separate MCC presentation and share
+  one capability-derived allowlist; Docker never implies Composer and
+  Composer never implies Docker.
+- Docker descriptors may expose a host bind-mounted plugin path. MCD then
+  inventories, installs, removes and fixes ownership for plugins through that
+  exact path and still runs post-install console work through the container.
+  Missing descriptor capabilities fail closed instead of falling back to
+  `<host_root>/plugins` or `www-data`.
+- Cross-host Docker migration is delegated to a root-owned executable under
+  `/usr/local/libexec/mcd-runtime-adapters`. A target is eligible only when
+  Docker is running, the exact named adapter is installed and the source image
+  reference is available locally. Adapter/image validation precedes every
+  destructive target cleanup.
 - Instance uid is domain-based (from active nginx/apache vhost), fallback to root-based short id
 - Mautic versions supported now: 4, 5, 6, 7
 - DB settings extraction from Mautic `local.php`:
@@ -94,7 +109,8 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 - Mautic instance discovery is not executed every tick
 - instance list is loaded from local inventory (SQLite) and can be refreshed on demand
 - inventory and MCC-safe state include the instance runtime, container id,
-  runtime paths/user and immutable image reference
+  runtime paths/user, ZIP/Composer layout, declared capabilities, migration
+  adapter and immutable image reference
 - MCC push model:
   - periodic push to MCC (`/api/v1/agent/state`) every 5 minutes by default
   - apt state is refreshed at `mcc.push_apt_state_interval_sec` (default 120 sec) and also refreshed immediately when local APT/DPKG state changes

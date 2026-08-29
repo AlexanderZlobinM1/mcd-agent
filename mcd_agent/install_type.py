@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from mcd_agent.runtime_descriptor import descriptor_for_root
+
 
 def _load_json(path: Path) -> dict[str, Any] | None:
     if not path.exists() or not path.is_file():
@@ -33,7 +35,7 @@ def _is_recommended_project(proj_dir: Path) -> bool:
     return "mautic/core-composer-scaffold" in req_keys
 
 
-def detect_install_type(root: str) -> str:
+def detect_host_install_type(root: str) -> str:
     p = Path(root).resolve()
     parent = p.parent
     base = p.name.lower()
@@ -61,8 +63,26 @@ def detect_install_type(root: str) -> str:
     return "zip"
 
 
+def detect_install_type(root: str) -> str:
+    try:
+        descriptor = descriptor_for_root(root)
+    except (OSError, ValueError):
+        return "unknown"
+    if descriptor is not None:
+        return str(descriptor.install_type or "unknown").strip().lower() or "unknown"
+    return detect_host_install_type(root)
+
+
 def plugin_dir_candidates(root: str | Path) -> list[Path]:
     base = Path(root)
+    try:
+        descriptor = descriptor_for_root(str(base))
+    except (OSError, ValueError):
+        return []
+    if descriptor is not None:
+        if not descriptor.has_capability("plugin-read"):
+            return []
+        return [descriptor.host_plugins_path] if descriptor.host_plugins_path is not None else []
     composer_layout = (
         detect_install_type(str(base)) == "composer"
         or (base / "docroot").is_dir()
@@ -104,6 +124,12 @@ def is_complete_plugin_bundle(plugin_dir: Path, bundle_name: str) -> bool:
 
 def app_bundle_dir_candidates(root: str | Path) -> list[Path]:
     base = Path(root)
+    try:
+        descriptor = descriptor_for_root(str(base))
+    except (OSError, ValueError):
+        return []
+    if descriptor is not None:
+        return []
     composer_layout = (
         detect_install_type(str(base)) == "composer"
         or (base / "docroot").is_dir()

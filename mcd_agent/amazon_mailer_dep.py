@@ -11,6 +11,7 @@ import urllib.request
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
+from mcd_agent.runtime_descriptor import descriptor_for_root
 
 
 AMAZON_MAILER_REQUIRED_BUNDLES: set[str] = {
@@ -380,6 +381,46 @@ def _ensure_composer_packages(
     no_scripts: bool = False,
 ) -> bool:
     if not required:
+        return False
+
+    descriptor = descriptor_for_root(root)
+    if descriptor is not None:
+        if str(descriptor.install_type or "unknown") != "composer":
+            raise RuntimeError(
+                "Docker runtime packages require a Composer-based application image"
+            )
+        lock_path = descriptor.host_composer_lock_path
+        if lock_path is None:
+            raise RuntimeError(
+                "Docker Composer metadata is unavailable; rebuild the image with composer.lock metadata"
+            )
+        try:
+            lock = json.loads(lock_path.read_text(encoding="utf-8", errors="strict"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Docker Composer metadata is invalid") from exc
+        installed = {
+            str(row.get("name") or "").strip().lower()
+            for section in ("packages", "packages-dev")
+            for row in (lock.get(section) or [])
+            if isinstance(row, dict) and str(row.get("name") or "").strip()
+        }
+        required_names = {
+            str(package or "").split(":", 1)[0].strip().lower()
+            for package in required
+            if str(package or "").strip()
+        }
+        missing = sorted(required_names - installed)
+        if missing:
+            raise RuntimeError(
+                "Docker runtime dependencies are image-managed; rebuild/synchronize the image with: "
+                + ", ".join(missing)
+            )
+        logging.info(
+            "[%s] Docker image already contains required Composer packages=%s (%s)",
+            root,
+            ",".join(sorted(required_names)),
+            reason,
+        )
         return False
 
     install_type = detect_install_type(root)

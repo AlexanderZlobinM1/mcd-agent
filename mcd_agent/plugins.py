@@ -33,6 +33,7 @@ from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_type import is_complete_plugin_bundle, plugin_dir_candidates
 from mcd_agent.plugin_interactions import selection_conflicts_for_rules
 from mcd_agent.runtime_overrides import fetch_runtime_overrides
+from mcd_agent.runtime_descriptor import descriptor_for_root
 from mcd_agent.state_backend import mysql_state_enabled, mysql_state_existing_connection, mysql_state_table_names
 
 
@@ -1017,7 +1018,16 @@ def _version_cmp(left: str | None, right: str | None) -> int | None:
 
 
 def _resolve_plugins_dir(root: str, create: bool = False) -> Path:
+    descriptor = descriptor_for_root(root)
+    if descriptor is not None:
+        required = "plugin-write" if create else "plugin-read"
+        if not descriptor.has_capability(required):
+            raise RuntimeError(f"runtime descriptor does not allow {required}")
     candidates = plugin_dir_candidates(root)
+    if not candidates:
+        raise RuntimeError(
+            "plugin files are not writable for this runtime; declare a trusted plugin-write path"
+        )
     for p in candidates:
         if p.exists() and p.is_dir():
             return p
@@ -1317,7 +1327,15 @@ def _find_bundle_root(staging: Path, bundle: str) -> Path:
     raise RuntimeError(f"cannot locate bundle root for {bundle} in {staging}")
 
 
-def _set_owner_group(path: Path, owner_group: str = "www-data:www-data") -> None:
+def _set_owner_group(
+    path: Path,
+    *,
+    root: str,
+    owner_group: str = "www-data:www-data",
+) -> None:
+    descriptor = descriptor_for_root(root)
+    if descriptor is not None:
+        owner_group = descriptor.container_user
     subprocess.run(["chown", "-R", owner_group, str(path)], check=True)
 
 
@@ -1353,7 +1371,7 @@ def _install_or_replace_plugin(
 
         shutil.copytree(source_dir, dst_dir)
         (dst_dir / state_filename).write_text(json.dumps(state_payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-        _set_owner_group(dst_dir)
+        _set_owner_group(dst_dir, root=root)
 
         if backup_dir.exists():
             shutil.rmtree(backup_dir, ignore_errors=True)
