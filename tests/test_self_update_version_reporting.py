@@ -54,6 +54,26 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         self.assertFalse(changed)
         run.assert_not_called()
 
+    def test_service_dropin_cannot_override_control_group_with_process(self) -> None:
+        with TemporaryDirectory() as tmp:
+            unit = Path(tmp) / "mcd.service"
+            unit.write_text("[Service]\nKillMode=control-group\n", encoding="utf-8")
+            dropin_dir = Path(tmp) / "mcd.service.d"
+            dropin_dir.mkdir()
+            override = dropin_dir / "override.conf"
+            override.write_text("[Service]\nKillMode=process\nTimeoutStopSec=15\n", encoding="utf-8")
+            with patch.object(
+                self_update.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ) as run:
+                changed = self_update._ensure_mcd_service_kill_mode(unit)
+                override_content = override.read_text(encoding="utf-8")
+
+        self.assertTrue(changed)
+        self.assertIn("KillMode=control-group", override_content)
+        run.assert_called_once_with(["systemctl", "daemon-reload"], capture_output=True, text=True)
+
     def test_update_status_overwrites_stale_state_versions(self) -> None:
         with TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)

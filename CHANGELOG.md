@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 0.11.47 - 2026-08-29
+
+- Extended the startup service migration to `mcd.service.d/*.conf` drop-ins,
+  preventing a legacy `KillMode=process` override from defeating the corrected
+  main unit. Unit and drop-in changes share rollback and one daemon reload.
+
 ## 0.11.46 - 2026-08-29
 
 - Run the existing-unit `KillMode=control-group` migration at daemon startup,
