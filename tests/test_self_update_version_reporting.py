@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import mcd_agent.self_update as self_update
 
@@ -19,6 +20,35 @@ def _cfg(tmp: str) -> SimpleNamespace:
 
 
 class SelfUpdateVersionReportingTests(unittest.TestCase):
+    def test_existing_service_unit_is_migrated_to_control_group(self) -> None:
+        with TemporaryDirectory() as tmp:
+            unit = Path(tmp) / "mcd.service"
+            unit.write_text(
+                "[Service]\nExecStart=/opt/mcd/venv/bin/python -m mcd_agent\nKillMode=process\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                self_update.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ) as run:
+                changed = self_update._ensure_mcd_service_kill_mode(unit)
+                content = unit.read_text(encoding="utf-8")
+
+        self.assertTrue(changed)
+        self.assertIn("KillMode=control-group", content)
+        run.assert_called_once_with(["systemctl", "daemon-reload"], capture_output=True, text=True)
+
+    def test_current_service_unit_does_not_reload_systemd(self) -> None:
+        with TemporaryDirectory() as tmp:
+            unit = Path(tmp) / "mcd.service"
+            unit.write_text("[Service]\nKillMode=control-group\n", encoding="utf-8")
+            with patch.object(self_update.subprocess, "run") as run:
+                changed = self_update._ensure_mcd_service_kill_mode(unit)
+
+        self.assertFalse(changed)
+        run.assert_not_called()
+
     def test_update_status_overwrites_stale_state_versions(self) -> None:
         with TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)

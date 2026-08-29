@@ -463,6 +463,41 @@ def _restart_service_async() -> None:
     )
 
 
+def _ensure_mcd_service_kill_mode(
+    unit_path: Path = Path("/etc/systemd/system/mcd.service"),
+) -> bool:
+    """Migrate an existing MCD unit to process-group shutdown semantics."""
+    if not unit_path.exists():
+        return False
+    original = unit_path.read_text(encoding="utf-8")
+    if "KillMode=control-group" in original:
+        return False
+    if "KillMode=process" in original:
+        updated = original.replace("KillMode=process", "KillMode=control-group", 1)
+    else:
+        marker = "[Service]\n"
+        if marker not in original:
+            raise RuntimeError(f"MCD systemd unit has no Service section: {unit_path}")
+        updated = original.replace(marker, marker + "KillMode=control-group\n", 1)
+
+    mode = unit_path.stat().st_mode
+    tmp_path = unit_path.with_suffix(unit_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(updated, encoding="utf-8")
+        tmp_path.chmod(mode)
+        os.replace(tmp_path, unit_path)
+        proc = subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl daemon-reload failed").strip()
+            unit_path.write_text(original, encoding="utf-8")
+            unit_path.chmod(mode)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+            raise RuntimeError(f"MCD systemd unit migration failed: {detail}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return True
+
+
 def _acquire_update_lock(cfg: AgentConfig, *, blocking: bool) -> Any | None:
     lock_p = _lock_path(cfg)
     lock_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1339,6 +1374,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
         os.replace(src_next_dir, src_dir)
         swapped = True
         _install_agent_package_for_source(install_dir, src_dir)
+        _ensure_mcd_service_kill_mode()
 
         release_session(
             cfg,

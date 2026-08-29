@@ -1,5 +1,13 @@
 # MCD Changelog
 
+## 0.11.45 - 2026-08-29
+
+- Migrated existing `mcd.service` units from `KillMode=process` to
+  `KillMode=control-group` during self-update, so a daemon restart also stops
+  its managed flock, sudo, and PHP child processes.
+- Aligned the MCC installation template with the same process-group shutdown
+  contract and added regression coverage for idempotent unit migration.
+
 ## 0.11.44 - 2026-08-29
 
 - Reconciled production fixes that had remained on divergent release branches
