@@ -30,10 +30,11 @@ from mcd_agent.apt_profile import collect_apt_state
 from mcd_agent.backup import backup_profile_for_push, backup_state_for_push
 from mcd_agent.cluster_assets import collect_cluster_assets_status
 from mcd_agent.config import AgentConfig
+from mcd_agent.form_embed import load_form_embed_state
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.instance_size import collect_instance_sizes
-from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
+from mcd_agent.install_type import detect_install_type, is_complete_plugin_bundle, plugin_dir_candidates
 from mcd_agent.inventory import InstanceInventory, MauticInstall, ensure_seeded
 from mcd_agent.logical_issues import read_logical_issues_snapshot
 from mcd_agent.maintenance_mode import collect_maintenance_state
@@ -149,6 +150,15 @@ def stable_change_payload(payload: dict[str, Any]) -> dict[str, Any]:
             out[key] = cleaned
     out.pop("signals_collected_at_ts", None)
     return out
+
+
+def _runtime_overrides_for_state_push(cfg: AgentConfig) -> dict[str, Any]:
+    """Include managed form policy outcomes in the normal observed snapshot."""
+    runtime = dict(local_runtime_overrides(cfg))
+    state = load_form_embed_state()
+    statuses = state.get("instances", {}) if isinstance(state, dict) else {}
+    runtime["form_embed_instance_status"] = statuses if isinstance(statuses, dict) else {}
+    return runtime
 
 
 def monitor_signals_change_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1447,12 +1457,13 @@ def _collect_installed_plugins(root: str, limit: int = 200) -> list[dict[str, st
         if not pdir.is_dir():
             continue
         cfg = pdir / "Config" / "config.php"
+        if not is_complete_plugin_bundle(pdir, name):
+            continue
         ver = "-"
-        if cfg.exists():
-            try:
-                ver = _extract_version_from_php_text(cfg.read_text(encoding="utf-8", errors="ignore"))
-            except Exception:
-                ver = "-"
+        try:
+            ver = _extract_version_from_php_text(cfg.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            ver = "-"
         rows.append({"bundle": name, "version": ver or "-"})
         if len(rows) >= limit:
             break
@@ -2138,6 +2149,7 @@ class MCCStatePusher:
                         self.cfg.php_bin,
                         console_path=i.console_path,
                         run_as_user=self.cfg.mautic_run_as_user,
+                        expected_major=i.mautic_major,
                     ),
                     "install_type": detect_install_type(i.root),
                     "plugins": plugins,
@@ -2168,7 +2180,7 @@ class MCCStatePusher:
                 "source_host_name": str(identity.get("source_host_name") or ""),
             },
             "profile": (profile_name or "").strip().lower(),
-            "runtime_overrides": local_runtime_overrides(self.cfg),
+            "runtime_overrides": _runtime_overrides_for_state_push(self.cfg),
             "maintenance_state": collect_maintenance_state(self.cfg),
             "config_state": {
                 "path": self.cfg.config_file_path,

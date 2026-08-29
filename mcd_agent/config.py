@@ -558,6 +558,7 @@ class AgentConfig:
     segment_sql_ring_rules: dict[str, Any]
     segment_kill_mode: str
     segment_kill_grace_sec: int
+    priority_segment_timeout_sec: int
     campaign_priority_parallel: int
     campaign_regular_parallel: int
     campaign_total_parallel: int
@@ -2117,6 +2118,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_sql_ring_rules": "segment_sql_ring_rules",
     "segment_kill_mode": "segment_kill_mode",
     "segment_kill_grace_sec": "segment_kill_grace_sec",
+    "priority_segment_timeout_sec": "priority_segment_timeout_sec",
     "campaign_priority_parallel": "campaign_priority_parallel",
     "campaign_regular_parallel": "campaign_regular_parallel",
     "campaign_total_parallel": "campaign_total_parallel",
@@ -2919,6 +2921,10 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_ring_rules=_normalize_json_dict(runtime.get("segment_sql_ring_rules", {})),
         segment_kill_mode=str(runtime.get("segment_kill_mode", "graceful")),
         segment_kill_grace_sec=int(runtime.get("segment_kill_grace_sec", 10)),
+        priority_segment_timeout_sec=max(
+            0,
+            int(runtime.get("priority_segment_timeout_sec", 3600) or 0),
+        ),
         campaign_priority_parallel=campaign_priority_parallel,
         campaign_regular_parallel=campaign_regular_parallel,
         campaign_total_parallel=campaign_total_parallel,

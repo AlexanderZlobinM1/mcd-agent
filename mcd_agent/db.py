@@ -650,9 +650,12 @@ class MauticDB:
                     cur.execute(
                         "INSERT INTO `{tbl}` "
                         "(`leadlist_id`,`lead_id`,`date_added`,`manually_removed`,`manually_added`) "
-                        "SELECT %s, t.lead_id, NOW(), 0, 0 FROM `{tmp}` t".format(
+                        "SELECT %s, t.lead_id, NOW(), 0, 0 "
+                        "FROM `{tmp}` t "
+                        "INNER JOIN `{leads}` l ON l.`id`=t.`lead_id`".format(
                             tbl=table_segment_links,
                             tmp=temp_table,
+                            leads=self._safe_table(f"{prefix}leads"),
                         ),
                         (sid,),
                     )

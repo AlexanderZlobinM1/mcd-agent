@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -78,6 +79,27 @@ def plugin_dir_candidates(root: str | Path) -> list[Path]:
         base / "docroot" / "plugins",
         base / "public" / "plugins",
     ]
+
+
+def is_complete_plugin_bundle(plugin_dir: Path, bundle_name: str) -> bool:
+    """Return whether a directory contains the minimum Mautic plugin shape.
+
+    A directory can survive a partial or manual removal, but it is not an
+    installed plugin unless both Mautic metadata and the bundle entry class are
+    present. This intentionally inspects only plugin-owned files.
+    """
+    name = str(bundle_name or "").strip()
+    if not name or not plugin_dir.is_dir():
+        return False
+    config_path = plugin_dir / "Config" / "config.php"
+    entry_path = plugin_dir / f"{name}.php"
+    if not config_path.is_file() or not entry_path.is_file():
+        return False
+    try:
+        entry_source = entry_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(rf"\bclass\s+{re.escape(name)}\b", entry_source))
 
 
 def app_bundle_dir_candidates(root: str | Path) -> list[Path]:

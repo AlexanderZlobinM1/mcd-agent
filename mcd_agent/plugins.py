@@ -30,7 +30,7 @@ from mcd_agent.db import MauticDB
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.executor import build_mautic_exec_args, execute_mautic_command_template
 from mcd_agent.host_identity import resolve_agent_identity
-from mcd_agent.install_type import plugin_dir_candidates
+from mcd_agent.install_type import is_complete_plugin_bundle, plugin_dir_candidates
 from mcd_agent.plugin_interactions import selection_conflicts_for_rules
 from mcd_agent.runtime_overrides import fetch_runtime_overrides
 from mcd_agent.state_backend import mysql_state_enabled, mysql_state_existing_connection, mysql_state_table_names
@@ -729,6 +729,8 @@ def _installed_plugins_from_dir(plugins_dir: Path) -> dict[str, str]:
             continue
         name = str(child.name or "").strip()
         if not _is_valid_bundle_name(name):
+            continue
+        if not is_complete_plugin_bundle(child, name):
             continue
         out[name] = _read_installed_version(child)
     return out

@@ -86,11 +86,14 @@ class FormEmbedTests(unittest.TestCase):
                 patch.object(form_embed.subprocess, "run", return_value=completed),
             ):
                 result = form_embed.sync_form_embed_settings(cfg, [_install(root)])
+                repeat = form_embed.sync_form_embed_settings(cfg, [_install(root)])
 
             rendered = site.read_text(encoding="utf-8")
             self.assertEqual(result["instances"]["form-example"]["status"], "applied")
             self.assertIn("# BEGIN MCD managed form embed", rendered)
             self.assertIn("fastcgi_pass unix:/run/php/php8.4-fpm.sock;", rendered)
+            self.assertFalse(repeat["changed"])
+            self.assertEqual(repeat["instances"]["form-example"]["status"], "applied")
 
     def test_sync_inserts_managed_block_and_adopts_compatible_custom_form_headers(self) -> None:
         with tempfile.TemporaryDirectory() as td:

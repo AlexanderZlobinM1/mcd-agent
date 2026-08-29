@@ -9,6 +9,36 @@ from mcd_agent import mautic_version_cache
 
 
 class MauticVersionCacheTest(unittest.TestCase):
+    def test_candidate_roots_do_not_escape_to_shared_var_www(self) -> None:
+        self.assertEqual(
+            mautic_version_cache._candidate_roots("/var/www/client/public_html"),
+            [Path("/var/www/client/public_html"), Path("/var/www/client")],
+        )
+
+    def test_cached_version_with_wrong_major_is_refreshed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site" / "public_html"
+            root.mkdir(parents=True)
+            console = root / "bin" / "console"
+            console.parent.mkdir()
+            console.write_text("<?php\n", encoding="utf-8")
+            generated = Path(td) / "generated"
+
+            with (
+                patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", generated),
+                patch.object(mautic_version_cache, "_read_version_from_mcd_source", return_value="6.0.9"),
+            ):
+                mautic_version_cache.write_mautic_version_cache(root, "7.1.3")
+                actual = mautic_version_cache.collect_mautic_version(
+                    str(root),
+                    "/usr/bin/php",
+                    console_path=str(console),
+                    expected_major=6,
+                )
+
+                self.assertEqual(actual, "6.0.9")
+                self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "6.0.9")
+
     def test_migrates_legacy_cache_outside_instance_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "var" / "www" / "site" / "public_html"

@@ -49,6 +49,18 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertIn("{campaign_limit_arg}", cfg.cmd_campaign_trigger_template)
         self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 60)
 
+    def test_priority_segment_timeout_is_independent_from_unlimited_regular_tasks(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            '[runtime]\nprofile_name = "hiload"\ncommand_timeout_sec = 0\n',
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.command_timeout_sec, 0)
+        self.assertEqual(cfg.priority_segment_timeout_sec, 3600)
+
     def test_active_profile_enforces_one_minute_campaign_audit(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(

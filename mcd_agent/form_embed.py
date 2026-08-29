@@ -23,10 +23,12 @@ _MANAGED_END = "# END MCD managed form embed"
 _MANAGED_HEADERS_BEGIN = "# BEGIN MCD managed form embed headers"
 _MANAGED_HEADERS_END = "# END MCD managed form embed headers"
 _MANAGED_BLOCK_RE = re.compile(
-    rf"(?ms)^[ \t]*{re.escape(_MANAGED_BEGIN)}\n.*?^[ \t]*{re.escape(_MANAGED_END)}\n?"
+    rf"(?ms)^[ \t]*{re.escape(_MANAGED_BEGIN)}[ \t]*\r?\n.*?"
+    rf"^[ \t]*{re.escape(_MANAGED_END)}[ \t]*(?:\r?\n|$)"
 )
 _MANAGED_HEADERS_BLOCK_RE = re.compile(
-    rf"(?ms)^[ \t]*{re.escape(_MANAGED_HEADERS_BEGIN)}\n.*?^[ \t]*{re.escape(_MANAGED_HEADERS_END)}\n?"
+    rf"(?ms)^[ \t]*{re.escape(_MANAGED_HEADERS_BEGIN)}[ \t]*\r?\n.*?"
+    rf"^[ \t]*{re.escape(_MANAGED_HEADERS_END)}[ \t]*(?:\r?\n|$)"
 )
 _SERVER_START_RE = re.compile(r"(?m)^\s*server\s*\{")
 _SERVER_NAME_RE = re.compile(r"(?m)^\s*server_name\s+([^;]+);")
@@ -475,12 +477,17 @@ def _rewrite_vhost(text: str, inst: MauticInstall, setting: dict[str, Any]) -> t
             upstream = _fastcgi_pass_in(old)
             if enabled and upstream is None:
                 return text, "blocked_managed_upstream_missing"
+            indent = _line_indent(result, marker.start())
             replacement = (
-                render_form_embed_location(
-                    fastcgi_pass=upstream or "",
-                    frame_ancestors=setting.get("frame_ancestors", []),
-                    cors_origins=setting.get("cors_origins", []),
+                _indent_block(
+                    render_form_embed_location(
+                        fastcgi_pass=upstream or "",
+                        frame_ancestors=setting.get("frame_ancestors", []),
+                        cors_origins=setting.get("cors_origins", []),
+                    ),
+                    indent,
                 )
+                + "\n"
                 if enabled
                 else ""
             )
@@ -597,7 +604,10 @@ def sync_form_embed_settings(config: Any, installs: list[MauticInstall]) -> dict
                 "enabled": bool(setting["enabled"]),
                 "frame_ancestors": list(setting["frame_ancestors"]),
                 "cors_origins": list(setting["cors_origins"]),
-                "status": "unchanged",
+                # The policy is still active even when this pass did not need
+                # to rewrite the vhost. MCC must expose the effective state,
+                # not merely whether this specific reconciliation changed it.
+                "status": "applied",
                 "vhosts": [],
             }
             paths = _active_vhosts_for_instance(inst)

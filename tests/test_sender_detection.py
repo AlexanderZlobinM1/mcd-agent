@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from mcd_agent.state_push import _detect_sender_profile
+from mcd_agent.state_push import _collect_installed_plugins, _detect_sender_profile
 
 
 class SenderDetectionTests(unittest.TestCase):
@@ -59,6 +59,42 @@ class SenderDetectionTests(unittest.TestCase):
         self.assertEqual(observed["credentials_present"], {"username": True, "password": True})
         self.assertNotIn("ACCESS", str(observed))
         self.assertNotIn("SECRET", str(observed))
+
+    def test_plugin_inventory_ignores_incomplete_removed_bundle_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugins = root / "plugins"
+            complete = plugins / "MultiCaptchaBundle"
+            (complete / "Config").mkdir(parents=True)
+            (complete / "Config" / "config.php").write_text("<?php return ['version' => '2.1.0'];\n", encoding="utf-8")
+            (complete / "MultiCaptchaBundle.php").write_text(
+                "<?php class MultiCaptchaBundle extends PluginBundleBase {}\n", encoding="utf-8"
+            )
+
+            config_only = plugins / "RemovedConfigOnlyBundle" / "Config"
+            config_only.mkdir(parents=True)
+            (config_only / "config.php").write_text("<?php return [];\n", encoding="utf-8")
+
+            class_only = plugins / "RemovedClassOnlyBundle"
+            class_only.mkdir()
+            (class_only / "RemovedClassOnlyBundle.php").write_text(
+                "<?php class RemovedClassOnlyBundle extends PluginBundleBase {}\n", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                _collect_installed_plugins(str(root)),
+                [{"bundle": "MultiCaptchaBundle", "version": "2.1.0"}],
+            )
+
+    def test_plugin_inventory_ignores_entry_file_without_matching_bundle_class(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "plugins" / "BrokenBundle"
+            (bundle / "Config").mkdir(parents=True)
+            (bundle / "Config" / "config.php").write_text("<?php return ['version' => '1.0.0'];\n", encoding="utf-8")
+            (bundle / "BrokenBundle.php").write_text("<?php class OtherBundle {}\n", encoding="utf-8")
+
+            self.assertEqual(_collect_installed_plugins(str(root)), [])
 
 
 if __name__ == "__main__":

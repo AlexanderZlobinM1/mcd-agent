@@ -66,6 +66,10 @@ segment_sql_ring_rules = {}
 segment_kill_mode = "graceful"
 # Grace period in seconds before hard kill when graceful stop is used.
 segment_kill_grace_sec = 10
+# Safety ceiling for isolated priority native segment updates. This is
+# separate from command_timeout_sec, which remains unlimited for regular work.
+# 0 disables the ceiling.
+priority_segment_timeout_sec = 3600
 
 # SQLite file for task state / weight cache / inventory.
 state_db_path = "/opt/mcd/var/mcd-state.db"

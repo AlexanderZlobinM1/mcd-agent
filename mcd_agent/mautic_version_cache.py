@@ -77,7 +77,6 @@ def _candidate_roots(root: str) -> list[Path]:
     base = root_path.name.lower()
     if base in {"public", "docroot", "public_html"}:
         candidates.append(root_path.parent)
-    candidates.append(root_path.parent.parent)
     out: list[Path] = []
     seen: set[str] = set()
     for p in candidates:
@@ -87,6 +86,16 @@ def _candidate_roots(root: str) -> list[Path]:
         seen.add(ps)
         out.append(p)
     return out
+
+
+def _version_major(version: str | None) -> int | None:
+    match = _SEMVER_RE.search(str(version or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1).split(".", 1)[0])
+    except ValueError:
+        return None
 
 
 def _read_version_from_composer_lock(root: Path) -> str | None:
@@ -164,6 +173,7 @@ def collect_mautic_version(
     update_cache: bool = True,
     run_as_user: str | None = "www-data",
     force_refresh: bool = False,
+    expected_major: int | None = None,
 ) -> str:
     detected_root: Path | None = None
     version: str | None = None
@@ -174,6 +184,8 @@ def collect_mautic_version(
     if not force_refresh:
         for candidate in _candidate_roots(root):
             version = read_cached_mautic_version(candidate)
+            if version and expected_major is not None and _version_major(version) != int(expected_major):
+                version = None
             if version:
                 detected_root = candidate
                 break
@@ -217,6 +229,7 @@ def refresh_mautic_version_cache(
             update_cache=True,
             run_as_user=run_as_user,
             force_refresh=True,
+            expected_major=inst.mautic_major,
         )
         cache = version_cache_path(inst.root)
         cached = cache.exists() and cache.is_file()

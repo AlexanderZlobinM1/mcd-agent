@@ -1,5 +1,22 @@
 # MCD Changelog
 
+## 0.11.44 - 2026-08-29
+
+- Reconciled production fixes that had remained on divergent release branches
+  instead of the canonical agent tree.
+- Prevented per-instance Mautic version probes from walking into a shared
+  parent installation and reject cached versions whose major differs from the
+  discovered instance major.
+- Disabled the unsafe path-agnostic `nginx-4xx-scan` fail2ban jail while
+  preserving bans independently held by other jails.
+- Restored managed web-ingress firewall ordering, persistent embedded-form
+  status, and filtering of incomplete plugin directories left after removal.
+- Added a one-hour default ceiling for isolated priority segment updates,
+  avoided segment-link foreign-key races, and made agent restarts terminate
+  the complete managed process group.
+- Kept all new behavior covered by focused regression tests while preserving
+  the 0.11.43 cron ownership contract for `mautic:emails:send`.
+
 ## 0.11.43 - 2026-08-29
 
 - Restored the permanent cron ownership contract for `mautic:emails:send`

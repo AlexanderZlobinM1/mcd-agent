@@ -714,6 +714,38 @@ class CampaignRingDispatchTests(unittest.TestCase):
         kill_pid.assert_called_once_with(4321, 7)
         self.assertEqual(result, [None])
 
+    def test_priority_segment_timeout_is_forwarded_to_executor(self) -> None:
+        executor = _PriorityTaskExecutor()
+        observed: list[int | None] = []
+        done = threading.Event()
+
+        class Process:
+            pid = 4322
+
+            @staticmethod
+            def wait(timeout: int | None = None) -> int:
+                observed.append(timeout)
+                return 0
+
+        cfg = SimpleNamespace(command_timeout_sec=0, segment_kill_grace_sec=7)
+        with patch.object(daemon_mod, "_spawn_command", return_value=Process()):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="segment",
+                    entity_id=23,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                    timeout_sec=3600,
+                    on_complete=lambda _rc: done.set(),
+                )
+            )
+            self.assertTrue(done.wait(timeout=1))
+
+        self.assertEqual(observed, [3600])
+
     def test_kill_pid_signals_isolated_process_group(self) -> None:
         calls: list[tuple[int, int]] = []
 

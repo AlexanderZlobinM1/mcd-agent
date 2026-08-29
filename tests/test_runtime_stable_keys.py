@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from mcd_agent import daemon
 
 
@@ -65,3 +68,34 @@ def test_message_queue_runtime_keys_are_stable() -> None:
     }
 
     assert expected <= daemon._STABLE_RUNTIME_KEYS
+
+
+def test_form_embed_status_reconcile_publishes_observed_state() -> None:
+    cfg = SimpleNamespace(
+        form_embed_instance_settings={"instance-1": {"enabled": True}},
+    )
+    observed = {"instance-1": {"status": "applied", "vhosts": [{"result": "managed"}]}}
+    with (
+        patch.object(daemon, "sync_form_embed_settings", return_value={"instances": observed}) as sync,
+        patch.object(daemon, "push_runtime_overrides", return_value={"status": "ok"}) as push,
+    ):
+        assert daemon._sync_and_publish_form_embed_status(cfg, ["install"], reason="test") is True
+
+    sync.assert_called_once_with(cfg, ["install"])
+    push.assert_called_once_with(
+        cfg,
+        {"form_embed_instance_status": observed},
+        merge=True,
+    )
+
+
+def test_form_embed_status_reconcile_skips_hosts_without_policy() -> None:
+    cfg = SimpleNamespace(form_embed_instance_settings={})
+    with (
+        patch.object(daemon, "sync_form_embed_settings") as sync,
+        patch.object(daemon, "push_runtime_overrides") as push,
+    ):
+        assert daemon._sync_and_publish_form_embed_status(cfg, ["install"], reason="test") is False
+
+    sync.assert_not_called()
+    push.assert_not_called()

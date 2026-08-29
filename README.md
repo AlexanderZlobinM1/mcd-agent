@@ -506,7 +506,9 @@ Important:
   - daemon also watches local mutable runtime section fingerprint and pushes to MCC immediately when it changes.
   - any mutating command that already does immediate state push updates observed runtime view in MCC without separate polling.
   - `runtime.tasks_compact_*` controls quiet-window compaction cadence (`DELETE` + optional `VACUUM`).
-  - systemd service uses `KillMode=process` and `TimeoutStopSec=15` so restart does not kill child Mautic commands.
+  - systemd service uses `KillMode=control-group` and `TimeoutStopSec=15` so a
+    restart cannot leave child Mautic commands orphaned while preserving the
+    normal per-task process-group timeout behavior.
 - Plugin interactive sync:
 - MCD reads `manifest.json` from MCC plugin repo
   - shows status table (`OK`, `UPDATE`, `MISSING`, `BROKEN`) plus local-only rows (`-`)

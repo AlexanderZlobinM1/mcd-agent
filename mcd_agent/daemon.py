@@ -58,7 +58,8 @@ from mcd_agent.db import MauticDB
 from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_watchdog_config
 from mcd_agent.email_counters import repair_campaign_email_counters
 from mcd_agent.executor import render_mautic_command
-from mcd_agent.fail2ban_guard import ensure_nginx_4xx_browser_icon_guard
+from mcd_agent.fail2ban_guard import ensure_nginx_4xx_scan_safety
+from mcd_agent.web_ingress_firewall import ensure_managed_web_firewall_loopback
 from mcd_agent.fs_permissions import effective_guard_identity, ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
@@ -1561,18 +1562,35 @@ def _persist_stable_backup_runtime_to_config(
     ):
         _sync_segment_whitelist_file(config, installs)
     if "form_embed_instance_settings" in stable_keys:
-        try:
-            result = sync_form_embed_settings(config, list(installs or []))
-            observed = result.get("instances", {}) if isinstance(result, dict) else {}
-            pushed = push_runtime_overrides(
-                config,
-                {"form_embed_instance_status": observed if isinstance(observed, dict) else {}},
-                merge=True,
-            )
-            if str(pushed.get("status", "")).lower() != "ok":
-                logging.warning("form embed status push failed: %s", pushed.get("reason", "unknown"))
-        except Exception as e:
-            logging.warning("form embed settings sync failed: %s", e)
+        _sync_and_publish_form_embed_status(config, installs, reason="runtime_override")
+
+
+def _sync_and_publish_form_embed_status(
+    config: AgentConfig,
+    installs: list[object] | None,
+    *,
+    reason: str,
+) -> bool:
+    """Reconcile saved form policies and retain their observed status in MCC."""
+    settings = getattr(config, "form_embed_instance_settings", {})
+    if not isinstance(settings, dict) or not settings:
+        return False
+    try:
+        result = sync_form_embed_settings(config, list(installs or []))
+        observed = result.get("instances", {}) if isinstance(result, dict) else {}
+        pushed = push_runtime_overrides(
+            config,
+            {"form_embed_instance_status": observed if isinstance(observed, dict) else {}},
+            merge=True,
+        )
+        if str(pushed.get("status", "")).lower() != "ok":
+            logging.warning("form embed status push failed (%s): %s", reason, pushed.get("reason", "unknown"))
+            return False
+        logging.info("form embed status reconciled and published (%s)", reason)
+        return True
+    except Exception as e:
+        logging.warning("form embed settings sync failed (%s): %s", reason, e)
+        return False
 
 
 def _to_int_list(value: object) -> list[int]:
@@ -7555,13 +7573,26 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     base_config = config
 
     try:
-        fail2ban_guard = ensure_nginx_4xx_browser_icon_guard()
+        fail2ban_guard = ensure_nginx_4xx_scan_safety()
         if bool(fail2ban_guard.get("changed", False)):
-            logging.info("Fail2ban browser icon false-positive guard applied")
+            logging.warning(
+                "Unsafe path-agnostic nginx 4xx jail disabled: released=%s preserved=%s",
+                fail2ban_guard.get("released_bans", 0),
+                fail2ban_guard.get("preserved_bans", 0),
+            )
         elif str(fail2ban_guard.get("status", "")) == "error":
-            logging.warning("Fail2ban browser icon false-positive guard failed: %s", fail2ban_guard.get("reason", "unknown"))
+            logging.warning("Fail2ban nginx 4xx safety guard failed: %s", fail2ban_guard.get("reason", "unknown"))
     except Exception as exc:
-        logging.warning("Fail2ban browser icon false-positive guard failed: %s", exc)
+        logging.warning("Fail2ban nginx 4xx safety guard failed: %s", exc)
+
+    try:
+        web_firewall_guard = ensure_managed_web_firewall_loopback()
+        if bool(web_firewall_guard.get("changed", False)):
+            logging.info("Managed web firewall loopback guard applied")
+        elif str(web_firewall_guard.get("status", "")) == "error":
+            logging.warning("Managed web firewall loopback guard failed: %s", web_firewall_guard.get("reason", "unknown"))
+    except Exception as exc:
+        logging.warning("Managed web firewall loopback guard failed: %s", exc)
 
     campaign_whitelist = set(config.campaign_whitelist) | _load_id_file(config.campaign_whitelist_file)
     if config.disable_whitelist:
@@ -7603,6 +7634,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     _sync_segment_whitelist_file(config, installs)
     _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
     _apply_instance_runtime_guard(installs, reason="startup")
+    _sync_and_publish_form_embed_status(config, installs, reason="startup")
     retired_zabbix_probe = retire_zabbix_mautic_version_userparameter()
     if bool(retired_zabbix_probe.get("changed", False)):
         logging.info("retired per-instance Zabbix mautic.version probe")
@@ -8084,6 +8116,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             if segment_is_realtime
                             else max(1, int(cfg.segment_priority_parallel_idle or 1))
                         ),
+                        timeout_sec=max(
+                            0,
+                            int(getattr(cfg, "priority_segment_timeout_sec", 3600) or 0),
+                        ),
                         on_success=lambda root=root, segment_id=int(segment_id): _mark_segment_finished(
                             root,
                             segment_id,
@@ -8290,6 +8326,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         "runtime-overrides local change pushed to MCC (keys=%s)",
                         ",".join(sorted(local_runtime.keys())) if local_runtime else "-",
                     )
+                    _sync_and_publish_form_embed_status(config, installs, reason="local_runtime_push")
                 elif p_status != "disabled":
                     logging.warning("runtime-overrides local push failed: %s", pushed.get("reason", "unknown"))
 

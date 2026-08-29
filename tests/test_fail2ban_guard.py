@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,99 +7,101 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcd_agent.fail2ban_guard import (
-    BROWSER_ICON_IGNORE_REGEX,
-    MCD_BROWSER_ICON_GUARD_MARKER,
-    _patched_nginx_4xx_filter,
-    ensure_nginx_4xx_browser_icon_guard,
+    NGINX_4XX_SAFETY_MARKER,
+    _is_path_agnostic_4xx_filter,
+    ensure_nginx_4xx_scan_safety,
 )
 
 
-class Fail2banBrowserIconGuardTests(unittest.TestCase):
-    def test_empty_ignoreregex_receives_browser_icon_guard(self) -> None:
-        source = "[Definition]\nfailregex = bad\nignoreregex =\n"
+BROAD_FILTER = r'''[Definition]
+failregex = ^<HOST>\s+.*"(?:GET|POST|HEAD|OPTIONS)\s+[^\"]+"\s+(?:400|403|404|444)\s+\d+
+ignoreregex =
+'''
 
-        patched, changed = _patched_nginx_4xx_filter(source)
 
-        self.assertTrue(changed)
-        self.assertIn(MCD_BROWSER_ICON_GUARD_MARKER, patched)
-        self.assertIn(f"ignoreregex = {BROWSER_ICON_IGNORE_REGEX}", patched)
+class Fail2ban4xxSafetyTests(unittest.TestCase):
+    def test_detects_path_agnostic_4xx_filter(self) -> None:
+        self.assertTrue(_is_path_agnostic_4xx_filter(BROAD_FILTER))
 
-    def test_existing_ignoreregex_is_preserved_as_multiline_value(self) -> None:
-        source = "[Definition]\nfailregex = bad\nignoreregex = ^old$\n"
+    def test_keeps_path_scoped_filter_enabled(self) -> None:
+        scoped = r'''[Definition]
+failregex = ^<HOST> .*"GET /(?:wp-admin|\.env) HTTP/[^\"]+" (?:403|404) \d+
+'''
+        self.assertFalse(_is_path_agnostic_4xx_filter(scoped))
 
-        patched, changed = _patched_nginx_4xx_filter(source)
-
-        self.assertTrue(changed)
-        self.assertIn("ignoreregex = ^old$", patched)
-        self.assertIn(f"    {BROWSER_ICON_IGNORE_REGEX}", patched)
-
-    def test_patch_is_idempotent(self) -> None:
-        source = "[Definition]\nfailregex = bad\nignoreregex =\n"
-        first, first_changed = _patched_nginx_4xx_filter(source)
-        second, second_changed = _patched_nginx_4xx_filter(first)
-
-        self.assertTrue(first_changed)
-        self.assertFalse(second_changed)
-        self.assertEqual(second, first)
-
-    def test_guard_matches_safari_icon_404_but_not_mautic_route_404(self) -> None:
-        pattern = re.compile(BROWSER_ICON_IGNORE_REGEX.replace("<HOST>", r"178\.220\.160\.14"))
-        safari = (
-            '178.220.160.14 - - [10/Aug/2026:12:12:15 +0200] '
-            '"GET /apple-touch-icon-precomposed.png HTTP/2.0" 404 12076 "-" "Safari"'
-        )
-        favicon = (
-            '178.220.160.14 - - [10/Aug/2026:12:12:15 +0200] '
-            '"HEAD /favicon.ico?refresh=1 HTTP/2.0" 404 0 "-" "Safari"'
-        )
-        mautic_route = (
-            '178.220.160.14 - - [10/Aug/2026:12:12:15 +0200] '
-            '"GET /s/unknown HTTP/2.0" 404 12076 "-" "Safari"'
-        )
-
-        self.assertRegex(safari, pattern)
-        self.assertRegex(favicon, pattern)
-        self.assertNotRegex(mautic_route, pattern)
-
-    def test_ensure_writes_filter_and_reloads_jail(self) -> None:
+    def test_disables_broad_jail_and_preserves_other_jail_bans(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            target = Path(td) / "nginx-4xx-scan.conf"
-            target.write_text("[Definition]\nfailregex = bad\nignoreregex =\n", encoding="utf-8")
-            completed = SimpleNamespace(returncode=0, stdout="OK", stderr="")
+            filter_path = Path(td) / "nginx-4xx-scan.conf"
+            override_path = Path(td) / "99-mcd-nginx-4xx-safety.local"
+            filter_path.write_text(BROAD_FILTER, encoding="utf-8")
+            responses = [
+                SimpleNamespace(returncode=0, stdout="Jail list: nginx-4xx-scan, nginx-php-probe\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="Banned IP list: 192.0.2.10 192.0.2.11\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="Banned IP list: 192.0.2.11\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="Jail list: nginx-4xx-scan, nginx-php-probe\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="Banned IP list: 192.0.2.10 192.0.2.11\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="Banned IP list: 192.0.2.11\n", stderr=""),
+            ]
+            responses.extend(SimpleNamespace(returncode=0, stdout="", stderr="") for _ in range(7))
             with (
                 patch("mcd_agent.fail2ban_guard.os.geteuid", return_value=0),
                 patch("mcd_agent.fail2ban_guard.shutil.which", return_value="/usr/bin/fail2ban-client"),
-                patch("mcd_agent.fail2ban_guard.subprocess.run", return_value=completed) as run,
+                patch("mcd_agent.fail2ban_guard.subprocess.run", side_effect=responses) as run,
             ):
-                result = ensure_nginx_4xx_browser_icon_guard(filter_path=target)
+                result = ensure_nginx_4xx_scan_safety(
+                    filter_path=filter_path,
+                    override_path=override_path,
+                )
+                override = override_path.read_text(encoding="utf-8")
 
         self.assertEqual(result["status"], "applied")
-        self.assertTrue(result["changed"])
-        run.assert_called_once_with(
-            ["/usr/bin/fail2ban-client", "reload", "nginx-4xx-scan"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        self.assertEqual(result["released_bans"], 1)
+        self.assertEqual(result["preserved_bans"], 1)
+        self.assertIn(NGINX_4XX_SAFETY_MARKER, override)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["/usr/bin/fail2ban-client", "stop", "nginx-4xx-scan"], commands)
+        self.assertIn(
+            ["/usr/bin/fail2ban-client", "set", "nginx-php-probe", "banip", "192.0.2.11"],
+            commands,
         )
 
-    def test_reload_failure_restores_original_filter(self) -> None:
+    def test_inactive_jail_does_not_reload_when_override_is_current(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            target = Path(td) / "nginx-4xx-scan.conf"
-            original = "[Definition]\nfailregex = bad\nignoreregex =\n"
-            target.write_text(original, encoding="utf-8")
-            failed = SimpleNamespace(returncode=1, stdout="", stderr="bad filter")
-            restored = SimpleNamespace(returncode=0, stdout="OK", stderr="")
+            filter_path = Path(td) / "nginx-4xx-scan.conf"
+            override_path = Path(td) / "99-mcd-nginx-4xx-safety.local"
+            filter_path.write_text(BROAD_FILTER, encoding="utf-8")
+            override_path.write_text(
+                f"{NGINX_4XX_SAFETY_MARKER}\n[nginx-4xx-scan]\nenabled = false\n",
+                encoding="utf-8",
+            )
+            status = SimpleNamespace(returncode=0, stdout="Jail list: nginx-php-probe\n", stderr="")
             with (
                 patch("mcd_agent.fail2ban_guard.os.geteuid", return_value=0),
                 patch("mcd_agent.fail2ban_guard.shutil.which", return_value="/usr/bin/fail2ban-client"),
-                patch("mcd_agent.fail2ban_guard.subprocess.run", side_effect=[failed, restored]),
+                patch("mcd_agent.fail2ban_guard.subprocess.run", return_value=status) as run,
             ):
-                result = ensure_nginx_4xx_browser_icon_guard(filter_path=target)
-                current = target.read_text(encoding="utf-8")
+                result = ensure_nginx_4xx_scan_safety(
+                    filter_path=filter_path,
+                    override_path=override_path,
+                )
 
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "noop")
         self.assertFalse(result["changed"])
-        self.assertEqual(current, original)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn(
+            ["/usr/bin/fail2ban-client", "reload"],
+            [call.args[0] for call in run.call_args_list],
+        )
+
+    def test_noop_when_filter_is_path_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            filter_path = Path(td) / "nginx-4xx-scan.conf"
+            filter_path.write_text("[Definition]\nfailregex = ^<HOST> GET /wp-admin 404\n", encoding="utf-8")
+            result = ensure_nginx_4xx_scan_safety(filter_path=filter_path)
+
+        self.assertEqual(result["status"], "noop")
+        self.assertFalse(result["changed"])
 
 
 if __name__ == "__main__":
