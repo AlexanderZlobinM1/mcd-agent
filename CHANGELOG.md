@@ -1,5 +1,16 @@
 # MCD Changelog
 
+## 0.11.43 - 2026-08-29
+
+- Restored the permanent cron ownership contract for `mautic:emails:send`
+  after the public 0.11.42 package regressed to an older cron-reconciliation
+  implementation. MCD never migrates or schedules Mautic file-spool delivery.
+- Active hosts automatically restore only MCD-commented
+  `mautic:emails:send` workers. Other managed and manually disabled cron jobs
+  remain unchanged.
+- Added release regression coverage for direct workers, wrapper scripts,
+  marker recovery and mixed managed cron content.
+
 ## 0.11.38 - 2026-08-27
 
 - Ensure Mautic 6 to 7 upgrades install or update `MauticLocaleFixBundle`,

@@ -372,6 +372,7 @@ Same operations via wrapper (`mcd-cli`):
 - `mcd-cli profile <tiny|mini|midi|maxi|hiload|ultra|farm-tiny|farm-mini|farm-midi|farm-maxi|farm-hiload|farm-ultra|custom>`:
   - applies selected non-passive profile,
   - comments managed cron lines (`segments:update`, `campaigns:update`, `campaigns:trigger`, `campaigns:rebuild`, `import`),
+  - always leaves `mautic:emails:send` under cron ownership; MCD does not migrate or schedule file-spool delivery,
   - restarts `mcd`.
 - `mcd-cli maintenance on|off|status`:
   - temporary maintenance mode without profile change,
