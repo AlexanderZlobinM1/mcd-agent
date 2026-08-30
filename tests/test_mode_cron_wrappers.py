@@ -60,30 +60,36 @@ class ModeCronWrapperTests(unittest.TestCase):
         self.assertEqual(changed, 0)
         self.assertEqual(updated, content)
 
-    def test_email_spool_consumer_is_not_managed(self) -> None:
-        content = (
-            "* * * * * php /var/www/example/bin/console mautic:emails:send "
-            "--time-limit=55 --lock-name=process1 --lock_mode=flock\n"
-        )
+    def test_email_spool_consumer_is_version_gated(self) -> None:
+        console = "/var/www/example/bin/console"
+        content = f"* * * * * php {console} mautic:emails:send --time-limit=55 --lock-name=process1\n"
 
-        updated, changed = _comment_managed(content, "ts")
+        for major in (5, 6, 7):
+            with self.subTest(major=major):
+                updated, commented, restored = _reconcile_active_managed_content(content, "ts", {console: major})
+                self.assertEqual((commented, restored), (1, 0))
+                self.assertIn("# " + content.rstrip("\n"), updated)
 
-        self.assertEqual(changed, 0)
-        self.assertEqual(updated, content)
+        for label, versions in (("mautic4", {console: 4}), ("unknown", {}), ("wrong-path", {"/other/bin/console": 7})):
+            with self.subTest(label=label):
+                updated, commented, restored = _reconcile_active_managed_content(content, "ts", versions)
+                self.assertEqual((commented, restored), (0, 0))
+                self.assertEqual(updated, content)
 
-    def test_email_spool_wrapper_is_not_managed(self) -> None:
+    def test_email_spool_wrapper_is_version_gated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "mautic-email-spool.sh"
+            console = "/var/www/example/bin/console"
             script.write_text(
-                "#!/bin/bash\nphp /var/www/example/bin/console mautic:emails:send --time-limit=55\n",
+                f"#!/bin/bash\nphp {console} mautic:emails:send --time-limit=55\n",
                 encoding="utf-8",
             )
             content = f"* * * * * {script}\n"
 
-            updated, changed = _comment_managed(content, "ts")
+            updated, commented, restored = _reconcile_active_managed_content(content, "ts", {console: 6})
 
-        self.assertEqual(changed, 0)
-        self.assertEqual(updated, content)
+        self.assertEqual((commented, restored), (1, 0))
+        self.assertIn("# " + content.rstrip("\n"), updated)
 
     def test_previously_managed_email_spool_consumer_is_restored(self) -> None:
         email_send = (
@@ -97,11 +103,39 @@ class ModeCronWrapperTests(unittest.TestCase):
             "# * * * * * php /var/www/example/bin/console mautic:segments:update\n"
         )
 
-        updated, restored = _restore_mautic_email_send_comments(content)
+        updated, restored = _restore_mautic_email_send_comments(
+            content,
+            {"/var/www/example/bin/console": 4},
+        )
 
         self.assertEqual(restored, 1)
         self.assertIn(email_send, updated)
         self.assertIn("# * * * * * php /var/www/example/bin/console mautic:segments:update", updated)
+
+    def test_previously_managed_email_spool_consumer_stays_disabled_for_newer_or_unknown_version(self) -> None:
+        console = "/var/www/example/bin/console"
+        content = (
+            "# MCD_MANAGED old: disabled by mcd profile=active\n"
+            f"# * * * * * php {console} mautic:emails:send --time-limit=55\n"
+        )
+
+        for versions in ({console: 5}, {console: 6}, {console: 7}, {}):
+            with self.subTest(versions=versions):
+                updated, restored = _restore_mautic_email_send_comments(content, versions)
+                self.assertEqual(restored, 0)
+                self.assertEqual(updated, content)
+
+    def test_relative_console_email_send_is_left_unchanged(self) -> None:
+        content = "* * * * * cd /var/www/example && php bin/console mautic:emails:send\n"
+
+        updated, commented, restored = _reconcile_active_managed_content(
+            content,
+            "ts",
+            {"/var/www/example/bin/console": 7},
+        )
+
+        self.assertEqual((commented, restored), (0, 0))
+        self.assertEqual(updated, content)
 
     def test_active_reconcile_restores_email_send_and_keeps_segments_managed(self) -> None:
         email_send = "* * * * * php /var/www/example/bin/console mautic:emails:send"
@@ -113,7 +147,11 @@ class ModeCronWrapperTests(unittest.TestCase):
             f"# {segment}\n"
         )
 
-        updated, commented, restored = _reconcile_active_managed_content(content, "new")
+        updated, commented, restored = _reconcile_active_managed_content(
+            content,
+            "new",
+            {"/var/www/example/bin/console": 4},
+        )
 
         self.assertEqual(restored, 1)
         self.assertEqual(commented, 0)

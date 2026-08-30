@@ -1,5 +1,20 @@
 # MCD Changelog
 
+## 1.0.1 - 2026-08-30
+
+- Blocked Composer Mautic 6 to 7 upgrades unless the observed active database
+  is MySQL 8.4+ or MariaDB 10.11+. Detection is fail-closed and the agent
+  repeats it immediately before maintenance; MCD never upgrades the database.
+- Migrated active cron paths from the ZIP source root to the new Composer root,
+  retired the removed `mautic:emails:send` command for Mautic 5/6/7, and added
+  rollback plus a post-write stale-root guard.
+- Gated global `mautic:emails:send` reconciliation on independently confirmed
+  runtime, Composer lock, discovered major and layout evidence. Mautic 4 keeps
+  its command; Mautic 5/6/7 disable it; unknown or conflicting evidence makes
+  no cron change.
+- Required the same independent evidence before applying the Mautic 6
+  ReloadHelper core patch, preventing stale inventory from modifying Mautic 7.
+
 ## 1.0.0 - 2026-08-30
 
 - Introduced the two-axis Mautic runtime matrix: host or Docker runtime,

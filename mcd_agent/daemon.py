@@ -67,7 +67,7 @@ from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
 from mcd_agent.grapesjs_ckeditor_patch import ensure_grapesjs_ckeditor_gpl_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
-from mcd_agent.mautic_version_cache import retire_zabbix_mautic_version_userparameter
+from mcd_agent.mautic_version_cache import confirmed_mautic_major, retire_zabbix_mautic_version_userparameter
 from mcd_agent.mautic_core_restore import restore_retired_mcd_core_patches
 from mcd_agent.logical_issues import (
     logical_issue_blocked_segment_ids,
@@ -8990,12 +8990,29 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         apply_if_version_unknown=bool(config.mautic6_core_patch_apply_if_version_unknown),
                     )
                     if bool(patch_gate.get("apply", False)):
-                        patch_res = ensure_m6_plugin_update_metadata_patch(inst)
+                        confirmed_major = confirmed_mautic_major(
+                            inst.root,
+                            config.php_bin,
+                            console_path=inst.console_path,
+                            local_php_path=inst.local_php_path,
+                            expected_major=6,
+                            run_as_user=config.mautic_run_as_user,
+                        )
+                        if confirmed_major != 6:
+                            patch_res = {
+                                "status": "skip",
+                                "reason": "runtime_major_not_independently_confirmed",
+                                "root": inst.root,
+                            }
+                        else:
+                            patch_res = ensure_m6_plugin_update_metadata_patch(inst)
                         p_status = str(patch_res.get("status", "")).strip().lower()
                         if p_status == "patched":
                             logging.info("[%s] mautic6 core patch applied: %s", inst.root, patch_res.get("path", "-"))
                         elif p_status == "error":
                             logging.warning("[%s] mautic6 core patch error: %s", inst.root, patch_res.get("reason", "unknown"))
+                        elif p_status == "skip":
+                            logging.info("[%s] mautic6 core patch skipped: %s", inst.root, patch_res.get("reason", "unknown"))
                     else:
                         reason = str(patch_gate.get("reason", "")).strip()
                         version = str(patch_gate.get("version", "")).strip() or "-"
@@ -9980,6 +9997,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 mcron = reconcile_managed_cron(
                     profile_name=(config.profile_name or ""),
                     install_dir="/opt/mcd",
+                    installs=installs,
+                    php_bin=config.php_bin,
+                    run_as_user=config.mautic_run_as_user,
                 )
                 changed = [line for line in mcron.lines if "commented managed cron" in line]
                 if changed:

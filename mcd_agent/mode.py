@@ -7,6 +7,10 @@ import json
 import os
 import re
 import subprocess
+from typing import TYPE_CHECKING, Iterable
+
+if TYPE_CHECKING:
+    from mcd_agent.models import MauticInstall
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -36,6 +40,7 @@ MESSAGE_QUEUE_SEND_KEYWORDS = ("mautic:messages:send",)
 
 _MAX_CRON_WRAPPER_BYTES = 128 * 1024
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[A-Za-z0-9_@%+=:,./-]+)")
+_CONFIRMED_MAJOR_CACHE: dict[tuple[object, ...], int] = {}
 
 
 @dataclass
@@ -120,6 +125,38 @@ def _is_mautic_email_send_job(line: str) -> bool:
     if "bin/console" in s:
         return any(k in s for k in EMAIL_SEND_KEYWORDS)
     return _cron_wrapper_has_keywords(s, EMAIL_SEND_KEYWORDS)
+
+
+def _job_payloads(line: str) -> list[str]:
+    payloads = [line]
+    for match in _ABSOLUTE_PATH_RE.finditer(line):
+        path = Path(match.group(1).rstrip(";|&)"))
+        try:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size <= 0 or stat.st_size > _MAX_CRON_WRAPPER_BYTES:
+                continue
+            payloads.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    return payloads
+
+
+def _payload_console_majors(payload: str, confirmed_console_majors: dict[str, int]) -> set[int]:
+    tokens = {match.group(1).rstrip(";|&)") for match in _ABSOLUTE_PATH_RE.finditer(payload)}
+    return {int(major) for path, major in confirmed_console_majors.items() if path in tokens}
+
+
+def _email_send_job_major(line: str, confirmed_console_majors: dict[str, int]) -> int | None:
+    payloads = [payload for payload in _job_payloads(line) if any(key in payload for key in EMAIL_SEND_KEYWORDS)]
+    if not payloads:
+        return None
+    majors: set[int] = set()
+    for payload in payloads:
+        payload_majors = _payload_console_majors(payload, confirmed_console_majors)
+        if len(payload_majors) != 1:
+            return None
+        majors.update(payload_majors)
+    return next(iter(majors)) if len(majors) == 1 else None
 
 
 def _is_empty_leads_cleanup_job(line: str) -> bool:
@@ -227,7 +264,10 @@ def _restore_mautic_email_fetch_comments(content: str) -> tuple[str, int]:
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
 
 
-def _restore_mautic_email_send_comments(content: str) -> tuple[str, int]:
+def _restore_mautic_email_send_comments(
+    content: str,
+    confirmed_console_majors: dict[str, int] | None = None,
+) -> tuple[str, int]:
     out: list[str] = []
     changed = 0
     pending_marker: str | None = None
@@ -242,7 +282,10 @@ def _restore_mautic_email_send_comments(content: str) -> tuple[str, int]:
         if pending_marker is not None:
             if line.startswith("# "):
                 legacy = line[2:]
-                if _is_mautic_email_send_job(legacy):
+                if _is_mautic_email_send_job(legacy) and _email_send_job_major(
+                    legacy,
+                    confirmed_console_majors or {},
+                ) == 4:
                     out.append(legacy)
                     changed += 1
                     pending_marker = None
@@ -255,10 +298,34 @@ def _restore_mautic_email_send_comments(content: str) -> tuple[str, int]:
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
 
 
-def _reconcile_active_managed_content(content: str, stamp: str) -> tuple[str, int, int]:
-    restored_content, restored = _restore_mautic_email_send_comments(content)
-    updated, commented = _comment_managed(restored_content, stamp)
-    return updated, commented, restored
+def _comment_mautic_email_send_by_version(
+    content: str,
+    stamp: str,
+    confirmed_console_majors: dict[str, int],
+) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if _email_send_job_major(line, confirmed_console_majors) in {5, 6, 7}:
+            out.append(f"# MCD_MANAGED {stamp}: disabled by mcd profile=active")
+            out.append("# " + line)
+            changed += 1
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _reconcile_active_managed_content(
+    content: str,
+    stamp: str,
+    confirmed_console_majors: dict[str, int] | None = None,
+) -> tuple[str, int, int]:
+    versions = confirmed_console_majors or {}
+    restored_content, restored = _restore_mautic_email_send_comments(content, versions)
+    managed_content, managed_commented = _comment_managed(restored_content, stamp)
+    updated, email_commented = _comment_mautic_email_send_by_version(managed_content, stamp, versions)
+    return updated, managed_commented + email_commented, restored
 
 
 def _comment_empty_leads_cleanup(content: str, stamp: str) -> tuple[str, int, list[str]]:
@@ -341,7 +408,72 @@ def _restore_from_backup(install_dir: str, user: str) -> tuple[bool, str]:
     return True, f"restored {user} crontab from backup"
 
 
-def reconcile_managed_cron(*, profile_name: str, install_dir: str) -> ModeResult:
+def _path_signature(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat = path.stat()
+        return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return None
+
+
+def _confirmed_console_major_map(
+    installs: Iterable[MauticInstall],
+    php_bin: str,
+    *,
+    run_as_user: str | None = "www-data",
+) -> tuple[dict[str, int], list[str]]:
+    from mcd_agent.mautic_version_cache import confirmed_mautic_major
+
+    confirmed: dict[str, int] = {}
+    diagnostics: list[str] = []
+    php_signature = _path_signature(Path(php_bin))
+    for inst in installs:
+        console = Path(str(inst.console_path or ""))
+        root = Path(inst.root)
+        lock_candidates = [root / "composer.lock"]
+        if root.name.lower() in {"public", "docroot", "public_html"}:
+            lock_candidates.append(root.parent / "composer.lock")
+        cache_key = (
+            str(console),
+            _path_signature(console),
+            tuple(sig for sig in (_path_signature(path) for path in lock_candidates) if sig is not None),
+            php_signature,
+            int(inst.mautic_major) if inst.mautic_major is not None else None,
+            str(inst.local_php_path or ""),
+        )
+        major = _CONFIRMED_MAJOR_CACHE.get(cache_key)
+        if major is None:
+            major = confirmed_mautic_major(
+                inst.root,
+                php_bin,
+                console_path=inst.console_path,
+                local_php_path=inst.local_php_path,
+                expected_major=inst.mautic_major,
+                run_as_user=run_as_user,
+            )
+            if major is not None:
+                _CONFIRMED_MAJOR_CACHE[cache_key] = major
+        if major is None:
+            diagnostics.append(f"{inst.name}: Mautic major is not independently confirmed; email send cron unchanged")
+            continue
+        try:
+            resolved_console = str(console.resolve(strict=True))
+            confirmed[resolved_console] = int(major)
+            if console.is_absolute():
+                confirmed[str(console)] = int(major)
+        except OSError:
+            diagnostics.append(f"{inst.name}: console path is unavailable; email send cron unchanged")
+    return confirmed, diagnostics
+
+
+def reconcile_managed_cron(
+    *,
+    profile_name: str,
+    install_dir: str,
+    installs: Iterable[MauticInstall] = (),
+    php_bin: str = "/usr/bin/php",
+    run_as_user: str | None = "www-data",
+) -> ModeResult:
     """
     Idempotently keep active profiles from racing legacy Mautic cron jobs.
 
@@ -355,14 +487,19 @@ def reconcile_managed_cron(*, profile_name: str, install_dir: str) -> ModeResult
     if profile == "passive":
         return ModeResult(ok=True, lines=["passive profile, managed cron left unchanged"])
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines: list[str] = []
+    confirmed_console_majors, diagnostics = _confirmed_console_major_map(
+        installs,
+        php_bin,
+        run_as_user=run_as_user,
+    )
+    lines: list[str] = list(diagnostics)
     for user in ("root", "www-data"):
         rc, cur = _read_crontab(None if user == "root" else user)
         if rc != 0:
             lines.append(f"{user}: crontab not readable, skip")
             continue
         _ensure_backup(install_dir, user, cur)
-        updated, changed, restored = _reconcile_active_managed_content(cur, stamp)
+        updated, changed, restored = _reconcile_active_managed_content(cur, stamp, confirmed_console_majors)
         if changed <= 0 and restored <= 0:
             lines.append(f"{user}: no managed cron change")
             continue

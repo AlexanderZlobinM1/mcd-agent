@@ -37,6 +37,7 @@ from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import write_mautic_version_cache
 from mcd_agent.executor import execute_mautic_command_template
 from mcd_agent.plugins import run_plugins_interactive
+from mcd_agent.install_readiness import _database_state, mautic7_database_compatibility
 
 
 CORE_PLUGIN_BUNDLES = {
@@ -1565,6 +1566,10 @@ def run_upgrade_apply(
             raise RuntimeError(
                 "Major upgrade is supported only for Composer Mautic 6 -> 7 with --allow-major"
             )
+        database_ok, database_reason = mautic7_database_compatibility(_database_state())
+        if not database_ok:
+            raise RuntimeError("Mautic 6 to 7 upgrade is blocked: " + database_reason)
+        print("Mautic 7 database preflight: " + database_reason)
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
     if not yes:

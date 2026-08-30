@@ -54,6 +54,116 @@ class MauticVersionCacheTest(unittest.TestCase):
 
             self.assertEqual(legacy.read_text(encoding="utf-8"), "6.0.9\n")
 
+    def test_confirmed_major_requires_runtime_and_lock_agreement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            console = root / "bin" / "console"
+            console.parent.mkdir(parents=True)
+            console.write_text("<?php\n", encoding="utf-8")
+
+            with (
+                patch.object(mautic_version_cache, "descriptor_for_root", return_value=None),
+                patch.object(mautic_version_cache, "_read_version_from_runtime_only", return_value="7.1.3"),
+                patch.object(mautic_version_cache, "_read_major_from_composer_lock", return_value=7),
+            ):
+                major = mautic_version_cache.confirmed_mautic_major(
+                    str(root),
+                    "/usr/bin/php",
+                    console_path=str(console),
+                    expected_major=7,
+                )
+
+            self.assertEqual(major, 7)
+
+    def test_confirmed_major_returns_unknown_for_missing_or_conflicting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            console = root / "bin" / "console"
+            console.parent.mkdir(parents=True)
+            console.write_text("<?php\n", encoding="utf-8")
+            cases = (
+                ("6.0.9", 7, 6),
+                (None, 7, 7),
+                ("7.1.3", 7, 6),
+            )
+
+            for runtime, lock, discovered in cases:
+                with self.subTest(runtime=runtime, lock=lock, discovered=discovered), patch.object(
+                    mautic_version_cache,
+                    "descriptor_for_root",
+                    return_value=None,
+                ), patch.object(
+                    mautic_version_cache,
+                    "_read_version_from_runtime_only",
+                    return_value=runtime,
+                ), patch.object(
+                    mautic_version_cache,
+                    "_read_major_from_composer_lock",
+                    return_value=lock,
+                ):
+                    self.assertIsNone(
+                        mautic_version_cache.confirmed_mautic_major(
+                            str(root),
+                            "/usr/bin/php",
+                            console_path=str(console),
+                            expected_major=discovered,
+                        )
+                    )
+
+    def test_confirmed_major_accepts_zip_install_without_composer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            console = root / "bin" / "console"
+            console.parent.mkdir(parents=True)
+            console.write_text("<?php\n", encoding="utf-8")
+
+            with (
+                patch.object(mautic_version_cache, "descriptor_for_root", return_value=None),
+                patch.object(mautic_version_cache, "_read_version_from_runtime_only", return_value="4.4.13"),
+                patch.object(mautic_version_cache, "_read_major_from_composer_lock", return_value=None),
+            ):
+                major = mautic_version_cache.confirmed_mautic_major(
+                    str(root),
+                    "/usr/bin/php",
+                    console_path=str(console),
+                    local_php_path=str(root / "app" / "config" / "local.php"),
+                    expected_major=4,
+                )
+
+            self.assertEqual(major, 4)
+
+    def test_confirmed_major_rejects_mautic4_layout_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            console = root / "bin" / "console"
+            console.parent.mkdir(parents=True)
+            console.write_text("<?php\n", encoding="utf-8")
+
+            with (
+                patch.object(mautic_version_cache, "descriptor_for_root", return_value=None),
+                patch.object(mautic_version_cache, "_read_version_from_runtime_only", return_value="7.1.3"),
+                patch.object(mautic_version_cache, "_read_major_from_composer_lock", return_value=7),
+            ):
+                major = mautic_version_cache.confirmed_mautic_major(
+                    str(root),
+                    "/usr/bin/php",
+                    console_path=str(console),
+                    local_php_path=str(root / "app" / "config" / "local.php"),
+                    expected_major=7,
+                )
+
+            self.assertIsNone(major)
+
+    def test_composer_major_supports_x_dev_release_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"4.3.x-dev"}]}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(mautic_version_cache._read_major_from_composer_lock(root), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

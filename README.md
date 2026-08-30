@@ -584,6 +584,9 @@ Important:
   - guarded Composer Mautic 6 to 7 upgrades require an explicit target and
     `--allow-major`; MCC runs a Storage Box instance backup first and starts the
     upgrade only after that backup succeeds
+  - the 6 to 7 path is unavailable unless the active database is independently
+    reported as MySQL 8.4+ or MariaDB 10.11+; MCD does not install or upgrade a
+    database because a host-level database change can affect other instances
   - the Mautic 6 to 7 Composer path prepares Composer and Node 20, updates
     `composer.json` to the selected Mautic 7 target, runs Composer with
     dependencies, clears cache, finishes the Mautic updater, and reconciles
@@ -593,6 +596,9 @@ Important:
     `90-redis-sessions.ini`, rewrites nginx PHP-FPM socket references from
     8.3 to 8.4, validates nginx, restarts services, and purges PHP 8.3 only
     after all other discovered host instances are Mautic 7-compatible
+  - ZIP-to-Composer migration rewrites active root/www-data cron paths to the
+    Composer root, disables the removed `mautic:emails:send` command on Mautic
+    5+, and fails with rollback if an active source-root cron entry remains
   - MCD repairs the Mautic 7 GrapesJS CKEditor GPL-license fallback on every
     inventory cycle, including passive hosts, and reapplies it after plugin or
     Mautic updates overwrite either the source or published builder artifact;

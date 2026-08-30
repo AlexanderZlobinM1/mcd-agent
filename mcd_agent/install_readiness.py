@@ -15,6 +15,12 @@ from mcd_agent.nginx_baseline import cloudflare_real_ip_state
 from mcd_agent.runtime_adapters import installed_runtime_adapters
 
 
+MAUTIC7_DATABASE_MINIMUMS: dict[str, tuple[int, int, int]] = {
+    "mysql": (8, 4, 0),
+    "mariadb": (10, 11, 0),
+}
+
+
 def _run(args: list[str], *, timeout_sec: int = 8) -> tuple[int, str]:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout_sec, check=False)
@@ -128,6 +134,31 @@ def _database_state() -> dict[str, Any]:
         "service": service,
         "active": service != "unknown",
     }
+
+
+def mautic7_database_compatibility(database: dict[str, Any] | None) -> tuple[bool, str]:
+    """Fail closed unless the observed host database satisfies Mautic 7."""
+    row = database if isinstance(database, dict) else {}
+    engine = str(row.get("engine") or "").strip().lower()
+    if engine not in MAUTIC7_DATABASE_MINIMUMS:
+        return False, "database engine is unknown; Mautic 7 requires MySQL 8.4+ or MariaDB 10.11+"
+    raw_version = row.get("version_tuple")
+    if not isinstance(raw_version, (list, tuple)) or not raw_version:
+        return False, f"{engine} version is unknown"
+    try:
+        version = tuple(int(value) for value in list(raw_version)[:3])
+    except (TypeError, ValueError):
+        return False, f"{engine} version is invalid"
+    version = version + (0,) * (3 - len(version))
+    minimum = MAUTIC7_DATABASE_MINIMUMS[engine]
+    if version < minimum:
+        current = ".".join(str(value) for value in version)
+        required = ".".join(str(value) for value in minimum)
+        return False, f"{engine} {current} is incompatible; Mautic 7 requires {engine} {required}+"
+    if not bool(row.get("active", False)):
+        return False, f"{engine} service is not confirmed active"
+    current = ".".join(str(value) for value in version)
+    return True, f"{engine} {current} is compatible with Mautic 7"
 
 
 def _docker_state() -> dict[str, Any]:
