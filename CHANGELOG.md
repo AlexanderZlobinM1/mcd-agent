@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Updated full-control-plane regression coverage for the canonical AnanasRS
-  campaign pool worker, including persistent claims, cooldowns and pressure
-  detection. Agent runtime behavior and version are unchanged.
+- Removed the host-local AnanasRS campaign worker test from the public agent
+  suite. The script is not MCD functionality and remains owned by its single
+  runtime host; agent runtime behavior and version are unchanged.
 
 ## 1.0.1 - 2026-08-30
 
