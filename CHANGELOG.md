@@ -5,9 +5,10 @@
 - Blocked Composer Mautic 6 to 7 upgrades unless the observed active database
   is MySQL 8.4+ or MariaDB 10.11+. Detection is fail-closed and the agent
   repeats it immediately before maintenance; MCD never upgrades the database.
-- Migrated active cron paths from the ZIP source root to the new Composer root,
-  retired the removed `mautic:emails:send` command for Mautic 5/6/7, and added
-  rollback plus a post-write stale-root guard.
+- Migrated active cron paths and referenced wrapper scripts from the ZIP source
+  root to the new Composer root, retired the removed `mautic:emails:send`
+  command for Mautic 5/6/7, and added rollback plus post-write stale-root
+  guards.
 - Gated global `mautic:emails:send` reconciliation on independently confirmed
   runtime, Composer lock, discovered major and layout evidence. Mautic 4 keeps
   its command; Mautic 5/6/7 disable it; unknown or conflicting evidence makes

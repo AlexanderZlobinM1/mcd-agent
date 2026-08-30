@@ -24,6 +24,8 @@ RETIRED_INSTANCE_MARKER = ".mcd-retired-after-composer-move"
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 COMPOSER_MOVE_CRON_MARKER = "MCD_COMPOSER_MOVE"
+_MAX_CRON_WRAPPER_BYTES = 128 * 1024
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[A-Za-z0-9_@%+=:,./-]+)")
 
 
 @dataclass
@@ -322,9 +324,51 @@ def _active_cron_references_root(content: str, root: Path) -> bool:
     )
 
 
+def _active_cron_wrapper_paths(content: str, source_root: Path) -> list[Path]:
+    source = str(source_root).encode()
+    paths: set[Path] = set()
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        for match in _ABSOLUTE_PATH_RE.finditer(line):
+            path = Path(match.group(1).rstrip(";|&)"))
+            try:
+                stat = path.stat()
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            if not path.is_file() or stat.st_size <= 0 or stat.st_size > _MAX_CRON_WRAPPER_BYTES:
+                continue
+            if source in payload and b"bin/console" in payload:
+                paths.add(path)
+    return sorted(paths)
+
+
+def _rewrite_composer_move_cron_wrapper(
+    path: Path,
+    *,
+    source_root: Path,
+    target_root: Path,
+    mautic_major: int,
+) -> tuple[bytes, int, int]:
+    original = path.read_bytes()
+    text = original.decode("utf-8")
+    updated, rewritten, retired = _rewrite_composer_move_crontab(
+        text,
+        source_root=source_root,
+        target_root=target_root,
+        mautic_major=mautic_major,
+    )
+    if updated != text:
+        path.write_bytes(updated.encode("utf-8"))
+    return original, rewritten, retired
+
+
 def _migrate_composer_move_crontabs(plan: ComposerMovePlan, mautic_major: int) -> dict[str, Any]:
     snapshots: dict[str, str] = {}
+    wrapper_snapshots: dict[str, bytes] = {}
     results: dict[str, dict[str, int]] = {}
+    wrapper_results: dict[str, dict[str, int]] = {}
     written: list[str] = []
     try:
         for user in ("root", "www-data"):
@@ -333,6 +377,18 @@ def _migrate_composer_move_crontabs(plan: ComposerMovePlan, mautic_major: int) -
             if rc != 0:
                 continue
             snapshots[user] = current
+            for wrapper in _active_cron_wrapper_paths(current, plan.source_root):
+                key = str(wrapper)
+                if key in wrapper_snapshots:
+                    continue
+                original, wrapper_rewritten, wrapper_retired = _rewrite_composer_move_cron_wrapper(
+                    wrapper,
+                    source_root=plan.source_root,
+                    target_root=plan.target_root,
+                    mautic_major=mautic_major,
+                )
+                wrapper_snapshots[key] = original
+                wrapper_results[key] = {"rewritten": wrapper_rewritten, "retired": wrapper_retired}
             updated, rewritten, retired = _rewrite_composer_move_crontab(
                 current,
                 source_root=plan.source_root,
@@ -350,12 +406,21 @@ def _migrate_composer_move_crontabs(plan: ComposerMovePlan, mautic_major: int) -
                 raise RuntimeError(f"failed to verify {user} crontab after Composer migration")
             if _active_cron_references_root(verified, plan.source_root):
                 raise RuntimeError(f"active {user} crontab still references retired root {plan.source_root}")
+            if _active_cron_wrapper_paths(verified, plan.source_root):
+                raise RuntimeError(f"active {user} cron wrapper still references retired root {plan.source_root}")
     except Exception:
         for user in written:
             cron_user = None if user == "root" else user
             _write_crontab(snapshots[user], cron_user)
+        for path, content in wrapper_snapshots.items():
+            Path(path).write_bytes(content)
         raise
-    return {"users": results, "snapshots": snapshots}
+    return {
+        "users": results,
+        "wrappers": wrapper_results,
+        "snapshots": snapshots,
+        "wrapper_snapshots": wrapper_snapshots,
+    }
 
 
 def _restore_composer_move_crontabs(snapshot: dict[str, Any]) -> None:
@@ -368,6 +433,13 @@ def _restore_composer_move_crontabs(snapshot: dict[str, Any]) -> None:
         rc, detail = _write_crontab(str(content), cron_user)
         if rc != 0:
             failures.append(f"{user}: {detail}")
+    wrapper_rows = snapshot.get("wrapper_snapshots") if isinstance(snapshot, dict) else {}
+    if isinstance(wrapper_rows, dict):
+        for path, content in wrapper_rows.items():
+            try:
+                Path(str(path)).write_bytes(bytes(content))
+            except OSError as exc:
+                failures.append(f"{path}: {exc}")
     if failures:
         raise RuntimeError("failed to restore crontab after Composer migration error: " + "; ".join(failures))
 
@@ -478,6 +550,7 @@ def move_zip_to_composer(
         "local_php_path_patched": path_patched,
         "runtime_dirs": runtime_dirs,
         "cron_migration": cron_migration.get("users", {}),
+        "cron_wrapper_migration": cron_migration.get("wrappers", {}),
         "source_retired_marker": retired_marker,
         "vhost": vhost,
         "instances": count,
