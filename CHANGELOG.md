@@ -6,6 +6,12 @@
   suite. The script is not MCD functionality and remains owned by its single
   runtime host; agent runtime behavior and version are unchanged.
 
+## 1.0.6 - 2026-08-31
+
+- Split bulk Fail2ban updates by IP family. A shared blocklist containing both
+  IPv4 and IPv6 addresses now creates separate commands and nftables sets
+  instead of failing on a mixed-family comparison.
+
 ## 1.0.5 - 2026-08-31
 
 - Compared blocklist and allowlist networks only within the same IP family, so

@@ -127,6 +127,41 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertEqual(len(ban_commands), 3)
         self.assertTrue(all(len(command[4:]) <= 250 for command in ban_commands))
 
+    def test_bulk_commands_never_mix_ipv4_and_ipv6(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(*args: str, **_kwargs):
+            commands.append(list(args))
+            if len(args) >= 3 and args[-2:] == ("status", "mcc-global"):
+                return SimpleNamespace(returncode=0, stdout="Banned IP list:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
+                patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
+                patch.object(security_blocklist.os, "geteuid", return_value=0),
+                patch.object(
+                    security_blocklist,
+                    "_ensure_fail2ban_installed",
+                    return_value=(False, "/usr/bin/fail2ban-client"),
+                ),
+                patch.object(security_blocklist, "_run", side_effect=fake_run),
+            ):
+                security_blocklist.apply_security_blocklist_profile(
+                    {
+                        "enabled": True,
+                        "blocked": ["8.8.8.8", "2001:4860:4860::8888"],
+                        "allowlist": [],
+                    }
+                )
+
+        ban_commands = [command for command in commands if command[2:4] == ["mcc-global", "banip"]]
+        self.assertEqual(len(ban_commands), 2)
+        self.assertEqual([len(command[4:]) for command in ban_commands], [1, 1])
+
     def test_failed_fetch_never_changes_local_bans(self) -> None:
         with (
             patch.object(

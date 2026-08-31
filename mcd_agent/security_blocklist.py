@@ -207,6 +207,17 @@ def _chunks(values: list[str], size: int = 250) -> list[list[str]]:
     return [values[offset : offset + size] for offset in range(0, len(values), size)]
 
 
+def _address_batches(values: list[str], size: int = 250) -> list[list[str]]:
+    by_family: dict[int, list[str]] = {4: [], 6: []}
+    for value in values:
+        try:
+            family = ipaddress.ip_network(value, strict=False).version
+        except Exception:
+            continue
+        by_family[family].append(value)
+    return [batch for family in (4, 6) for batch in _chunks(by_family[family], size)]
+
+
 def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     enabled = bool(profile.get("enabled", False))
     if os.geteuid() != 0:
@@ -273,17 +284,17 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     current = _status_ips(client, JAIL_NAME)
     added = sorted(desired - current)
     removed = sorted(current - desired)
-    for batch in _chunks(removed):
+    for batch in _address_batches(removed):
         _client_ok(
             _run(client, "set", JAIL_NAME, "unbanip", *batch, timeout=120),
             f"unban {len(batch)} addresses",
         )
-    for batch in _chunks(added):
+    for batch in _address_batches(added):
         _client_ok(
             _run(client, "set", JAIL_NAME, "banip", *batch, timeout=120),
             f"ban {len(batch)} addresses",
         )
-    for batch in _chunks(sorted(allowlist)):
+    for batch in _address_batches(sorted(allowlist)):
         _run(client, "set", "sshd", "unbanip", *batch, timeout=120)
 
     return {
