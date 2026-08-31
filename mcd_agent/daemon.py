@@ -814,14 +814,61 @@ def _mark_plugin_operation_bootstrap_completed(
     *,
     reason: str,
 ) -> None:
+    state = store.get_runtime_sync(_plugin_operation_bootstrap_state_key(digest)) or {}
     store.put_runtime_sync(
         _plugin_operation_bootstrap_state_key(digest),
         {
+            **state,
             "completed": True,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "reason": str(reason or "completed"),
         },
     )
+
+
+def _sync_plugin_operation_bootstrap_enabled_state(
+    store: "TaskStore",
+    digest: str,
+    *,
+    enabled: bool,
+) -> None:
+    state = store.get_runtime_sync(_plugin_operation_bootstrap_state_key(digest)) or {}
+    previous = state.get("enabled")
+    if previous is not None and bool(previous) == bool(enabled):
+        return
+    store.put_runtime_sync(
+        _plugin_operation_bootstrap_state_key(digest),
+        {
+            **state,
+            "enabled": bool(enabled),
+            "completed": False,
+            "enabled_changed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _plugin_operation_bootstrap_is_completed(
+    store: "TaskStore",
+    digest: str,
+    *,
+    db: MauticDB,
+    complete_when: object,
+    now_local: datetime,
+) -> bool:
+    completed = _plugin_operation_bootstrap_completed(store, digest)
+    if not isinstance(complete_when, dict):
+        return completed
+    if _plugin_operation_guard_matches(db, complete_when, now_local):
+        if not completed:
+            _mark_plugin_operation_bootstrap_completed(
+                store,
+                digest,
+                reason="adopted_existing_plugin_data",
+            )
+        return True
+    # A previous completion marker must not suppress bootstrap after the
+    # plugin data was removed or the bundle was reinstalled into the same root.
+    return False
 
 
 def _plugin_operation_bootstrap_digest_from_task(task: "RunningTask") -> str:
@@ -12085,6 +12132,23 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         task_id = str(plugin_task.get("id", "") or "")
                         run_key = f"{operation_key}:{task_id}"
                         previous = jobs_last_run.get((root, run_key), 0.0)
+                        bootstrap = (
+                            plugin_task.get("bootstrap")
+                            if isinstance(plugin_task.get("bootstrap"), dict)
+                            else None
+                        )
+                        if bootstrap is not None and bool(bootstrap.get("reset_on_enable", False)):
+                            schedule = (
+                                plugin_task.get("schedule")
+                                if isinstance(plugin_task.get("schedule"), dict)
+                                else {}
+                            )
+                            enabled_field = str(schedule.get("enabled_field", "enabled") or "enabled")
+                            _sync_plugin_operation_bootstrap_enabled_state(
+                                store,
+                                _plugin_operation_bootstrap_digest(root, operation_key, task_id),
+                                enabled=bool(values.get(enabled_field, True)),
+                            )
                         try:
                             if not plugin_operation_schedule_due(
                                 plugin_item,
@@ -12109,32 +12173,17 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 if str(plugin_task.get("task_class", "standard") or "standard") == "safety"
                                 else "job:plugin_operation"
                             )
-                            bootstrap = (
-                                plugin_task.get("bootstrap")
-                                if isinstance(plugin_task.get("bootstrap"), dict)
-                                else None
-                            )
                             if bootstrap is not None:
                                 digest = _plugin_operation_bootstrap_digest(root, operation_key, task_id)
-                                completed = _plugin_operation_bootstrap_completed(store, digest)
+                                complete_when = bootstrap.get("complete_when")
                                 try:
-                                    if _plugin_operation_guard_matches(
-                                        db,
-                                        bootstrap.get("complete_when"),
-                                        inst_now,
-                                    ):
-                                        if not completed:
-                                            _mark_plugin_operation_bootstrap_completed(
-                                                store,
-                                                digest,
-                                                reason="adopted_existing_plugin_data",
-                                            )
-                                        completed = True
-                                    else:
-                                        # A previous completion marker must not suppress
-                                        # bootstrap after the plugin data was removed or
-                                        # the bundle was reinstalled into the same root.
-                                        completed = False
+                                    completed = _plugin_operation_bootstrap_is_completed(
+                                        store,
+                                        digest,
+                                        db=db,
+                                        complete_when=complete_when,
+                                        now_local=inst_now,
+                                    )
                                 except Exception as exc:
                                     logging.warning(
                                         "[%s] plugin operation %s/%s bootstrap probe failed: %s",
@@ -12143,6 +12192,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                         task_id,
                                         exc,
                                     )
+                                    completed = False
                                 if not completed:
                                     selected_command = (
                                         bootstrap.get("command")

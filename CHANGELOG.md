@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.10 - 2026-08-31
+
+- Added a marker-only scheduled bootstrap mode. A successful one-time repair
+  can now be retained without treating pre-existing rows as proof that the
+  repair already ran.
+- Viber statistics now run `viber:stats:update --backfill` after every
+  `Enabled` transition, then return to routine `viber:stats:update` runs.
+  Explicitly disabling Viber Stats still prevents both commands.
+
 ## 1.0.9 - 2026-08-31
 
 - Fixed scheduled plugin operations to require both the installed bundle path
