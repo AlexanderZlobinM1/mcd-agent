@@ -59,6 +59,7 @@ from mcd_agent.db_watchdog import collect_db_watchdog_snapshot, effective_db_wat
 from mcd_agent.email_counters import repair_campaign_email_counters
 from mcd_agent.executor import render_mautic_command
 from mcd_agent.fail2ban_guard import ensure_nginx_4xx_scan_safety
+from mcd_agent.security_blocklist import sync_security_blocklist_once
 from mcd_agent.web_ingress_firewall import ensure_managed_web_firewall_loopback
 from mcd_agent.fs_permissions import effective_guard_identity, ensure_instance_permissions
 from mcd_agent.host_identity import resolve_agent_identity
@@ -7736,6 +7737,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     update_deferred_by_backup = False
     last_campaign_console_activity_ts = 0.0
     next_service_profile_apply_at = 0.0
+    next_security_blocklist_sync_at = 0.0
     next_backup_profile_sync_at = 0.0
     next_backup_storage_probe_at = 0.0
     next_runtime_overrides_poll_at = 0.0
@@ -8641,6 +8643,30 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             except Exception as e:
                 logging.warning("service-profile auto-apply failed: %s", e)
                 next_service_profile_apply_at = now + max(300, int(config.service_profiles_poll_interval_sec or 3600))
+
+        if now >= next_security_blocklist_sync_at:
+            poll_sec = 300
+            try:
+                security_sync = sync_security_blocklist_once(config)
+                applied = security_sync.get("apply")
+                if isinstance(applied, dict):
+                    poll_sec = max(30, min(3600, int(applied.get("poll_sec") or 60)))
+                    if bool(applied.get("changed", False)):
+                        logging.warning(
+                            "security blocklist reconciled: status=%s desired=%s added=%s removed=%s",
+                            applied.get("status", "unknown"),
+                            applied.get("desired", 0),
+                            len(applied.get("added") or []),
+                            len(applied.get("removed") or []),
+                        )
+                elif str(security_sync.get("status") or "").lower() not in {"ok", "noop", "disabled"}:
+                    logging.warning(
+                        "security blocklist sync failed: %s",
+                        security_sync.get("reason", "unknown"),
+                    )
+            except Exception as exc:
+                logging.warning("security blocklist sync failed: %s", exc)
+            next_security_blocklist_sync_at = now + poll_sec
 
         if _cluster_files_producer_allowed(config) and now >= next_cluster_files_produce_at:
             interval = max(300, int(getattr(config, "backup_cluster_files_produce_interval_sec", 3600) or 3600))

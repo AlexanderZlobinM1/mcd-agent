@@ -6,6 +6,17 @@
   suite. The script is not MCD functionality and remains owned by its single
   runtime host; agent runtime behavior and version are unchanged.
 
+## 1.0.3 - 2026-08-31
+
+- Added authenticated MCC security blocklist polling and exact reconciliation
+  into a dedicated permanent `mcc-global` Fail2ban jail. Central additions,
+  removals and allowlist changes propagate without giving agents Cloudflare or
+  Wazuh credentials; stale/unavailable snapshots never trigger mass-unban.
+- Added an independently operating aggressive SSH jail with progressive bans
+  and centrally synchronized ignore addresses. Fail2ban is installed only on
+  explicitly targeted hosts, and the all-ports nftables action also protects
+  direct SMTP/SSH services while Cloudflare remains the web enforcement plane.
+
 ## 1.0.2 - 2026-08-31
 
 - Constrained Symfony Amazon SES and SendGrid mailer bridges to the installed
