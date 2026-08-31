@@ -18,6 +18,7 @@ from mcd_agent.host_identity import resolve_agent_identity
 
 
 FILTER_PATH = Path("/etc/fail2ban/filter.d/mcc-global.conf")
+MAUTIC_AUTH_FILTER_PATH = Path("/etc/fail2ban/filter.d/mautic-auth-nginx.conf")
 JAIL_PATH = Path("/etc/fail2ban/jail.d/98-mcd-security.local")
 LOG_PATH = Path("/var/log/fail2ban-mcc-global.log")
 JAIL_NAME = "mcc-global"
@@ -208,6 +209,17 @@ def _filter_config() -> str:
     )
 
 
+def _mautic_auth_filter_config() -> str:
+    return (
+        f"{MANAGED_MARKER}\n"
+        "# Match Mautic login POSTs across every nginx vhost (v4-v7).\n"
+        "[Definition]\n"
+        "failregex = ^<HOST> .*\"POST \\S*(?:/index\\.php)?/s/login(?:_check)?(?:[/?#][^\" ]*)? HTTP/[0-9.]+\" \\d{3} .*$\n"
+        "            ^<HOST> .*\"POST \\S*(?:/index\\.php)?/login(?:_check)?(?:[/?#][^\" ]*)? HTTP/[0-9.]+\" \\d{3} .*$\n"
+        "ignoreregex =\n"
+    )
+
+
 def _status_ips(client: str, jail: str) -> set[str]:
     proc = _run(client, "status", jail)
     if proc.returncode != 0:
@@ -295,9 +307,15 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     # the host's active netfilter compatibility layer and is verifiable.
     action = "iptables[type=allports, name={name}]" if shutil.which("iptables") else "nftables[type=allports, name={name}]"
     before_filter = FILTER_PATH.read_text(encoding="utf-8", errors="ignore") if FILTER_PATH.is_file() else None
+    before_mautic_filter = (
+        MAUTIC_AUTH_FILTER_PATH.read_text(encoding="utf-8", errors="ignore")
+        if MAUTIC_AUTH_FILTER_PATH.is_file()
+        else None
+    )
     before_jail = JAIL_PATH.read_text(encoding="utf-8", errors="ignore") if JAIL_PATH.is_file() else None
     changed_files = False
     changed_files |= _atomic_write(FILTER_PATH, _filter_config())
+    changed_files |= _atomic_write(MAUTIC_AUTH_FILTER_PATH, _mautic_auth_filter_config())
     changed_files |= _atomic_write(
         JAIL_PATH,
         _jail_config(enabled=enabled, allowlist=allowlist, action=action),
@@ -319,6 +337,10 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
             FILTER_PATH.unlink(missing_ok=True)
         else:
             _atomic_write(FILTER_PATH, before_filter)
+        if before_mautic_filter is None:
+            MAUTIC_AUTH_FILTER_PATH.unlink(missing_ok=True)
+        else:
+            _atomic_write(MAUTIC_AUTH_FILTER_PATH, before_mautic_filter)
         if before_jail is None:
             JAIL_PATH.unlink(missing_ok=True)
         else:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.20 - 2026-09-01
+
+- Install and maintain the Mautic nginx login Fail2ban filter with the managed
+  jail. Hosts without a legacy local filter now receive the same all-vhost
+  login-brute-force protection rather than rejecting the security profile.
+
 ## 1.0.19 - 2026-09-01
 
 - Use the same verified all-ports netfilter action for a detected Mautic login

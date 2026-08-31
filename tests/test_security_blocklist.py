@@ -38,6 +38,14 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertIn("action = iptables[type=allports, name=mcd-mautic-auth-nginx]", config)
         self.assertNotIn("nginx-4xx-scan", config)
 
+    def test_managed_mautic_login_filter_covers_both_front_controller_routes(self) -> None:
+        config = security_blocklist._mautic_auth_filter_config()
+
+        self.assertIn("/s/login", config)
+        self.assertIn("/login", config)
+        self.assertIn("index\\.php", config)
+        self.assertNotIn("nginx-4xx-scan", config)
+
     def test_allowlist_comparison_ignores_other_ip_family(self) -> None:
         self.assertFalse(
             security_blocklist._allowlisted(
@@ -71,6 +79,7 @@ class SecurityBlocklistTests(unittest.TestCase):
             root = Path(td)
             with (
                 patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "MAUTIC_AUTH_FILTER_PATH", root / "mautic-filter.conf"),
                 patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
                 patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
                 patch.object(security_blocklist.os, "geteuid", return_value=0),
@@ -137,6 +146,7 @@ class SecurityBlocklistTests(unittest.TestCase):
             root = Path(td)
             with (
                 patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "MAUTIC_AUTH_FILTER_PATH", root / "mautic-filter.conf"),
                 patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
                 patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
                 patch.object(security_blocklist.os, "geteuid", return_value=0),
@@ -170,6 +180,7 @@ class SecurityBlocklistTests(unittest.TestCase):
             root = Path(td)
             with (
                 patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "MAUTIC_AUTH_FILTER_PATH", root / "mautic-filter.conf"),
                 patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
                 patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
                 patch.object(security_blocklist.os, "geteuid", return_value=0),
