@@ -112,6 +112,11 @@ from mcd_agent.mautic6_core_patch import (
     patch_status as mautic6_patch_status,
     revert_m6_plugin_update_metadata_patch,
 )
+from mcd_agent.mautic713_import_tag_patch import (
+    ensure_patch as ensure_mautic713_import_tag_patch,
+    patch_status as mautic713_import_tag_patch_status,
+    revert_patch as revert_mautic713_import_tag_patch,
+)
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.local_mail import (
     configure_local_mail,
@@ -2088,6 +2093,12 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("op", choices=["status", "apply", "revert", "policy"], nargs="?", default="status")
     m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
     m6p.add_argument("--json", action="store_true")
+
+    m713p = sub.add_parser("mautic713-import-tag-patch", help="Manage the reversible Mautic 7.1.3 import tag detach remediation")
+    m713p.add_argument("--config", default=default_cfg)
+    m713p.add_argument("--root", help="Instance root or instance uid (default: all)")
+    m713p.add_argument("op", choices=["status", "apply", "revert"], nargs="?", default="status")
+    m713p.add_argument("--json", action="store_true")
 
     assets = sub.add_parser("cluster-assets", help="Verify/sanitize cluster-shared Mautic plugins and app/bundles")
     assets.add_argument("--config", default=default_cfg)
@@ -4152,6 +4163,37 @@ def main() -> int:
             _push_state_after_change(cfg, "mautic6-core-patch-apply")
         if args.op == "revert":
             _push_state_after_change(cfg, "mautic6-core-patch-revert")
+        return rc
+
+    if args.cmd == "mautic713-import-tag-patch":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note:
+            print(f"NOTICE: {note}")
+        installs = _select_installs_for_patch(cfg, args.root)
+        if not installs:
+            raise RuntimeError("No matching instances")
+        payload = []
+        rc = 0
+        for inst in installs:
+            if args.op == "status":
+                res = mautic713_import_tag_patch_status(inst)
+            elif args.op == "apply":
+                res = ensure_mautic713_import_tag_patch(inst)
+            elif args.op == "revert":
+                res = revert_mautic713_import_tag_patch(inst)
+            else:
+                raise RuntimeError(f"unsupported op: {args.op}")
+            payload.append({"root": inst.root, "instance_uid": inst.instance_uid, "result": res})
+            if str(res.get("status", "")).strip().lower() == "error":
+                rc = 1
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            for row in payload:
+                print(json.dumps(row, ensure_ascii=True))
+        if args.op in {"apply", "revert"}:
+            _push_state_after_change(cfg, f"mautic713-import-tag-patch-{args.op}")
         return rc
 
     if args.cmd == "profile":

@@ -35,6 +35,7 @@ from mcd_agent.amazon_mailer_dep import (
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import write_mautic_version_cache
+from mcd_agent.mautic713_import_tag_patch import revert_patch as revert_mautic713_import_tag_patch
 from mcd_agent.executor import execute_mautic_command_template
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.install_readiness import _database_state, mautic7_database_compatibility
@@ -1582,6 +1583,18 @@ def run_upgrade_apply(
     try:
         # Mandatory preflight: align permissions before any upgrade action.
         _pre_upgrade_permissions_check(config, install_root)
+
+        # This narrow 7.1.3 hotfix changes a core file. Restore the exact
+        # verified original before any version change so Composer/ZIP updates
+        # never inherit a local patch into a new Mautic release.
+        if current == "7.1.3" and target != "7.1.3":
+            restore = revert_mautic713_import_tag_patch(inst)
+            if str(restore.get("status", "")).strip().lower() == "error":
+                raise RuntimeError(
+                    "Mautic 7.1.3 import tag remediation rollback failed: "
+                    + str(restore.get("reason", "unknown"))
+                )
+            print("Mautic 7.1.3 import tag remediation rollback: " + str(restore.get("status", "clean")))
 
         if do_backup:
             b = _backup_install(install_root)

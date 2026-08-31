@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.15 - 2026-08-31
+
+- Added a narrowly scoped, reversible Mautic `7.1.3` import-tag remediation.
+  It repairs the detached existing-tag reference only on the affected version,
+  records verified original and patched checksums, and never rewrites an
+  already-fixed file.
+- Mautic upgrades from `7.1.3` now restore that exact core file before changing
+  versions, preventing the temporary remediation from carrying into a later
+  release.
+
 ## 1.0.14 - 2026-08-31
 
 - Enforced the dual priority queue whenever campaign or segment whitelists are
