@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.17 - 2026-08-31
+
+- Wait for Fail2ban to restore its persistent SSH firewall chain after a
+  managed restart. This avoids rolling back a valid strict jail merely because
+  systemd reports the service active before its actions are installed.
+
 ## 1.0.16 - 2026-08-31
 
 - Hardened the managed SSH Fail2ban jail to ban after three failed attempts in

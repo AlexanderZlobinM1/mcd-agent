@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
@@ -219,6 +220,20 @@ def _verify_ssh_firewall_action(action: str) -> None:
         raise RuntimeError("Fail2ban SSH jail has no active nftables set")
 
 
+def _wait_for_ssh_firewall_action(action: str, timeout_sec: float = 20.0) -> None:
+    """Wait for Fail2ban to restore persistent tickets and its firewall chain."""
+    deadline = time.monotonic() + timeout_sec
+    last_error: RuntimeError | None = None
+    while time.monotonic() < deadline:
+        try:
+            _verify_ssh_firewall_action(action)
+            return
+        except RuntimeError as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise last_error or RuntimeError("Fail2ban SSH jail verification timed out")
+
+
 def _chunks(values: list[str], size: int = 250) -> list[list[str]]:
     return [values[offset : offset + size] for offset in range(0, len(values), size)]
 
@@ -279,7 +294,7 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
             # Fail2ban releases. Restarting preserves persistent tickets and
             # makes the new managed chain authoritative before verification.
             _client_ok(_run("systemctl", "restart", "fail2ban", timeout=120), "fail2ban restart")
-        _verify_ssh_firewall_action(action)
+        _wait_for_ssh_firewall_action(action)
     except Exception:
         if before_filter is None:
             FILTER_PATH.unlink(missing_ok=True)

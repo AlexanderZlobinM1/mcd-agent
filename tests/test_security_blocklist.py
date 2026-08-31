@@ -65,7 +65,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -131,7 +131,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -164,7 +164,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 security_blocklist.apply_security_blocklist_profile(
