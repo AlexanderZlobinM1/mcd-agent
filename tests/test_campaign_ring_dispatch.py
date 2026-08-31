@@ -62,6 +62,8 @@ from mcd_agent.daemon import (
     _published_segment_whitelist_ids,
     _priority_campaign_due_check_needed,
     _priority_interleaved_dispatch_installs,
+    _priority_realtime_campaign_rebuild_ids,
+    _priority_realtime_segment_ids,
     _recover_orphaned_imports_if_safe,
     _remove_ring_entities,
     _rotated_dispatch_installs,
@@ -75,6 +77,7 @@ from mcd_agent.daemon import (
     _segment_task_limit_after_import,
     _segment_whitelist_effective_setting,
     _segment_whitelist_realtime_setting,
+    _split_segment_circles,
     _sync_segment_whitelist_file,
     _submit_import_if_segment_slot,
     _task_key,
@@ -896,6 +899,46 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(_campaign_whitelist_effective_setting(cfg, electronic), {29})
         self.assertEqual(_campaign_whitelist_effective_setting(cfg, other), {99})
+
+    def test_whitelists_are_priority_only_without_explicit_realtime(self) -> None:
+        cfg = SimpleNamespace(
+            disable_whitelist=False,
+            segment_whitelist=[],
+            segment_whitelist_file=None,
+            segment_whitelist_instance_settings={"electronic@host": {"segment_whitelist": [86]}},
+            campaign_whitelist=[],
+            campaign_whitelist_file=None,
+            campaign_whitelist_instance_settings={"electronic@host": {"campaign_whitelist": [61]}},
+        )
+        inst = SimpleNamespace(
+            root="/var/www/electronic/public_html",
+            instance_uid="electronic@host",
+            primary_domain="electronic.sales-snap.com",
+            name="electronic.sales-snap.com",
+            domains=[],
+        )
+
+        self.assertEqual(_segment_whitelist_effective_setting(cfg, inst), {86})
+        self.assertEqual(_campaign_whitelist_effective_setting(cfg, inst), {61})
+        self.assertEqual(_priority_realtime_segment_ids(_segment_whitelist_realtime_setting(cfg, inst)), set())
+        self.assertEqual(
+            _priority_realtime_campaign_rebuild_ids(_campaign_whitelist_realtime_setting(cfg, inst)),
+            set(),
+        )
+
+    def test_segment_whitelist_orders_due_work_without_injecting_absent_segment(self) -> None:
+        priority, regular = _split_segment_circles(
+            [90, 91],
+            weights={90: 1.0, 91: 2.0},
+            whitelist={86},
+            threshold=999.0,
+            priority_size=0,
+        )
+
+        self.assertNotIn(86, priority)
+        self.assertNotIn(86, regular)
+        self.assertEqual(priority, [])
+        self.assertEqual(regular, [91, 90])
 
     def test_priority_campaign_skip_keeps_candidate_for_fast_recheck(self) -> None:
         ring = deque([29])

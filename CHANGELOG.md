@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.12 - 2026-08-31
+
+- Changed segment and campaign whitelists into queue-priority only. A
+  whitelisted entity enters its priority ring when Mautic has work to process,
+  but no longer gains a periodic execution schedule merely by being listed.
+  Explicit `realtime` settings remain the opt-in mechanism for timed runs.
+
 ## 1.0.11 - 2026-08-31
 
 - Added revisioned MCC canonical desired-state synchronization for live runtime
