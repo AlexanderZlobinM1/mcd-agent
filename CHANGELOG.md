@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.18 - 2026-08-31
+
+- Manage the Mautic nginx login jail alongside SSH. Every Mautic vhost on a
+  protected host now blocks three failed login POSTs in ten minutes, with the
+  same office/VPN allowlist and progressive seven-to-thirty-day bans. The
+  action is limited to HTTP/HTTPS and does not ban generic web or API errors.
+- Verify both the SSH and Mautic-login firewall chains after a managed
+  Fail2ban restart before accepting the profile.
+
 ## 1.0.17 - 2026-08-31
 
 - Wait for Fail2ban to restore its persistent SSH firewall chain after a

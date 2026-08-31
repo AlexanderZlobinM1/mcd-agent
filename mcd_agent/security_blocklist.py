@@ -150,6 +150,11 @@ def _ensure_fail2ban_installed() -> tuple[bool, str]:
 
 def _jail_config(*, enabled: bool, allowlist: set[str], action: str) -> str:
     ignore = ["127.0.0.1/8", "::1", *sorted(allowlist)]
+    web_action = (
+        "iptables-multiport[name=mcd-mautic-auth-nginx, port=\"http,https\", protocol=tcp]"
+        if action.startswith("iptables[")
+        else "nftables[type=multiport, name=mcd-mautic-auth-nginx, port=\"http,https\", protocol=tcp]"
+    )
     return (
         f"{MANAGED_MARKER}\n"
         "[sshd]\n"
@@ -166,6 +171,24 @@ def _jail_config(*, enabled: bool, allowlist: set[str], action: str) -> str:
         # Keep the managed action name separate from legacy sshd jails.  A
         # shared action name made Fail2ban retain a stale nftables action.
         f"action = {action.format(name='mcd-sshd')}\n"
+        "\n"
+        # The filter matches only Mautic login POSTs across every nginx vhost.
+        # Do not use a generic 4xx jail: normal Mautic and API traffic can
+        # legitimately return client errors.
+        "[mautic-auth-nginx]\n"
+        "enabled = true\n"
+        "filter = mautic-auth-nginx\n"
+        "port = http,https\n"
+        "backend = auto\n"
+        "logpath = /var/log/nginx/*access.log\n"
+        f"ignoreip = {' '.join(ignore)}\n"
+        "maxretry = 3\n"
+        "findtime = 10m\n"
+        "bantime = 7d\n"
+        "bantime.increment = true\n"
+        "bantime.factor = 2\n"
+        "bantime.maxtime = 30d\n"
+        f"action = {web_action}\n"
         "\n"
         f"[{JAIL_NAME}]\n"
         f"enabled = {'true' if enabled else 'false'}\n"
@@ -206,32 +229,38 @@ def _client_ok(proc: subprocess.CompletedProcess[str], operation: str) -> None:
     raise RuntimeError(f"{operation} failed: {detail}")
 
 
-def _verify_ssh_firewall_action(action: str) -> None:
-    """Prove that Fail2ban installed an enforceable SSH action, not only a ticket."""
+def _verify_managed_firewall_actions(action: str) -> None:
+    """Prove that Fail2ban installed enforceable SSH and web-login actions."""
     if action.startswith("iptables["):
         proc = _run("iptables", "-S")
-        _client_ok(proc, "iptables SSH jail verification")
-        if "f2b-mcd-sshd" not in proc.stdout:
-            raise RuntimeError("Fail2ban SSH jail has no active iptables chain")
+        _client_ok(proc, "iptables Fail2ban jail verification")
+        missing = [
+            chain
+            for chain in ("f2b-mcd-sshd", "f2b-mcd-mautic-auth-nginx")
+            if chain not in proc.stdout
+        ]
+        if missing:
+            raise RuntimeError(f"Fail2ban has no active iptables chain: {', '.join(missing)}")
         return
     proc = _run("nft", "list", "table", "inet", "f2b-table")
-    _client_ok(proc, "nftables SSH jail verification")
-    if "mcd-sshd" not in proc.stdout:
-        raise RuntimeError("Fail2ban SSH jail has no active nftables set")
+    _client_ok(proc, "nftables Fail2ban jail verification")
+    missing = [name for name in ("mcd-sshd", "mcd-mautic-auth-nginx") if name not in proc.stdout]
+    if missing:
+        raise RuntimeError(f"Fail2ban has no active nftables set: {', '.join(missing)}")
 
 
-def _wait_for_ssh_firewall_action(action: str, timeout_sec: float = 20.0) -> None:
-    """Wait for Fail2ban to restore persistent tickets and its firewall chain."""
+def _wait_for_managed_firewall_actions(action: str, timeout_sec: float = 20.0) -> None:
+    """Wait for Fail2ban to restore persistent tickets and its firewall chains."""
     deadline = time.monotonic() + timeout_sec
     last_error: RuntimeError | None = None
     while time.monotonic() < deadline:
         try:
-            _verify_ssh_firewall_action(action)
+            _verify_managed_firewall_actions(action)
             return
         except RuntimeError as exc:
             last_error = exc
             time.sleep(0.25)
-    raise last_error or RuntimeError("Fail2ban SSH jail verification timed out")
+    raise last_error or RuntimeError("Fail2ban managed jail verification timed out")
 
 
 def _chunks(values: list[str], size: int = 250) -> list[list[str]]:
@@ -294,7 +323,7 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
             # Fail2ban releases. Restarting preserves persistent tickets and
             # makes the new managed chain authoritative before verification.
             _client_ok(_run("systemctl", "restart", "fail2ban", timeout=120), "fail2ban restart")
-        _wait_for_ssh_firewall_action(action)
+        _wait_for_managed_firewall_actions(action)
     except Exception:
         if before_filter is None:
             FILTER_PATH.unlink(missing_ok=True)
@@ -332,8 +361,9 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
             _run(client, "set", JAIL_NAME, "banip", *batch, timeout=120),
             f"ban {len(batch)} addresses",
         )
-    for batch in _address_batches(sorted(allowlist)):
-        _run(client, "set", "sshd", "unbanip", *batch, timeout=120)
+    for jail in ("sshd", "mautic-auth-nginx"):
+        for batch in _address_batches(sorted(allowlist)):
+            _run(client, "set", jail, "unbanip", *batch, timeout=120)
 
     return {
         "status": "applied" if installed or changed_files or added or removed else "noop",
