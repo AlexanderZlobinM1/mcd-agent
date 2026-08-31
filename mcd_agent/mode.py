@@ -36,6 +36,15 @@ MANAGED_KEYWORDS = (
 )
 
 EMAIL_SEND_KEYWORDS = ("mautic:emails:send",)
+# Mautic 4 has two queued email sender forms in supported deployments.  The
+# legacy spool command remains common on installed Mautic 4 roots, while the
+# documented messenger consumer is used by queue-based installations.  These
+# commands must never be treated as a Mautic 5+ sender migration.
+MAUTIC4_QUEUED_EMAIL_SEND_KEYWORDS = (
+    "mautic:emails:send",
+    "messenger:consume email_transport",
+    "messenger:consume email",
+)
 MESSAGE_QUEUE_SEND_KEYWORDS = ("mautic:messages:send",)
 
 _MAX_CRON_WRAPPER_BYTES = 128 * 1024
@@ -148,6 +157,31 @@ def _payload_console_majors(payload: str, confirmed_console_majors: dict[str, in
 
 def _email_send_job_major(line: str, confirmed_console_majors: dict[str, int]) -> int | None:
     payloads = [payload for payload in _job_payloads(line) if any(key in payload for key in EMAIL_SEND_KEYWORDS)]
+    if not payloads:
+        return None
+    majors: set[int] = set()
+    for payload in payloads:
+        payload_majors = _payload_console_majors(payload, confirmed_console_majors)
+        if len(payload_majors) != 1:
+            return None
+        majors.update(payload_majors)
+    return next(iter(majors)) if len(majors) == 1 else None
+
+
+def _mautic4_queued_email_sender_job_major(
+    line: str,
+    confirmed_console_majors: dict[str, int],
+) -> int | None:
+    """Return the confirmed major for a Mautic 4 queued-email sender cron job.
+
+    This deliberately excludes ``mautic:messages:send``: that command drains
+    frequency-rule messages and cannot deliver a queued email transport.
+    """
+    payloads = [
+        payload
+        for payload in _job_payloads(line)
+        if any(key in payload for key in MAUTIC4_QUEUED_EMAIL_SEND_KEYWORDS)
+    ]
     if not payloads:
         return None
     majors: set[int] = set()
@@ -282,7 +316,7 @@ def _restore_mautic_email_send_comments(
         if pending_marker is not None:
             if line.startswith("# "):
                 legacy = line[2:]
-                if _is_mautic_email_send_job(legacy) and _email_send_job_major(
+                if _mautic4_queued_email_sender_job_major(
                     legacy,
                     confirmed_console_majors or {},
                 ) == 4:

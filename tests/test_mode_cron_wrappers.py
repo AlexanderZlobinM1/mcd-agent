@@ -125,6 +125,44 @@ class ModeCronWrapperTests(unittest.TestCase):
                 self.assertEqual(restored, 0)
                 self.assertEqual(updated, content)
 
+    def test_previously_managed_mautic4_messenger_email_transport_workers_are_restored(self) -> None:
+        console = "/var/www/example/bin/console"
+        worker1 = f"* * * * * php {console} messenger:consume email_transport --time-limit=55 --limit=100"
+        worker2 = f"* * * * * php {console} messenger:consume email --time-limit=55 --limit=100"
+        content = (
+            "# MCD_MANAGED old: disabled by mcd profile=active\n"
+            f"# {worker1}\n"
+            "# MCD_MANAGED old: disabled by mcd profile=active\n"
+            f"# {worker2}\n"
+        )
+
+        updated, restored = _restore_mautic_email_send_comments(content, {console: 4})
+
+        self.assertEqual(restored, 2)
+        self.assertIn(worker1, updated)
+        self.assertIn(worker2, updated)
+
+    def test_mautic4_messenger_email_transport_workers_are_not_restored_without_confirmed_major(self) -> None:
+        console = "/var/www/example/bin/console"
+        worker = f"* * * * * php {console} messenger:consume email_transport --time-limit=55"
+        content = "# MCD_MANAGED old: disabled by mcd profile=active\n# " + worker + "\n"
+
+        for versions in ({console: 5}, {console: 6}, {console: 7}, {}):
+            with self.subTest(versions=versions):
+                updated, restored = _restore_mautic_email_send_comments(content, versions)
+                self.assertEqual(restored, 0)
+                self.assertEqual(updated, content)
+
+    def test_frequency_rule_message_queue_is_not_restored_as_an_email_transport_worker(self) -> None:
+        console = "/var/www/example/bin/console"
+        queue = f"* * * * * php {console} mautic:messages:send"
+        content = "# MCD_MANAGED old: disabled by mcd profile=active\n# " + queue + "\n"
+
+        updated, restored = _restore_mautic_email_send_comments(content, {console: 4})
+
+        self.assertEqual(restored, 0)
+        self.assertEqual(updated, content)
+
     def test_relative_console_email_send_is_left_unchanged(self) -> None:
         content = "* * * * * cd /var/www/example && php bin/console mautic:emails:send\n"
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.22 - 2026-09-01
+
+- Preserve and restore only confirmed Mautic 4 queued-email sender workers,
+  including legacy `mautic:emails:send` and documented Messenger consumers.
+  MCD continues to retire the removed legacy command on Mautic 5/6/7, while
+  `mautic:messages:send` remains separate because it only processes
+  frequency-rule messages.
+
 ## 1.0.21 - 2026-09-01
 
 - Serialize security-blocklist synchronization and add desired bans before
