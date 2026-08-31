@@ -51,6 +51,7 @@ from mcd_agent.daemon import (
     _fairness_promotion_log_due,
     _force_due_campaigns_to_priority,
     _import_pending_poll_due,
+    _load_id_file,
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
     _merge_campaign_trigger_audit_ids,
@@ -103,6 +104,14 @@ class CampaignRingDispatchTests(unittest.TestCase):
             daemon_mod._CAMPAIGN_FALLBACK_ACTIVE_ROOTS.clear()
             daemon_mod._CAMPAIGN_DISPATCHING_ROOTS.clear()
         _set_scheduler_priority_pending_roots(set())
+
+    def test_missing_optional_campaign_whitelist_file_is_quiet(self) -> None:
+        missing = "/tmp/mcd-missing-campaign-whitelist"
+
+        with patch("mcd_agent.daemon.logging.warning") as warning:
+            self.assertEqual(_load_id_file(missing), set())
+
+        warning.assert_not_called()
 
     def test_campaign_launch_can_remove_audit_only_id_from_current_ring(self) -> None:
         ring = deque([3, 4, 5])

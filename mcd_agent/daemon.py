@@ -2781,7 +2781,8 @@ def _load_id_file(path: str | None) -> set[int]:
                 except ValueError:
                     continue
     except FileNotFoundError:
-        logging.warning("ID file not found: %s", path)
+        # Whitelist files are optional; an absent file means no file-scoped IDs.
+        logging.debug("optional ID file not found: %s", path)
     return out
 
 

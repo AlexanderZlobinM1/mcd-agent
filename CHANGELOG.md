@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.13 - 2026-08-31
+
+- Fixed optional missing campaign/segment whitelist files being logged as a
+  warning every scheduler cycle. Empty optional files now leave the rings
+  unchanged without obscuring operational errors.
+
 ## 1.0.12 - 2026-08-31
 
 - Changed segment and campaign whitelists into queue-priority only. A
