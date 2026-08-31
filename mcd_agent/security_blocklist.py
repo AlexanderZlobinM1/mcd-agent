@@ -94,6 +94,8 @@ def _allowlisted(value: str, allowlist: set[str]) -> bool:
             allowed = ipaddress.ip_network(raw, strict=False)
         except Exception:
             continue
+        if target.version != allowed.version:
+            continue
         if target.subnet_of(allowed) or allowed.subnet_of(target):
             return True
     return False

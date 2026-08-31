@@ -6,6 +6,11 @@
   suite. The script is not MCD functionality and remains owned by its single
   runtime host; agent runtime behavior and version are unchanged.
 
+## 1.0.5 - 2026-08-31
+
+- Compared blocklist and allowlist networks only within the same IP family, so
+  mixed IPv4/IPv6 MCC allowlists cannot interrupt Fail2ban reconciliation.
+
 ## 1.0.4 - 2026-08-31
 
 - Reconciled large MCC security blocklists through bounded bulk Fail2ban

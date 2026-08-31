@@ -10,6 +10,20 @@ from mcd_agent import security_blocklist
 
 
 class SecurityBlocklistTests(unittest.TestCase):
+    def test_allowlist_comparison_ignores_other_ip_family(self) -> None:
+        self.assertFalse(
+            security_blocklist._allowlisted(
+                "37.27.194.110/32",
+                {"2a09:bac5:280f:248c::3a4:5d/128"},
+            )
+        )
+        self.assertFalse(
+            security_blocklist._allowlisted(
+                "2a09:bac5:280f:248c::3a4:5d/128",
+                {"37.27.194.110/32"},
+            )
+        )
+
     def test_reconcile_adds_and_removes_exact_central_bans(self) -> None:
         commands: list[list[str]] = []
 
