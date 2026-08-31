@@ -139,6 +139,42 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertEqual(result["status"], "noop")
         install.assert_not_called()
 
+    def test_web_blocklist_does_not_require_an_ssh_jail(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(*args: str, **_kwargs):
+            command = list(args)
+            commands.append(command)
+            if command[-2:] == ["status", "sshd"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="jail missing")
+            if command[-2:] == ["status", "mcc-global"]:
+                return SimpleNamespace(returncode=0, stdout="Banned IP list:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "MAUTIC_AUTH_FILTER_PATH", root / "mautic-filter.conf"),
+                patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
+                patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
+                patch.object(security_blocklist.os, "geteuid", return_value=0),
+                patch.object(
+                    security_blocklist,
+                    "_ensure_fail2ban_installed",
+                    return_value=(False, "/usr/bin/fail2ban-client"),
+                ),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action") as wait_for_ssh,
+                patch.object(security_blocklist, "_run", side_effect=fake_run),
+            ):
+                result = security_blocklist.apply_security_blocklist_profile(
+                    {"enabled": True, "blocked": ["34.11.12.151"], "allowlist": []}
+                )
+
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["added"], ["34.11.12.151"])
+        wait_for_ssh.assert_not_called()
+
     def test_large_blocklist_is_applied_in_bounded_batches(self) -> None:
         commands: list[list[str]] = []
 

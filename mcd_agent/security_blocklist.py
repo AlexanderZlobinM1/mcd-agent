@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -233,6 +234,10 @@ def _status_ips(client: str, jail: str) -> set[str]:
     return set()
 
 
+def _jail_is_active(client: str, jail: str) -> bool:
+    return _run(client, "status", jail).returncode == 0
+
+
 def _client_ok(proc: subprocess.CompletedProcess[str], operation: str) -> None:
     if proc.returncode == 0:
         return
@@ -334,7 +339,14 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
             # Fail2ban releases. Restarting preserves persistent tickets and
             # makes the new managed chain authoritative before verification.
             _client_ok(_run("systemctl", "restart", "fail2ban", timeout=120), "fail2ban restart")
-        _wait_for_ssh_firewall_action(action)
+        # Existing hosts can have an independently managed SSH jail or no
+        # SSH Fail2ban jail at all. That must not prevent the separate MCC web
+        # scanner blocklist from being installed. Verify the SSH chain only
+        # when this host exposes an active SSH jail.
+        if _jail_is_active(client, "sshd"):
+            _wait_for_ssh_firewall_action(action)
+        elif changed_files:
+            logging.info("security blocklist: SSH Fail2ban jail is not active; web blocklist remains enabled")
     except Exception:
         if before_filter is None:
             FILTER_PATH.unlink(missing_ok=True)

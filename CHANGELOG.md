@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.23 - 2026-09-01
+
+- Kept the MCC web-scanner blocklist independent from SSH Fail2ban state. A
+  host with an absent or externally managed SSH jail now still applies its
+  verified web-security blocks; active managed SSH jails retain their firewall
+  verification.
+
 ## 1.0.22 - 2026-09-01
 
 - Preserve and restore only confirmed Mautic 4 queued-email sender workers,
