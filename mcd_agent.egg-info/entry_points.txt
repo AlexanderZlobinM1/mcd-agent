@@ -1,3 +1,0 @@
-[console_scripts]
-mcd-agent = mcd_agent.cli:main
-mcd-cli = mcd_agent.cli:main
