@@ -201,6 +201,10 @@ def _client_ok(proc: subprocess.CompletedProcess[str], operation: str) -> None:
     raise RuntimeError(f"{operation} failed: {detail}")
 
 
+def _chunks(values: list[str], size: int = 250) -> list[list[str]]:
+    return [values[offset : offset + size] for offset in range(0, len(values), size)]
+
+
 def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     enabled = bool(profile.get("enabled", False))
     if os.geteuid() != 0:
@@ -267,12 +271,18 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     current = _status_ips(client, JAIL_NAME)
     added = sorted(desired - current)
     removed = sorted(current - desired)
-    for ip_value in removed:
-        _client_ok(_run(client, "set", JAIL_NAME, "unbanip", ip_value), f"unban {ip_value}")
-    for ip_value in added:
-        _client_ok(_run(client, "set", JAIL_NAME, "banip", ip_value), f"ban {ip_value}")
-    for ip_value in sorted(allowlist):
-        _run(client, "set", "sshd", "unbanip", ip_value)
+    for batch in _chunks(removed):
+        _client_ok(
+            _run(client, "set", JAIL_NAME, "unbanip", *batch, timeout=120),
+            f"unban {len(batch)} addresses",
+        )
+    for batch in _chunks(added):
+        _client_ok(
+            _run(client, "set", JAIL_NAME, "banip", *batch, timeout=120),
+            f"ban {len(batch)} addresses",
+        )
+    for batch in _chunks(sorted(allowlist)):
+        _run(client, "set", "sshd", "unbanip", *batch, timeout=120)
 
     return {
         "status": "applied" if installed or changed_files or added or removed else "noop",

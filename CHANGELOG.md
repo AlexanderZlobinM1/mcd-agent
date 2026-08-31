@@ -6,6 +6,12 @@
   suite. The script is not MCD functionality and remains owned by its single
   runtime host; agent runtime behavior and version are unchanged.
 
+## 1.0.4 - 2026-08-31
+
+- Reconciled large MCC security blocklists through bounded bulk Fail2ban
+  commands instead of one process per address. Lists containing several
+  thousand entries now converge quickly without blocking the daemon loop.
+
 ## 1.0.3 - 2026-08-31
 
 - Added authenticated MCC security blocklist polling and exact reconciliation

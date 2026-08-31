@@ -56,7 +56,14 @@ class SecurityBlocklistTests(unittest.TestCase):
             commands,
         )
         self.assertIn(
-            ["/usr/bin/fail2ban-client", "set", "mcc-global", "unbanip", "9.9.9.9"],
+            [
+                "/usr/bin/fail2ban-client",
+                "set",
+                "mcc-global",
+                "unbanip",
+                "8.8.4.4",
+                "9.9.9.9",
+            ],
             commands,
         )
 
@@ -72,6 +79,39 @@ class SecurityBlocklistTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "noop")
         install.assert_not_called()
+
+    def test_large_blocklist_is_applied_in_bounded_batches(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(*args: str, **_kwargs):
+            commands.append(list(args))
+            if len(args) >= 3 and args[-2:] == ("status", "mcc-global"):
+                return SimpleNamespace(returncode=0, stdout="Banned IP list:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        blocked = [f"8.0.{index // 256}.{index % 256}" for index in range(501)]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(security_blocklist, "FILTER_PATH", root / "filter.conf"),
+                patch.object(security_blocklist, "JAIL_PATH", root / "jail.local"),
+                patch.object(security_blocklist, "LOG_PATH", root / "mcc.log"),
+                patch.object(security_blocklist.os, "geteuid", return_value=0),
+                patch.object(
+                    security_blocklist,
+                    "_ensure_fail2ban_installed",
+                    return_value=(False, "/usr/bin/fail2ban-client"),
+                ),
+                patch.object(security_blocklist, "_run", side_effect=fake_run),
+            ):
+                result = security_blocklist.apply_security_blocklist_profile(
+                    {"enabled": True, "blocked": blocked, "allowlist": []}
+                )
+
+        ban_commands = [command for command in commands if command[2:4] == ["mcc-global", "banip"]]
+        self.assertEqual(result["desired"], 501)
+        self.assertEqual(len(ban_commands), 3)
+        self.assertTrue(all(len(command[4:]) <= 250 for command in ban_commands))
 
     def test_failed_fetch_never_changes_local_bans(self) -> None:
         with (
