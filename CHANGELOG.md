@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.0.11 - 2026-08-31
+
+- Added revisioned MCC canonical desired-state synchronization for live runtime
+  settings. MCD now uses optimistic revision matching, so a stale disconnected
+  or reinstalled local configuration cannot overwrite a newer confirmed MCC
+  change after reconnecting.
+- Added immutable `instance_uid` desired-state records for every supported
+  instance-scoped runtime map. Their settings follow an instance to a new host,
+  apply without restarting the daemon, and are acknowledged back to MCC with
+  source, revision, agent version, applied host, time, status, and error.
+- Promoted existing root/domain-keyed MCC instance maps into UID records on
+  agent contact while retaining host JSON compatibility for older agents.
+
 ## 1.0.10 - 2026-08-31
 
 - Added a marker-only scheduled bootstrap mode. A successful one-time repair

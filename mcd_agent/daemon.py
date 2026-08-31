@@ -107,10 +107,13 @@ from mcd_agent.monitored_email import (
 )
 from mcd_agent.form_embed import sync_form_embed_settings
 from mcd_agent.runtime_overrides import (
+    acknowledge_runtime_state,
     apply_remote_overrides,
     consume_poll_trigger,
     fetch_runtime_overrides,
+    instance_desired_states,
     local_runtime_overrides,
+    merge_instance_desired_states,
     overrides_fingerprint,
     push_runtime_overrides,
 )
@@ -8386,15 +8389,50 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             store.put_runtime_sync("local_runtime", local_runtime)
             last_local_runtime_fp = local_fp
             if config.mcc_url and config.mcc_token:
-                # A local operator edit is the newest canonical intent; observed remains telemetry.
-                pushed = push_runtime_overrides(config, local_runtime, merge=False, target="desired")
+                known_state = store.get_runtime_sync("mcc_runtime_desired_state") or {}
+                known_revision_raw = known_state.get("revision")
+                known_revision = known_revision_raw if isinstance(known_revision_raw, int) else None
+                known_instance_revisions_raw = known_state.get("instance_revisions")
+                known_instance_revisions = (
+                    known_instance_revisions_raw if isinstance(known_instance_revisions_raw, dict) else {}
+                )
+                # Local edits are accepted only when based on MCC's current
+                # revision. A stale disconnected machine receives canonical
+                # state instead of overwriting a newer confirmed change.
+                pushed = push_runtime_overrides(
+                    config,
+                    local_runtime,
+                    merge=False,
+                    target="desired",
+                    desired_state_revision=known_revision,
+                    instance_desired_states=instance_desired_states(local_runtime, installs),
+                    instance_desired_state_revisions={
+                        str(key): int(value)
+                        for key, value in known_instance_revisions.items()
+                        if isinstance(value, int)
+                    },
+                )
                 p_status = str(pushed.get("status", "")).strip().lower()
                 if p_status == "ok":
+                    state = pushed.get("desired_state")
+                    if isinstance(state, dict):
+                        state_for_store = dict(state)
+                        pushed_instances = pushed.get("instance_desired_states")
+                        state_for_store["instance_revisions"] = {
+                            str(uid): int(item["revision"])
+                            for uid, item in pushed_instances.items()
+                            if isinstance(item, dict) and isinstance(item.get("revision"), int)
+                        } if isinstance(pushed_instances, dict) else {}
+                        store.put_runtime_sync("mcc_runtime_desired_state", state_for_store)
                     logging.info(
                         "runtime-overrides local change pushed to MCC (keys=%s)",
                         ",".join(sorted(local_runtime.keys())) if local_runtime else "-",
                     )
                     _sync_and_publish_form_embed_status(config, installs, reason="local_runtime_push")
+                elif p_status == "conflict":
+                    runtime_overrides_sync_requested = True
+                    next_runtime_overrides_poll_at = 0.0
+                    logging.warning("runtime-overrides local change deferred: MCC has newer canonical revision")
                 elif p_status != "disabled":
                     logging.warning("runtime-overrides local push failed: %s", pushed.get("reason", "unknown"))
 
@@ -8408,13 +8446,29 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         if config.mcc_url and config.mcc_token and (
             startup_runtime_sync_pending or runtime_overrides_sync_requested or should_runtime_poll
         ):
-            ro = fetch_runtime_overrides(config)
+            ro = fetch_runtime_overrides(
+                config,
+                instance_uids=[str(getattr(inst, "instance_uid", "") or "") for inst in installs],
+            )
             status = str(ro.get("status", "")).strip().lower()
             poll_interval = max(15, min(300, int(config.mcc_push_interval_sec or config.poll_interval_sec or 60)))
             if status == "ok":
                 overrides_raw = ro.get("runtime_overrides")
                 overrides = overrides_raw if isinstance(overrides_raw, dict) else {}
+                instance_states = ro.get("instance_desired_states")
+                overrides = merge_instance_desired_states(overrides, instance_states)
                 store.put_runtime_sync("mcc_runtime", overrides)
+                desired_state = ro.get("desired_state")
+                previous_state = store.get_runtime_sync("mcc_runtime_desired_state") or {}
+                if isinstance(desired_state, dict):
+                    revisions: dict[str, int] = {}
+                    if isinstance(instance_states, dict):
+                        for uid, item in instance_states.items():
+                            if isinstance(item, dict) and isinstance(item.get("revision"), int):
+                                revisions[str(uid)] = int(item["revision"])
+                    state_for_store = dict(desired_state)
+                    state_for_store["instance_revisions"] = revisions
+                    store.put_runtime_sync("mcc_runtime_desired_state", state_for_store)
                 fp = overrides_fingerprint(overrides)
                 if fp != last_runtime_overrides_fp:
                     # Apply new MCC runtime over the currently effective
@@ -8483,6 +8537,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         applied_keys,
                         installs,
                     )
+                    # Persisted MCC values are not a new local operator edit.
+                    # Refresh the local fingerprint so the next tick does not
+                    # echo the same revision back as another desired write.
+                    last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
                     base_config = config
                     last_runtime_overrides_fp = fp
                     store.put_runtime_sync(
@@ -8494,6 +8552,40 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "unsupported_keys": unsupported_keys,
                         },
                     )
+                # Acknowledge only a newly observed revision. This remains
+                # compact while exposing actual convergence in MCC.
+                if isinstance(desired_state, dict) and isinstance(desired_state.get("revision"), int):
+                    revision = int(desired_state["revision"])
+                    if int(previous_state.get("revision", -1) or -1) != revision:
+                        ack = acknowledge_runtime_state(
+                            config,
+                            scope="host",
+                            scope_key=str(desired_state.get("scope_key", "") or ""),
+                            revision=revision,
+                            status="applied",
+                            observed={"runtime_fingerprint": fp},
+                        )
+                        if str(ack.get("status", "")).lower() != "ok":
+                            logging.warning("runtime desired-state acknowledgement failed: %s", ack.get("reason", "unknown"))
+                if isinstance(instance_states, dict):
+                    previous_instance_revisions = previous_state.get("instance_revisions")
+                    previous_instance_revisions = (
+                        previous_instance_revisions if isinstance(previous_instance_revisions, dict) else {}
+                    )
+                    for uid, item in instance_states.items():
+                        if not isinstance(item, dict) or not isinstance(item.get("revision"), int):
+                            continue
+                        revision = int(item["revision"])
+                        if int(previous_instance_revisions.get(str(uid), -1) or -1) == revision:
+                            continue
+                        acknowledge_runtime_state(
+                            config,
+                            scope="instance",
+                            scope_key=str(uid),
+                            revision=revision,
+                            status="applied",
+                            observed={"runtime_fingerprint": fp},
+                        )
                 startup_runtime_sync_pending = False
                 last_runtime_overrides_error = ""
                 next_runtime_overrides_poll_at = now + poll_interval

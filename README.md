@@ -505,11 +505,19 @@ Important:
   - runtime-sync snapshots are kept in backend runtime table `runtime_sync`:
   - `local_runtime` (runtime section from local config)
   - `mcc_runtime` (desired runtime payload fetched from MCC)
+  - `mcc_runtime_desired_state` (revision, provenance, instance revisions, and last confirmed apply state)
   - `active_runtime` (last runtime apply metadata)
 
 ## Runtime Sync (MCC <-> MCD)
+- Canonical desired state:
+  - MCC stores revisioned host state plus per-instance state in `desired_runtime_states`.
+  - Instance records use immutable `instance_uid`, not a root path or the current host, and therefore follow an installation after a migration.
+  - Legacy host JSON remains a compatibility mirror. MCC promotes legacy root/domain keyed instance maps to UID records on the next agent/API contact.
+  - Each state row records source, origin host and agent version, modification time, revision, last applied revision, actual apply status, error, and the host that confirmed application.
+  - MCD writes desired changes using optimistic revision matching. A disconnected or reinstalled agent with no matching base revision receives MCC state instead of overwriting newer confirmed state.
+  - Static agent configuration continues to use MCC's existing desired config snapshot and startup recovery path; dynamic settings use the revisioned live protocol above. Together they let a reinstall recover its config at startup and apply post-start changes without a restart.
 - Source of truth split:
-  - `desired` runtime overrides are stored in MCC host table (`runtime_overrides_json`).
+  - `desired` runtime overrides are revisioned in MCC and mirrored to the legacy host table (`runtime_overrides_json`) for compatibility.
   - `observed` runtime overrides are pushed by MCD and stored separately in MCC (`observed_runtime_overrides_json`).
 - Template runtime keys:
   - `runtime.host_template=true` marks host as template source.
@@ -517,8 +525,9 @@ Important:
 - MCC -> MCD:
   - normal path: daemon polls MCC runtime endpoint.
   - immediate path: `mcc_cli host-runtime set/unset` triggers `mcd-cli runtime-overrides trigger`, daemon consumes trigger and pulls immediately.
+  - a successful live apply is acknowledged back to MCC; no daemon restart is required.
 - MCD -> MCC:
-  - MCD state push payload contains `runtime_overrides` from local config runtime section.
+  - MCD state push contains `runtime_overrides` and extracted instance-scoped values keyed by `instance_uid`.
   - daemon also watches local mutable runtime section fingerprint and pushes to MCC immediately when it changes.
   - any mutating command that already does immediate state push updates observed runtime view in MCC without separate polling.
   - `runtime.tasks_compact_*` controls quiet-window compaction cadence (`DELETE` + optional `VACUUM`).
