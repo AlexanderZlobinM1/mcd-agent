@@ -118,6 +118,13 @@ class SecurityBlocklistTests(unittest.TestCase):
             ],
             commands,
         )
+        ban_index = commands.index(
+            ["/usr/bin/fail2ban-client", "set", "mcc-global", "banip", "8.8.8.8"]
+        )
+        unban_index = commands.index(
+            ["/usr/bin/fail2ban-client", "set", "mcc-global", "unbanip", "8.8.4.4", "9.9.9.9"]
+        )
+        self.assertLess(ban_index, unban_index)
 
     def test_disabled_profile_does_not_install_fail2ban(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -205,15 +212,17 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertEqual([len(command[4:]) for command in ban_commands], [1, 1])
 
     def test_failed_fetch_never_changes_local_bans(self) -> None:
-        with (
-            patch.object(
-                security_blocklist,
-                "fetch_security_blocklist",
-                return_value={"status": "error", "reason": "snapshot stale"},
-            ),
-            patch.object(security_blocklist, "apply_security_blocklist_profile") as apply,
-        ):
-            result = security_blocklist.sync_security_blocklist_once(SimpleNamespace())
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                patch.object(security_blocklist, "SYNC_LOCK_PATH", Path(td) / "security.lock"),
+                patch.object(
+                    security_blocklist,
+                    "fetch_security_blocklist",
+                    return_value={"status": "error", "reason": "snapshot stale"},
+                ),
+                patch.object(security_blocklist, "apply_security_blocklist_profile") as apply,
+            ):
+                result = security_blocklist.sync_security_blocklist_once(SimpleNamespace())
 
         self.assertEqual(result["status"], "error")
         apply.assert_not_called()

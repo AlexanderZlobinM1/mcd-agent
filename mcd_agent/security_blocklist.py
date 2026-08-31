@@ -12,6 +12,8 @@ from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
 
+import fcntl
+
 from mcd_agent import __version__
 from mcd_agent.config import AgentConfig
 from mcd_agent.host_identity import resolve_agent_identity
@@ -21,6 +23,7 @@ FILTER_PATH = Path("/etc/fail2ban/filter.d/mcc-global.conf")
 MAUTIC_AUTH_FILTER_PATH = Path("/etc/fail2ban/filter.d/mautic-auth-nginx.conf")
 JAIL_PATH = Path("/etc/fail2ban/jail.d/98-mcd-security.local")
 LOG_PATH = Path("/var/log/fail2ban-mcc-global.log")
+SYNC_LOCK_PATH = Path("/run/mcd/security-blocklist.lock")
 JAIL_NAME = "mcc-global"
 MANAGED_MARKER = "# Managed by MCD: Wazuh/Cloudflare local Fail2ban enforcement"
 
@@ -363,15 +366,18 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
     current = _status_ips(client, JAIL_NAME)
     added = sorted(desired - current)
     removed = sorted(current - desired)
-    for batch in _address_batches(removed):
-        _client_ok(
-            _run(client, "set", JAIL_NAME, "unbanip", *batch, timeout=120),
-            f"unban {len(batch)} addresses",
-        )
+    # Preserve protection when a host is interrupted mid-reconcile: install
+    # current desired blocks before removing stale entries. A stale block is
+    # safer than a temporary unprotected source IP.
     for batch in _address_batches(added):
         _client_ok(
             _run(client, "set", JAIL_NAME, "banip", *batch, timeout=120),
             f"ban {len(batch)} addresses",
+        )
+    for batch in _address_batches(removed):
+        _client_ok(
+            _run(client, "set", JAIL_NAME, "unbanip", *batch, timeout=120),
+            f"unban {len(batch)} addresses",
         )
     for jail in ("sshd", "mautic-auth-nginx"):
         for batch in _address_batches(sorted(allowlist)):
@@ -390,11 +396,20 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def sync_security_blocklist_once(cfg: AgentConfig) -> dict[str, Any]:
-    fetched = fetch_security_blocklist(cfg)
-    if str(fetched.get("status") or "").strip().lower() != "ok":
-        return {"status": "error", "reason": fetched.get("reason", "fetch_failed"), "fetch": fetched}
-    profile = fetched.get("profile")
-    if not isinstance(profile, dict):
-        return {"status": "error", "reason": "invalid profile payload", "fetch": fetched}
-    applied = apply_security_blocklist_profile(profile)
-    return {"status": str(applied.get("status") or "error"), "fetch": fetched, "apply": applied}
+    SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with SYNC_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "noop", "reason": "sync_already_running"}
+        try:
+            fetched = fetch_security_blocklist(cfg)
+            if str(fetched.get("status") or "").strip().lower() != "ok":
+                return {"status": "error", "reason": fetched.get("reason", "fetch_failed"), "fetch": fetched}
+            profile = fetched.get("profile")
+            if not isinstance(profile, dict):
+                return {"status": "error", "reason": "invalid profile payload", "fetch": fetched}
+            applied = apply_security_blocklist_profile(profile)
+            return {"status": str(applied.get("status") or "error"), "fetch": fetched, "apply": applied}
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

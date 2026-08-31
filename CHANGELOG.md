@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.21 - 2026-09-01
+
+- Serialize security-blocklist synchronization and add desired bans before
+  removing stale ones. A stalled or interrupted reconciliation can no longer
+  create an unprotected window or race a concurrent daemon cycle.
+
 ## 1.0.20 - 2026-09-01
 
 - Install and maintain the Mautic nginx login Fail2ban filter with the managed
