@@ -1405,6 +1405,9 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
             and "null given" in text
         )
 
+    def _is_inactive_transaction_reload_error(out: str) -> bool:
+        return "there is no active transaction" in str(out or "").lower()
+
     def _repair_plugin_metadata_null_once() -> bool:
         if not install.db:
             return False
@@ -1440,6 +1443,21 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
     rc, out = _run_plugin_template(config, install, "mautic:plugin:install")
     if rc == 0:
         return
+    if int(getattr(install, "mautic_major", 0) or 0) == 6 and _is_inactive_transaction_reload_error(out):
+        # Plugin DDL can implicitly commit on MySQL. Mautic 6 then attempts a
+        # rollback and reports failure even though the migration was applied.
+        # A single reload reconciles the now-current plugin schema.
+        logging.warning(
+            "[%s] retry mautic:plugin:install after Mautic 6 transaction state error",
+            root,
+        )
+        rc2, out2 = _run_plugin_template(config, install, "mautic:plugin:install")
+        if rc2 == 0:
+            return
+        raise RuntimeError(
+            "mautic:plugin:install failed after Mautic 6 transaction retry: "
+            f"{out2}"
+        )
     if _is_metadata_null_reload_error(out):
         repaired = _repair_plugin_metadata_null_once()
         if repaired:

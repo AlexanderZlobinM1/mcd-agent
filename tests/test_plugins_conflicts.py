@@ -450,6 +450,41 @@ class PluginConflictPathTests(unittest.TestCase):
         db.execute_sql_template.assert_not_called()
         run_template.assert_called_once()
 
+    def test_mautic6_plugin_reload_retries_inactive_transaction_once(self) -> None:
+        cfg = SimpleNamespace()
+        install = SimpleNamespace(
+            root="/var/www/ss/public_html",
+            db={"driver": "pdo_mysql"},
+            mautic_major=6,
+        )
+        db = SimpleNamespace(table_has_column=Mock(return_value=False))
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db), patch(
+            "mcd_agent.plugins._run_plugin_template",
+            side_effect=[(1, "There is no active transaction"), (0, "ok")],
+        ) as run_template:
+            _run_plugin_install_reload(cfg, install)
+
+        self.assertEqual(run_template.call_count, 2)
+
+    def test_non_mautic6_plugin_reload_does_not_retry_transaction_error(self) -> None:
+        cfg = SimpleNamespace()
+        install = SimpleNamespace(
+            root="/var/www/ss/public_html",
+            db={"driver": "pdo_mysql"},
+            mautic_major=7,
+        )
+        db = SimpleNamespace(table_has_column=Mock(return_value=False))
+
+        with patch("mcd_agent.plugins.MauticDB", return_value=db), patch(
+            "mcd_agent.plugins._run_plugin_template",
+            return_value=(1, "There is no active transaction"),
+        ) as run_template:
+            with self.assertRaisesRegex(RuntimeError, "mautic:plugin:install failed"):
+                _run_plugin_install_reload(cfg, install)
+
+        run_template.assert_called_once()
+
     def test_plugin_config_metadata_patch_adds_metadata_without_core_patch(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

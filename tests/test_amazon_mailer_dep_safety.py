@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from mcd_agent.amazon_mailer_dep import (
     _composer_project_is_mautic,
+    _resolve_mailer_bridge_requirement,
     _composer_update_targeted_package,
     _ensure_composer_packages,
     ensure_composer_runtime_packages,
@@ -16,6 +17,32 @@ from mcd_agent.amazon_mailer_dep import (
 
 
 class MailerComposerSafetyTests(unittest.TestCase):
+    def test_sendgrid_wildcard_tracks_installed_symfony_mailer_minor(self) -> None:
+        proc = Mock(
+            returncode=0,
+            stdout=json.dumps({"versions": ["* v6.4.40"]}),
+            stderr="",
+        )
+        with patch("mcd_agent.amazon_mailer_dep._run", return_value=proc) as run:
+            requirement = _resolve_mailer_bridge_requirement(
+                project_root="/var/www/mautic",
+                composer_bin="composer",
+                package_name="symfony/sendgrid-mailer:*",
+            )
+
+        self.assertEqual(requirement, "symfony/sendgrid-mailer:^6.4")
+        self.assertIn("symfony/mailer", run.call_args.args[0])
+
+    def test_amazon_bridge_fails_closed_without_installed_mailer_version(self) -> None:
+        proc = Mock(returncode=0, stdout=json.dumps({"versions": []}), stderr="")
+        with patch("mcd_agent.amazon_mailer_dep._run", return_value=proc):
+            with self.assertRaisesRegex(RuntimeError, "Cannot parse"):
+                _resolve_mailer_bridge_requirement(
+                    project_root="/var/www/mautic",
+                    composer_bin="composer",
+                    package_name="symfony/amazon-mailer",
+                )
+
     def test_rejects_unrelated_composer_project_created_by_mailer_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

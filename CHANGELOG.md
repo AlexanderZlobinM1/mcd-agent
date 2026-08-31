@@ -6,6 +6,15 @@
   suite. The script is not MCD functionality and remains owned by its single
   runtime host; agent runtime behavior and version are unchanged.
 
+## 1.0.2 - 2026-08-31
+
+- Constrained Symfony Amazon SES and SendGrid mailer bridges to the installed
+  `symfony/mailer` minor branch, preventing unconstrained Composer resolution
+  from selecting incompatible Symfony generations on Mautic 6.
+- Retried Mautic 6 plugin reload exactly once when MySQL DDL was applied but
+  Mautic reported `There is no active transaction`; other versions and reload
+  failures remain fail-fast.
+
 ## 1.0.1 - 2026-08-30
 
 - Blocked Composer Mautic 6 to 7 upgrades unless the observed active database

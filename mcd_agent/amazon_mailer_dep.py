@@ -209,6 +209,61 @@ def _composer_has_package(project_root: str, composer_bin: str, package_name: st
     return proc.returncode == 0
 
 
+def _resolve_mailer_bridge_requirement(
+    *,
+    project_root: str,
+    composer_bin: str,
+    package_name: str,
+) -> str:
+    """Constrain Symfony mailer bridges to the installed Mailer minor."""
+    show_name = _composer_show_name(package_name)
+    bridge_names = {
+        _composer_show_name(AMAZON_MAILER_PACKAGE),
+        _composer_show_name(SENDGRID_MAILER_PACKAGE),
+    }
+    if show_name not in bridge_names:
+        return package_name
+
+    _, separator, constraint = str(package_name or "").partition(":")
+    if separator and constraint.strip() not in {"", "*"}:
+        return package_name
+
+    proc = _run(
+        [
+            composer_bin,
+            "show",
+            "symfony/mailer",
+            "--format=json",
+            "--no-interaction",
+            "--no-ansi",
+        ],
+        cwd=project_root,
+        as_www_data=True,
+        check=False,
+        timeout_sec=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine installed symfony/mailer version")
+
+    versions: list[str] = []
+    try:
+        payload = json.loads(proc.stdout or "{}")
+        raw_versions = payload.get("versions", []) if isinstance(payload, dict) else []
+        if isinstance(raw_versions, list):
+            versions.extend(str(value) for value in raw_versions)
+        if isinstance(payload, dict) and payload.get("version"):
+            versions.append(str(payload["version"]))
+    except (TypeError, ValueError):
+        versions = []
+
+    for version in versions:
+        match = re.search(r"\bv?(\d+)\.(\d+)(?:\.\d+)?\b", version)
+        if match:
+            return f"{show_name}:^{match.group(1)}.{match.group(2)}"
+
+    raise RuntimeError("Cannot parse installed symfony/mailer version")
+
+
 def _composer_update_targeted_package(
     *,
     project_root: str,
@@ -224,6 +279,11 @@ def _composer_update_targeted_package(
     original_data = json.loads(original_json.decode("utf-8"))
     completed = False
     try:
+        package_requirement = _resolve_mailer_bridge_requirement(
+            project_root=project_root,
+            composer_bin=composer_bin,
+            package_name=package_name,
+        )
         data = original_data
         repositories = data.get("repositories") if isinstance(data, dict) else None
         if isinstance(repositories, list):
@@ -235,7 +295,15 @@ def _composer_update_targeted_package(
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
         _run(
-            [composer_bin, "require", package_name, "--no-update", "--no-interaction", "--no-scripts", "--no-progress"],
+            [
+                composer_bin,
+                "require",
+                package_requirement,
+                "--no-update",
+                "--no-interaction",
+                "--no-scripts",
+                "--no-progress",
+            ],
             cwd=project_root, as_www_data=True, timeout_sec=timeout_sec,
         )
         _run(
