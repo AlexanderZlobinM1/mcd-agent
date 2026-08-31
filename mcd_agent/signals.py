@@ -14,10 +14,19 @@ from mcd_agent.config import AgentConfig
 
 
 _SCHEDULER_MONITOR_PLAN_PREFIX = "scheduler_monitor_plan:"
+_SCHEDULER_FAIRNESS_KEY = "scheduler_fairness_state"
 
 
 def _empty_scheduler_shadow() -> dict[str, Any]:
-    return {"tracked_total": 0, "duplicate_task_keys": 0, "by_type": {}, "sample": [], "recent": [], "planned": []}
+    return {
+        "tracked_total": 0,
+        "duplicate_task_keys": 0,
+        "by_type": {},
+        "sample": [],
+        "recent": [],
+        "planned": [],
+        "fairness": {},
+    }
 
 
 def _run_journal(args: list[str], timeout_sec: int = 4) -> str:
@@ -215,6 +224,7 @@ def _shadow_running_tasks(
     except Exception:
         return _empty_scheduler_shadow()
     planned_rows: list[sqlite3.Row] = []
+    fairness: dict[str, Any] = {}
     try:
         planned_rows = conn.execute(
             """
@@ -226,8 +236,18 @@ def _shadow_running_tasks(
             """,
             (_SCHEDULER_MONITOR_PLAN_PREFIX + "%",),
         ).fetchall()
+        fairness_row = conn.execute(
+            "SELECT payload_json FROM runtime_sync WHERE key=? LIMIT 1",
+            (_SCHEDULER_FAIRNESS_KEY,),
+        ).fetchone()
+        if fairness_row:
+            raw_fairness = str(fairness_row["payload_json"] or "").strip()
+            parsed_fairness = json.loads(raw_fairness) if raw_fairness else {}
+            if isinstance(parsed_fairness, dict):
+                fairness = parsed_fairness
     except Exception:
         planned_rows = []
+        fairness = {}
     finally:
         try:
             conn.close()
@@ -345,6 +365,7 @@ def _shadow_running_tasks(
         "sample": sample,
         "recent": recent,
         "planned": planned,
+        "fairness": fairness,
     }
 
 
@@ -647,6 +668,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
             "sample": scheduler_shadow.get("sample", []),
             "recent": scheduler_shadow.get("recent", []),
             "planned": scheduler_shadow.get("planned", []),
+            "fairness": scheduler_shadow.get("fairness", {}),
         },
         "php_console_recent": console_rows[:20],
         "swap": swap_state,
@@ -655,23 +677,38 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
     return payload
 
 
-def collect_monitor_signals(cfg: AgentConfig | None = None) -> dict[str, object]:
+def collect_monitor_signals(
+    cfg: AgentConfig | None = None,
+    *,
+    mail_queue_metrics: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
     console_rows = _ps_console_processes()
     scheduler_shadow = _shadow_running_tasks(cfg, live_console_rows=console_rows)
+    details: dict[str, object] = {
+        "scheduler": {
+            "tracked_total": int(scheduler_shadow.get("tracked_total", 0) or 0),
+            "duplicate_task_keys": int(scheduler_shadow.get("duplicate_task_keys", 0) or 0),
+            "by_type": scheduler_shadow.get("by_type", {}),
+            "sample": scheduler_shadow.get("sample", []),
+            "recent": scheduler_shadow.get("recent", []),
+            "planned": scheduler_shadow.get("planned", []),
+            "fairness": scheduler_shadow.get("fairness", {}),
+        },
+        "php_console_recent": console_rows[:20],
+    }
+    if isinstance(mail_queue_metrics, dict):
+        details["mail_queue"] = {
+            "instances": {
+                str(root): dict(metrics)
+                for root, metrics in mail_queue_metrics.items()
+                if isinstance(metrics, dict)
+            },
+            "updated_at_ts": time.time(),
+        }
     return {
         "monitor_only": True,
         "collected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "details": {
-            "scheduler": {
-                "tracked_total": int(scheduler_shadow.get("tracked_total", 0) or 0),
-                "duplicate_task_keys": int(scheduler_shadow.get("duplicate_task_keys", 0) or 0),
-                "by_type": scheduler_shadow.get("by_type", {}),
-                "sample": scheduler_shadow.get("sample", []),
-                "recent": scheduler_shadow.get("recent", []),
-                "planned": scheduler_shadow.get("planned", []),
-            },
-            "php_console_recent": console_rows[:20],
-        },
+        "details": details,
     }
 
 

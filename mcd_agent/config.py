@@ -271,8 +271,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "      OR ce.trigger_mode IS NULL "
     "      OR ("
     "        ce.trigger_mode = 'date' "
-    "        AND ce.trigger_date IS NOT NULL "
-    "        AND ce.trigger_date <= '{now_utc}'"
+    "        AND (ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}')"
     "      ) "
     "      OR ("
     "        ce.trigger_mode = 'interval' "
@@ -319,8 +318,7 @@ _DEFAULT_SQL_CAMPAIGN_TRIGGERS_DUE = (
     "      OR ce.trigger_mode IS NULL "
     "      OR ("
     "        ce.trigger_mode = 'date' "
-    "        AND ce.trigger_date IS NOT NULL "
-    "        AND ce.trigger_date <= '{now_utc}'"
+    "        AND (ce.trigger_date IS NULL OR ce.trigger_date <= '{now_utc}')"
     "      )"
     "    ) "
     "    AND NOT EXISTS ("
@@ -519,6 +517,10 @@ class AgentConfig:
     worker_stuck_restart_limit: int
     jobs_max_workers: int
     scheduler_host_max_parallel: int
+    scheduler_elastic_slots_enabled: bool
+    scheduler_emergency_reserved_slots: int
+    scheduler_instance_max_parallel: int
+    scheduler_fairness_watchdog_sec: int
     segment_whitelist: list[int]
     segment_whitelist_file: str | None
     segment_whitelist_instance_settings: dict[str, Any]
@@ -556,6 +558,7 @@ class AgentConfig:
     segment_sql_ring_rules: dict[str, Any]
     segment_kill_mode: str
     segment_kill_grace_sec: int
+    priority_segment_timeout_sec: int
     campaign_priority_parallel: int
     campaign_regular_parallel: int
     campaign_total_parallel: int
@@ -566,6 +569,8 @@ class AgentConfig:
     campaign_rebuild_max_cycles_per_tick: int
     campaign_rebuild_priority_parallel: int
     campaign_rebuild_regular_parallel: int
+    campaign_native_fallback_enabled: bool
+    campaign_native_fallback_interval_sec: int
     enable_contacts_cleanup: bool
     contacts_cleanup_interval_sec: int
     contacts_cleanup_quiet_hour: int
@@ -584,15 +589,6 @@ class AgentConfig:
     page_hits_orphan_cleanup_grace_min: int
     page_hits_orphan_cleanup_max_run_sec: int
     page_hits_orphan_cleanup_instance_settings: dict[str, Any]
-    housekeeping_plugin_enabled: bool
-    housekeeping_plugin_interval_sec: int
-    housekeeping_plugin_quiet_hour: int
-    housekeeping_plugin_quiet_window_min: int
-    housekeeping_plugin_days_old: int
-    housekeeping_plugin_flags: list[str]
-    housekeeping_plugin_optimize_tables: bool
-    housekeeping_plugin_dry_run: bool
-    housekeeping_plugin_instance_settings: dict[str, Any]
     enable_mautic_lock_cleanup: bool
     mautic_lock_cleanup_interval_sec: int
     mautic_lock_cleanup_quiet_hour: int
@@ -607,9 +603,12 @@ class AgentConfig:
     cache_warm_interval_sec: int
     cache_warm_quiet_hour: int
     cache_warm_quiet_window_min: int
-    viber_stats_enabled: bool
-    viber_stats_interval_sec: int
-    viber_stats_instance_settings: dict[str, Any]
+    plugin_operations: dict[str, Any]
+    plugin_operation_instance_settings: dict[str, Any]
+    plugin_operation_legacy_runtime: dict[str, Any]
+    message_queue_enabled: bool
+    message_queue_interval_sec: int
+    message_queue_instance_settings: dict[str, Any]
     monitored_email_parser_enabled: bool
     monitored_email_parser_interval_sec: int
     monitored_email_parser_batch_size: int
@@ -619,6 +618,7 @@ class AgentConfig:
     monitored_email_parser_types: list[str]
     monitored_email_parser_whitelist: list[str]
     monitored_email_parser_instance_settings: dict[str, Any]
+    form_embed_instance_settings: dict[str, Any]
     empty_leads_cleanup_enabled: bool
     empty_leads_cleanup_interval_sec: int
     empty_leads_cleanup_batch_size: int
@@ -996,7 +996,33 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_rebuild_priority_parallel=2,
             campaign_rebuild_regular_parallel=1,
         )
-    if p == "hiload":
+    farm_defaults = {
+        "farm-tiny": (1, 1, 1, 1, 1, 1),
+        "farm-mini": (1, 1, 1, 1, 2, 1),
+        "farm-midi": (2, 1, 2, 1, 4, 2),
+        "farm-maxi": (5, 2, 3, 1, 8, 4),
+        "farm-hiload": (8, 3, 4, 2, 12, 6),
+        "farm-ultra": (16, 7, 8, 4, 24, 12),
+        # Compatibility for hosts assigned before the farm profile split.
+        "farm": (8, 3, 4, 2, 12, 6),
+    }
+    if p in {"hiload", "ultra"} or p in farm_defaults:
+        if p in farm_defaults:
+            (
+                segment_priority,
+                segment_regular,
+                campaign_priority,
+                campaign_regular,
+                scheduler_host_limit,
+                scheduler_instance_limit,
+            ) = farm_defaults[p]
+        else:
+            segment_priority = 10 if p == "ultra" else 6
+            segment_regular = 4 if p == "ultra" else 2
+            campaign_priority = 8 if p == "ultra" else 4
+            campaign_regular = 4 if p == "ultra" else 2
+            scheduler_host_limit = base.scheduler_host_max_parallel
+            scheduler_instance_limit = base.scheduler_instance_max_parallel
         return replace(
             base,
             ring_mode="dual",
@@ -1007,8 +1033,8 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             queue_throttle_window_min=5,
             segment_priority_size=10,
             campaign_priority_size=10,
-            segment_priority_parallel_idle=6,
-            segment_regular_parallel_idle=2,
+            segment_priority_parallel_idle=segment_priority,
+            segment_regular_parallel_idle=segment_regular,
             segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=2,
             segment_regular_parallel_throttled=0,
@@ -1018,10 +1044,12 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_total_parallel=0,
             campaign_update_priority_parallel=0,
             campaign_update_regular_parallel=0,
-            campaign_trigger_priority_parallel=4,
-            campaign_trigger_regular_parallel=2,
-            campaign_rebuild_priority_parallel=3,
-            campaign_rebuild_regular_parallel=1,
+            campaign_trigger_priority_parallel=campaign_priority,
+            campaign_trigger_regular_parallel=campaign_regular,
+            campaign_rebuild_priority_parallel=max(1, campaign_priority - 1),
+            campaign_rebuild_regular_parallel=max(1, campaign_regular - 1),
+            scheduler_host_max_parallel=scheduler_host_limit,
+            scheduler_instance_max_parallel=scheduler_instance_limit,
         )
     return base
 
@@ -1317,7 +1345,8 @@ def _is_legacy_campaigns_due_sql(value: object) -> bool:
         "ce.trigger_mode = 'date'",
     )
     if all(sig in normalized for sig in old_root_action_date_semantics):
-        return "ce.trigger_date is null" not in normalized
+        if "ce.trigger_date is null" not in normalized:
+            return True
     old_root_action_event_specific_log = (
         "campaign_events ce",
         "el0.event_id = ce.id",
@@ -2048,6 +2077,10 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "worker_stuck_restart_limit": "worker_stuck_restart_limit",
     "jobs_max_workers": "jobs_max_workers",
     "scheduler_host_max_parallel": "scheduler_host_max_parallel",
+    "scheduler_elastic_slots_enabled": "scheduler_elastic_slots_enabled",
+    "scheduler_emergency_reserved_slots": "scheduler_emergency_reserved_slots",
+    "scheduler_instance_max_parallel": "scheduler_instance_max_parallel",
+    "scheduler_fairness_watchdog_sec": "scheduler_fairness_watchdog_sec",
     "segment_whitelist": "segment_whitelist",
     "segment_whitelist_file": "segment_whitelist_file",
     "segment_whitelist_instance_settings": "segment_whitelist_instance_settings",
@@ -2085,6 +2118,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_sql_ring_rules": "segment_sql_ring_rules",
     "segment_kill_mode": "segment_kill_mode",
     "segment_kill_grace_sec": "segment_kill_grace_sec",
+    "priority_segment_timeout_sec": "priority_segment_timeout_sec",
     "campaign_priority_parallel": "campaign_priority_parallel",
     "campaign_regular_parallel": "campaign_regular_parallel",
     "campaign_total_parallel": "campaign_total_parallel",
@@ -2107,6 +2141,8 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "campaign_rebuild_max_cycles_per_tick": "campaign_rebuild_max_cycles_per_tick",
     "campaign_rebuild_priority_parallel": "campaign_rebuild_priority_parallel",
     "campaign_rebuild_regular_parallel": "campaign_rebuild_regular_parallel",
+    "campaign_native_fallback_enabled": "campaign_native_fallback_enabled",
+    "campaign_native_fallback_interval_sec": "campaign_native_fallback_interval_sec",
     "enable_contacts_cleanup": "enable_contacts_cleanup",
     "contacts_cleanup_interval_sec": "contacts_cleanup_interval_sec",
     "contacts_cleanup_quiet_hour": "contacts_cleanup_quiet_hour",
@@ -2125,15 +2161,6 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "page_hits_orphan_cleanup_grace_min": "page_hits_orphan_cleanup_grace_min",
     "page_hits_orphan_cleanup_max_run_sec": "page_hits_orphan_cleanup_max_run_sec",
     "page_hits_orphan_cleanup_instance_settings": "page_hits_orphan_cleanup_instance_settings",
-    "housekeeping_plugin_enabled": "housekeeping_plugin_enabled",
-    "housekeeping_plugin_interval_sec": "housekeeping_plugin_interval_sec",
-    "housekeeping_plugin_quiet_hour": "housekeeping_plugin_quiet_hour",
-    "housekeeping_plugin_quiet_window_min": "housekeeping_plugin_quiet_window_min",
-    "housekeeping_plugin_days_old": "housekeeping_plugin_days_old",
-    "housekeeping_plugin_flags": "housekeeping_plugin_flags",
-    "housekeeping_plugin_optimize_tables": "housekeeping_plugin_optimize_tables",
-    "housekeeping_plugin_dry_run": "housekeeping_plugin_dry_run",
-    "housekeeping_plugin_instance_settings": "housekeeping_plugin_instance_settings",
     "enable_mautic_lock_cleanup": "enable_mautic_lock_cleanup",
     "mautic_lock_cleanup_interval_sec": "mautic_lock_cleanup_interval_sec",
     "mautic_lock_cleanup_quiet_hour": "mautic_lock_cleanup_quiet_hour",
@@ -2148,9 +2175,11 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "cache_warm_interval_sec": "cache_warm_interval_sec",
     "cache_warm_quiet_hour": "cache_warm_quiet_hour",
     "cache_warm_quiet_window_min": "cache_warm_quiet_window_min",
-    "viber_stats_enabled": "viber_stats_enabled",
-    "viber_stats_interval_sec": "viber_stats_interval_sec",
-    "viber_stats_instance_settings": "viber_stats_instance_settings",
+    "plugin_operations": "plugin_operations",
+    "plugin_operation_instance_settings": "plugin_operation_instance_settings",
+    "message_queue_enabled": "message_queue_enabled",
+    "message_queue_interval_sec": "message_queue_interval_sec",
+    "message_queue_instance_settings": "message_queue_instance_settings",
     "monitored_email_parser_enabled": "monitored_email_parser_enabled",
     "monitored_email_parser_interval_sec": "monitored_email_parser_interval_sec",
     "monitored_email_parser_batch_size": "monitored_email_parser_batch_size",
@@ -2160,6 +2189,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "monitored_email_parser_types": "monitored_email_parser_types",
     "monitored_email_parser_whitelist": "monitored_email_parser_whitelist",
     "monitored_email_parser_instance_settings": "monitored_email_parser_instance_settings",
+    "form_embed_instance_settings": "form_embed_instance_settings",
     "inventory_auto_rescan_enabled": "inventory_auto_rescan_enabled",
     "inventory_auto_rescan_interval_sec": "inventory_auto_rescan_interval_sec",
     "empty_leads_cleanup_enabled": "empty_leads_cleanup_enabled",
@@ -2344,6 +2374,8 @@ def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any])
         elif isinstance(current, int):
             if attr == "campaign_limit":
                 updates[attr] = _normalize_campaign_limit(raw_value)
+            elif attr == "campaign_native_fallback_interval_sec":
+                updates[attr] = max(300, int(raw_value or 3600))
             else:
                 updates[attr] = int(raw_value)
         elif isinstance(current, float):
@@ -2819,6 +2851,19 @@ def _load_config_inner(path: str) -> AgentConfig:
         worker_stuck_restart_limit=int(runtime.get("worker_stuck_restart_limit", 1)),
         jobs_max_workers=int(runtime.get("jobs_max_workers", 2)),
         scheduler_host_max_parallel=max(0, int(runtime.get("scheduler_host_max_parallel", 0))),
+        scheduler_elastic_slots_enabled=bool(runtime.get("scheduler_elastic_slots_enabled", True)),
+        scheduler_emergency_reserved_slots=max(
+            0,
+            int(runtime.get("scheduler_emergency_reserved_slots", 1) or 0),
+        ),
+        scheduler_instance_max_parallel=max(
+            0,
+            int(runtime.get("scheduler_instance_max_parallel", 0) or 0),
+        ),
+        scheduler_fairness_watchdog_sec=max(
+            30,
+            int(runtime.get("scheduler_fairness_watchdog_sec", 300) or 300),
+        ),
         segment_whitelist=_normalize_int_list(runtime.get("segment_whitelist", [])),
         segment_whitelist_file=str(runtime.get("segment_whitelist_file")).strip() if runtime.get("segment_whitelist_file") else None,
         segment_whitelist_instance_settings=(
@@ -2876,6 +2921,10 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_sql_ring_rules=_normalize_json_dict(runtime.get("segment_sql_ring_rules", {})),
         segment_kill_mode=str(runtime.get("segment_kill_mode", "graceful")),
         segment_kill_grace_sec=int(runtime.get("segment_kill_grace_sec", 10)),
+        priority_segment_timeout_sec=max(
+            0,
+            int(runtime.get("priority_segment_timeout_sec", 3600) or 0),
+        ),
         campaign_priority_parallel=campaign_priority_parallel,
         campaign_regular_parallel=campaign_regular_parallel,
         campaign_total_parallel=campaign_total_parallel,
@@ -2886,6 +2935,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         campaign_rebuild_max_cycles_per_tick=int(runtime.get("campaign_rebuild_max_cycles_per_tick", 4)),
         campaign_rebuild_priority_parallel=int(runtime.get("campaign_rebuild_priority_parallel", 4)),
         campaign_rebuild_regular_parallel=int(runtime.get("campaign_rebuild_regular_parallel", 1)),
+        campaign_native_fallback_enabled=bool(runtime.get("campaign_native_fallback_enabled", False)),
+        campaign_native_fallback_interval_sec=max(
+            300,
+            int(runtime.get("campaign_native_fallback_interval_sec", 3600) or 3600),
+        ),
         enable_contacts_cleanup=bool(runtime.get("enable_contacts_cleanup", False)),
         contacts_cleanup_interval_sec=int(runtime.get("contacts_cleanup_interval_sec", 86_400)),
         contacts_cleanup_quiet_hour=int(runtime.get("contacts_cleanup_quiet_hour", 2)),
@@ -2932,32 +2986,6 @@ def _load_config_inner(path: str) -> AgentConfig:
             if isinstance(runtime.get("page_hits_orphan_cleanup_instance_settings", {}), dict)
             else {}
         ),
-        housekeeping_plugin_enabled=bool(runtime.get("housekeeping_plugin_enabled", False)),
-        housekeeping_plugin_interval_sec=max(
-            60,
-            int(runtime.get("housekeeping_plugin_interval_sec", 86400) or 86400),
-        ),
-        housekeeping_plugin_quiet_hour=max(
-            0,
-            min(23, int(runtime.get("housekeeping_plugin_quiet_hour", 3) or 3)),
-        ),
-        housekeeping_plugin_quiet_window_min=max(
-            1,
-            min(720, int(runtime.get("housekeeping_plugin_quiet_window_min", 120) or 120)),
-        ),
-        housekeeping_plugin_days_old=max(1, int(runtime.get("housekeeping_plugin_days_old", 365) or 365)),
-        housekeeping_plugin_flags=(
-            [str(x).strip() for x in runtime.get("housekeeping_plugin_flags", []) if str(x).strip()]
-            if isinstance(runtime.get("housekeeping_plugin_flags", []), list)
-            else []
-        ),
-        housekeeping_plugin_optimize_tables=bool(runtime.get("housekeeping_plugin_optimize_tables", False)),
-        housekeeping_plugin_dry_run=bool(runtime.get("housekeeping_plugin_dry_run", True)),
-        housekeeping_plugin_instance_settings=(
-            dict(runtime.get("housekeeping_plugin_instance_settings", {}))
-            if isinstance(runtime.get("housekeeping_plugin_instance_settings", {}), dict)
-            else {}
-        ),
         enable_mautic_lock_cleanup=bool(runtime.get("enable_mautic_lock_cleanup", True)),
         mautic_lock_cleanup_interval_sec=max(
             300,
@@ -2987,11 +3015,28 @@ def _load_config_inner(path: str) -> AgentConfig:
         cache_warm_interval_sec=int(runtime.get("cache_warm_interval_sec", 86_400)),
         cache_warm_quiet_hour=int(runtime.get("cache_warm_quiet_hour", 8)),
         cache_warm_quiet_window_min=int(runtime.get("cache_warm_quiet_window_min", 60)),
-        viber_stats_enabled=bool(runtime.get("viber_stats_enabled", True)),
-        viber_stats_interval_sec=max(60, int(runtime.get("viber_stats_interval_sec", 600) or 600)),
-        viber_stats_instance_settings=(
-            dict(runtime.get("viber_stats_instance_settings", {}))
-            if isinstance(runtime.get("viber_stats_instance_settings", {}), dict)
+        plugin_operations=(
+            dict(runtime.get("plugin_operations", {}))
+            if isinstance(runtime.get("plugin_operations", {}), dict)
+            else {}
+        ),
+        plugin_operation_instance_settings=(
+            dict(runtime.get("plugin_operation_instance_settings", {}))
+            if isinstance(runtime.get("plugin_operation_instance_settings", {}), dict)
+            else {}
+        ),
+        # Internal migration input: catalog legacy_runtime mappings decide
+        # which keys matter. This preserves old local plugin settings without
+        # teaching the agent any plugin-specific names.
+        plugin_operation_legacy_runtime=dict(runtime),
+        message_queue_enabled=bool(runtime.get("message_queue_enabled", False)),
+        message_queue_interval_sec=max(
+            60,
+            min(86_400, int(runtime.get("message_queue_interval_sec", 3600) or 3600)),
+        ),
+        message_queue_instance_settings=(
+            dict(runtime.get("message_queue_instance_settings", {}))
+            if isinstance(runtime.get("message_queue_instance_settings", {}), dict)
             else {}
         ),
         monitored_email_parser_enabled=bool(runtime.get("monitored_email_parser_enabled", False)),
@@ -3026,6 +3071,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         monitored_email_parser_instance_settings=(
             dict(runtime.get("monitored_email_parser_instance_settings", {}))
             if isinstance(runtime.get("monitored_email_parser_instance_settings", {}), dict)
+            else {}
+        ),
+        form_embed_instance_settings=(
+            dict(runtime.get("form_embed_instance_settings", {}))
+            if isinstance(runtime.get("form_embed_instance_settings", {}), dict)
             else {}
         ),
         empty_leads_cleanup_enabled=bool(runtime.get("empty_leads_cleanup_enabled", False)),

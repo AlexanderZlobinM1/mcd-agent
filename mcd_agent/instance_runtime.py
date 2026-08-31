@@ -456,6 +456,20 @@ def apply_instance_runtime(
                 changed = True
                 actions.extend(legacy_actions)
         for inst in selected:
+            if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
+                results.append(
+                    {
+                        "root": inst.root,
+                        "name": inst.name,
+                        "slug": _pool_slug(inst),
+                        "timezone": _instance_timezone(inst),
+                        "nginx_files": [],
+                        "php_versions": [],
+                        "status": "skipped",
+                        "reason": "docker_runtime_managed_by_container",
+                    }
+                )
+                continue
             slug = _pool_slug(inst)
             matched = [p for p in _active_nginx_files() if _nginx_file_matches_instance(p, inst)]
             inst_versions: set[str] = set()

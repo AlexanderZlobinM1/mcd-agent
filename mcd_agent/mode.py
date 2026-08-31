@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
+from typing import TYPE_CHECKING, Iterable
+
+if TYPE_CHECKING:
+    from mcd_agent.models import MauticInstall
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -26,14 +31,16 @@ MANAGED_KEYWORDS = (
     "cache:clear",
     "cache:warm",
     "cache:warmup",
-    "mautic:emails:send",
     "mautic:email:fetch",
     "mautic:emails:fetch",
-    "viber:stats:update",
 )
+
+EMAIL_SEND_KEYWORDS = ("mautic:emails:send",)
+MESSAGE_QUEUE_SEND_KEYWORDS = ("mautic:messages:send",)
 
 _MAX_CRON_WRAPPER_BYTES = 128 * 1024
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[A-Za-z0-9_@%+=:,./-]+)")
+_CONFIRMED_MAJOR_CACHE: dict[tuple[object, ...], int] = {}
 
 
 @dataclass
@@ -73,6 +80,10 @@ def _is_managed_job(line: str) -> bool:
 
 
 def _cron_wrapper_has_managed_job(line: str) -> bool:
+    return _cron_wrapper_has_keywords(line, MANAGED_KEYWORDS)
+
+
+def _cron_wrapper_has_keywords(line: str, keywords: tuple[str, ...]) -> bool:
     for match in _ABSOLUTE_PATH_RE.finditer(line):
         token = match.group(1).rstrip(";|&)")
         path = Path(token)
@@ -88,7 +99,7 @@ def _cron_wrapper_has_managed_job(line: str) -> bool:
             continue
         if "bin/console" not in content:
             continue
-        if any(k in content for k in MANAGED_KEYWORDS):
+        if any(k in content for k in keywords):
             return True
     return False
 
@@ -100,18 +111,52 @@ def _is_direct_managed_job(line: str) -> bool:
     return "bin/console" in s and any(k in s for k in MANAGED_KEYWORDS)
 
 
-def _is_viber_stats_job(line: str) -> bool:
-    s = line.strip()
-    if not s or s.startswith("#"):
-        return False
-    return "bin/console" in s and "viber:stats:update" in s
-
-
 def _is_mautic_email_fetch_job(line: str) -> bool:
     s = line.strip()
     if not s or s.startswith("#"):
         return False
     return "bin/console" in s and ("mautic:email:fetch" in s or "mautic:emails:fetch" in s)
+
+
+def _is_mautic_email_send_job(line: str) -> bool:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return False
+    if "bin/console" in s:
+        return any(k in s for k in EMAIL_SEND_KEYWORDS)
+    return _cron_wrapper_has_keywords(s, EMAIL_SEND_KEYWORDS)
+
+
+def _job_payloads(line: str) -> list[str]:
+    payloads = [line]
+    for match in _ABSOLUTE_PATH_RE.finditer(line):
+        path = Path(match.group(1).rstrip(";|&)"))
+        try:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size <= 0 or stat.st_size > _MAX_CRON_WRAPPER_BYTES:
+                continue
+            payloads.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    return payloads
+
+
+def _payload_console_majors(payload: str, confirmed_console_majors: dict[str, int]) -> set[int]:
+    tokens = {match.group(1).rstrip(";|&)") for match in _ABSOLUTE_PATH_RE.finditer(payload)}
+    return {int(major) for path, major in confirmed_console_majors.items() if path in tokens}
+
+
+def _email_send_job_major(line: str, confirmed_console_majors: dict[str, int]) -> int | None:
+    payloads = [payload for payload in _job_payloads(line) if any(key in payload for key in EMAIL_SEND_KEYWORDS)]
+    if not payloads:
+        return None
+    majors: set[int] = set()
+    for payload in payloads:
+        payload_majors = _payload_console_majors(payload, confirmed_console_majors)
+        if len(payload_majors) != 1:
+            return None
+        majors.update(payload_majors)
+    return next(iter(majors)) if len(majors) == 1 else None
 
 
 def _is_empty_leads_cleanup_job(line: str) -> bool:
@@ -181,20 +226,6 @@ def _comment_managed(content: str, stamp: str) -> tuple[str, int]:
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
 
 
-def _comment_viber_stats(content: str, stamp: str) -> tuple[str, int]:
-    out: list[str] = []
-    changed = 0
-    for raw in content.splitlines():
-        line = raw.rstrip("\n")
-        if _is_viber_stats_job(line):
-            out.append(f"# MCD_MANAGED {stamp}: disabled viber stats by mcd profile=active")
-            out.append("# " + line)
-            changed += 1
-            continue
-        out.append(line)
-    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
-
-
 def _comment_mautic_email_fetch(content: str, stamp: str) -> tuple[str, int]:
     out: list[str] = []
     changed = 0
@@ -231,6 +262,70 @@ def _restore_mautic_email_fetch_comments(content: str) -> tuple[str, int]:
             skip_next_managed = False
         out.append(line)
     return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _restore_mautic_email_send_comments(
+    content: str,
+    confirmed_console_majors: dict[str, int] | None = None,
+) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    pending_marker: str | None = None
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        s = line.strip()
+        if s.startswith("# MCD_MANAGED") and "disabled by mcd profile=active" in s:
+            if pending_marker is not None:
+                out.append(pending_marker)
+            pending_marker = line
+            continue
+        if pending_marker is not None:
+            if line.startswith("# "):
+                legacy = line[2:]
+                if _is_mautic_email_send_job(legacy) and _email_send_job_major(
+                    legacy,
+                    confirmed_console_majors or {},
+                ) == 4:
+                    out.append(legacy)
+                    changed += 1
+                    pending_marker = None
+                    continue
+            out.append(pending_marker)
+            pending_marker = None
+        out.append(line)
+    if pending_marker is not None:
+        out.append(pending_marker)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _comment_mautic_email_send_by_version(
+    content: str,
+    stamp: str,
+    confirmed_console_majors: dict[str, int],
+) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if _email_send_job_major(line, confirmed_console_majors) in {5, 6, 7}:
+            out.append(f"# MCD_MANAGED {stamp}: disabled by mcd profile=active")
+            out.append("# " + line)
+            changed += 1
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def _reconcile_active_managed_content(
+    content: str,
+    stamp: str,
+    confirmed_console_majors: dict[str, int] | None = None,
+) -> tuple[str, int, int]:
+    versions = confirmed_console_majors or {}
+    restored_content, restored = _restore_mautic_email_send_comments(content, versions)
+    managed_content, managed_commented = _comment_managed(restored_content, stamp)
+    updated, email_commented = _comment_mautic_email_send_by_version(managed_content, stamp, versions)
+    return updated, managed_commented + email_commented, restored
 
 
 def _comment_empty_leads_cleanup(content: str, stamp: str) -> tuple[str, int, list[str]]:
@@ -313,7 +408,72 @@ def _restore_from_backup(install_dir: str, user: str) -> tuple[bool, str]:
     return True, f"restored {user} crontab from backup"
 
 
-def reconcile_managed_cron(*, profile_name: str, install_dir: str) -> ModeResult:
+def _path_signature(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat = path.stat()
+        return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return None
+
+
+def _confirmed_console_major_map(
+    installs: Iterable[MauticInstall],
+    php_bin: str,
+    *,
+    run_as_user: str | None = "www-data",
+) -> tuple[dict[str, int], list[str]]:
+    from mcd_agent.mautic_version_cache import confirmed_mautic_major
+
+    confirmed: dict[str, int] = {}
+    diagnostics: list[str] = []
+    php_signature = _path_signature(Path(php_bin))
+    for inst in installs:
+        console = Path(str(inst.console_path or ""))
+        root = Path(inst.root)
+        lock_candidates = [root / "composer.lock"]
+        if root.name.lower() in {"public", "docroot", "public_html"}:
+            lock_candidates.append(root.parent / "composer.lock")
+        cache_key = (
+            str(console),
+            _path_signature(console),
+            tuple(sig for sig in (_path_signature(path) for path in lock_candidates) if sig is not None),
+            php_signature,
+            int(inst.mautic_major) if inst.mautic_major is not None else None,
+            str(inst.local_php_path or ""),
+        )
+        major = _CONFIRMED_MAJOR_CACHE.get(cache_key)
+        if major is None:
+            major = confirmed_mautic_major(
+                inst.root,
+                php_bin,
+                console_path=inst.console_path,
+                local_php_path=inst.local_php_path,
+                expected_major=inst.mautic_major,
+                run_as_user=run_as_user,
+            )
+            if major is not None:
+                _CONFIRMED_MAJOR_CACHE[cache_key] = major
+        if major is None:
+            diagnostics.append(f"{inst.name}: Mautic major is not independently confirmed; email send cron unchanged")
+            continue
+        try:
+            resolved_console = str(console.resolve(strict=True))
+            confirmed[resolved_console] = int(major)
+            if console.is_absolute():
+                confirmed[str(console)] = int(major)
+        except OSError:
+            diagnostics.append(f"{inst.name}: console path is unavailable; email send cron unchanged")
+    return confirmed, diagnostics
+
+
+def reconcile_managed_cron(
+    *,
+    profile_name: str,
+    install_dir: str,
+    installs: Iterable[MauticInstall] = (),
+    php_bin: str = "/usr/bin/php",
+    run_as_user: str | None = "www-data",
+) -> ModeResult:
     """
     Idempotently keep active profiles from racing legacy Mautic cron jobs.
 
@@ -327,58 +487,313 @@ def reconcile_managed_cron(*, profile_name: str, install_dir: str) -> ModeResult
     if profile == "passive":
         return ModeResult(ok=True, lines=["passive profile, managed cron left unchanged"])
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines: list[str] = []
+    confirmed_console_majors, diagnostics = _confirmed_console_major_map(
+        installs,
+        php_bin,
+        run_as_user=run_as_user,
+    )
+    lines: list[str] = list(diagnostics)
     for user in ("root", "www-data"):
         rc, cur = _read_crontab(None if user == "root" else user)
         if rc != 0:
             lines.append(f"{user}: crontab not readable, skip")
             continue
         _ensure_backup(install_dir, user, cur)
-        updated, changed = _comment_managed(cur, stamp)
-        if changed <= 0:
+        updated, changed, restored = _reconcile_active_managed_content(cur, stamp, confirmed_console_majors)
+        if changed <= 0 and restored <= 0:
             lines.append(f"{user}: no managed cron change")
             continue
         rc2, out2 = _write_crontab(updated, None if user == "root" else user)
         if rc2 != 0:
             lines.append(f"{user}: failed to write crontab: {out2}")
             return ModeResult(ok=False, lines=lines)
-        lines.append(f"{user}: commented managed cron lines={changed}")
+        lines.append(f"{user}: commented managed cron lines={changed}; restored email spool consumers={restored}")
     return ModeResult(ok=True, lines=lines)
 
 
-def reconcile_viber_stats_cron(*, profile_name: str, install_dir: str) -> ModeResult:
-    """
-    Keep legacy viber:stats:update cron from racing active MCD scheduling.
+def _plugin_cron_line_matches(line: str, rule: dict[str, object]) -> bool:
+    text = str(line or "").strip()
+    if not text or text.startswith("#"):
+        return False
+    root = str(rule.get("root", "") or "").rstrip("/")
+    tokens = [str(x) for x in list(rule.get("match") or []) if str(x)]
+    if not tokens:
+        return False
+    if all(token in text for token in tokens) and (not root or root in text):
+        return True
+    for match in _ABSOLUTE_PATH_RE.finditer(text):
+        path = Path(match.group(1).rstrip(";|&)"))
+        try:
+            if not path.is_file() or path.stat().st_size <= 0 or path.stat().st_size > _MAX_CRON_WRAPPER_BYTES:
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if all(token in content for token in tokens) and (not root or root in content):
+            return True
+    return False
 
-    Profile commands already do this on explicit transitions. The daemon also
-    calls this idempotently so hosts that were already active before an update
-    are reconciled without requiring a manual profile toggle.
-    """
+
+def _plugin_cron_interval_sec(line: str) -> int:
+    fields = _cron_fields(line).split()
+    if len(fields) != 5:
+        return 0
+    minute, hour, dom, month, dow = fields
+    if dom != "*" or month != "*" or dow != "*":
+        return 0
+    minute_step = re.fullmatch(r"\*/(\d+)", minute)
+    if minute_step and hour == "*":
+        return max(60, int(minute_step.group(1)) * 60)
+    if minute == "*" and hour == "*":
+        return 60
+    if minute.isdigit() and hour == "*":
+        return 3600
+    hour_step = re.fullmatch(r"\*/(\d+)", hour)
+    if minute.isdigit() and hour_step:
+        return max(3600, int(hour_step.group(1)) * 3600)
+    if minute.isdigit() and hour.isdigit():
+        return 86_400
+    return 0
+
+
+def reconcile_plugin_operation_cron(
+    *, profile_name: str, install_dir: str, rules: list[dict[str, object]]
+) -> ModeResult:
+    """Apply catalog-provided legacy cron rules for installed plugin operations."""
     if os.geteuid() != 0:
-        return ModeResult(ok=False, lines=["viber cron reconcile requires root"])
-    profile = (profile_name or "").strip().lower()
+        return ModeResult(ok=False, lines=["plugin operation cron reconcile requires root"])
+    if (profile_name or "").strip().lower() == "passive":
+        return ModeResult(ok=True, lines=["passive profile, plugin operation cron left unchanged"])
+    safe_rules = [rule for rule in rules if isinstance(rule, dict) and str(rule.get("operation_key", "") or "")]
+    if not safe_rules:
+        return ModeResult(ok=True, lines=["no plugin operation cron rules"])
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines: list[str] = []
+    migrations: dict[tuple[str, str], tuple[int, str, str]] = {}
     for user in ("root", "www-data"):
         rc, cur = _read_crontab(None if user == "root" else user)
         if rc != 0:
             lines.append(f"{user}: crontab not readable, skip")
             continue
-        if profile == "passive":
-            updated, changed = _restore_managed_comments(cur)
-            action = "restored managed cron lines from markers"
+        _ensure_backup(install_dir, user, cur)
+        out: list[str] = []
+        changed = 0
+        raw_lines = cur.splitlines()
+        for line in raw_lines:
+            matched = next((rule for rule in safe_rules if _plugin_cron_line_matches(line, rule)), None)
+            if matched is None:
+                out.append(line)
+                continue
+            op_key = str(matched.get("operation_key", "") or "")
+            instance_key = str(matched.get("instance_key", "") or "")
+            interval = _plugin_cron_interval_sec(line) if bool(matched.get("migrate_schedule", False)) else 0
+            migrations[(instance_key, op_key)] = (
+                interval,
+                str(matched.get("enabled_field", "enabled") or "enabled"),
+                str(matched.get("interval_field", "interval_sec") or "interval_sec"),
+            )
+            if str(matched.get("action", "comment") or "comment") == "remove":
+                changed += 1
+                continue
+            out.append(f"# MCD_PLUGIN_OPERATION {op_key} {stamp}: disabled catalog-managed cron")
+            out.append("# " + line)
+            changed += 1
+        updated = "\n".join(out) + ("\n" if cur.endswith("\n") else "")
+        if changed > 0:
+            rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+            if rc2 != 0:
+                lines.append(f"{user}: failed to write crontab: {out2}")
+                return ModeResult(ok=False, lines=lines)
+            lines.append(f"{user}: catalog plugin cron reconciled lines={changed}")
         else:
-            _ensure_backup(install_dir, user, cur)
-            updated, changed = _comment_viber_stats(cur, stamp)
-            action = "commented viber stats cron lines"
-        if changed <= 0:
-            lines.append(f"{user}: no viber cron change")
+            for idx, line in enumerate(raw_lines[:-1]):
+                marker = re.match(r"^# MCD_PLUGIN_OPERATION (\S+) ", line.strip())
+                if not marker or not raw_lines[idx + 1].startswith("# "):
+                    continue
+                op_key = marker.group(1)
+                rule = next((item for item in safe_rules if str(item.get("operation_key", "")) == op_key), None)
+                if rule is None:
+                    continue
+                legacy = raw_lines[idx + 1][2:]
+                interval = _plugin_cron_interval_sec(legacy) if bool(rule.get("migrate_schedule", False)) else 0
+                migrations[(str(rule.get("instance_key", "") or ""), op_key)] = (
+                    interval,
+                    str(rule.get("enabled_field", "enabled") or "enabled"),
+                    str(rule.get("interval_field", "interval_sec") or "interval_sec"),
+                )
+            lines.append(f"{user}: no catalog plugin cron change")
+    for (instance_key, op_key), (interval, enabled_field, interval_field) in sorted(migrations.items()):
+        migrated = {
+            "instance_key": instance_key,
+            "operation_key": op_key,
+            "cron_found": True,
+            "enabled_field": enabled_field,
+            "interval_field": interval_field,
+        }
+        if interval > 0:
+            migrated["interval_sec"] = interval
+        lines.append(
+            "MCD_PLUGIN_OPERATION_MIGRATE_JSON="
+            + json.dumps(migrated, ensure_ascii=True, separators=(",", ":"))
+        )
+    return ModeResult(ok=True, lines=lines)
+
+
+def _message_queue_cron_root(line: str, managed_roots: tuple[str, ...]) -> str | None:
+    text = str(line or "").strip()
+    if not text or text.startswith("#") or not managed_roots:
+        return None
+    if "bin/console" in text and any(token in text for token in MESSAGE_QUEUE_SEND_KEYWORDS):
+        return next((root for root in managed_roots if root in text), None)
+    for match in _ABSOLUTE_PATH_RE.finditer(text):
+        path = Path(match.group(1).rstrip(";|&)"))
+        try:
+            if not path.is_file() or path.stat().st_size <= 0 or path.stat().st_size > _MAX_CRON_WRAPPER_BYTES:
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
             continue
-        rc2, out2 = _write_crontab(updated, None if user == "root" else user)
+        if not any(token in content for token in MESSAGE_QUEUE_SEND_KEYWORDS):
+            continue
+        combined = f"{text}\n{content}"
+        root = next((item for item in managed_roots if item in combined), None)
+        if root:
+            return root
+    return None
+
+
+def _message_queue_marker(root: str, interval_sec: int, stamp: str) -> str:
+    payload = json.dumps(
+        {"root": root, "interval_sec": max(60, min(86_400, int(interval_sec or 3600)))},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"# MCD_MESSAGE_QUEUE {payload} {stamp}: disabled MCD-managed cron"
+
+
+def _message_queue_marker_payload(line: str) -> dict[str, object] | None:
+    match = re.match(r"^# MCD_MESSAGE_QUEUE (\{.*\}) \S+: disabled MCD-managed cron$", line.strip())
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not str(payload.get("root", "") or "").startswith("/"):
+        return None
+    return payload
+
+
+def _comment_mautic_message_queue_cron(
+    content: str,
+    stamp: str,
+    managed_roots: tuple[str, ...],
+) -> tuple[str, int, dict[str, int]]:
+    out: list[str] = []
+    changed = 0
+    migrations: dict[str, int] = {}
+    for line in content.splitlines():
+        root = _message_queue_cron_root(line, managed_roots)
+        if root is None:
+            out.append(line)
+            continue
+        interval_sec = _plugin_cron_interval_sec(line) or 3600
+        interval_sec = max(60, min(86_400, interval_sec))
+        migrations[root] = min(migrations.get(root, interval_sec), interval_sec)
+        out.append(_message_queue_marker(root, interval_sec, stamp))
+        out.append("# " + line)
+        changed += 1
+    updated = "\n".join(out) + ("\n" if content.endswith("\n") else "")
+    return updated, changed, migrations
+
+
+def _managed_mautic_message_queue_migrations(content: str) -> dict[str, int]:
+    migrations: dict[str, int] = {}
+    for line in content.splitlines():
+        payload = _message_queue_marker_payload(line)
+        if payload is None:
+            continue
+        root = str(payload.get("root", "") or "")
+        try:
+            interval_sec = max(60, min(86_400, int(payload.get("interval_sec", 3600) or 3600)))
+        except (TypeError, ValueError):
+            interval_sec = 3600
+        migrations[root] = min(migrations.get(root, interval_sec), interval_sec)
+    return migrations
+
+
+def _restore_mautic_message_queue_cron(content: str) -> tuple[str, int]:
+    out: list[str] = []
+    changed = 0
+    restore_next = False
+    for line in content.splitlines():
+        if _message_queue_marker_payload(line) is not None:
+            restore_next = True
+            changed += 1
+            continue
+        if restore_next and line.startswith("# "):
+            out.append(line[2:])
+            restore_next = False
+            changed += 1
+            continue
+        restore_next = False
+        out.append(line)
+    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), changed
+
+
+def reconcile_mautic_message_queue_cron(
+    *,
+    profile_name: str,
+    install_dir: str,
+    managed_roots: list[str],
+) -> ModeResult:
+    """Move Mautic 5/6/7 message queue cron into per-instance MCD scheduling."""
+    if os.geteuid() != 0:
+        return ModeResult(ok=False, lines=["mautic message queue cron reconcile requires root"])
+    roots = tuple(
+        sorted(
+            {str(Path(root).resolve()) for root in managed_roots if str(root or "").strip()},
+            key=len,
+            reverse=True,
+        )
+    )
+    profile = (profile_name or "").strip().lower()
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    migrations: dict[str, int] = {}
+    for user in ("root", "www-data"):
+        rc, current = _read_crontab(None if user == "root" else user)
+        if rc != 0:
+            lines.append(f"{user}: crontab not readable, skip")
+            continue
+        if profile == "passive":
+            updated, changed = _restore_mautic_message_queue_cron(current)
+            action = "restored mautic message queue cron lines"
+        else:
+            _ensure_backup(install_dir, user, current)
+            updated, changed, discovered = _comment_mautic_message_queue_cron(current, stamp, roots)
+            action = "commented mautic message queue cron lines"
+            if not discovered:
+                discovered = _managed_mautic_message_queue_migrations(current)
+            for root, interval_sec in discovered.items():
+                migrations[root] = min(migrations.get(root, interval_sec), interval_sec)
+        if changed <= 0:
+            lines.append(f"{user}: no mautic message queue cron change")
+            continue
+        rc2, output = _write_crontab(updated, None if user == "root" else user)
         if rc2 != 0:
-            lines.append(f"{user}: failed to write crontab: {out2}")
+            lines.append(f"{user}: failed to write crontab: {output}")
             return ModeResult(ok=False, lines=lines)
         lines.append(f"{user}: {action}={changed}")
+    for root, interval_sec in sorted(migrations.items()):
+        lines.append(
+            "MCD_MESSAGE_QUEUE_MIGRATE_JSON="
+            + json.dumps(
+                {"root": root, "enabled": True, "interval_sec": interval_sec},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        )
     return ModeResult(ok=True, lines=lines)
 
 
@@ -610,13 +1025,15 @@ def mode_activate(*, pause_flag_path: str, install_dir: str, config_path: str) -
             lines.append(f"{user}: crontab not readable, skip")
             continue
         _ensure_backup(install_dir, user, cur)
-        updated, changed = _comment_managed(cur, stamp)
-        if changed > 0:
+        updated, changed, restored = _reconcile_active_managed_content(cur, stamp)
+        if changed > 0 or restored > 0:
             rc2, out2 = _write_crontab(updated, None if user == "root" else user)
             if rc2 != 0:
                 lines.append(f"{user}: failed to write crontab: {out2}")
             else:
-                lines.append(f"{user}: commented managed cron lines={changed}")
+                lines.append(
+                    f"{user}: commented managed cron lines={changed}; restored email spool consumers={restored}"
+                )
         else:
             lines.append(f"{user}: no managed cron lines found")
 
@@ -676,7 +1093,22 @@ def mode_passive(*, pause_flag_path: str, install_dir: str, config_path: str) ->
     return ModeResult(ok=True, lines=lines)
 
 
-SUPPORTED_PROFILE_NAMES = ("passive", "tiny", "mini", "midi", "maxi", "hiload", "custom")
+SUPPORTED_PROFILE_NAMES = (
+    "passive",
+    "tiny",
+    "mini",
+    "midi",
+    "maxi",
+    "hiload",
+    "ultra",
+    "farm-tiny",
+    "farm-mini",
+    "farm-midi",
+    "farm-maxi",
+    "farm-hiload",
+    "farm-ultra",
+    "custom",
+)
 
 # Runtime keys controlled by named profiles.
 # If these remain in [runtime], they override profile baseline and can cause
@@ -709,6 +1141,10 @@ PROFILE_MANAGED_RUNTIME_KEYS = (
     "campaign_trigger_regular_parallel",
     "campaign_rebuild_priority_parallel",
     "campaign_rebuild_regular_parallel",
+    "scheduler_elastic_slots_enabled",
+    "scheduler_emergency_reserved_slots",
+    "scheduler_instance_max_parallel",
+    "scheduler_fairness_watchdog_sec",
 )
 
 # Legacy keys used by old config revisions; they are ignored by current runtime
@@ -842,13 +1278,15 @@ def profile_set(*, profile: str, pause_flag_path: str, install_dir: str, config_
             lines.append(f"{user}: crontab not readable, skip")
             continue
         _ensure_backup(install_dir, user, cur)
-        updated, changed = _comment_managed(cur, stamp)
-        if changed > 0:
+        updated, changed, restored = _reconcile_active_managed_content(cur, stamp)
+        if changed > 0 or restored > 0:
             rc2, out2 = _write_crontab(updated, None if user == "root" else user)
             if rc2 != 0:
                 lines.append(f"{user}: failed to write crontab: {out2}")
             else:
-                lines.append(f"{user}: commented managed cron lines={changed}")
+                lines.append(
+                    f"{user}: commented managed cron lines={changed}; restored email spool consumers={restored}"
+                )
         else:
             lines.append(f"{user}: no managed cron lines found")
 

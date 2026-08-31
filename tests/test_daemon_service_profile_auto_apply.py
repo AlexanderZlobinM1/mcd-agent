@@ -1,12 +1,13 @@
 import ast
+import inspect
 import unittest
-from pathlib import Path
+
+from mcd_agent import daemon
 
 
 class DaemonServiceProfileAutoApplyTests(unittest.TestCase):
     def test_daemon_service_profile_calls_are_advisory_dry_runs(self) -> None:
-        source = Path(__file__).resolve().parents[1] / "mcd_agent" / "daemon.py"
-        tree = ast.parse(source.read_text(encoding="utf-8"))
+        tree = ast.parse(inspect.getsource(daemon))
 
         calls: list[ast.Call] = []
         for node in ast.walk(tree):

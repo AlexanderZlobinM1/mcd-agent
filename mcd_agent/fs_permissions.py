@@ -56,6 +56,16 @@ def normalize_guard_paths(raw_paths: list[str] | tuple[str, ...] | None) -> list
     return out or default_guard_paths()
 
 
+def effective_guard_identity(
+    *, runtime: str | None, runtime_user: str | None, host_user: str | None
+) -> str:
+    if str(runtime or "host").strip().lower() == "docker":
+        container_identity = str(runtime_user or "").strip()
+        if container_identity:
+            return container_identity
+    return str(host_user or "www-data").strip() or "www-data"
+
+
 @dataclass(frozen=True)
 class PermissionRepairEvent:
     rel_path: str
@@ -196,6 +206,10 @@ _AUSEARCH_EXISTS = bool(shutil.which("ausearch"))
 def _uid_for(user: str) -> int:
     if user in _UID_CACHE:
         return _UID_CACHE[user]
+    if str(user).isdigit():
+        uid = int(user)
+        _UID_CACHE[user] = uid
+        return uid
     import pwd
 
     uid = int(pwd.getpwnam(user).pw_uid)
@@ -206,6 +220,10 @@ def _uid_for(user: str) -> int:
 def _gid_for(group: str) -> int:
     if group in _GID_CACHE:
         return _GID_CACHE[group]
+    if str(group).isdigit():
+        gid = int(group)
+        _GID_CACHE[group] = gid
+        return gid
     import grp
 
     gid = int(grp.getgrnam(group).gr_gid)
@@ -375,8 +393,11 @@ def ensure_instance_permissions(
     fix_console_exec: bool = True,
     console_relpath: str = "bin/console",
 ) -> PermissionsGuardResult:
-    owner = (run_as_user or "www-data").strip() or "www-data"
-    group = owner
+    identity = (run_as_user or "www-data").strip() or "www-data"
+    owner, separator, group = identity.partition(":")
+    owner = owner.strip() or "www-data"
+    group = group.strip() if separator else owner
+    group = group or owner
     owner_group = f"{owner}:{group}"
     root_path = Path(root)
     paths = normalize_guard_paths(guard_paths)

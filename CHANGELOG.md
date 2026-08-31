@@ -1,5 +1,921 @@
 # MCD Changelog
 
+## Unreleased
+
+## 1.0.12 - 2026-08-31
+
+- Changed segment and campaign whitelists into queue-priority only. A
+  whitelisted entity enters its priority ring when Mautic has work to process,
+  but no longer gains a periodic execution schedule merely by being listed.
+  Explicit `realtime` settings remain the opt-in mechanism for timed runs.
+
+## 1.0.11 - 2026-08-31
+
+- Added revisioned MCC canonical desired-state synchronization for live runtime
+  settings. MCD now uses optimistic revision matching, so a stale disconnected
+  or reinstalled local configuration cannot overwrite a newer confirmed MCC
+  change after reconnecting.
+- Added immutable `instance_uid` desired-state records for every supported
+  instance-scoped runtime map. Their settings follow an instance to a new host,
+  apply without restarting the daemon, and are acknowledged back to MCC with
+  source, revision, agent version, applied host, time, status, and error.
+- Promoted existing root/domain-keyed MCC instance maps into UID records on
+  agent contact while retaining host JSON compatibility for older agents.
+
+## 1.0.10 - 2026-08-31
+
+- Added a marker-only scheduled bootstrap mode. A successful one-time repair
+  can now be retained without treating pre-existing rows as proof that the
+  repair already ran.
+- Viber statistics now run `viber:stats:update --backfill` after every
+  `Enabled` transition, then return to routine `viber:stats:update` runs.
+  Explicitly disabling Viber Stats still prevents both commands.
+
+## 1.0.9 - 2026-08-31
+
+- Fixed scheduled plugin operations to require both the installed bundle path
+  and a non-missing Mautic plugin registry record. A stale Viber directory can
+  no longer make `viber:stats:update` executable.
+- Added regression coverage for the registry gate and packaged generic plugin
+  scheduler path.
+
+## 1.0.7 - 2026-08-31
+
+- Promote local runtime override edits to MCC `desired` state so the canonical operator change is preserved and propagated back to the active MCD instance. Keep `observed` state telemetry-only and retain live application without requiring a daemon restart.
+
+- Removed the host-local AnanasRS campaign worker test from the public agent
+  suite. The script is not MCD functionality and remains owned by its single
+  runtime host; agent runtime behavior and version are unchanged.
+
+## 1.0.6 - 2026-08-31
+
+- Split bulk Fail2ban updates by IP family. A shared blocklist containing both
+  IPv4 and IPv6 addresses now creates separate commands and nftables sets
+  instead of failing on a mixed-family comparison.
+
+## 1.0.5 - 2026-08-31
+
+- Compared blocklist and allowlist networks only within the same IP family, so
+  mixed IPv4/IPv6 MCC allowlists cannot interrupt Fail2ban reconciliation.
+
+## 1.0.4 - 2026-08-31
+
+- Reconciled large MCC security blocklists through bounded bulk Fail2ban
+  commands instead of one process per address. Lists containing several
+  thousand entries now converge quickly without blocking the daemon loop.
+
+## 1.0.3 - 2026-08-31
+
+- Added authenticated MCC security blocklist polling and exact reconciliation
+  into a dedicated permanent `mcc-global` Fail2ban jail. Central additions,
+  removals and allowlist changes propagate without giving agents Cloudflare or
+  Wazuh credentials; stale/unavailable snapshots never trigger mass-unban.
+- Added an independently operating aggressive SSH jail with progressive bans
+  and centrally synchronized ignore addresses. Fail2ban is installed only on
+  explicitly targeted hosts, and the all-ports nftables action also protects
+  direct SMTP/SSH services while Cloudflare remains the web enforcement plane.
+
+## 1.0.2 - 2026-08-31
+
+- Constrained Symfony Amazon SES and SendGrid mailer bridges to the installed
+  `symfony/mailer` minor branch, preventing unconstrained Composer resolution
+  from selecting incompatible Symfony generations on Mautic 6.
+- Retried Mautic 6 plugin reload exactly once when MySQL DDL was applied but
+  Mautic reported `There is no active transaction`; other versions and reload
+  failures remain fail-fast.
+
+## 1.0.1 - 2026-08-30
+
+- Blocked Composer Mautic 6 to 7 upgrades unless the observed active database
+  is MySQL 8.4+ or MariaDB 10.11+. Detection is fail-closed and the agent
+  repeats it immediately before maintenance; MCD never upgrades the database.
+- Migrated active cron paths and referenced wrapper scripts from the ZIP source
+  root to the new Composer root, retired the removed `mautic:emails:send`
+  command for Mautic 5/6/7, and added rollback plus post-write stale-root
+  guards.
+- Gated global `mautic:emails:send` reconciliation on independently confirmed
+  runtime, Composer lock, discovered major and layout evidence. Mautic 4 keeps
+  its command; Mautic 5/6/7 disable it; unknown or conflicting evidence makes
+  no cron change.
+- Required the same independent evidence before applying the Mautic 6
+  ReloadHelper core patch, preventing stale inventory from modifying Mautic 7.
+
+## 1.0.0 - 2026-08-30
+
+- Introduced the two-axis Mautic runtime matrix: host or Docker runtime,
+  independently combined with ZIP or Composer installation layout.
+- Added root-owned Docker descriptors with explicit capabilities, plugin and
+  Composer metadata paths, exact image references and a trusted migration
+  adapter contract. Console jobs, plugin operations, dependency checks,
+  backups and migrations now route or fail closed from that contract instead
+  of guessing host paths.
+- Added Docker-to-compatible-Docker migration relay support. Target selection
+  requires a running Docker daemon, the exact trusted adapter and a locally
+  synchronized source image; adapter validation happens before any requested
+  target cleanup.
+- Added host readiness reporting for Docker and an explicit, opt-in Docker
+  service profile. Docker remains optional for ordinary host-native Mautic
+  hosts.
+
+## 0.11.47 - 2026-08-29
+
+- Extended the startup service migration to `mcd.service.d/*.conf` drop-ins,
+  preventing a legacy `KillMode=process` override from defeating the corrected
+  main unit. Unit and drop-in changes share rollback and one daemon reload.
+
+## 0.11.46 - 2026-08-29
+
+- Run the existing-unit `KillMode=control-group` migration at daemon startup,
+  after the updated source is active. This fixes the updater bootstrap case in
+  which the previous running version cannot execute newly downloaded code.
+
+## 0.11.45 - 2026-08-29
+
+- Migrated existing `mcd.service` units from `KillMode=process` to
+  `KillMode=control-group` during self-update, so a daemon restart also stops
+  its managed flock, sudo, and PHP child processes.
+- Aligned the MCC installation template with the same process-group shutdown
+  contract and added regression coverage for idempotent unit migration.
+
+## 0.11.44 - 2026-08-29
+
+- Reconciled production fixes that had remained on divergent release branches
+  instead of the canonical agent tree.
+- Prevented per-instance Mautic version probes from walking into a shared
+  parent installation and reject cached versions whose major differs from the
+  discovered instance major.
+- Disabled the unsafe path-agnostic `nginx-4xx-scan` fail2ban jail while
+  preserving bans independently held by other jails.
+- Restored managed web-ingress firewall ordering, persistent embedded-form
+  status, and filtering of incomplete plugin directories left after removal.
+- Added a one-hour default ceiling for isolated priority segment updates,
+  avoided segment-link foreign-key races, and made agent restarts terminate
+  the complete managed process group.
+- Kept all new behavior covered by focused regression tests while preserving
+  the 0.11.43 cron ownership contract for `mautic:emails:send`.
+
+## 0.11.43 - 2026-08-29
+
+- Restored the permanent cron ownership contract for `mautic:emails:send`
+  after the public 0.11.42 package regressed to an older cron-reconciliation
+  implementation. MCD never migrates or schedules Mautic file-spool delivery.
+- Active hosts automatically restore only MCD-commented
+  `mautic:emails:send` workers. Other managed and manually disabled cron jobs
+  remain unchanged.
+- Added release regression coverage for direct workers, wrapper scripts,
+  marker recovery and mixed managed cron content.
+- Reconciled the previously divergent public package before release, retaining
+  fresh-install mail parameter creation and MCC queue/Postmaster telemetry.
+
+## 0.11.42 - 2026-08-28
+
+- Restricted direct external SMTP from unprivileged host processes and blocked
+  forwarded/container SMTP while own-host mail is enabled. Mautic continues to
+  submit through the local managed MTA, and the MTA retains outbound delivery.
+
+## 0.11.41 - 2026-08-28
+
+- Aligned the managed public Sendmail SMTP greeting/HELO identity with the
+  configured own-host mail hostname and PTR without changing the OS hostname.
+
+## 0.11.40 - 2026-08-28
+
+- Fixed own-host mail FCrDNS validation to query public DNS resolvers before
+  the host resolver, preventing `/etc/hosts` or local resolver aliases from
+  producing a false PTR mismatch.
+
+## 0.11.39 - 2026-08-28
+
+- Hardened own-host mail identity: activation now requires forward-confirmed
+  IPv4 reverse DNS for the host MTA name, and runtime status reports the
+  resolved A/PTR identity.
+- Restricted managed outbound Sendmail and Postfix delivery to IPv4 until a
+  separately validated IPv6 mail identity is configured.
+- Disabled SMTP AUTH advertisement on the public Sendmail listener used only
+  for managed bounce and feedback-loop reception.
+- Fixed activation on valid Mautic installations whose `local.php` parameters
+  array does not yet contain mailer keys.
+
+## 0.11.38 - 2026-08-27
+
+- Ensure Mautic 6 to 7 upgrades install or update `MauticLocaleFixBundle`,
+  publish its integration, and enable Gmail image-proxy counting.
+- Preserve all other Locale Fix integration settings during the migration.
+
+## 0.11.37 - 2026-08-27
+
+- Fixed Nginx vhost parsing when a location regex contains `#`, which is valid
+  Nginx syntax. MCD now reaches the PHP FastCGI handler and can safely add the
+  managed `/form/` route instead of reporting a false missing-upstream block.
+
+## 0.11.24 - 2026-08-20
+
+- Added safe adoption of compatible existing Nginx form locations. When MCC
+  supplies an allowed HTTPS origin, MCD replaces only the known CSP and CORS
+  directives inside that form location with a marked managed header block;
+  the form handler and unrelated directives stay unchanged.
+- Unsupported form locations, custom origin logic, multiline security
+  directives, missing FastCGI handlers and ambiguous routes are reported as
+  blocked without touching the vhost. Each instance is planned fully before
+  any of its vhosts is written.
+
+## 0.11.23 - 2026-08-20
+
+- Added a standard managed Nginx `/form/` route to new Mautic image installs
+  and completed instance migrations. The secure default permits only
+  `frame-ancestors 'self'` and does not enable browser CORS.
+- Added an opt-in per-instance form embedding policy. MCC can set exact HTTPS
+  domain origins separately for CSP `frame-ancestors` and CORS; the agent
+  validates, tests and reloads Nginx atomically before applying it.
+- Protected custom form routes: an existing unmanaged `location /form/` is
+  reported as blocked and remains untouched. Failed Nginx validation or reload
+  restores every modified vhost from a timestamped backup.
+
+## 0.11.22 - 2026-08-20
+
+- Added opt-in per-instance realtime subsets inside segment and campaign
+  whitelist settings. Realtime segment, campaign-rebuild and campaign-trigger
+  work uses separately bounded executor capacity outside the normal scheduler
+  budget, so regular priority work cannot occupy the dedicated slots.
+- Added independent realtime intervals for segment rebuild, campaign rebuild
+  and campaign trigger. The executor now applies the selected lane interval to
+  the shared launch guard, allowing a realtime subset to run faster than the
+  host's normal full-scan and campaign-audit cadence without changing other
+  entities.
+- Kept exact-task and campaign-root file locking across realtime and normal
+  dispatch, preventing duplicate execution when both schedulers observe the
+  same whitelisted ID.
+
+## 0.11.20 - 2026-08-18
+
+- Fixed targeted Composer preflight to keep the newly required runtime package
+  in `composer.json` alongside its updated lock entry while restoring the
+  original private VCS repository list. A successful dependency repair can no
+  longer leave `composer.json` and `composer.lock` inconsistent.
+- Added failure-path coverage proving both Composer files are restored when the
+  targeted update fails.
+
+## 0.11.19 - 2026-08-18
+
+- Fixed Composer plugin preflight when a Mautic instance contains private
+  `git.sales-snap.com` repositories that are unavailable to the runtime
+  `www-data` Composer process. Each missing runtime package is now resolved in
+  a targeted two-step operation (`require --no-update`, then package-only
+  `update --with-dependencies`) with private VCS repository entries temporarily
+  excluded from resolution. The original `composer.json` is always restored;
+  a failed update also restores the original lock file. This prevents a
+  dependency check such as `nikic/php-parser` from failing because Composer
+  tried to authenticate against unrelated private plugin repositories.
+- Added regression coverage for repository restoration and the targeted
+  Composer command shape. The fix applies globally to all plugin operations
+  using the agent preflight and does not change Mautic plugin source code.
+
+## 0.11.18 - 2026-08-16
+
+- Matched native Mautic scheduling for campaign actions stored with
+  `trigger_mode=date` and a null `trigger_date`. Mautic executes that shape
+  from the campaign comparison time; MCD now keeps root and decision-no action
+  campaigns in the trigger ring instead of rejecting them as stale.
+- Added regression coverage for Najboljamama campaign 16 and automatic
+  replacement of persisted trigger SQL with the corrected packaged default.
+
+## 0.11.17 - 2026-08-14
+
+- Fixed first-run message-queue adoption on the immutable agent configuration.
+  The daemon now replaces the frozen runtime snapshot instead of assigning to
+  it, so default, cron and legacy-job migrations complete and synchronize with
+  MCC without interrupting the scheduler loop.
+
+## 0.11.16 - 2026-08-14
+
+- Added dedicated per-instance `mautic:messages:send` scheduling for Mautic
+  5, 6 and 7. The safe default is disabled with a 3600-second interval;
+  Mautic 4 and unrelated scheduled jobs retain their existing behavior.
+- Added startup reconciliation for direct and wrapper cron entries. Matching
+  modern-instance cron is commented, its enabled state and cadence are moved
+  into MCC/MCD settings, and passive mode restores only entries marked by this
+  reconciler. Existing canonical settings always win. A temporary MCC outage
+  keeps the adopted worker active locally and retries desired-state sync.
+- Migrated legacy `[[jobs]]` message-queue settings when no canonical setting
+  exists and suppressed the old worker afterward so it cannot bypass the new
+  per-instance checkbox.
+- Added count-only queue telemetry for total, due, future and exhausted rows.
+  Database connections are closed deterministically and recipient addresses or
+  message payloads are never included in agent state.
+
+## 0.11.15 - 2026-08-14
+
+- Added the generic MCC-catalog plugin operation scheduler with installed
+  bundle checks, typed interval/quiet-window/cron values and safe declarative
+  Mautic console argument templates.
+- Replaced built-in Viber, Oracle Hospitality and Leuchtfeuer Housekeeping
+  policy, plus the composite Mail.ru Postmaster worker, with catalog
+  definitions. Plugin commands, defaults and cron match tokens no longer live
+  in MCD scheduler branches or host configuration templates.
+- Added generic legacy cron reconciliation and canonical migration. Existing
+  tile/runtime values, including explicit enabled/disabled state and all mapped
+  parameters, take precedence; otherwise a matching cron enables the operation
+  and imports common minute/hour/daily cadences.
+- Added catalog-defined multi-task operations, conditional arguments, safety
+  task lanes, read-only database guards and bootstrap completion probes so
+  complex plugin workflows use the same generic scheduler.
+
+## 0.11.14 - 2026-08-14
+
+- Deferred campaign email-counter reconciliation while any native campaign
+  process is active on the same Mautic root. This prevents an intermediate
+  `email_stats` count from being written into `emails.sent_count` while Mautic
+  still holds its own pending counter increment, which produced false doubled
+  UI statistics on Enoteka campaign 25 without duplicate recipient sends.
+- Added compact, rate-limited evidence for deferred reconciliations; a deferred
+  check does not consume the normal reconciliation cooldown and is retried
+  after native campaign work exits.
+
+## 0.11.13 - 2026-08-14
+
+- Bounded fairness-watchdog logging after live farm validation. Persistent
+  promoted work now logs once on transition and at most once per hour with a
+  count, oldest wait and three-root sample; the complete bounded state remains
+  available in MCC telemetry without per-minute full-root log lines.
+
+## 0.11.12 - 2026-08-14
+
+- Split the high-density farm scheduler into hardware-specific profiles:
+  `farm-tiny`, `farm-mini`, `farm-midi`, `farm-maxi`, `farm-hiload` and
+  `farm-ultra`. Each class keeps the elastic one-slot emergency reserve and
+  per-instance fairness while MCC derives its actual limits from host CPU/RAM.
+- Removed the generic `farm` profile from operator-facing CLI and MCC choices.
+  Existing generic assignments are forcibly migrated on service reconciliation
+  to the matching hardware class, including hosts pinned in manual mode.
+
+## 0.11.11 - 2026-08-14
+
+- Replaced isolated segment and campaign host lanes with one elastic scheduler
+  budget. Segment work can use idle capacity while preserving one emergency
+  slot for imports and campaign work on hosts with at least two slots.
+- Added independent per-instance concurrency for high-density farms. When an
+  instance has pending import or campaign work, its segment admission leaves a
+  local slot available so background segment rebuilds cannot block priority
+  work from the same Mautic database.
+- Added `farm` and `ultra` profiles. MCC sizes farm hosts up to one scheduler
+  command per CPU within a separate RAM budget, while standard hosts retain the
+  conservative half-CPU limit; 24+ CPU, 96+ GiB hosts can use `ultra`.
+- Removed repeated whitelist-root dispatch within one scheduler cycle and added
+  a five-minute fairness watchdog. Compact watchdog state is reported in MCC
+  scheduler telemetry without accumulating per-cycle log files.
+
+## 0.11.10 - 2026-08-14
+
+- Fixed host-wide import starvation when priority segment instances repeatedly
+  filled the shared segment/import lane before a regular instance could claim
+  a slot. Instances with a known pending Mautic import now dispatch first while
+  preserving existing rotation and whitelist ordering for all other work.
+- Added regression coverage for the Mensa import 56 shape: a regular instance
+  with a delayed import must precede duplicated whitelist-segment dispatches
+  from another instance, and normal ordering remains unchanged without pending
+  imports.
+
+## 0.11.9 - 2026-08-13
+
+- Preserved `mautic:emails:send` cron workers in active MCD profiles. MCD does
+  not replace the Symfony/SwiftMailer file-spool consumer, so disabling these
+  workers could leave campaign messages queued after a successful trigger.
+- Added automatic repair for active hosts where an earlier MCD release had
+  commented those workers. Only MCD-created generic markers immediately
+  wrapping an email-spool consumer are restored; campaign, segment, import,
+  email-fetch, Viber, OHIP and other MCD-owned cron jobs remain disabled.
+
+## 0.11.8 - 2026-08-13
+
+- Added selective logical-issue remediation. Explicit segment IDs are accepted
+  only when a fresh scan confirms that they belong to the referenced active
+  issue; the maintenance-compatible command without IDs still disables the
+  complete affected branch.
+- Added bounded multi-issue remediation in one database transaction. Every
+  selected segment receives its applicable issue IDs and reasons, while MCD
+  retains per-issue before/after audit rows and rescans after the commit.
+
+## 0.11.7 - 2026-08-12
+
+- Fixed the contact-count report's Python 3.10 compatibility by using
+  `timezone.utc`; the `0.11.6` test build stopped at the pre-switch import gate
+  and was never activated or promoted to `approved`.
+
+## 0.11.6 - 2026-08-12
+
+- Added the read-only `report:contact-count` command for one selected Mautic
+  instance. It counts each database contact once when `email` or `mobile`
+  contains a non-whitespace value and excludes rows where both fields are
+  empty.
+- Added independently checkable totals for email-only, mobile-only, both-field
+  and excluded-empty rows. The command fails on an internally inconsistent
+  aggregate instead of returning an unreliable billing count.
+
+## 0.11.5 - 2026-08-12
+
+- Added an instance logical-issue guard for Mautic segments. MCD scans every
+  five minutes for dependency cycles, self-references and known invalid filter
+  values, persists concrete reasons and affected IDs, and prevents unsafe
+  segments and their published descendants from entering the scheduler.
+- Added bounded `logical-issues scan/status/remediate` CLI operations. The
+  guarded remediation disables the affected published branch transactionally,
+  appends the reason, issue ID, operator and UTC timestamp to each segment, and
+  retains a compact before/after audit history.
+- Classified missing and unpublished segment dependencies as visible warnings
+  without scheduler blocking or automatic remediation. These configurations
+  can be stale but do not always make native Mautic execution fail.
+- Stored logical-issue state through the existing `runtime_sync` backend:
+  `mysql_hybrid` remains authoritative and keeps the bounded SQLite fallback
+  shadow. Detailed state is limited to 100 active issues and 50 remediation
+  actions while the complete compact blocked-ID set remains effective. State
+  for deleted instance roots is pruned from both backends during inventory
+  refresh so the legacy fallback cannot become an unbounded history store.
+- Added logical-issue snapshots to the authenticated MCC state payload. Cycle
+  detection is iterative and the fleet scan reads only the segment fields it
+  needs, avoiding recursion and unnecessary data on large installations.
+
+## 0.11.4 - 2026-08-11
+
+- Remove stale Docker runtime instances from local inventory when their
+  root-owned descriptor is deleted. A rescan now reconciles descriptor-backed
+  rows as authoritatively as normal autodiscovery rows, so deletion disappears
+  from MCD and the next MCC state push.
+
+## 0.11.3 - 2026-08-11
+
+- Preserve descriptor-declared numeric container ownership in the filesystem
+  permissions guard. Docker bind mounts are no longer rewritten to the host
+  PHP user, while host-native Mautic permissions remain unchanged.
+- Added an optional host-side database endpoint to Docker runtime descriptors.
+  MCD uses it for scheduler queries, administrator management and other host
+  database work while console commands continue through scoped `docker exec`.
+- Made the manual permissions repair command honor the Docker descriptor user,
+  including numeric `uid:gid` identities that do not exist in the host passwd
+  database.
+
+## 0.11.2 - 2026-08-11
+
+- Account for firmware- and kernel-reserved RAM when mapping Linux `MemTotal`
+  to nominal provider hardware classes. A 2-vCPU/4-GiB CX23 that exposes about
+  3.73 GiB to Linux now correctly selects `mini` instead of `tiny`, while the
+  lower CPU-or-memory class remains authoritative.
+
+## 0.11.1 - 2026-08-11
+
+- Added automatic scheduler-profile selection from the host's logical CPU and
+  physical memory class. Fresh passive installations now select the
+  conservative `tiny`, `mini`, `midi`, `maxi` or `hiload` baseline on MCD
+  startup and retain the automatic policy across normal restarts.
+- Persisted profile-selection authority independently of the MCD configuration.
+  A CLI, MCC or direct configuration choice locks the host in manual mode, so
+  later hardware detection cannot overwrite an operator decision. Existing
+  active installations are migrated as manual and remain unchanged.
+- Added `mcd-cli profile auto` to explicitly restore hardware-managed selection,
+  and extended `mcd-cli profile status` with the selection mode, detected CPU,
+  detected memory and current recommendation.
+
+## 0.11.0 - 2026-08-11
+
+- Added root-owned runtime descriptors for isolated Docker Mautic instances.
+  Inventory and MCC state now retain the container identity, in-container root,
+  console path, numeric execution user and immutable image reference without
+  publishing database secrets.
+- Routed normal MCD console execution through an exact `docker exec` target for
+  descriptor-backed instances. Host PHP/FPM behavior remains unchanged for
+  legacy installations, and Docker containers never receive the Docker socket.
+- Kept host PHP-FPM tuning and in-place Mautic upgrades away from immutable
+  container instances. Their application version is managed by the platform
+  image while MCD continues database, status and console-level management.
+
+## 0.10.35 - 2026-08-11
+
+- Added instance-scoped Oracle Hospitality synchronization. When
+  `OracleHospitalityBundle` is installed, active MCD profiles run
+  `ohip:sync` every six hours by default; MCC runtime overrides can disable
+  the task or change its interval per instance.
+- Added `ohip:sync` to active-profile cron reconciliation so a legacy cron
+  cannot race the MCD-managed task. Instances without the plugin remain
+  untouched.
+
+## 0.10.34 - 2026-08-11
+
+- Dispatch campaigns returned by the native due query through an independent
+  priority lane. Due triggers no longer wait behind campaign rebuild-ring
+  traversal or segment activity on large shared hosts.
+- Defer hourly native campaign fallback while an untracked Mautic campaign
+  console process is still alive for the same instance. Child processes that
+  outlive their tracked parent can no longer overlap a global fallback run.
+
+## 0.10.33 - 2026-08-10
+
+- Reserve an independent scheduler slot for the seven-second Mail.ru Postmaster
+  campaign-guard refresh. Segment and campaign rebuild saturation can no longer
+  starve the safety poll that must stop a campaign before its next send batch.
+
+## 0.10.32 - 2026-08-10
+
+- Detect active Mail.ru Postmaster campaign guards by Mautic's `type` column;
+  `event_type` contains the generic value `action` and previously prevented the
+  maximum-frequency domain polling loop from starting.
+
+## 0.10.31 - 2026-08-10
+
+- Prevented `nginx-4xx-scan` Fail2ban false positives caused by Safari and
+  other browsers repeatedly requesting missing root icons. MCD now adds a
+  narrow ignore rule for `404` responses on `/apple-touch-icon*.png` and
+  `/favicon.ico`, reloads only that jail, and preserves all other 4xx scan
+  detection.
+
+## 0.10.30 - 2026-08-10
+
+- Treat an already populated Mail.ru Postmaster statistics table as an
+  existing installation when MCD first detects the plugin. MCD records that
+  adoption and continues with the current-month job instead of launching an
+  immediate 365-day backfill; fresh empty installations still receive the
+  first full missing-month pass.
+
+## 0.10.29 - 2026-08-10
+
+- Run one persistent, per-instance 365-day Mail.ru Postmaster full
+  synchronization on the first MCD launch after the plugin is detected. The
+  completion marker is written only after a successful command; subsequent
+  routine work returns to the current month and the configured weekly pass asks
+  the plugin to fill only domain/month periods without completion evidence.
+- Separate bulk Postmaster jobs from active campaign-guard refresh jobs. A
+  first or weekly full sync can no longer delay the seven-second, current-day,
+  single-domain polling used by campaign stoppers.
+
+## 0.10.28 - 2026-08-10
+
+- Fixed explicit plugin `update` operations to repair bundles in `BROKEN`
+  registration state, matching the automatic and reinstall recovery paths.
+
+## 0.10.27 - 2026-08-10
+
+- Added a Mautic 7 plugin-registration preflight that installs the missing
+  `nikic/php-parser:^5.0` runtime package through Composer without running
+  project scripts. This prevents Symfony's translation extractor from aborting
+  `mautic:plugins:reload` with `PhpParser\\NodeVisitor` missing.
+- Made catalog status registration-aware: copied files and a matching MCD
+  package marker are now reported as `BROKEN` until the bundle has an active
+  `{prefix}plugins` row. Plugin operations also fail explicitly if Mautic exits
+  without registering every selected bundle.
+- Added regressions for the Fruške Terme Oracle Hospitality installation where
+  package files were present but the plugin was absent from `/s/plugins`.
+
+## 0.10.26 - 2026-08-10
+
+- Kept campaigns with future scheduled event logs in the trigger ring and
+  armed a precise database-clock wake-up for their earliest trigger date.
+  Date actions can no longer wait for the next minute-level published audit
+  after becoming due, allowing the hourly native fallback to win the race.
+- Cached future wake-ups suppress repeated due-guard SQL probes and emit one
+  compact scheduling line per changed date, including across repeated rebuilds,
+  instead of stale-skip log churn.
+- Added a production-shape regression for Merkurosiguranje campaign 56 with
+  468 scheduled root email actions due at 07:00 UTC.
+- Prioritized a campaign trigger immediately after its successful rebuild
+  before round-robin launches another rebuild. This closes the Fruške Terme
+  campaign 13 race where native fallback sent four newly rebuilt contacts
+  before MCD revisited the trigger lane.
+
+## 0.10.23 - 2026-08-10
+
+- Added instance-scoped Mail.ru Postmaster synchronization for active MCD
+  profiles. The scheduler auto-detects `MauticMailRuPostmasterBundle`, runs its
+  current-month sync every ten minutes by default, and never dispatches the command
+  to sibling instances without the plugin.
+- Added a published-campaign probe for Postmaster guard nodes. While at least
+  one guard campaign is active, MCD runs the plugin's domain-only refresh every
+  seven seconds; inactive instances make no high-frequency API calls.
+- Added stable global and per-instance runtime overrides for the Postmaster
+  sync switch and interval. Active-profile cron reconciliation now recognizes
+  the standalone Postmaster fallback command and prevents duplicate runs.
+- Added a minute-level scheduled-full probe. The plugin performs its 365-day
+  fallback at the weekday/time configured in Mautic, while optional MCC
+  weekday/time values override the plugin schedule per instance.
+
+## 0.10.22 - 2026-08-09
+
+- Capped the exclusive native campaign fallback at 30 minutes and restarted
+  its interval from completion, failure, or timeout. A looping native trigger
+  can no longer hold the campaign root lock for hours or relaunch immediately
+  after it is terminated.
+- Added one bounded retry for automatic exact campaign triggers when the host's
+  general task retry setting is `1`. Other automatic and manual task retry
+  behavior is unchanged.
+- Added regressions for the Alex Personal fallback lock incident that delayed
+  segment-backed rebuild and trigger work for campaigns 165 through 168.
+
+## 0.10.21 - 2026-08-09
+
+- Fixed campaign trigger priority so IDs returned by the narrow due query are
+  promoted ahead of recurring all-published audit entries. A large stale audit
+  ring can no longer reinsert completed campaigns at the front on every plan
+  refresh and starve a newly due campaign.
+- Extended the campaign trigger progress watchdog with campaign-scoped
+  `email_stats` progress. Long native sends are no longer killed while email
+  rows are advancing but Mautic has not yet committed matching event-log
+  updates.
+- Added production-shape regressions for Abelapharm campaigns 1065/1066 and
+  Hotelsunce campaign 57.
+
+## 0.10.20 - 2026-08-08
+
+- Fixed scheduled campaign event-log due checks to follow native timestamp
+  storage by Mautic generation: Mautic 4 keeps the validated instance-local
+  compatibility baseline, while Mautic 5, 6, and 7 compare Doctrine campaign
+  event-log timestamps in UTC.
+- Prevented modern Mautic exact triggers from running early and entering their
+  repeat cooldown before the event is actually due. This closes the observed
+  Hotelsunce campaign 35 gap where native fallback processed event 110/111
+  before MCD's next exact trigger pass.
+
+## 0.10.19 - 2026-08-08
+
+- Fixed priority campaign-whitelist dispatch to follow native Mautic's active
+  publication window. Unpublished, not-yet-published, and expired campaign IDs
+  are removed from the priority rebuild/trigger lane within one audit interval
+  instead of being rebuilt indefinitely merely because they remain configured
+  in the whitelist.
+- Guarded the whitelist publication check to fail closed and rate-limit its
+  error log, preventing both unsafe launches and repetitive log noise when the
+  instance database cannot be checked.
+
+## 0.10.18 - 2026-08-07
+
+- Fixed campaign audit-ring publication filtering to use Mautic's UTC database
+  timestamps. On hosts with a non-UTC timezone, a newly scheduled campaign can
+  no longer be rebuilt before `publish_up`, treated as already known, and then
+  delayed behind the existing ring when its real publication time arrives.
+
+## 0.10.17 - 2026-08-07
+
+- Page-hit orphan cleanup now fails closed when the managed
+  `idx_mcd_ph_lead_date` index is absent. This prevents an unindexed cleanup
+  preview from scanning very large `page_hits` tables and blocking scheduler
+  reaping, import polling, and MCC user-task dispatch.
+
+## 0.10.16 - 2026-08-07
+
+- Fixed State DB bootstrap to use the same effective configuration, including
+  MCC runtime overrides, for status checks, database validation, connection
+  defaults, and schema creation. This prevents valid `mysql_hybrid` bootstrap
+  from being rejected when state settings are supplied by MCC rather than the
+  local TOML file.
+
+## 0.10.15 - 2026-08-07
+- Fixed: explicit `state-db init` now accepts an existing state database whose
+  MCD tables or schema-version record have not been initialized. This repairs
+  interrupted `mysql_hybrid` rollouts instead of leaving the agent in noisy
+  SQLite fallback mode.
+- Guarded: bootstrap remains unavailable when MySQL state is already active or
+  when the probe failed for an unrelated connection error.
+
+## 0.10.14 - 2026-08-07
+- Fixed: own-host MX delivery now opens TCP/25 through an exact, comment-tagged
+  firewall rule instead of leaving Sendmail unreachable behind a default-drop
+  host policy.
+- Guarded: a dedicated idempotent systemd unit restores that one rule after a
+  reboot and removes only its own rule when the final own-host domain is
+  disabled. Local submission on 2525 and all unrelated firewall rules remain
+  unchanged.
+
+## 0.10.13 - 2026-08-07
+- Fixed: mail-profile test delivery no longer supplies an empty Symfony
+  return-path address when Mautic intentionally leaves the setting blank.
+- Added: own-host mail can receive delivery-status and feedback-loop reports
+  at exact `bounce@`, `fbl@` and `abuse@` addresses. MCD validates the managed
+  domain, parses the message and writes idempotent email DNC state directly to
+  the matching Mautic database.
+- Guarded: Sendmail keeps the pre-existing system relay and submission
+  settings while MCD owns a separately marked inbound listener and exact
+  virtual-address map. Unknown recipients are rejected, changes have persistent
+  baselines, and disabling the final own-host domain restores the original
+  MTA files and removes the receive helper.
+
+## 0.10.12 - 2026-08-06
+- Fixed: own-host mail runtime uses `datetime.timezone.utc` instead of the
+  Python 3.11-only `datetime.UTC` alias. MCD packages now pass pre-switch import
+  smoke on supported Python 3.10 hosts, including Booka.
+
+## 0.10.11 - 2026-08-06
+- Added: mail-profile apply can preserve credentials from the active Mautic
+  `mailer_dsn` while changing between `mautic+ses+api`, `ses+api` and
+  `ses+https`. Blank credential fields retain their current values and supplied
+  fields replace only the corresponding value.
+- Guarded: SES API credentials are never reused for `ses+smtp`, which requires
+  its own SMTP username and password.
+- Added: after apply and test succeed, MCD reports the effective credentials to
+  MCC through the authenticated mail-profile status endpoint for encrypted
+  control-plane storage. Credentials are not included in command output.
+
+## 0.10.10 - 2026-08-06
+- Fixed: `MauticZenderBundle` is no longer classified as an email sender. MCD
+  derives sender state only from the active `local.php` mail transport or DSN,
+  including own-host `mcd-mail-submit` sendmail configurations.
+- Added: instance state reports a secret-free snapshot of the active mail
+  configuration: method, source file, region/host/port, sender addresses and
+  credential-presence flags. DSN credentials are never included in state.
+- Added: Amazon SES profiles support `mautic+ses+api`, `ses+api`, `ses+https`
+  and `ses+smtp`. MCD installs the Symfony Amazon Mailer and HTTP client where
+  required and provides a package-only mail profile preflight operation.
+
+## 0.10.9 - 2026-08-06
+- Fixed: managed image database-user cleanup now uses the agent's local SQL
+  literal quoting helper instead of failing safely with an undefined helper
+  after the database was removed.
+- Regression: executes the complete convention-matched database and user
+  cleanup path and verifies the exact guarded SQL statements.
+
+## 0.10.8 - 2026-08-06
+- Fixed: image deployment accepts a pre-existing instance parent only when it
+  is an empty directory, while non-empty or non-directory paths remain blocked.
+- Fixed: a failed image deployment rolls back only resources created for that
+  attempt: local mail, exact nginx entries, a dedicated certificate, webroot,
+  database and the convention-matched database user.
+- Fixed: full instance deletion removes an empty dedicated instance parent and
+  drops the matching MCD-image database user and dedicated single-domain
+  certificate; custom database users and shared certificates are never
+  inferred or removed.
+- Safety: image database users must not pre-exist and are created without
+  `IF NOT EXISTS`, preventing a stale account password from being paired with
+  newly generated Mautic credentials.
+
+## 0.10.7 - 2026-08-06
+- Fixed: full instance deletion now disables any matching MCD-managed local
+  mail domain before database, vhost or file removal. Missing local-mail state
+  is an idempotent no-op; a real mail cleanup failure blocks deletion.
+- Fixed: vhost deletion removes both the exact `sites-enabled` entry and its
+  exact domain-matched `sites-available` configuration while preserving every
+  unrelated virtual host. An nginx preflight blocks changes when the existing
+  host configuration is already invalid.
+- Regression: covers local-mail cleanup ordering, exact vhost ownership and
+  complete enabled/available removal.
+
+## 0.10.6 - 2026-08-06
+- Fixed: URL-encoded mailer DSNs are escaped for the Symfony parameter bag, so
+  values such as `%2Fusr` cannot be interpreted as missing DI parameters and
+  break Mautic web requests after mail-profile activation.
+- Fixed: direct mail tests decode Symfony percent literals before constructing
+  the transport; the same handling covers own-host, SMTP, SES and SendGrid.
+- Safety: own-host activation must now rebuild the Mautic cache before success.
+  Rollback restores `local.php` and rebuilds the cache from the restored config.
+- Regression: covers own-host and credential-bearing external DSN persistence.
+
+## 0.10.5 - 2026-08-06
+- Fixed: the isolated Sendmail systemd unit now stops with `SIGINT`, which the
+  daemon handles immediately and cleanly, instead of waiting for the default
+  90-second `SIGTERM` timeout when a second instance refreshes DKIM mappings.
+- Safety: the isolated service has a bounded 15-second stop timeout; the system
+  Sendmail service, configuration and queue remain outside MCD ownership.
+- Regression: verifies the generated unit carries both stop safeguards.
+
+## 0.10.4 - 2026-08-06
+- Fixed: profile activation accepts hosts whose observed local hostname differs
+  from their canonical MCC inventory name. Private material remains protected
+  by MCC bearer authentication, source-IP binding and canonical profile/local-
+  mail ownership checks before it reaches the agent.
+- Regression: covers a legacy host identified locally as `Nikola` and
+  canonically as `host-46-62-129-237` without weakening instance-domain scope.
+
+## 0.10.3 - 2026-08-06
+- Fixed: isolated Sendmail now compiles `QUEUE_DIR` as an m4 definition and
+  refuses activation unless the resulting `sendmail.cf` contains the exact
+  dedicated `/var/spool/mqueue-mcd` path. It cannot consume a sibling system
+  Sendmail queue.
+- Fixed: own-host SMTP submission normalizes message line endings to CRLF
+  before passing byte payloads to Python `smtplib`, preventing Sendmail from
+  rejecting Symfony Mailer messages with `Bare linefeed (LF) not allowed`.
+- Regression: verifies the compiled queue guard, untouched system Sendmail
+  configuration, isolated listener selection and SMTP wire line endings.
+
+## 0.10.2 - 2026-08-06
+- Fixed: profile activation test mail reads both supported Mautic `local.php`
+  layouts: arrays returned by newer releases and the `$parameters = array(...)`
+  assignment used by older installations. The test no longer rolls back a
+  valid own-host configuration because it misread an existing Mautic config.
+- Regression: covers both local configuration layouts while retaining the
+  mandatory real-message test before profile activation.
+
+## 0.10.1 - 2026-08-06
+- Fixed: own-host activation on an existing Sendmail host now uses an isolated
+  loopback listener, generated configuration and dedicated queue. MCD no longer
+  edits `/etc/mail/sendmail.mc`, restarts the system Sendmail service or moves
+  its existing queue, so sibling instances retain their current relay path.
+- Fixed: the Mautic quota wrapper now reaches root-owned MCC mail state through
+  a single validated sudoers helper and submits to the isolated listener. Daily
+  and monthly recipient accounting remains atomic without exposing MCD state to
+  the shared web user.
+- Regression: covers dedicated Sendmail port/queue generation, isolated SMTP
+  submission and quota rollback after delivery failure.
+
+## 0.10.0 - 2026-08-06
+- Added: MCD applies MCC-stored per-instance mail profiles for own-host mail,
+  SMTP, Amazon SES API and SendGrid API. Missing Symfony mailer bridges are
+  installed through the existing guarded Composer dependency workflow.
+- Added: own-host mail uses per-instance DKIM keys, MCC-provided sender
+  settings and atomic daily/monthly recipient quotas. Existing native Sendmail
+  hosts remain on Sendmail; clean new hosts install Postfix and OpenDKIM.
+- Added: profile activation sends a real Symfony Mailer test message to the
+  current MCC user's email before MCC marks the profile active.
+- Safety: MTA, OpenDKIM and Mautic changes roll back on failure; unmanaged MTAs
+  are never replaced.
+- Changed: instance mail state is stored only under `/etc/mcd/local-mail` and
+  `/var/lib/mcd/local-mail`; no instance `.mcd` runtime directory is created.
+
+## 0.9.287 - 2026-08-06
+- Fixed: native fallback owns an exclusive per-instance campaign gate for its
+  complete global update/trigger pair. MCD exact rebuild/trigger launches use
+  the shared side of the same gate and cannot overlap the fallback, while
+  segment and import scheduling remain independent.
+- Added: an in-process dispatch coordinator closes the admission race before a
+  child process starts; the root-level `flock` provides restart and
+  cross-process protection. Lock contention defers fallback without recording
+  a false native-command error.
+- Regression: covers the observed Dexyco overlap between a global fallback
+  trigger and exact campaign 176.
+
+## 0.9.286 - 2026-08-06
+- Fixed: newly discovered campaigns in the priority lane are inserted ahead of
+  previously queued priority work for both rebuild and trigger scheduling. A
+  fresh campaign can no longer wait behind an existing shared-host ring before
+  its first MCD execution.
+- Regression: covers MauticFarm-02 campaign 27 entering the existing
+  `22/17/8/10` priority ring while preserving regular-ring round-robin order.
+
+## 0.9.285 - 2026-08-06
+- Fixed: the first `recovered_runs` schema migration backfills the cumulative
+  counter once from retained durable fallback events. Upgrading from 0.9.283
+  through 0.9.284 no longer leaves a permanent canonical/reported telemetry
+  gap after a recovery event occurred before the new counter was installed.
+
+## 0.9.284 - 2026-08-06
+- Fixed: campaign watchdog and priority timeout termination now signal the
+  complete isolated process group. A stopped `flock` wrapper can no longer
+  leave its `sudo`/PHP campaign command running indefinitely as an orphan.
+- Added: native fallback executions have a six-hour safety timeout and publish
+  compact `deferred`/`running` runtime state to MCC, including schedule delay,
+  PID, start time and final duration.
+- Added: fallback statistics now accumulate `recovered_runs` in addition to
+  recovered pending and email-stat deltas, making MCD misses directly countable.
+
+## 0.9.283 - 2026-08-05
+- Fixed: campaign trigger due-guard now evaluates scheduled event-log timestamps
+  against a timezone-aware baseline (`now_event_log`) derived from the instance
+  timezone. UTC-configured instances still use UTC, non-UTC instances use local
+  campaign time for due checks.
+
+## 0.9.282 - 2026-08-05
+- Fixed: campaign trigger due-guard now treats scheduled event-log timestamps as due
+  when they are stored in local time and differ from UTC by the instance timezone.
+  This addresses hosts where `campaign_lead_event_log.trigger_date` is shifted
+  versus UTC and otherwise appears as future by strict UTC comparison.
+
+## 0.9.281 - 2026-08-05
+- Preserved: configured campaign-pressure throttling still reduces the segment
+  lane for long or concurrent campaign work. This resource guard is separate
+  from scheduler ownership: segment tasks cannot consume campaign slots or
+  prevent campaign update, trigger, and rebuild launches.
+
+## 0.9.280 - 2026-08-05
+- Changed: host scheduler capacity is split into independent segment/import and
+  campaign lanes. Saturated `segment`, `segment_sql`, or `import` work cannot
+  block `campaign_update`, `campaign_trigger`, or `campaign_rebuild`, and busy
+  campaign workers no longer consume or throttle segment capacity.
+- Regression: covers the Prodajadelova rebuild ring `22/17/8/10` on a shared
+  host with all segment slots occupied, including isolation in both directions.
+
+## 0.9.279 - 2026-08-05
+- Fixed: exact campaign rebuild backlog now temporarily suspends new segment
+  admission across the host. Existing segment work drains and frees a scheduler
+  slot for campaign membership rebuilds instead of continuously refilling every
+  slot and starving due campaigns on shared hosts.
+- Regression: covers the Prodajadelova campaigns 8/10/17/22 shape where native
+  `campaigns:update` recovered missing campaign membership after MCD rebuilds
+  had not launched while segment work saturated the host scheduler.
+
+## 0.9.278 - 2026-08-05
+- Fixed: native fallback metrics now inspect the real prefixed Mautic event-log
+  schema and support both current and legacy scheduling columns. Metric failures
+  are best-effort diagnostics and can no longer suppress native commands.
+- Changed: each fallback always runs the global native campaign update and
+  trigger commands without campaign or batch arguments. Shared hosts admit only
+  one fallback instance at a time and emit one compact completion log.
+- Added: fallback outcomes and recovered-work deltas accumulate per instance in
+  the agent state database across restarts. MCC receives cumulative totals and a
+  bounded recent history with stable event IDs; operation events retain 30 days
+  with a 5000-row cap so MCC can persist and deduplicate its canonical aggregate.
+
+## 0.9.277 - 2026-08-05
+- Added: an opt-in native campaign safety fallback. Once per configured interval,
+  an active MCD host runs global `mautic:campaigns:update` followed by
+  `mautic:campaigns:trigger` only after local campaign work is idle.
+- Added: one compact MCC signal per fallback run with return code and before/after
+  due-event and campaign-email counts, so recovery differences are auditable.
+- Fixed: fallback metrics now render each Mautic database table prefix before
+  querying, so prefixed installations do not skip the fallback preflight.
+
 ## 0.9.275 - 2026-08-03
 - Fixed: full MCC state pushes now reload the shared instance inventory before
   serialization. An instance deleted by a separate `mcd-cli` process can no

@@ -25,6 +25,15 @@ class MauticInstall:
     source: str = "autodiscovery"
     markers: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
+    runtime: str = "host"
+    runtime_id: str | None = None
+    runtime_root: str | None = None
+    runtime_user: str | None = None
+    runtime_php_bin: str | None = None
+    runtime_image_ref: str | None = None
+    install_type: str | None = None
+    runtime_capabilities: list[str] = field(default_factory=list)
+    runtime_adapter: str | None = None
 
     def safe_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -39,6 +48,15 @@ class MauticInstall:
             "source": self.source,
             "markers": self.markers,
             "domains": list(self.domains or []),
+            "runtime": self.runtime,
+            "runtime_id": self.runtime_id,
+            "runtime_root": self.runtime_root,
+            "runtime_user": self.runtime_user,
+            "runtime_php_bin": self.runtime_php_bin,
+            "runtime_image_ref": self.runtime_image_ref,
+            "install_type": self.install_type,
+            "runtime_capabilities": list(self.runtime_capabilities or []),
+            "runtime_adapter": self.runtime_adapter,
         }
         if self.db:
             payload["db"] = {

@@ -463,6 +463,58 @@ def _restart_service_async() -> None:
     )
 
 
+def _ensure_mcd_service_kill_mode(
+    unit_path: Path = Path("/etc/systemd/system/mcd.service"),
+) -> bool:
+    """Migrate an existing MCD unit and its drop-ins to group shutdown."""
+    if not unit_path.exists():
+        return False
+    dropin_dir = unit_path.parent / f"{unit_path.name}.d"
+    paths = [unit_path]
+    if dropin_dir.is_dir():
+        paths.extend(sorted(dropin_dir.glob("*.conf")))
+
+    changes: dict[Path, tuple[str, str, int]] = {}
+    for path in paths:
+        original = path.read_text(encoding="utf-8")
+        updated = original.replace("KillMode=process", "KillMode=control-group")
+        if path == unit_path and "KillMode=" not in updated:
+            marker = "[Service]\n"
+            if marker not in updated:
+                raise RuntimeError(f"MCD systemd unit has no Service section: {unit_path}")
+            updated = updated.replace(marker, marker + "KillMode=control-group\n", 1)
+        if updated != original:
+            changes[path] = (original, updated, path.stat().st_mode)
+    if not changes:
+        return False
+
+    written: list[Path] = []
+    tmp_paths: list[Path] = []
+    try:
+        for path, (_original, updated, mode) in changes.items():
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_paths.append(tmp_path)
+            tmp_path.write_text(updated, encoding="utf-8")
+            tmp_path.chmod(mode)
+            os.replace(tmp_path, path)
+            written.append(path)
+        proc = subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl daemon-reload failed").strip()
+            raise RuntimeError(f"MCD systemd unit migration failed: {detail}")
+    except Exception:
+        for path in written:
+            original, _updated, mode = changes[path]
+            path.write_text(original, encoding="utf-8")
+            path.chmod(mode)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+        raise
+    finally:
+        for tmp_path in tmp_paths:
+            tmp_path.unlink(missing_ok=True)
+    return True
+
+
 def _acquire_update_lock(cfg: AgentConfig, *, blocking: bool) -> Any | None:
     lock_p = _lock_path(cfg)
     lock_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1339,6 +1391,7 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
         os.replace(src_next_dir, src_dir)
         swapped = True
         _install_agent_package_for_source(install_dir, src_dir)
+        _ensure_mcd_service_kill_mode()
 
         release_session(
             cfg,

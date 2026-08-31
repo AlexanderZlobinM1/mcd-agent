@@ -11,7 +11,7 @@
 # - final value will be 3 (customized tiny)
 
 [profile]
-# custom|passive|tiny|mini|midi|maxi|hiload
+# custom|passive|tiny|mini|midi|maxi|hiload|ultra|farm-tiny|farm-mini|farm-midi|farm-maxi|farm-hiload|farm-ultra
 name = "passive"
 
 # Profile defaults snapshot:
@@ -21,6 +21,8 @@ name = "passive"
 # midi   : dual ring, no throttle, whitelist on, priority size 10, seg 3+1, trigger 3+1
 # maxi   : dual ring, throttle 200/5m, whitelist on, seg 5+1, trigger 3+1, rebuild 2+1
 # hiload : dual ring, throttle 200/5m, whitelist on, seg 6+2, trigger 4+2, rebuild 3+1
+# ultra  : 24+ CPU / 96+ GiB high-capacity dual ring
+# farm-* : separate high-density hardware line for many small Mautic DBs
 
 [runtime]
 # MCC dynamic runtime table (hot apply):
@@ -103,16 +105,10 @@ page_hits_orphan_cleanup_grace_min = 60
 page_hits_orphan_cleanup_max_run_sec = 180
 page_hits_orphan_cleanup_instance_settings = {}
 
-# Leuchtfeuer Housekeeping plugin scheduling for Mautic 4/5/6/7 instances.
-housekeeping_plugin_enabled = false
-housekeeping_plugin_interval_sec = 86400
-housekeeping_plugin_quiet_hour = 3
-housekeeping_plugin_quiet_window_min = 120
-housekeeping_plugin_days_old = 365
-housekeeping_plugin_flags = []
-housekeeping_plugin_optimize_tables = false
-housekeeping_plugin_dry_run = true
-housekeeping_plugin_instance_settings = {}
+# Catalog-owned plugin operation definitions and their per-instance values are
+# supplied dynamically by MCC.
+plugin_operations = {}
+plugin_operation_instance_settings = {}
 
 # Monitored mailbox parser (MCD-managed replacement for mautic:email:fetch).
 monitored_email_parser_enabled = false

@@ -7,6 +7,7 @@ import shlex
 import subprocess
 
 from mcd_agent.fs_permissions import ensure_instance_permissions
+from mcd_agent.runtime_descriptor import descriptor_for_root
 
 SUPPORTED_COMMANDS = {
     "campaign:trigger": "mautic:campaigns:trigger",
@@ -38,6 +39,9 @@ _DISABLED_LIMIT_VALUES = {"", "0", "none", "null", "false", "off", "disabled", "
 
 
 def _resolve_console_path(root: str) -> str | None:
+    runtime = descriptor_for_root(root)
+    if runtime is not None:
+        return runtime.console_path
     root_path = Path(root)
     console_bin = root_path / "bin" / "console"
     console_legacy = root_path / "app" / "console"
@@ -104,8 +108,14 @@ def render_mautic_command(
     parts = shlex.split(rendered)
     if has_campaign_limit_param and _is_disabled_limit(campaign_limit):
         parts = _strip_option(parts, "--campaign-limit")
-    cmd = [php_bin, console] + parts + ["--no-interaction"]
-    if run_as_user:
+    runtime = descriptor_for_root(root)
+    if runtime is not None:
+        if not runtime.has_capability("console"):
+            raise ValueError("runtime descriptor does not allow Mautic console execution")
+        cmd = runtime.docker_exec_prefix() + parts + ["--no-interaction"]
+    else:
+        cmd = [php_bin, console] + parts + ["--no-interaction"]
+    if run_as_user and runtime is None:
         cmd = ["sudo", "-u", run_as_user] + cmd
     return cmd
 
@@ -159,7 +169,12 @@ def execute_mautic_command(
         return 3, str(e)
 
     rc, output = _run_cmd(cmd=cmd, root=root, timeout_sec=timeout_sec)
-    if command in _CACHE_COMMANDS and rc != 0 and _looks_like_permission_error(output):
+    if (
+        command in _CACHE_COMMANDS
+        and rc != 0
+        and _looks_like_permission_error(output)
+        and descriptor_for_root(root) is None
+    ):
         repaired, repair_note = _repair_cache_permissions(root=root, run_as_user=run_as_user)
         rc2, output2 = _run_cmd(cmd=cmd, root=root, timeout_sec=timeout_sec)
         combined = _combine_output(output, repair_note, output2)
@@ -203,7 +218,12 @@ def execute_mautic_command_template(
         return 3, str(e)
 
     rc, output = _run_cmd(cmd=cmd, root=root, timeout_sec=timeout_sec)
-    if command_name in _CACHE_COMMANDS and rc != 0 and _looks_like_permission_error(output):
+    if (
+        command_name in _CACHE_COMMANDS
+        and rc != 0
+        and _looks_like_permission_error(output)
+        and descriptor_for_root(root) is None
+    ):
         repaired, repair_note = _repair_cache_permissions(root=root, run_as_user=run_as_user)
         rc2, output2 = _run_cmd(cmd=cmd, root=root, timeout_sec=timeout_sec)
         combined = _combine_output(output, repair_note, output2)

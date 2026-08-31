@@ -23,6 +23,7 @@ from mcd_agent.install_readiness import collect_mautic_install_readiness
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_image_install import _mysql_admin_base, _mysql_exec, _quote_ident, _quote_sql
+from mcd_agent.form_embed import render_form_embed_location
 from mcd_agent.models import DBConfig
 from mcd_agent.models import MauticInstall
 from mcd_agent.nginx_baseline import (
@@ -32,6 +33,9 @@ from mcd_agent.nginx_baseline import (
     normalize_legacy_http2_listen,
 )
 from mcd_agent.nginx_templates import render_nginx_template
+from mcd_agent.runtime_adapters import run_runtime_adapter, runtime_adapter_path
+from mcd_agent.runtime_descriptor import descriptor_for_root
+from mcd_agent.runtime_matrix import build_runtime_profile
 
 
 _MIN_TARGET_HEADROOM_BYTES = 5 * 1024 * 1024 * 1024
@@ -417,12 +421,59 @@ def preflight_target_relay(
     target_db_name: str,
     wipe_target_root: bool = False,
     wipe_target_db: bool = False,
+    runtime_adapter: str | None = None,
+    runtime: str | None = None,
+    install_type: str | None = None,
+    image_ref: str | None = None,
+    domains_json: str = "[]",
 ) -> dict[str, Any]:
     target = Path(target_root).resolve()
     if not str(target).startswith("/"):
         raise RuntimeError("target root must be absolute")
     problems: list[str] = []
     cleanup: list[str] = []
+    adapter_result: dict[str, Any] = {}
+    required_commands = ("tar", "gzip") if runtime_adapter else ("tar", "gzip", "nginx", "php")
+    for cmd in required_commands:
+        if not shutil.which(cmd):
+            problems.append(f"missing command: {cmd}")
+    if not _DB_IDENT_RE.match(str(target_db_name or "")):
+        problems.append(f"invalid target database name: {target_db_name}")
+    if runtime_adapter:
+        try:
+            runtime_adapter_path(runtime_adapter)
+            adapter_result = run_runtime_adapter(
+                runtime_adapter,
+                operation="target-preflight",
+                payload={
+                    "target_root": str(target),
+                    "target_db_name": str(target_db_name or ""),
+                    "runtime": str(runtime or "host").strip().lower() or "host",
+                    "install_type": str(install_type or "unknown").strip().lower() or "unknown",
+                    "image_ref": str(image_ref or ""),
+                    "domains": _json_domains(domains_json),
+                },
+                timeout_sec=120,
+            )
+        except Exception as exc:
+            problems.append(f"runtime adapter preflight failed: {exc}")
+
+    # A missing/untrusted adapter or image must never trigger destructive
+    # cleanup.  Validate the complete runtime route first, then process the
+    # operator's explicit wipe flags.
+    if problems:
+        return {
+            "schema": "mcd-instance-migration-target-preflight-v1",
+            "ok": False,
+            "target_root": str(target),
+            "target_db_name": str(target_db_name or ""),
+            "wipe_target_root": bool(wipe_target_root),
+            "wipe_target_db": bool(wipe_target_db),
+            "cleanup": cleanup,
+            "runtime_adapter": str(runtime_adapter or ""),
+            "adapter": adapter_result,
+            "problems": problems,
+        }
     if target.exists() and any(target.iterdir()):
         if wipe_target_root:
             try:
@@ -433,9 +484,7 @@ def preflight_target_relay(
                 problems.append(f"target root cleanup failed: {exc}")
         else:
             problems.append(f"target root already exists and is not empty: {target}")
-    if not _DB_IDENT_RE.match(str(target_db_name or "")):
-        problems.append(f"invalid target database name: {target_db_name}")
-    else:
+    if _DB_IDENT_RE.match(str(target_db_name or "")):
         try:
             if _target_db_exists(str(target_db_name)):
                 if wipe_target_db:
@@ -445,9 +494,6 @@ def preflight_target_relay(
                     problems.append(f"target database already exists: {target_db_name}")
         except Exception as exc:
             problems.append(f"target database preflight failed: {exc}")
-    for cmd in ("tar", "gzip", "nginx", "php"):
-        if not shutil.which(cmd):
-            problems.append(f"missing command: {cmd}")
     return {
         "schema": "mcd-instance-migration-target-preflight-v1",
         "ok": not problems,
@@ -456,6 +502,8 @@ def preflight_target_relay(
         "wipe_target_root": bool(wipe_target_root),
         "wipe_target_db": bool(wipe_target_db),
         "cleanup": cleanup,
+        "runtime_adapter": str(runtime_adapter or ""),
+        "adapter": adapter_result,
         "problems": problems,
     }
 
@@ -482,6 +530,7 @@ def stream_source_files(config: AgentConfig, *, selector: str | None, output: An
         "--exclude=./app/cache",
         "--exclude=./app/logs",
         "--exclude=./.git",
+        "--exclude=./.mcd-runtime.json",
         "-C",
         str(root),
         "-czf",
@@ -642,7 +691,15 @@ def stream_source_db(config: AgentConfig, *, selector: str | None, output: Any) 
     inv = InstanceInventory(config.state_db_path)
     ensure_seeded(inv, config)
     inst = _select_instance(inv.list_instances(), selector)
-    source_db = _db_from_local_php(Path(inst.root).resolve())
+    # Runtime descriptors translate container-only DB endpoints to the
+    # host-side address MCD can actually reach.  Re-reading local.php here
+    # would discard that translation (for example 172.30.0.1 -> 127.0.0.1)
+    # and makes Docker migrations fail even though inventory and probes work.
+    source_db = inst.db or _db_from_local_php(Path(inst.root).resolve())
+    if not _is_local_db_host(source_db.host):
+        raise RuntimeError(
+            f"only a host-local source DB is supported for migration, got db_host={source_db.host}"
+        )
     with tempfile.TemporaryDirectory(prefix="mcd-migrate-source-db-") as td:
         defaults = Path(td) / "db.cnf"
         defaults.write_text(
@@ -755,10 +812,30 @@ def finalize_target_relay(
     target_db_password: str,
     domains_json: str,
     php_version: str | None = None,
+    runtime_adapter: str | None = None,
+    runtime: str | None = None,
+    image_ref: str | None = None,
+    install_type: str | None = None,
 ) -> dict[str, Any]:
     target = Path(target_root).resolve()
     domains = _json_domains(domains_json)
     target_db = _target_db_from_direct_values(name=target_db_name, user=target_db_user, password=target_db_password)
+    if runtime_adapter:
+        return run_runtime_adapter(
+            runtime_adapter,
+            operation="target-finalize",
+            payload={
+                "target_root": str(target),
+                "target_db_name": target_db.name,
+                "target_db_user": target_db.user,
+                "target_db_password": target_db.password,
+                "domains": domains,
+                "runtime": str(runtime or "host").strip().lower() or "host",
+                "image_ref": str(image_ref or ""),
+                "install_type": str(install_type or "unknown"),
+            },
+            timeout_sec=1800,
+        )
     cert_live = _matching_live_certificate(domains, require_current=True)
     if cert_live is None:
         raise RuntimeError(
@@ -884,6 +961,10 @@ def _write_nginx_vhost(*, root: Path, domains: list[str], php_version: str) -> s
         WEB_ROOT=web_root,
         SSL_BLOCK=ssl_block,
         FASTCGI_SOCKET=sock,
+        FORM_EMBED_LOCATION="\n".join(
+            ("    " + line) if line else ""
+            for line in render_form_embed_location(fastcgi_pass=f"unix:{sock}").splitlines()
+        ),
     )
     content = ensure_mautic_public_app_asset_locations(content)
     content = normalize_legacy_http2_listen(content, modern_http2=_nginx_supports_http2_directive())
@@ -1316,6 +1397,14 @@ def collect_source_probe(config: AgentConfig, selector: str | None = None) -> di
     files_bytes = _du_bytes(root)
     db_payload = _database_probe(inst)
     db_bytes = _safe_int(db_payload.get("size_bytes"), 0)
+    descriptor = descriptor_for_root(str(root))
+    runtime = str(inst.runtime or "host").strip().lower() or "host"
+    install_type = str(inst.install_type or "unknown").strip().lower() or "unknown"
+    profile = build_runtime_profile(
+        runtime=runtime,
+        install_type=install_type,
+        capabilities=inst.runtime_capabilities,
+    )
     payload: dict[str, Any] = {
         "schema": "mcd-instance-migration-source-probe-v1",
         "ok": True,
@@ -1328,6 +1417,11 @@ def collect_source_probe(config: AgentConfig, selector: str | None = None) -> di
             "domains": list(inst.domains or []),
             "mautic_major": inst.mautic_major,
             "source": inst.source,
+            "runtime": runtime,
+            "install_type": install_type,
+            "runtime_profile": profile.safe_dict(),
+            "runtime_adapter": descriptor.migration_adapter if descriptor is not None else "",
+            "image_ref": str(inst.runtime_image_ref or ""),
         },
         "files": {
             "bytes": files_bytes,

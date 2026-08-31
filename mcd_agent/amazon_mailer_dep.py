@@ -11,6 +11,7 @@ import urllib.request
 
 from mcd_agent.config import AgentConfig
 from mcd_agent.install_type import detect_install_type, plugin_dir_candidates
+from mcd_agent.runtime_descriptor import descriptor_for_root
 
 
 AMAZON_MAILER_REQUIRED_BUNDLES: set[str] = {
@@ -30,6 +31,7 @@ SENDGRID_MAILER_REQUIRED_BUNDLES: set[str] = {
 }
 
 AMAZON_MAILER_PACKAGE = "symfony/amazon-mailer"
+HTTP_CLIENT_PACKAGE = "symfony/http-client"
 SENDGRID_MAILER_PACKAGE = "symfony/sendgrid-mailer:*"
 
 _MAUTIC_COMPOSER_REQUIRE_MARKERS = {
@@ -207,6 +209,130 @@ def _composer_has_package(project_root: str, composer_bin: str, package_name: st
     return proc.returncode == 0
 
 
+def _resolve_mailer_bridge_requirement(
+    *,
+    project_root: str,
+    composer_bin: str,
+    package_name: str,
+) -> str:
+    """Constrain Symfony mailer bridges to the installed Mailer minor."""
+    show_name = _composer_show_name(package_name)
+    bridge_names = {
+        _composer_show_name(AMAZON_MAILER_PACKAGE),
+        _composer_show_name(SENDGRID_MAILER_PACKAGE),
+    }
+    if show_name not in bridge_names:
+        return package_name
+
+    _, separator, constraint = str(package_name or "").partition(":")
+    if separator and constraint.strip() not in {"", "*"}:
+        return package_name
+
+    proc = _run(
+        [
+            composer_bin,
+            "show",
+            "symfony/mailer",
+            "--format=json",
+            "--no-interaction",
+            "--no-ansi",
+        ],
+        cwd=project_root,
+        as_www_data=True,
+        check=False,
+        timeout_sec=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine installed symfony/mailer version")
+
+    versions: list[str] = []
+    try:
+        payload = json.loads(proc.stdout or "{}")
+        raw_versions = payload.get("versions", []) if isinstance(payload, dict) else []
+        if isinstance(raw_versions, list):
+            versions.extend(str(value) for value in raw_versions)
+        if isinstance(payload, dict) and payload.get("version"):
+            versions.append(str(payload["version"]))
+    except (TypeError, ValueError):
+        versions = []
+
+    for version in versions:
+        match = re.search(r"\bv?(\d+)\.(\d+)(?:\.\d+)?\b", version)
+        if match:
+            return f"{show_name}:^{match.group(1)}.{match.group(2)}"
+
+    raise RuntimeError("Cannot parse installed symfony/mailer version")
+
+
+def _composer_update_targeted_package(
+    *,
+    project_root: str,
+    composer_bin: str,
+    package_name: str,
+    timeout_sec: int,
+) -> None:
+    """Install one package without resolving unrelated private VCS repositories."""
+    composer_json = Path(project_root) / "composer.json"
+    composer_lock = Path(project_root) / "composer.lock"
+    original_json = composer_json.read_bytes()
+    original_lock = composer_lock.read_bytes() if composer_lock.exists() else None
+    original_data = json.loads(original_json.decode("utf-8"))
+    completed = False
+    try:
+        package_requirement = _resolve_mailer_bridge_requirement(
+            project_root=project_root,
+            composer_bin=composer_bin,
+            package_name=package_name,
+        )
+        data = original_data
+        repositories = data.get("repositories") if isinstance(data, dict) else None
+        if isinstance(repositories, list):
+            data["repositories"] = [
+                repo for repo in repositories
+                if "git.sales-snap.com" not in json.dumps(repo, ensure_ascii=False)
+            ]
+            composer_json.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        _run(
+            [
+                composer_bin,
+                "require",
+                package_requirement,
+                "--no-update",
+                "--no-interaction",
+                "--no-scripts",
+                "--no-progress",
+            ],
+            cwd=project_root, as_www_data=True, timeout_sec=timeout_sec,
+        )
+        _run(
+            [composer_bin, "update", _composer_show_name(package_name), "--with-dependencies", "--no-interaction", "--no-scripts", "--no-progress"],
+            cwd=project_root, as_www_data=True, timeout_sec=timeout_sec,
+        )
+        updated_data = json.loads(composer_json.read_text(encoding="utf-8"))
+        if not isinstance(updated_data, dict):
+            raise RuntimeError("Composer did not leave a JSON object in composer.json")
+        if isinstance(repositories, list):
+            updated_data["repositories"] = repositories
+        elif isinstance(original_data, dict) and "repositories" not in original_data:
+            updated_data.pop("repositories", None)
+        composer_json.write_text(
+            json.dumps(updated_data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        completed = True
+    except Exception:
+        if original_lock is None:
+            composer_lock.unlink(missing_ok=True)
+        else:
+            composer_lock.write_bytes(original_lock)
+        raise
+    finally:
+        if not completed:
+            composer_json.write_bytes(original_json)
+
+
 def _normalize_console_path(project_root: str, console_path: str) -> str:
     if Path(console_path).is_absolute():
         return console_path
@@ -292,7 +418,7 @@ def _required_mailer_packages_from_bundles(bundles: set[str]) -> set[str]:
         if not b:
             continue
         if b in AMAZON_MAILER_REQUIRED_BUNDLES:
-            out.add(AMAZON_MAILER_PACKAGE)
+            out.update({AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE})
         if _bundle_requires_sendgrid_mailer(b):
             out.add(SENDGRID_MAILER_PACKAGE)
     return out
@@ -312,7 +438,7 @@ def installed_required_bundles(root: str) -> set[str]:
     return out
 
 
-def _ensure_mailer_packages(
+def _ensure_composer_packages(
     *,
     config: AgentConfig,
     root: str,
@@ -320,22 +446,63 @@ def _ensure_mailer_packages(
     required: set[str],
     reason: str,
     ensure_node: bool,
+    no_scripts: bool = False,
 ) -> bool:
     if not required:
+        return False
+
+    descriptor = descriptor_for_root(root)
+    if descriptor is not None:
+        if str(descriptor.install_type or "unknown") != "composer":
+            raise RuntimeError(
+                "Docker runtime packages require a Composer-based application image"
+            )
+        lock_path = descriptor.host_composer_lock_path
+        if lock_path is None:
+            raise RuntimeError(
+                "Docker Composer metadata is unavailable; rebuild the image with composer.lock metadata"
+            )
+        try:
+            lock = json.loads(lock_path.read_text(encoding="utf-8", errors="strict"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Docker Composer metadata is invalid") from exc
+        installed = {
+            str(row.get("name") or "").strip().lower()
+            for section in ("packages", "packages-dev")
+            for row in (lock.get(section) or [])
+            if isinstance(row, dict) and str(row.get("name") or "").strip()
+        }
+        required_names = {
+            str(package or "").split(":", 1)[0].strip().lower()
+            for package in required
+            if str(package or "").strip()
+        }
+        missing = sorted(required_names - installed)
+        if missing:
+            raise RuntimeError(
+                "Docker runtime dependencies are image-managed; rebuild/synchronize the image with: "
+                + ", ".join(missing)
+            )
+        logging.info(
+            "[%s] Docker image already contains required Composer packages=%s (%s)",
+            root,
+            ",".join(sorted(required_names)),
+            reason,
+        )
         return False
 
     install_type = detect_install_type(root)
     project_root = _resolve_project_root(root)
     if not _composer_project_is_mautic(project_root):
         logging.warning(
-            "[%s] skip mailer package composer preflight: %s/composer.json is not a valid Mautic composer project (%s)",
+            "[%s] skip composer package preflight: %s/composer.json is not a valid Mautic composer project (%s)",
             root,
             project_root,
             reason,
         )
         return False
     if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
-        raise RuntimeError(f"Mautic console is not healthy before mailer package preflight: {project_root}")
+        raise RuntimeError(f"Mautic console is not healthy before composer package preflight: {project_root}")
     composer_bin = _resolve_composer_bin()
     _verify_composer_as_www_data(project_root, composer_bin)
 
@@ -344,7 +511,7 @@ def _ensure_mailer_packages(
 
     missing = sorted([pkg for pkg in required if not _composer_has_package(project_root, composer_bin, pkg)])
     if not missing:
-        logging.info("[%s] mailer packages already installed required=%s (%s)", root, ",".join(sorted(required)), reason)
+        logging.info("[%s] composer packages already installed required=%s (%s)", root, ",".join(sorted(required)), reason)
         return False
 
     # For zip installs we also normalize Node.js runtime to v20 before composer require.
@@ -352,15 +519,15 @@ def _ensure_mailer_packages(
         _ensure_node20()
 
     for pkg in missing:
-        _run(
-            [composer_bin, "require", pkg, "--no-interaction"],
-            cwd=project_root,
-            as_www_data=True,
+        _composer_update_targeted_package(
+            project_root=project_root,
+            composer_bin=composer_bin,
+            package_name=pkg,
             timeout_sec=max(int(config.command_timeout_sec or 900), 900),
         )
 
     if not _mautic_console_healthy(project_root=project_root, console_path=console_path, php_bin=config.php_bin):
-        raise RuntimeError(f"Mautic console is not healthy after mailer package composer require: {project_root}")
+        raise RuntimeError(f"Mautic console is not healthy after composer require: {project_root}")
     console_abs = _normalize_console_path(project_root, console_path)
     _run(
         [config.php_bin, console_abs, "cache:clear"],
@@ -369,12 +536,32 @@ def _ensure_mailer_packages(
         timeout_sec=max(int(config.command_timeout_sec or 900), 600),
     )
     logging.info(
-        "[%s] mailer packages installed=%s (%s)",
+        "[%s] composer packages installed=%s (%s)",
         root,
         ",".join(missing),
         reason,
     )
     return True
+
+
+def ensure_composer_runtime_packages(
+    *,
+    config: AgentConfig,
+    root: str,
+    console_path: str,
+    packages: set[str],
+    reason: str,
+    no_scripts: bool = True,
+) -> bool:
+    return _ensure_composer_packages(
+        config=config,
+        root=root,
+        console_path=console_path,
+        required=set(packages),
+        reason=reason,
+        ensure_node=False,
+        no_scripts=no_scripts,
+    )
 
 
 def ensure_mailer_packages_for_bundles(
@@ -386,7 +573,7 @@ def ensure_mailer_packages_for_bundles(
     reason: str,
 ) -> bool:
     required = _required_mailer_packages_from_bundles(bundles)
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
@@ -407,11 +594,11 @@ def ensure_amazon_mailer_for_bundles(
     targets = set(bundles).intersection(AMAZON_MAILER_REQUIRED_BUNDLES)
     if not targets:
         return False
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
-        required={AMAZON_MAILER_PACKAGE},
+        required={AMAZON_MAILER_PACKAGE, HTTP_CLIENT_PACKAGE},
         reason=reason,
         ensure_node=False,
     )
@@ -428,11 +615,28 @@ def ensure_mailer_packages_for_sender_config(
     if not required:
         return False
 
-    return _ensure_mailer_packages(
+    return _ensure_composer_packages(
         config=config,
         root=root,
         console_path=console_path,
         required=required,
         reason=reason,
         ensure_node=SENDGRID_MAILER_PACKAGE in required,
+    )
+
+
+def ensure_mailer_packages(
+    *,
+    config: AgentConfig,
+    root: str,
+    packages: set[str],
+    reason: str,
+) -> bool:
+    return _ensure_composer_packages(
+        config=config,
+        root=root,
+        console_path=str(Path(root) / "bin" / "console"),
+        required=set(packages),
+        reason=reason,
+        ensure_node=SENDGRID_MAILER_PACKAGE in packages,
     )

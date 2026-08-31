@@ -9,6 +9,7 @@ from mcd_agent.config import ManualInstanceConfig
 from mcd_agent.instance_uid import build_domain_uid
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.models import DBConfig, MauticInstall
+from mcd_agent.runtime_descriptor import discover_runtime_instances
 
 
 _TEMPLATE_DOMAIN_RE = re.compile(r"^default[0-9a-z-]*\.sales-snap\.(com|ru)$", flags=re.IGNORECASE)
@@ -402,6 +403,10 @@ def discover_mautic(
                 domains=[],
             )
         )
+
+    installs.extend(
+        discover_runtime_instances(supported_mautic_majors=list(allowed))
+    )
 
     dedup: dict[str, MauticInstall] = {}
     for inst in installs:

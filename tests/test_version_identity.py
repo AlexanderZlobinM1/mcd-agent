@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import tomllib
 import unittest
+from importlib.metadata import version as package_version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,10 +14,14 @@ from mcd_agent.version_identity import agent_version_payload, installed_agent_ve
 class VersionIdentityTests(unittest.TestCase):
     def test_runtime_version_matches_package_metadata(self) -> None:
         package_root = Path(__file__).resolve().parents[1]
-        with (package_root / "pyproject.toml").open("rb") as handle:
-            package_version = str(tomllib.load(handle)["project"]["version"])
+        pyproject = package_root / "pyproject.toml"
+        if pyproject.is_file():
+            with pyproject.open("rb") as handle:
+                metadata_version = str(tomllib.load(handle)["project"]["version"])
+        else:
+            metadata_version = package_version("mcd-agent")
 
-        self.assertEqual(__version__, package_version)
+        self.assertEqual(__version__, metadata_version)
 
     def test_source_version_reads_installed_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as td:

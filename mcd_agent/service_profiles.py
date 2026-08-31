@@ -114,6 +114,74 @@ def _service_profile_apply_outcome(applied: dict[str, Any]) -> tuple[str, str | 
     return "error", str(applied.get("reason") or status or "apply_failed")
 
 
+def _docker_runtime_state() -> dict[str, Any]:
+    docker = shutil.which("docker") or ""
+    active = False
+    daemon_reachable = False
+    version = ""
+    if docker:
+        proc = subprocess.run([docker, "--version"], capture_output=True, text=True, check=False)
+        version = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[0] if ((proc.stdout or "") + (proc.stderr or "")).strip() else ""
+        active_proc = subprocess.run(
+            ["systemctl", "is-active", "docker"], capture_output=True, text=True, check=False
+        )
+        active = active_proc.returncode == 0 and (active_proc.stdout or "").strip() == "active"
+        info = subprocess.run(
+            [docker, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        daemon_reachable = info.returncode == 0 and bool((info.stdout or "").strip())
+    return {
+        "installed": bool(docker),
+        "path": docker,
+        "version": version,
+        "active": active,
+        "daemon_reachable": daemon_reachable,
+    }
+
+
+def apply_docker_profile(*, dry_run: bool = False) -> dict[str, Any]:
+    """Install the local Docker runtime only after an explicit operator action."""
+    before = _docker_runtime_state()
+    if before["installed"] and before["active"] and before["daemon_reachable"]:
+        return {"status": "noop", "reason": "docker_runtime_ready", "before": before, "after": before}
+    commands: list[list[str]] = []
+    if not before["installed"]:
+        commands.extend(
+            [
+                ["apt-get", "update"],
+                ["apt-get", "install", "-y", "docker.io"],
+            ]
+        )
+    commands.append(["systemctl", "enable", "--now", "docker"])
+    if dry_run:
+        return {"status": "planned", "before": before, "commands": commands}
+    if os.geteuid() != 0:
+        raise RuntimeError("Docker installation requires root")
+    for command in commands:
+        proc = subprocess.run(command, capture_output=True, text=True, check=False, timeout=1800)
+        if proc.returncode != 0:
+            detail = ((proc.stderr or "") + (proc.stdout or "")).strip()
+            return {
+                "status": "error",
+                "reason": f"command_failed:{' '.join(command)}:{detail[-1000:]}",
+                "before": before,
+                "commands": commands,
+            }
+    after = _docker_runtime_state()
+    if not (after["installed"] and after["active"] and after["daemon_reachable"]):
+        return {
+            "status": "error",
+            "reason": "docker_runtime_verification_failed",
+            "before": before,
+            "after": after,
+            "commands": commands,
+        }
+    return {"status": "applied", "before": before, "after": after, "commands": commands}
+
+
 def _detect_php_version() -> str:
     p = Path("/etc/php")
     if not p.exists():
@@ -944,7 +1012,7 @@ def service_profiles_apply_once(
     allow_cluster_db_maintenance: bool = False,
 ) -> dict[str, Any]:
     comp = (component or "php_fpm").strip().lower().replace("-", "_")
-    if comp not in {"php_fpm", "mysql", "apt", "wazuh", "mautic_db_indexes", "db_indexes"}:
+    if comp not in {"php_fpm", "mysql", "apt", "wazuh", "docker", "mautic_db_indexes", "db_indexes"}:
         return {"status": "skipped", "reason": f"unsupported component: {component}"}
     guard = _cluster_db_maintenance_guard(
         cfg,
@@ -961,6 +1029,13 @@ def service_profiles_apply_once(
         if status == "deferred":
             return {"status": "skipped", "reason": applied.get("reason", "deferred"), "apply": applied}
         return {"status": "error", "reason": applied.get("reason", status or "apply_failed"), "apply": applied}
+    if comp == "docker":
+        applied = apply_docker_profile(dry_run=dry_run)
+        result_status, reason = _service_profile_apply_outcome(applied)
+        out = {"status": result_status, "fetch": {"status": "ok", "source": "builtin"}, "apply": applied}
+        if reason:
+            out["reason"] = reason
+        return out
     fetched = fetch_service_profile(cfg, comp)
     status = str(fetched.get("status", "")).strip().lower()
     if status != "ok":

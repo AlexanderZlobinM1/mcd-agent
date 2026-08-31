@@ -11,6 +11,7 @@ from typing import Any
 from mcd_agent.config import AgentConfig
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.models import MauticInstall
+from mcd_agent.runtime_descriptor import descriptor_for_root
 
 _SEMVER_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _VERSION_CACHE_ROOT = Path("/opt/mcd/generated/mautic-version")
@@ -77,7 +78,6 @@ def _candidate_roots(root: str) -> list[Path]:
     base = root_path.name.lower()
     if base in {"public", "docroot", "public_html"}:
         candidates.append(root_path.parent)
-    candidates.append(root_path.parent.parent)
     out: list[Path] = []
     seen: set[str] = set()
     for p in candidates:
@@ -87,6 +87,16 @@ def _candidate_roots(root: str) -> list[Path]:
         seen.add(ps)
         out.append(p)
     return out
+
+
+def _version_major(version: str | None) -> int | None:
+    match = _SEMVER_RE.search(str(version or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1).split(".", 1)[0])
+    except ValueError:
+        return None
 
 
 def _read_version_from_composer_lock(root: Path) -> str | None:
@@ -112,6 +122,117 @@ def _read_version_from_composer_lock(root: Path) -> str | None:
     return None
 
 
+def _read_major_from_composer_lock(root: Path) -> int | None:
+    lock = root / "composer.lock"
+    if not lock.exists():
+        return None
+    try:
+        data = json.loads(lock.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    packages = data.get("packages", [])
+    if not isinstance(packages, list):
+        return None
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        if str(package.get("name", "")).strip() not in {"mautic/core-lib", "mautic/core-bundle", "mautic/core"}:
+            continue
+        match = re.match(r"^v?(\d+)(?:\.|$)", str(package.get("version", "")).strip())
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _read_version_from_runtime_only(
+    root: Path,
+    php_bin: str,
+    console_path: str | None = None,
+    *,
+    run_as_user: str | None = "www-data",
+) -> str | None:
+    try:
+        descriptor = descriptor_for_root(str(root))
+    except (OSError, ValueError):
+        descriptor = None
+    if descriptor is not None:
+        commands = [[*descriptor.docker_exec_prefix(), "--version"], [*descriptor.docker_exec_prefix(), "about", "--no-interaction"]]
+    else:
+        console = _console_path_for_root(root, console_path)
+        if console is None:
+            return None
+        commands = [[php_bin, str(console), "--version"], [php_bin, str(console), "about", "--no-interaction"]]
+        user = str(run_as_user or "").strip()
+        if user and user != "root" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            commands = [["sudo", "-H", "-u", user, *command] for command in commands]
+    for command in commands:
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception:
+            continue
+        match = _SEMVER_RE.search((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        if proc.returncode == 0 and match:
+            return match.group(1)
+    return None
+
+
+def confirmed_mautic_major(
+    root: str,
+    php_bin: str,
+    *,
+    console_path: str | None = None,
+    local_php_path: str | None = None,
+    expected_major: int | None = None,
+    run_as_user: str | None = "www-data",
+) -> int | None:
+    """Return a major only when runtime, lock metadata and layout agree."""
+    root_path = Path(root)
+    runtime_major = _version_major(
+        _read_version_from_runtime_only(
+            root_path,
+            php_bin,
+            console_path,
+            run_as_user=run_as_user,
+        )
+    )
+    if runtime_major is None:
+        return None
+
+    try:
+        descriptor = descriptor_for_root(str(root_path))
+    except (OSError, ValueError):
+        descriptor = None
+    lock_majors: set[int] = set()
+    if descriptor is not None and descriptor.host_composer_lock_path is not None:
+        major = _read_major_from_composer_lock(descriptor.host_composer_lock_path.parent)
+        if major is not None:
+            lock_majors.add(major)
+    else:
+        for candidate in _candidate_roots(root):
+            major = _read_major_from_composer_lock(candidate)
+            if major is not None:
+                lock_majors.add(major)
+    if lock_majors and lock_majors != {runtime_major}:
+        return None
+    if expected_major is not None and int(expected_major) != runtime_major:
+        return None
+
+    local_path = str(local_php_path or "").strip()
+    if local_path.endswith("/app/config/local.php") and runtime_major != 4:
+        return None
+    if local_path.endswith("/config/local.php") and not local_path.endswith("/app/config/local.php"):
+        if runtime_major < 5:
+            return None
+    return runtime_major
+
+
 def _console_path_for_root(root: Path, console_path: str | None = None) -> Path | None:
     if console_path:
         supplied = Path(console_path)
@@ -131,6 +252,29 @@ def _read_version_from_mcd_source(
     *,
     run_as_user: str | None = "www-data",
 ) -> str | None:
+    try:
+        descriptor = descriptor_for_root(str(root))
+    except (OSError, ValueError):
+        descriptor = None
+    if descriptor is not None:
+        for arguments in (["--version"], ["about", "--no-interaction"]):
+            try:
+                proc = subprocess.run(
+                    [*descriptor.docker_exec_prefix(), *arguments],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except Exception:
+                continue
+            match = _SEMVER_RE.search((proc.stdout or "") + "\n" + (proc.stderr or ""))
+            if proc.returncode == 0 and match:
+                return match.group(1)
+        if descriptor.host_composer_lock_path is not None:
+            return _read_version_from_composer_lock(descriptor.host_composer_lock_path.parent)
+        return None
     console = _console_path_for_root(root, console_path)
     if not console:
         return None
@@ -164,6 +308,7 @@ def collect_mautic_version(
     update_cache: bool = True,
     run_as_user: str | None = "www-data",
     force_refresh: bool = False,
+    expected_major: int | None = None,
 ) -> str:
     detected_root: Path | None = None
     version: str | None = None
@@ -174,6 +319,8 @@ def collect_mautic_version(
     if not force_refresh:
         for candidate in _candidate_roots(root):
             version = read_cached_mautic_version(candidate)
+            if version and expected_major is not None and _version_major(version) != int(expected_major):
+                version = None
             if version:
                 detected_root = candidate
                 break
@@ -217,6 +364,7 @@ def refresh_mautic_version_cache(
             update_cache=True,
             run_as_user=run_as_user,
             force_refresh=True,
+            expected_major=inst.mautic_major,
         )
         cache = version_cache_path(inst.root)
         cached = cache.exists() and cache.is_file()

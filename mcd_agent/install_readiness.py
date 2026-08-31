@@ -12,6 +12,13 @@ from typing import Any
 from mcd_agent.apt_profile import collect_zabbix_agent_state
 from mcd_agent.env import ipv6_runtime_disabled, ipv6_status, reconcile_ipv6_runtime_from_intent
 from mcd_agent.nginx_baseline import cloudflare_real_ip_state
+from mcd_agent.runtime_adapters import installed_runtime_adapters
+
+
+MAUTIC7_DATABASE_MINIMUMS: dict[str, tuple[int, int, int]] = {
+    "mysql": (8, 4, 0),
+    "mariadb": (10, 11, 0),
+}
 
 
 def _run(args: list[str], *, timeout_sec: int = 8) -> tuple[int, str]:
@@ -129,6 +136,60 @@ def _database_state() -> dict[str, Any]:
     }
 
 
+def mautic7_database_compatibility(database: dict[str, Any] | None) -> tuple[bool, str]:
+    """Fail closed unless the observed host database satisfies Mautic 7."""
+    row = database if isinstance(database, dict) else {}
+    engine = str(row.get("engine") or "").strip().lower()
+    if engine not in MAUTIC7_DATABASE_MINIMUMS:
+        return False, "database engine is unknown; Mautic 7 requires MySQL 8.4+ or MariaDB 10.11+"
+    raw_version = row.get("version_tuple")
+    if not isinstance(raw_version, (list, tuple)) or not raw_version:
+        return False, f"{engine} version is unknown"
+    try:
+        version = tuple(int(value) for value in list(raw_version)[:3])
+    except (TypeError, ValueError):
+        return False, f"{engine} version is invalid"
+    version = version + (0,) * (3 - len(version))
+    minimum = MAUTIC7_DATABASE_MINIMUMS[engine]
+    if version < minimum:
+        current = ".".join(str(value) for value in version)
+        required = ".".join(str(value) for value in minimum)
+        return False, f"{engine} {current} is incompatible; Mautic 7 requires {engine} {required}+"
+    if not bool(row.get("active", False)):
+        return False, f"{engine} service is not confirmed active"
+    current = ".".join(str(value) for value in version)
+    return True, f"{engine} {current} is compatible with Mautic 7"
+
+
+def _docker_state() -> dict[str, Any]:
+    path = shutil.which("docker") or ""
+    installed = bool(path)
+    version = ""
+    if installed:
+        rc, out = _run([path, "--version"], timeout_sec=8)
+        if rc == 0 or out:
+            version = out.splitlines()[0].strip() if out else ""
+    active_rc, active_out = _run(["systemctl", "is-active", "docker"], timeout_sec=4)
+    enabled_rc, enabled_out = _run(["systemctl", "is-enabled", "docker"], timeout_sec=4)
+    daemon_reachable = False
+    daemon_error = ""
+    if installed:
+        info_rc, info_out = _run([path, "info", "--format", "{{.ServerVersion}}"], timeout_sec=10)
+        daemon_reachable = info_rc == 0 and bool(info_out.strip())
+        if not daemon_reachable:
+            daemon_error = info_out.strip()[:500]
+    return {
+        "installed": installed,
+        "path": path,
+        "version": version,
+        "service": "docker",
+        "active": active_rc == 0 and active_out.strip() == "active",
+        "enabled": enabled_rc == 0 and enabled_out.strip() == "enabled",
+        "daemon_reachable": daemon_reachable,
+        "daemon_error": daemon_error,
+    }
+
+
 def _path_state(path: str) -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -188,6 +249,8 @@ def collect_mautic_install_readiness() -> dict[str, Any]:
         },
         "npm": {"installed": bool(npm_exists), "version": npm_version, "path": shutil.which("npm") or ""},
         "certbot": {"installed": bool(certbot_exists), "version": certbot_version},
+        "docker": _docker_state(),
+        "runtime_migration_adapters": installed_runtime_adapters(),
         "database": _database_state(),
         "zabbix_agent": collect_zabbix_agent_state(profile={"zabbix_agent_enabled": True}),
         "paths": {"var_www": _path_state("/var/www")},

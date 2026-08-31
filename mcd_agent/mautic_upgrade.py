@@ -35,6 +35,9 @@ from mcd_agent.amazon_mailer_dep import (
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import write_mautic_version_cache
+from mcd_agent.executor import execute_mautic_command_template
+from mcd_agent.plugins import run_plugins_interactive
+from mcd_agent.install_readiness import _database_state, mautic7_database_compatibility
 
 
 CORE_PLUGIN_BUNDLES = {
@@ -84,6 +87,7 @@ PHP84_PACKAGE_SUFFIXES = [
 
 PHP_CUSTOM_INI_NAMES = {"60-custom.ini", "90-redis-sessions.ini"}
 PHP_CUSTOM_INI_HINTS = ("custom", "mcd", "sales-snap", "redis-session", "redis_sessions")
+MAUTIC7_LOCALE_FIX_BUNDLE = "MauticLocaleFixBundle"
 
 
 @dataclass(slots=True)
@@ -202,7 +206,12 @@ def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
             consoles=int(stop_result.get("mautic_console_total") or 0),
         )
     )
-    if stop_failed > 0:
+    # A stop attempt can race with a short-lived console process: the kill
+    # helper may report a failure even though the final process snapshot is
+    # already clean. Only live processes make the maintenance guard unsafe.
+    managed_remaining = int(stop_result.get("managed_running") or 0)
+    console_remaining = int(stop_result.get("mautic_console_total") or 0)
+    if managed_remaining > 0 or console_remaining > 0:
         if owned_cron_stop:
             try:
                 restore_cron_service_if_needed(config)
@@ -210,7 +219,11 @@ def _enter_upgrade_maintenance(config: AgentConfig) -> UpgradeMaintenanceGuard:
                 pass
         if owned_pause_flag and pause_flag.exists():
             pause_flag.unlink()
-        raise RuntimeError("Maintenance guard failed: unable to stop all running Mautic tasks")
+        raise RuntimeError(
+            "Maintenance guard failed: unable to stop all running Mautic tasks "
+            f"(stop_failed={stop_failed} managed_remaining={managed_remaining} "
+            f"console_remaining={console_remaining})"
+        )
 
     return UpgradeMaintenanceGuard(
         pause_flag=pause_flag,
@@ -1458,7 +1471,13 @@ def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:
 
 
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
-    install_root, console = _pick_install(config, root)
+    inst = _pick_install_record(config, root)
+    if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
+        print(f"root={inst.root}")
+        print("runtime=docker")
+        print("next=image-managed")
+        return 0
+    install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _latest_same_branch(config, current)
     branch = _branch_key(current)
@@ -1471,6 +1490,45 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     else:
         print(f"next={target}")
     return 0
+
+
+def _ensure_mautic7_locale_fix(config: AgentConfig, root: str) -> None:
+    """Install/update Locale Fix and force only the two Mautic 7 safeguards."""
+    run_plugins_interactive(
+        config=config,
+        root=root,
+        selection=None,
+        bundles=[MAUTIC7_LOCALE_FIX_BUNDLE],
+        plugin_uids=None,
+        action="auto",
+        no_color=True,
+        yes=True,
+    )
+    refreshed = _pick_install_record(config, root)
+    if int(refreshed.mautic_major or 0) != 7:
+        raise RuntimeError("Mautic Locale Fix activation requires Mautic 7")
+    rc, out = execute_mautic_command_template(
+        php_bin=config.php_bin,
+        run_as_user=config.mautic_run_as_user,
+        root=root,
+        template=(
+            "mautic:locale-fix:configure --published=1 "
+            "--gmail-image-proxy-open=1 --no-interaction"
+        ),
+        timeout_sec=config.command_timeout_sec,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Mautic Locale Fix activation failed: {out}")
+    rc, out = execute_mautic_command_template(
+        php_bin=config.php_bin,
+        run_as_user=config.mautic_run_as_user,
+        root=root,
+        template="cache:clear",
+        timeout_sec=config.command_timeout_sec,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Mautic Locale Fix cache clear failed: {out}")
+    print("Mautic 7 Locale Fix ready: published=1 gmail_image_proxy_open=1; other settings preserved")
 
 
 def run_upgrade_apply(
@@ -1486,6 +1544,10 @@ def run_upgrade_apply(
     allow_major: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
+    if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
+        raise RuntimeError(
+            "Docker Mautic upgrades are image-managed; activate a new platform image instead"
+        )
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _clean_target_version(target_override) or _latest_same_branch(config, current)
@@ -1504,6 +1566,10 @@ def run_upgrade_apply(
             raise RuntimeError(
                 "Major upgrade is supported only for Composer Mautic 6 -> 7 with --allow-major"
             )
+        database_ok, database_reason = mautic7_database_compatibility(_database_state())
+        if not database_ok:
+            raise RuntimeError("Mautic 6 to 7 upgrade is blocked: " + database_reason)
+        print("Mautic 7 database preflight: " + database_reason)
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
     if not yes:
@@ -1547,6 +1613,9 @@ def run_upgrade_apply(
             bundles=installed_required_bundles(install_root),
             reason="mautic-upgrade",
         )
+
+        if _parse_semver(current)[0] != 7 and _parse_semver(target)[0] == 7:
+            _ensure_mautic7_locale_fix(config, install_root)
 
         _post_upgrade_verify(config, inst)
 
