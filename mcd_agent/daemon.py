@@ -8327,11 +8327,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             store.put_runtime_sync("local_runtime", local_runtime)
             last_local_runtime_fp = local_fp
             if config.mcc_url and config.mcc_token:
-                # A locally edited runtime file is an operator change, not a
-                # passive observation. Publish it as canonical desired state
-                # so MCC cannot overwrite it with an older value; the normal
-                # state push continues to publish the effective snapshot as
-                # observed state.
+                # A local operator edit is the newest canonical intent; observed remains telemetry.
                 pushed = push_runtime_overrides(config, local_runtime, merge=False, target="desired")
                 p_status = str(pushed.get("status", "")).strip().lower()
                 if p_status == "ok":
