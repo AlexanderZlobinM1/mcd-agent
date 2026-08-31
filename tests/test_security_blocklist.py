@@ -24,7 +24,7 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertIn("action = iptables[type=allports, name=mcd-sshd]", config)
         self.assertNotIn("name=sshd]", config)
 
-    def test_managed_mautic_login_jail_is_strict_and_web_scoped(self) -> None:
+    def test_managed_mautic_login_jail_is_strict_and_has_a_unique_action_name(self) -> None:
         config = security_blocklist._jail_config(
             enabled=True,
             allowlist={"89.216.113.155", "65.21.54.91"},
@@ -35,7 +35,7 @@ class SecurityBlocklistTests(unittest.TestCase):
         self.assertIn("filter = mautic-auth-nginx", config)
         self.assertIn("logpath = /var/log/nginx/*access.log", config)
         self.assertIn("maxretry = 3", config)
-        self.assertIn("action = iptables-multiport[name=mcd-mautic-auth-nginx, port=\"http,https\", protocol=tcp]", config)
+        self.assertIn("action = iptables[type=allports, name=mcd-mautic-auth-nginx]", config)
         self.assertNotIn("nginx-4xx-scan", config)
 
     def test_allowlist_comparison_ignores_other_ip_family(self) -> None:
@@ -79,7 +79,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_wait_for_managed_firewall_actions"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -145,7 +145,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_wait_for_managed_firewall_actions"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -178,7 +178,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
-                patch.object(security_blocklist, "_wait_for_managed_firewall_actions"),
+                patch.object(security_blocklist, "_wait_for_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 security_blocklist.apply_security_blocklist_profile(
