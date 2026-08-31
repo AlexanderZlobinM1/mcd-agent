@@ -573,6 +573,38 @@ class MauticDB:
         except (TypeError, ValueError):
             return 0
 
+    def has_installed_plugin_matching(self, bundle_fragment: str) -> bool:
+        """Return whether Mautic has a non-missing plugin matching a fragment.
+
+        Mautic's plugin registry does not expose an enable flag. Optional
+        scheduler behavior is enabled separately through its explicit runtime
+        setting; this check only confirms that the bundle is installed and
+        recognized by Mautic rather than being a stale filesystem directory.
+        """
+        fragment = str(bundle_fragment or "").strip().lower()
+        if not fragment:
+            return False
+        table = self._safe_table(f"{self.cfg.table_prefix}plugins")
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    columns = self._table_columns(cur, table)
+                    if "bundle" in columns:
+                        bundle_column = "bundle"
+                    elif "name" in columns:
+                        bundle_column = "name"
+                    else:
+                        return False
+                    where = f"LOWER(`{bundle_column}`) LIKE %s"
+                    if "is_missing" in columns:
+                        where += " AND COALESCE(`is_missing`, 0) = 0"
+                    cur.execute(f"SELECT 1 FROM `{table}` WHERE {where} LIMIT 1", (f"%{fragment}%",))
+                    return bool(cur.fetchone())
+        except Exception:
+            # Fail closed. A scheduler must never run an optional plugin when
+            # Mautic's plugin registry cannot be read.
+            return False
+
     @staticmethod
     def _apply_statement_timeout(cur: Any, timeout_sec: int | None) -> None:
         """Best-effort per-session cap for SQL segment rebuild statements."""

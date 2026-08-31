@@ -698,6 +698,18 @@ def _instance_setting_keys(inst: object) -> list[str]:
     return out
 
 
+def _plugin_operation_has_registered_bundle(db: MauticDB | None, item: object) -> bool:
+    """Require Mautic registry state in addition to the plugin directory.
+
+    The catalog helper verifies the filesystem path. A stale or incomplete
+    directory must not make an optional scheduled operation executable.
+    """
+    if not isinstance(item, dict) or db is None:
+        return False
+    bundle = str(item.get("bundle", "") or "").strip()
+    return bool(bundle and db.has_installed_plugin_matching(bundle))
+
+
 def _instance_scoped_whitelist_entry(settings: object, inst: object) -> tuple[bool, object]:
     if not isinstance(settings, dict):
         return False, None
@@ -12064,6 +12076,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 for plugin_item in plugin_operations_for_instance(config, inst):
                     operation = plugin_item.get("operation") if isinstance(plugin_item.get("operation"), dict) else {}
                     if str(operation.get("mode", "") or "") != "scheduled":
+                        continue
+                    if not _plugin_operation_has_registered_bundle(db, plugin_item):
                         continue
                     operation_key = str(plugin_item.get("operation_key", "") or "")
                     values = plugin_operation_effective_values(config, inst, plugin_item)

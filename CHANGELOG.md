@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.9 - 2026-08-31
+
+- Fixed scheduled plugin operations to require both the installed bundle path
+  and a non-missing Mautic plugin registry record. A stale Viber directory can
+  no longer make `viber:stats:update` executable.
+- Added regression coverage for the registry gate and packaged generic plugin
+  scheduler path.
+
 ## 1.0.7 - 2026-08-31
 
 - Promote local runtime override edits to MCC `desired` state so the canonical operator change is preserved and propagated back to the active MCD instance. Keep `observed` state telemetry-only and retain live application without requiring a daemon restart.
