@@ -1184,6 +1184,20 @@ def _enforce_profile_guards(cfg: AgentConfig) -> AgentConfig:
         # into runtime overrides. Do not let that exact legacy snapshot replace
         # the selected midi profile's dual 3+1 scheduler topology.
         return _apply_profile(cfg)
+    if (
+        cfg.ring_mode == "single"
+        and not cfg.disable_whitelist
+        and (
+            cfg.segment_whitelist
+            or cfg.campaign_whitelist
+            or cfg.segment_whitelist_instance_settings
+            or cfg.campaign_whitelist_instance_settings
+        )
+    ):
+        # Whitelists only change the ordering of due Mautic work. A single
+        # queue silently discards that distinction, so persisted legacy
+        # overrides must not disable the priority ring.
+        return replace(cfg, ring_mode="dual")
     if profile == "tiny" and not cfg.segment_periodic_full_scan_enabled:
         return replace(cfg, segment_periodic_full_scan_enabled=True)
     return cfg

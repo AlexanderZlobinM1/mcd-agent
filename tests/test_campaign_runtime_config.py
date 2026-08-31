@@ -263,6 +263,28 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.campaign_trigger_priority_parallel, 3)
         self.assertEqual(cfg.campaign_rebuild_priority_parallel, 3)
 
+    def test_whitelist_configuration_requires_dual_ring(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "farm-hiload"',
+                    "[runtime]",
+                    'ring_mode = "single"',
+                    'segment_whitelist_instance_settings = { "electronic.sales-snap.com" = { "segment_whitelist" = [23, 86] } }',
+                    'campaign_whitelist_instance_settings = { "electronic.sales-snap.com" = { "campaign_whitelist" = [29, 61] } }',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.ring_mode, "dual")
+        self.assertFalse(cfg.disable_whitelist)
+
     def test_passive_profile_keeps_campaign_rebuild_disabled(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(

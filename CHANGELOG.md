@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.14 - 2026-08-31
+
+- Enforced the dual priority queue whenever campaign or segment whitelists are
+  configured. A stale single-ring runtime override can no longer make the
+  whitelist ordering ineffective.
+
 ## 1.0.13 - 2026-08-31
 
 - Fixed optional missing campaign/segment whitelist files being logged as a
