@@ -156,13 +156,15 @@ def _jail_config(*, enabled: bool, allowlist: set[str], action: str) -> str:
         "mode = aggressive\n"
         "backend = systemd\n"
         f"ignoreip = {' '.join(ignore)}\n"
-        "maxretry = 5\n"
+        "maxretry = 3\n"
         "findtime = 10m\n"
-        "bantime = 1h\n"
+        "bantime = 7d\n"
         "bantime.increment = true\n"
         "bantime.factor = 2\n"
-        "bantime.maxtime = 7d\n"
-        f"action = {action}[name=sshd]\n"
+        "bantime.maxtime = 30d\n"
+        # Keep the managed action name separate from legacy sshd jails.  A
+        # shared action name made Fail2ban retain a stale nftables action.
+        f"action = {action.format(name='mcd-sshd')}\n"
         "\n"
         f"[{JAIL_NAME}]\n"
         f"enabled = {'true' if enabled else 'false'}\n"
@@ -173,7 +175,7 @@ def _jail_config(*, enabled: bool, allowlist: set[str], action: str) -> str:
         "maxretry = 1\n"
         "findtime = 10m\n"
         "bantime = -1\n"
-        f"action = {action}[name=mcc-global]\n"
+        f"action = {action.format(name='mcc-global')}\n"
     )
 
 
@@ -201,6 +203,20 @@ def _client_ok(proc: subprocess.CompletedProcess[str], operation: str) -> None:
         return
     detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()[-800:]
     raise RuntimeError(f"{operation} failed: {detail}")
+
+
+def _verify_ssh_firewall_action(action: str) -> None:
+    """Prove that Fail2ban installed an enforceable SSH action, not only a ticket."""
+    if action.startswith("iptables["):
+        proc = _run("iptables", "-S")
+        _client_ok(proc, "iptables SSH jail verification")
+        if "f2b-mcd-sshd" not in proc.stdout:
+            raise RuntimeError("Fail2ban SSH jail has no active iptables chain")
+        return
+    proc = _run("nft", "list", "table", "inet", "f2b-table")
+    _client_ok(proc, "nftables SSH jail verification")
+    if "mcd-sshd" not in proc.stdout:
+        raise RuntimeError("Fail2ban SSH jail has no active nftables set")
 
 
 def _chunks(values: list[str], size: int = 250) -> list[list[str]]:
@@ -240,7 +256,10 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
         return {"status": "noop", "reason": "disabled_client_missing", "changed": False, "poll_sec": profile.get("poll_sec", 60)}
     assert client is not None
 
-    action = "nftables-allports" if shutil.which("nft") else "iptables-allports"
+    # Debian's legacy nftables-allports action can report tickets as banned
+    # while the nft table was never created.  The generic iptables action uses
+    # the host's active netfilter compatibility layer and is verifiable.
+    action = "iptables[type=allports, name={name}]" if shutil.which("iptables") else "nftables[type=allports, name={name}]"
     before_filter = FILTER_PATH.read_text(encoding="utf-8", errors="ignore") if FILTER_PATH.is_file() else None
     before_jail = JAIL_PATH.read_text(encoding="utf-8", errors="ignore") if JAIL_PATH.is_file() else None
     changed_files = False
@@ -256,7 +275,11 @@ def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
         _client_ok(_run(client, "-t", timeout=120), "fail2ban config validation")
         _client_ok(_run("systemctl", "enable", "--now", "fail2ban", timeout=120), "fail2ban enable")
         if changed_files:
-            _client_ok(_run(client, "reload", timeout=120), "fail2ban reload")
+            # A reload retains an old action name for an existing jail on some
+            # Fail2ban releases. Restarting preserves persistent tickets and
+            # makes the new managed chain authoritative before verification.
+            _client_ok(_run("systemctl", "restart", "fail2ban", timeout=120), "fail2ban restart")
+        _verify_ssh_firewall_action(action)
     except Exception:
         if before_filter is None:
             FILTER_PATH.unlink(missing_ok=True)

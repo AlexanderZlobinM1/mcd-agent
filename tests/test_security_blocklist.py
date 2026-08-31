@@ -10,6 +10,20 @@ from mcd_agent import security_blocklist
 
 
 class SecurityBlocklistTests(unittest.TestCase):
+    def test_managed_sshd_jail_is_strict_and_uses_a_unique_action_name(self) -> None:
+        config = security_blocklist._jail_config(
+            enabled=True,
+            allowlist={"89.216.113.155", "65.21.54.91"},
+            action="iptables[type=allports, name={name}]",
+        )
+
+        self.assertIn("maxretry = 3", config)
+        self.assertIn("bantime = 7d", config)
+        self.assertIn("bantime.maxtime = 30d", config)
+        self.assertIn("ignoreip = 127.0.0.1/8 ::1 65.21.54.91 89.216.113.155", config)
+        self.assertIn("action = iptables[type=allports, name=mcd-sshd]", config)
+        self.assertNotIn("name=sshd]", config)
+
     def test_allowlist_comparison_ignores_other_ip_family(self) -> None:
         self.assertFalse(
             security_blocklist._allowlisted(
@@ -51,6 +65,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
+                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -116,6 +131,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
+                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 result = security_blocklist.apply_security_blocklist_profile(
@@ -148,6 +164,7 @@ class SecurityBlocklistTests(unittest.TestCase):
                     "_ensure_fail2ban_installed",
                     return_value=(False, "/usr/bin/fail2ban-client"),
                 ),
+                patch.object(security_blocklist, "_verify_ssh_firewall_action"),
                 patch.object(security_blocklist, "_run", side_effect=fake_run),
             ):
                 security_blocklist.apply_security_blocklist_profile(

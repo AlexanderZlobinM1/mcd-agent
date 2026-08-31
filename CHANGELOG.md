@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.16 - 2026-08-31
+
+- Hardened the managed SSH Fail2ban jail to ban after three failed attempts in
+  ten minutes, with office/MCC-VPN allowlisting and progressive bans from seven
+  to thirty days.
+- Replaced the stale legacy nftables action with a unique, verifiable
+  netfilter action. Fail2ban can no longer report SSH tickets as banned when
+  its firewall table was never created.
+
 ## 1.0.15 - 2026-08-31
 
 - Added a narrowly scoped, reversible Mautic `7.1.3` import-tag remediation.
