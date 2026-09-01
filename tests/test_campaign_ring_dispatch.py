@@ -46,11 +46,14 @@ from mcd_agent.daemon import (
     _classify_import_monitor_row,
     _dispatch_due_campaign_triggers,
     _effective_segment_slot_limit,
+    _fetch_import_monitor_snapshot,
     _fill_from_ring,
     _fairness_watchdog_dispatch_installs,
     _fairness_promotion_log_due,
     _force_due_campaigns_to_priority,
     _import_pending_poll_due,
+    _import_monitor_target_segment_ids,
+    _import_target_segment_ids,
     _load_id_file,
     _mark_campaign_rebuild_finished,
     _mark_campaign_trigger_finished,
@@ -1936,6 +1939,50 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertEqual(_classify_import_monitor_row({"status": 6}), ("running", "", "processing"))
         self.assertEqual(_classify_import_monitor_row({"status": 7}), ("queued", "delayed", "delayed"))
 
+    def test_import_target_segment_uses_explicit_default_list_not_import_id(self) -> None:
+        payload = '{"defaults":{"list":"25","tags":["import-15"]}}'
+
+        self.assertEqual(_import_target_segment_ids(payload), [25])
+        self.assertEqual(_import_target_segment_ids('{"defaults":{"list":"not-an-id"}}'), [])
+        self.assertEqual(_import_target_segment_ids('not-json'), [])
+
+    def test_import_monitor_target_segments_filters_active_and_successful_imports(self) -> None:
+        monitor = {
+            "queued": [15],
+            "running": [16],
+            "done": [17, 18],
+            "item_statuses": {"15": "queued", "16": "processing", "17": "success", "18": "error"},
+            "target_segments_by_import": {"15": [25], "16": [26], "17": [27], "18": [28]},
+        }
+
+        self.assertEqual(
+            _import_monitor_target_segment_ids(monitor, lanes={"queued", "running"}),
+            {15: [25], 16: [26]},
+        )
+        self.assertEqual(
+            _import_monitor_target_segment_ids(monitor, lanes={"done"}, successful_only=True),
+            {17: [27]},
+        )
+
+    def test_import_monitor_snapshot_reads_target_segment_properties(self) -> None:
+        db = SimpleNamespace(
+            fetch_rows=Mock(
+                return_value=[
+                    {
+                        "id": 15,
+                        "status": 2,
+                        "properties": '{"defaults":{"list":25}}',
+                    }
+                ]
+            )
+        )
+
+        snapshot = _fetch_import_monitor_snapshot(db, "/var/www/site", {"now_utc": "2026-09-01 12:00:00"})
+
+        self.assertEqual(snapshot["running"], [15])
+        self.assertEqual(snapshot["target_segments_by_import"], {"15": [25]})
+        self.assertIn("properties", db.fetch_rows.call_args.args[0])
+
     def test_orphaned_import_recovery_skips_when_cli_worker_is_alive(self) -> None:
         db = SimpleNamespace(recover_orphaned_imports=Mock(return_value=1))
 
@@ -1995,6 +2042,32 @@ class CampaignRingDispatchTests(unittest.TestCase):
         submit.assert_called_once()
         self.assertEqual(submit.call_args.kwargs["entity_id"], 11)
         self.assertEqual(list(ring), [22, 33, 11])
+
+    def test_fill_from_ring_blocks_active_import_target_and_bypasses_only_followup_repeat_guard(self) -> None:
+        root = "/var/www/site"
+        ring = deque([25, 26])
+        cfg = SimpleNamespace(command_timeout_sec=3600, segment_full_scan_interval_sec=300)
+
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True) as submit:
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=1,
+                total_limit=1,
+                root=root,
+                task_type="segment",
+                running={},
+                ring_entities={25, 26},
+                config=cfg,
+                store=SimpleNamespace(),
+                popens={},
+                build_args=lambda sid: ["php", "bin/console", "mautic:segments:update", "-i", str(sid)],
+                blocked_entities={25},
+                bypass_repeat_guard_entities={26},
+            )
+
+        self.assertEqual(launched, 1)
+        self.assertEqual(submit.call_args.kwargs["entity_id"], 26)
+        self.assertTrue(submit.call_args.kwargs["bypass_repeat_guard"])
 
     def test_fill_from_ring_can_fill_midi_priority_lane_in_one_pass(self) -> None:
         root = "/var/www/site"

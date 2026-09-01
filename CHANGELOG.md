@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.0.24 - 2026-09-01
+
+- Prevent MCD from rebuilding a segment while a queued or running import explicitly writes contacts to that segment through `defaults.list`.
+- Queue the exact target segment for a priority native rebuild after a successful import and bypass only that segment's ordinary repeat interval; task locks, capacity limits, throttling, and failure guards remain active.
+
 ## 1.0.23 - 2026-09-01
 
 - Kept the MCC web-scanner blocklist independent from SSH Fail2ban state. A

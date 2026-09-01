@@ -224,7 +224,7 @@ _MAILRU_POSTMASTER_LATEST_ROWS = (
 )
 _MAILRU_POSTMASTER_SPAM_STOP_PERCENT = 3.0
 _SQL_IMPORT_MONITOR_ROWS = (
-    "SELECT id, status, date_added, date_started, date_ended "
+    "SELECT id, status, date_added, date_started, date_ended, properties "
     "FROM {prefix}imports "
     "WHERE is_published = 1 "
     "AND (status IN (1,2,3,4,5,6,7) "
@@ -3822,6 +3822,7 @@ def _fill_from_ring(
     remove_on_skip: bool = True,
     remove_on_launch: bool = False,
     on_launch=None,
+    bypass_repeat_guard_entities: set[int] | None = None,
     max_launches: int = 1,
 ) -> int:
     if not ring or ring_limit <= 0 or total_limit <= 0:
@@ -3860,7 +3861,8 @@ def _fill_from_ring(
         if _is_running(running, root, task_type, eid):
             ring.rotate(-1)
             continue
-        if not _launch_allowed(config, root, task_type, eid):
+        bypass_repeat_guard = bool(bypass_repeat_guard_entities and eid in bypass_repeat_guard_entities)
+        if not bypass_repeat_guard and not _launch_allowed(config, root, task_type, eid):
             ring.rotate(-1)
             continue
         args = build_args(eid)
@@ -3875,6 +3877,7 @@ def _fill_from_ring(
             timeout_sec=config.command_timeout_sec,
             max_parallel_for_type=max(1, total_limit),
             popens=popens,
+            bypass_repeat_guard=bypass_repeat_guard,
         )
         if launched:
             if on_launch is not None:
@@ -6486,6 +6489,58 @@ def _classify_import_monitor_row(row: dict[str, object]) -> tuple[str, str, str]
     return "queued", "", "queued"
 
 
+def _import_target_segment_ids(properties: object) -> list[int]:
+    """Read only the explicit Mautic import target-list setting.
+
+    Imports can add contacts directly to a segment through ``defaults.list``.
+    That write races a concurrent native segment update for the same segment.
+    The payload is JSON on supported Mautic versions; invalid or unfamiliar
+    payloads are deliberately ignored instead of being deserialized.
+    """
+    payload = properties
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(payload, dict):
+        return []
+    defaults = payload.get("defaults")
+    if not isinstance(defaults, dict):
+        return []
+    raw_lists = defaults.get("list")
+    values = list(raw_lists) if isinstance(raw_lists, (list, tuple, set)) else [raw_lists]
+    return _unique_positive_ids(values)
+
+
+def _import_monitor_target_segment_ids(
+    import_monitor: dict[str, object] | None,
+    *,
+    lanes: set[str] | None = None,
+    successful_only: bool = False,
+) -> dict[int, list[int]]:
+    """Return explicit import target segments keyed by import id."""
+    if not isinstance(import_monitor, dict):
+        return {}
+    wanted_lanes = lanes or {"queued", "running", "done"}
+    statuses = import_monitor.get("item_statuses")
+    statuses = statuses if isinstance(statuses, dict) else {}
+    raw_targets = import_monitor.get("target_segments_by_import")
+    raw_targets = raw_targets if isinstance(raw_targets, dict) else {}
+    out: dict[int, list[int]] = {}
+    for lane in wanted_lanes:
+        raw_ids = import_monitor.get(lane)
+        if not isinstance(raw_ids, (list, tuple, set, deque)):
+            continue
+        for import_id in _unique_positive_ids(list(raw_ids)):
+            if successful_only and str(statuses.get(str(import_id), "")).lower() != "success":
+                continue
+            targets = _unique_positive_ids(list(raw_targets.get(str(import_id), []) or []))
+            if targets:
+                out[import_id] = targets
+    return out
+
+
 def _fetch_import_monitor_snapshot(
     db: MauticDB,
     root: str,
@@ -6497,6 +6552,7 @@ def _fetch_import_monitor_snapshot(
     done: list[int] = []
     variants: dict[str, list[int]] = {}
     statuses: dict[str, str] = {}
+    targets_by_import: dict[str, list[int]] = {}
     for row in rows:
         try:
             import_id = int(row.get("id", 0) or 0)
@@ -6515,12 +6571,16 @@ def _fetch_import_monitor_snapshot(
             variants.setdefault(variant, []).append(import_id)
         if status:
             statuses[str(import_id)] = status
+        targets = _import_target_segment_ids(row.get("properties"))
+        if targets:
+            targets_by_import[str(import_id)] = targets
     return {
         "queued": _unique_positive_ids(queued),
         "running": _unique_positive_ids(running),
         "done": _unique_positive_ids(done),
         "item_variants": {k: _unique_positive_ids(v) for k, v in variants.items()},
         "item_statuses": statuses,
+        "target_segments_by_import": targets_by_import,
     }
 
 
@@ -6867,6 +6927,7 @@ def _submit_if_slot(
     popens: dict[str, subprocess.Popen[bytes]] | None = None,
     ignore_limit: bool = False,
     manual_request_id: int | None = None,
+    bypass_repeat_guard: bool = False,
 ) -> bool:
     if not _campaign_dispatch_begin(root, task_type):
         return False
@@ -6884,6 +6945,7 @@ def _submit_if_slot(
             popens=popens,
             ignore_limit=ignore_limit,
             manual_request_id=manual_request_id,
+            bypass_repeat_guard=bypass_repeat_guard,
         )
     finally:
         _campaign_dispatch_end(root, task_type)
@@ -6903,15 +6965,16 @@ def _submit_if_slot_uncoordinated(
     popens: dict[str, subprocess.Popen[bytes]] | None = None,
     ignore_limit: bool = False,
     manual_request_id: int | None = None,
+    bypass_repeat_guard: bool = False,
 ) -> bool:
     key = _task_key(root, task_type, entity_id)
     if key in running:
         return False
     if store.has_running_task_key(key):
         return False
-    if manual_request_id is None and not _launch_allowed(config, root, task_type, entity_id):
+    if manual_request_id is None and not bypass_repeat_guard and not _launch_allowed(config, root, task_type, entity_id):
         return False
-    if manual_request_id is None:
+    if manual_request_id is None and not bypass_repeat_guard:
         min_repeat = _task_repeat_interval_sec(config, task_type)
         if min_repeat > 0:
             prev = store.last_task_started_at(key)
@@ -7763,6 +7826,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     last_import_activity_ts: dict[str, float] = {}
     import_pending_cache: dict[str, int] = {}
     import_monitor_cache: dict[str, dict[str, object]] = {}
+    import_completed_segment_followups: dict[str, set[int]] = {}
+    import_completed_segment_imports: dict[str, dict[int, float]] = {}
     last_import_monitor_warn_ts: dict[str, float] = {}
     segment_last_full_scan_ts: dict[str, float] = {}
     segment_force_full_scan_until: dict[str, float] = {}
@@ -9209,10 +9274,31 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         import_monitor_cache[root] = {}
                 else:
                     import_monitor_cache[root] = {}
+                import_monitor = import_monitor_cache.get(root, {})
+                completed_target_segments = _import_monitor_target_segment_ids(
+                    import_monitor,
+                    lanes={"done"},
+                    successful_only=True,
+                )
+                completed_imports = import_completed_segment_imports.setdefault(root, {})
+                for import_id, targets in completed_target_segments.items():
+                    if import_id in completed_imports:
+                        continue
+                    import_completed_segment_followups.setdefault(root, set()).update(targets)
+                    completed_imports[import_id] = now
+                    logging.info(
+                        "[%s] import completion queued segment follow-up import=%s segments=%s",
+                        root,
+                        import_id,
+                        ",".join(str(segment_id) for segment_id in targets),
+                    )
+                for import_id, observed_at in list(completed_imports.items()):
+                    if now - float(observed_at) > 3600.0:
+                        completed_imports.pop(import_id, None)
                 import_pending_now = max(0, int(import_pending_cache.get(root, 0)))
                 import_force_until = float(segment_force_full_scan_until.get(root, 0.0))
                 import_hold_sec = max(120, int(config.import_poll_interval_sec) * 8)
-                if import_pending_now > 0:
+                if import_pending_now > 0 or import_completed_segment_followups.get(root):
                     import_force_until = max(import_force_until, now + float(import_hold_sec))
                     segment_force_full_scan_until[root] = import_force_until
                 force_segment_full_scan = now < import_force_until
@@ -10541,10 +10627,19 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             segment_blocked_ids |= set(segment_invalid_filter_sets.get(root, set()))
             segment_blocked_ids |= set(segment_failure_blocked_sets.get(root, set()))
             segment_blocked_ids |= set(segment_logical_issue_blocked_sets.get(root, set()))
+            active_import_target_ids: set[int] = set()
+            for targets in _import_monitor_target_segment_ids(
+                import_monitor_cache.get(root),
+                lanes={"queued", "running"},
+            ).values():
+                active_import_target_ids.update(targets)
+            segment_blocked_ids |= active_import_target_ids
             dependency_parents_for_root = segment_parents_by_root.get(root, {})
             dependency_children_for_root = segment_dependencies_by_root.get(root, {})
 
             def _segment_chain_running_conflict(eid: int) -> bool:
+                if int(eid) in active_import_target_ids:
+                    return True
                 if not dependency_parents_for_root and not dependency_children_for_root:
                     return False
                 try:
@@ -10873,6 +10968,51 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 last_import_activity_ts[root] = now
                 segment_launched_this_tick += 1
 
+            import_followup_ids = set(import_completed_segment_followups.get(root, set()))
+            import_followup_limit = _segment_task_limit_after_import(
+                running,
+                root,
+                segment_slot_limit,
+            )
+            if (
+                cluster_cron_allowed
+                and not segment_throttled_active
+                and import_followup_ids
+                and import_followup_limit > 0
+            ):
+                import_followup_ring = deque(sorted(import_followup_ids))
+
+                def _mark_import_followup_launch(sid: int) -> None:
+                    import_completed_segment_followups.setdefault(root, set()).discard(sid)
+                    _mark_segment_cycle(sid)
+
+                segment_launched_this_tick += _fill_from_ring(
+                    ring=import_followup_ring,
+                    ring_limit=import_followup_limit,
+                    total_limit=import_followup_limit,
+                    root=root,
+                    task_type="segment",
+                    running=running,
+                    ring_entities=import_followup_ids,
+                    config=config,
+                    store=store,
+                    popens=popens,
+                    build_args=lambda sid: render_mautic_command(
+                        php_bin=config.php_bin,
+                        run_as_user=config.mautic_run_as_user,
+                        root=root,
+                        template=config.cmd_segment_update_template,
+                        id=sid,
+                        batch_limit=config.segment_batch_limit,
+                    ),
+                    blocked_entities=segment_blocked_ids,
+                    dynamic_blocked=_segment_chain_running_conflict,
+                    on_launch=_mark_import_followup_launch,
+                    bypass_repeat_guard_entities=import_followup_ids,
+                    remove_on_launch=True,
+                    max_launches=import_followup_limit,
+                )
+
             if (
                 segment_launched_this_tick <= 0
                 and cluster_cron_allowed
@@ -10956,7 +11096,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     root,
                     min(1, segment_slot_limit),
                 )
-                if classic_segment_limit > 0 and segment_launched_this_tick <= 0:
+                if (
+                    classic_segment_limit > 0
+                    and segment_launched_this_tick <= 0
+                    and not active_import_target_ids
+                ):
                     if _submit_if_slot(
                         config=config,
                         store=store,
