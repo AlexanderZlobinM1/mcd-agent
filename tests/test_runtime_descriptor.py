@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from mcd_agent.executor import build_mautic_exec_args
+from mcd_agent.executor import build_mautic_exec_args, render_mautic_command
 from mcd_agent.inventory import InstanceInventory
 from mcd_agent.runtime_descriptor import discover_runtime_instances, load_runtime_descriptor
 
@@ -128,6 +128,36 @@ def test_executor_routes_console_through_scoped_docker_exec(tmp_path: Path) -> N
         "--no-interaction",
     ]
     assert "sudo" not in command
+
+
+def test_executor_applies_command_env_inside_scoped_docker_exec(tmp_path: Path) -> None:
+    central, _marker = _descriptor(tmp_path)
+    descriptor = load_runtime_descriptor(central, require_root_owner=False)
+    with patch("mcd_agent.executor.descriptor_for_root", return_value=descriptor):
+        command = render_mautic_command(
+            php_bin="/usr/bin/php",
+            root=str(descriptor.host_root),
+            template="mautic:plugins:reload",
+            run_as_user="www-data",
+            command_env={"MAUTIC_TABLE_PREFIX": "mt_"},
+        )
+    assert command[:9] == [
+        "/usr/bin/docker",
+        "exec",
+        "--user",
+        "10001:10001",
+        "--workdir",
+        "/opt/mautic",
+        "mauticrfp-newlook",
+        "env",
+        "MAUTIC_TABLE_PREFIX=mt_",
+    ]
+    assert command[9:] == [
+        "/usr/bin/php8.4",
+        "/opt/mautic/bin/console",
+        "mautic:plugins:reload",
+        "--no-interaction",
+    ]
 
 
 def test_executor_fails_closed_without_console_capability(tmp_path: Path) -> None:

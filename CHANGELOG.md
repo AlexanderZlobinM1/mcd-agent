@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.26 - 2026-09-02
+
+- Fixed: plugin reload passes the discovered Mautic database table prefix via
+  Mautic's native `MAUTIC_TABLE_PREFIX` environment variable. Native plugin
+  migrations now inspect and update prefixed tables instead of silently
+  treating them as absent.
+- Added: host and container command rendering keeps that environment scoped to
+  plugin reload; unrelated Mautic commands receive no new environment values.
+- Added: regression coverage for prefix delivery and command scoping.
+
 ## 1.0.25 - 2026-09-02
 
 - Fixed: Mautic 6 plugin updates preserve the database version for selected

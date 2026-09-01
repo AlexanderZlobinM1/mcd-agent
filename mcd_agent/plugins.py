@@ -1379,12 +1379,21 @@ def _install_or_replace_plugin(
 
 
 def _run_plugin_template(config: AgentConfig, install, template: str) -> tuple[int, str]:
+    command_env: dict[str, str] | None = None
+    if str(template).strip().split(" ", 1)[0] in {"mautic:plugin:install", "mautic:plugins:install", "mautic:plugins:reload"}:
+        db_config = getattr(install, "db", None)
+        if isinstance(db_config, dict):
+            table_prefix = str(db_config.get("table_prefix", "") or "")
+        else:
+            table_prefix = str(getattr(db_config, "table_prefix", "") or "")
+        command_env = {"MAUTIC_TABLE_PREFIX": table_prefix}
     return execute_mautic_command_template(
         php_bin=config.php_bin,
         run_as_user=config.mautic_run_as_user,
         root=install.root,
         template=template,
         timeout_sec=config.command_timeout_sec,
+        command_env=command_env,
     )
 
 

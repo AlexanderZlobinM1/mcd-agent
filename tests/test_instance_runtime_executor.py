@@ -7,10 +7,29 @@ import unittest
 from unittest.mock import patch
 
 from mcd_agent.cli import _run_manual_command_with_scheduler
-from mcd_agent.executor import build_mautic_exec_args
+from mcd_agent.executor import build_mautic_exec_args, render_mautic_command
 
 
 class InstanceRuntimeExecutorTest(unittest.TestCase):
+    def test_host_command_env_is_applied_after_run_as_user(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "bin").mkdir()
+            (root / "bin" / "console").write_text("#!/usr/bin/env php\n", encoding="utf-8")
+
+            cmd = render_mautic_command(
+                php_bin="/usr/bin/php",
+                root=str(root),
+                template="mautic:plugins:reload",
+                run_as_user="www-data",
+                command_env={"MAUTIC_TABLE_PREFIX": "ss_"},
+            )
+
+        self.assertEqual(
+            cmd[:7],
+            ["sudo", "-u", "www-data", "env", "MAUTIC_TABLE_PREFIX=ss_", "/usr/bin/php", str(root / "bin" / "console")],
+        )
+
     def test_uses_configured_php_even_when_legacy_wrapper_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

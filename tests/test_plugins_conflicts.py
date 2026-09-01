@@ -23,6 +23,7 @@ from mcd_agent.plugins import (
     _registration_aware_status,
     _run_cluster_plugin_operation,
     _run_plugin_install_reload,
+    _run_plugin_template,
     _plugin_selection_digest,
     _protected_plugin_path_names,
     _remove_plugin_path,
@@ -36,6 +37,31 @@ from mcd_agent.plugins import (
 
 
 class PluginConflictPathTests(unittest.TestCase):
+    def test_plugin_reload_passes_discovered_table_prefix_to_mautic(self) -> None:
+        cfg = SimpleNamespace(php_bin="/usr/bin/php", mautic_run_as_user="www-data", command_timeout_sec=60)
+        install = SimpleNamespace(
+            root="/var/www/ss/public_html",
+            db=SimpleNamespace(table_prefix="ss_"),
+        )
+
+        with patch("mcd_agent.plugins.execute_mautic_command_template", return_value=(0, "ok")) as execute:
+            result = _run_plugin_template(cfg, install, "mautic:plugin:install")
+
+        self.assertEqual(result, (0, "ok"))
+        self.assertEqual(execute.call_args.kwargs["command_env"], {"MAUTIC_TABLE_PREFIX": "ss_"})
+
+    def test_non_reload_plugin_command_does_not_inject_table_prefix(self) -> None:
+        cfg = SimpleNamespace(php_bin="/usr/bin/php", mautic_run_as_user="www-data", command_timeout_sec=60)
+        install = SimpleNamespace(
+            root="/var/www/ss/public_html",
+            db=SimpleNamespace(table_prefix="ss_"),
+        )
+
+        with patch("mcd_agent.plugins.execute_mautic_command_template", return_value=(0, "ok")) as execute:
+            _run_plugin_template(cfg, install, "cache:clear")
+
+        self.assertIsNone(execute.call_args.kwargs["command_env"])
+
     def test_unregistered_plugin_files_are_reported_broken(self) -> None:
         status, reason = _registration_aware_status(
             "OK",

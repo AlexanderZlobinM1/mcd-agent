@@ -89,6 +89,7 @@ def render_mautic_command(
     root: str,
     template: str,
     run_as_user: str | None = None,
+    command_env: dict[str, str] | None = None,
     **params: object,
 ) -> list[str]:
     console = _resolve_console_path(root)
@@ -109,12 +110,22 @@ def render_mautic_command(
     if has_campaign_limit_param and _is_disabled_limit(campaign_limit):
         parts = _strip_option(parts, "--campaign-limit")
     runtime = descriptor_for_root(root)
+    env_args = [f"{key}={value}" for key, value in sorted((command_env or {}).items())]
     if runtime is not None:
         if not runtime.has_capability("console"):
             raise ValueError("runtime descriptor does not allow Mautic console execution")
-        cmd = runtime.docker_exec_prefix() + parts + ["--no-interaction"]
+        runtime_prefix = runtime.docker_exec_prefix()
+        if env_args:
+            # docker_exec_prefix ends with the PHP binary and console path.
+            # Run env inside the container, immediately before PHP.
+            cmd = runtime_prefix[:-2] + ["env", *env_args] + runtime_prefix[-2:]
+        else:
+            cmd = runtime_prefix
+        cmd += parts + ["--no-interaction"]
     else:
         cmd = [php_bin, console] + parts + ["--no-interaction"]
+        if env_args:
+            cmd = ["env", *env_args] + cmd
     if run_as_user and runtime is None:
         cmd = ["sudo", "-u", run_as_user] + cmd
     return cmd
@@ -203,6 +214,7 @@ def execute_mautic_command_template(
     template: str,
     timeout_sec: int,
     run_as_user: str | None = None,
+    command_env: dict[str, str] | None = None,
     **params: object,
 ) -> tuple[int, str]:
     rendered = str(template).format(**params)
@@ -213,6 +225,7 @@ def execute_mautic_command_template(
             root=root,
             template=rendered,
             run_as_user=run_as_user,
+            command_env=command_env,
         )
     except FileNotFoundError as e:
         return 3, str(e)
