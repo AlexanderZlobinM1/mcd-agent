@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import ipaddress
@@ -1393,13 +1394,17 @@ def _run_plugin_cache_clear(config: AgentConfig, install) -> None:
         raise RuntimeError(f"cache:clear failed: {out}")
 
 
-def _run_plugin_install_reload(config: AgentConfig, install) -> None:
+def _run_plugin_install_reload(
+    config: AgentConfig,
+    install,
+    expected_bundles: set[str] | None = None,
+) -> None:
     root = install.root
 
     def _is_metadata_null_reload_error(out: str) -> bool:
         text = str(out or "").lower()
         return (
-            "pluginevent" in text
+            ("pluginupdateevent" in text or "pluginevent" in text)
             and "metadata" in text
             and "must be of type array" in text
             and "null given" in text
@@ -1465,9 +1470,28 @@ def _run_plugin_install_reload(config: AgentConfig, install) -> None:
             rc2, out2 = _run_plugin_template(config, install, "mautic:plugin:install")
             if rc2 == 0:
                 return
+            out = out2
+        migration_rows = [
+            {"bundle": bundle, "install_bundle": bundle, "item": {}}
+            for bundle in sorted(expected_bundles or set())
+        ]
+        has_native_migration = bool(
+            _selected_metadataless_native_migration_bundles(install, migration_rows)
+        ) if migration_rows else False
+        if int(getattr(install, "mautic_major", 0) or 0) == 6 and has_native_migration:
+            logging.info("[%s] retry native migration reload with Mautic 6 metadata compatibility", root)
+            with _temporary_m6_native_migration_reload_compatibility(install, expected_bundles):
+                rc3, out3 = _run_plugin_template(config, install, "mautic:plugin:install")
+            if rc3 == 0:
+                return
+            raise RuntimeError(
+                "mautic:plugin:install failed after Mautic 6 native migration compatibility retry: "
+                f"{out3}"
+            )
+        if repaired:
             raise RuntimeError(
                 "mautic:plugin:install failed after metadata repair: "
-                f"{out2}"
+                f"{out}"
             )
     raise RuntimeError(f"mautic:plugin:install failed: {out}")
 
@@ -1476,7 +1500,7 @@ def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | N
     if config.plugins_post_cache_clear:
         _run_plugin_cache_clear(config, install)
     if config.plugins_post_install:
-        _run_plugin_install_reload(config, install)
+        _run_plugin_install_reload(config, install, expected_bundles=expected_bundles)
         _assert_plugin_bundles_registered(install, set(expected_bundles or set()))
 
 
@@ -1719,6 +1743,104 @@ def _plugin_has_doctrine_entity_metadata(plugin_dir: Path) -> bool:
         return True
 
 
+def _plugin_has_native_migrations(plugin_dir: Path) -> bool:
+    migrations_dir = plugin_dir / "Migrations"
+    if not migrations_dir.exists() or not migrations_dir.is_dir():
+        return False
+    try:
+        return any(path.is_file() and path.suffix.lower() == ".php" for path in migrations_dir.iterdir())
+    except Exception:
+        return True
+
+
+def _selected_metadataless_native_migration_bundles(
+    install,
+    selected_rows: list[dict[str, Any]],
+) -> set[str]:
+    if int(getattr(install, "mautic_major", 0) or 0) != 6:
+        return set()
+    plugins_dir = _resolve_plugins_dir(install.root, create=False)
+    out: set[str] = set()
+    for bundle in _selected_install_bundles(selected_rows):
+        plugin_dir = plugins_dir / bundle
+        if (
+            plugin_dir.exists()
+            and plugin_dir.is_dir()
+            and not _plugin_has_doctrine_entity_metadata(plugin_dir)
+            and _plugin_has_native_migrations(plugin_dir)
+        ):
+            out.add(bundle)
+    return out
+
+
+def _m6_reload_helper_path(root: str) -> Path | None:
+    candidates = (
+        Path(root) / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php",
+        Path(root) / "vendor" / "mautic" / "core-lib" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php",
+    )
+    return next((path for path in candidates if path.exists() and path.is_file()), None)
+
+
+@contextmanager
+def _temporary_m6_native_migration_reload_compatibility(
+    install,
+    expected_bundles: set[str],
+):
+    rows = [
+        {"bundle": bundle, "install_bundle": bundle, "item": {}}
+        for bundle in sorted({str(value or "").strip() for value in expected_bundles if str(value or "").strip()})
+    ]
+    migration_bundles = _selected_metadataless_native_migration_bundles(install, rows) if rows else set()
+    if not migration_bundles:
+        yield
+        return
+
+    helper_path = _m6_reload_helper_path(install.root)
+    if helper_path is None:
+        raise RuntimeError(
+            "Mautic 6 native plugin migration reload compatibility failed: ReloadHelper.php not found"
+        )
+
+    original = helper_path.read_text(encoding="utf-8")
+    patched = original
+    safe_pattern = re.compile(
+        r"\$metadata\s*=\s*\$pluginMetadata\[\$pluginConfig\['namespace'\]\]\s*\?\?\s*\[\];"
+    )
+    if not safe_pattern.search(original):
+        unsafe_pattern = re.compile(
+            r"\$metadata(?P<space>\s*)=(?P<rhs>\s*\$pluginMetadata\[\$pluginConfig\['namespace'\]\]\s*\?\?)\s*null;"
+        )
+        patched, replacements = unsafe_pattern.subn(
+            lambda match: f"$metadata{match.group('space')}={match.group('rhs')} [];",
+            original,
+            count=1,
+        )
+        if replacements != 1:
+            raise RuntimeError(
+                "Mautic 6 native plugin migration reload compatibility failed: unsupported ReloadHelper.php"
+            )
+        helper_path.write_text(patched, encoding="utf-8")
+        logging.info(
+            "[%s] temporary Mautic 6 native migration reload compatibility enabled for %s",
+            install.root,
+            ",".join(sorted(migration_bundles)),
+        )
+
+    try:
+        yield
+    finally:
+        if patched != original:
+            current = helper_path.read_text(encoding="utf-8")
+            if current == patched:
+                helper_path.write_text(original, encoding="utf-8")
+                logging.info("[%s] temporary Mautic 6 native migration reload compatibility restored", install.root)
+            else:
+                logging.warning(
+                    "[%s] Mautic ReloadHelper.php changed while temporary compatibility was active; refusing to overwrite it",
+                    install.root,
+                )
+
+
 def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str, Any]]) -> bool:
     if int(getattr(install, "mautic_major", 0) or 0) != 6:
         return False
@@ -1729,6 +1851,7 @@ def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str
     if not plugins_dir.exists():
         return False
 
+    preserve_versions = _selected_metadataless_native_migration_bundles(install, selected_rows)
     changed_any = False
     db: MauticDB | None = None
     for bundle, _config_path in _plugin_config_metadata_paths(plugins_dir, selected_rows):
@@ -1736,6 +1859,13 @@ def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str
             continue
         plugin_dir = plugins_dir / bundle
         if not plugin_dir.exists() or not plugin_dir.is_dir():
+            continue
+        if bundle in preserve_versions:
+            logging.info(
+                "[%s] preserving plugin DB version for native migration reload: %s",
+                install.root,
+                bundle,
+            )
             continue
         if _plugin_has_doctrine_entity_metadata(plugin_dir):
             continue
@@ -2524,7 +2654,7 @@ def _run_cluster_plugin_operation(
                 message="running mautic:plugin:install on reference node",
                 node_status="plugin_install",
             )
-            _run_plugin_install_reload(config, install)
+            _run_plugin_install_reload(config, install, expected_bundles=set(sync_bundles))
         _cluster_plugin_set_phase(
             config,
             key,

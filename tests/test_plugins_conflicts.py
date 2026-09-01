@@ -584,6 +584,96 @@ class PluginConflictPathTests(unittest.TestCase):
             db.align_plugin_version.assert_any_call("OtherBundle", "2.0.1")
             self.assertEqual(db.align_plugin_version.call_count, 2)
 
+    def test_m6_plugin_version_prealign_preserves_selected_native_migration_bundle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for bundle, version in (("MigratingBundle", "1.2.3"), ("OtherBundle", "2.0.1")):
+                config = root / "plugins" / bundle / "Config" / "config.php"
+                config.parent.mkdir(parents=True)
+                config.write_text(f"<?php\nreturn ['version' => '{version}'];\n", encoding="utf-8")
+            migration = root / "plugins" / "MigratingBundle" / "Migrations" / "Version_1_2_3.php"
+            migration.parent.mkdir(parents=True)
+            migration.write_text("<?php\n", encoding="utf-8")
+            install = SimpleNamespace(root=str(root), mautic_major=6, db={"driver": "pdo_mysql"})
+            selected = [{"bundle": "MigratingBundle", "install_bundle": "MigratingBundle", "item": {}}]
+            db = SimpleNamespace(align_plugin_version=Mock(return_value=1))
+
+            with patch("mcd_agent.plugins.MauticDB", return_value=db):
+                changed = _prealign_metadataless_plugin_versions(install, selected)
+
+            self.assertTrue(changed)
+            db.align_plugin_version.assert_called_once_with("OtherBundle", "2.0.1")
+
+    def test_m6_native_migration_reload_uses_stock_core_when_it_succeeds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            migration = root / "plugins" / "MigratingBundle" / "Migrations" / "Version_1_2_3.php"
+            migration.parent.mkdir(parents=True)
+            migration.write_text("<?php\n", encoding="utf-8")
+            helper = root / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php"
+            helper.parent.mkdir(parents=True)
+            original = "$metadata        = $pluginMetadata[$pluginConfig['namespace']] ?? null;\n"
+            helper.write_text(original, encoding="utf-8")
+            install = SimpleNamespace(root=str(root), mautic_major=6, db=None)
+            cfg = SimpleNamespace()
+
+            def assert_unmodified(*_args, **_kwargs):
+                self.assertEqual(helper.read_text(encoding="utf-8"), original)
+                return 0, "ok"
+
+            with patch("mcd_agent.plugins._run_plugin_template", side_effect=assert_unmodified) as run_template:
+                _run_plugin_install_reload(cfg, install, expected_bundles={"MigratingBundle"})
+
+            run_template.assert_called_once()
+            self.assertEqual(helper.read_text(encoding="utf-8"), original)
+
+    def test_m6_native_migration_reload_temporarily_patches_only_after_native_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            migration = root / "plugins" / "MigratingBundle" / "Migrations" / "Version_1_2_3.php"
+            migration.parent.mkdir(parents=True)
+            migration.write_text("<?php\n", encoding="utf-8")
+            helper = root / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php"
+            helper.parent.mkdir(parents=True)
+            original = "$metadata        = $pluginMetadata[$pluginConfig['namespace']] ?? null;\n"
+            helper.write_text(original, encoding="utf-8")
+            install = SimpleNamespace(root=str(root), mautic_major=6, db=None)
+            cfg = SimpleNamespace()
+            calls = 0
+
+            def native_then_compatibility(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    self.assertEqual(helper.read_text(encoding="utf-8"), original)
+                    return 1, "PluginUpdateEvent metadata must be of type array, null given"
+                self.assertIn("?? [];", helper.read_text(encoding="utf-8"))
+                return 0, "ok"
+
+            with patch("mcd_agent.plugins._run_plugin_template", side_effect=native_then_compatibility):
+                _run_plugin_install_reload(cfg, install, expected_bundles={"MigratingBundle"})
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(helper.read_text(encoding="utf-8"), original)
+
+    def test_m6_metadata_failure_without_native_migration_keeps_existing_behavior(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "plugins" / "PlainBundle" / "Config" / "config.php"
+            config.parent.mkdir(parents=True)
+            config.write_text("<?php\nreturn ['version' => '1.0.0'];\n", encoding="utf-8")
+            install = SimpleNamespace(root=str(root), mautic_major=6, db=None)
+            cfg = SimpleNamespace()
+
+            with patch(
+                "mcd_agent.plugins._run_plugin_template",
+                return_value=(1, "PluginUpdateEvent metadata must be of type array, null given"),
+            ) as run_template:
+                with self.assertRaisesRegex(RuntimeError, "mautic:plugin:install failed"):
+                    _run_plugin_install_reload(cfg, install, expected_bundles={"PlainBundle"})
+
+            run_template.assert_called_once()
+
     def test_m6_plugin_version_prealign_skips_entity_plugins(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

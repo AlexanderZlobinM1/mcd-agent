@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.0.25 - 2026-09-02
+
+- Fixed: Mautic 6 plugin updates preserve the database version for selected
+  metadata-less plugins that ship native migrations, so the normal plugin
+  reload executes those migrations instead of skipping them after version
+  prealignment.
+- Added: plugin updates try the stock Mautic reload first. The Mautic 6
+  null-metadata compatibility adjustment is used only after that known native
+  failure, is scoped to one retry, and restores the core helper immediately;
+  unrelated metadata-less plugins retain the existing prealignment guard.
+- Added: regression coverage for migration-version preservation and exact
+  temporary core restoration.
+
 ## 1.0.24 - 2026-09-01
 
 - Prevent MCD from rebuilding a segment while a queued or running import explicitly writes contacts to that segment through `defaults.list`.
