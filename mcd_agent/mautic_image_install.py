@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from typing import Any
 from urllib import request
 from urllib.parse import urlencode
@@ -23,6 +24,8 @@ from mcd_agent.nginx_templates import render_nginx_template
 _LETSENCRYPT_LIVE = Path("/etc/letsencrypt/live")
 _LETSENCRYPT_RENEWAL = Path("/etc/letsencrypt/renewal")
 _LETSENCRYPT_MCD = Path("/etc/letsencrypt/mcd")
+_CERTBOT_LOCK_RETRY_SEC = 5
+_CERTBOT_LOCK_MAX_WAIT_SEC = 180
 
 
 @dataclass
@@ -47,6 +50,17 @@ def _run(args: list[str], *, timeout_sec: int = 300, input_text: str | None = No
         check=False,
     )
     return int(proc.returncode), ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def _run_certbot(args: list[str], *, timeout_sec: int) -> tuple[int, str]:
+    deadline = time.monotonic() + _CERTBOT_LOCK_MAX_WAIT_SEC
+    while True:
+        rc, out = _run(args, timeout_sec=timeout_sec)
+        if rc == 0 or "another instance of certbot is already running" not in out.lower():
+            return rc, out
+        if time.monotonic() >= deadline:
+            return rc, out
+        time.sleep(_CERTBOT_LOCK_RETRY_SEC)
 
 
 def _domain(raw: str) -> str:
@@ -250,7 +264,7 @@ def _rollback_failed_install(
         cert_dir = _LETSENCRYPT_LIVE / plan.domain
         renewal = _LETSENCRYPT_RENEWAL / f"{plan.domain}.conf"
         if cert_dir.exists() or renewal.exists():
-            rc, out = _run(
+            rc, out = _run_certbot(
                 ["certbot", "delete", "--cert-name", plan.domain, "--non-interactive"],
                 timeout_sec=120,
             )
@@ -805,7 +819,7 @@ def _ensure_certbot_cloudflare_plugin() -> None:
 
 
 def _run_certbot_http01(plan: ImageInstallPlan) -> None:
-    rc, out = _run(
+    rc, out = _run_certbot(
         [
             "certbot",
             "--nginx",
@@ -825,7 +839,7 @@ def _run_certbot_http01(plan: ImageInstallPlan) -> None:
 def _run_certbot_cloudflare_dns01(cfg: AgentConfig, plan: ImageInstallPlan, credential_ref: str) -> None:
     _ensure_certbot_cloudflare_plugin()
     credentials_path = _certbot_cloudflare_credentials_path(cfg, plan, credential_ref)
-    rc, out = _run(
+    rc, out = _run_certbot(
         [
             "certbot",
             "certonly",
@@ -878,6 +892,29 @@ def _safe_extract(tar: tarfile.TarFile, dst: Path) -> None:
     tar.extractall(dst, members=members)
 
 
+def _preflight_requested_mail(
+    cfg: AgentConfig,
+    plan: ImageInstallPlan,
+    *,
+    own_mail: bool,
+    mail_profile_id: str | None,
+) -> dict[str, Any]:
+    if mail_profile_id:
+        from mcd_agent.mail_config import fetch_mail_profile
+
+        profile = fetch_mail_profile(cfg, str(mail_profile_id))
+        if str(profile.get("instance_domain") or "").strip().lower() != plan.domain:
+            raise RuntimeError("mail profile belongs to another instance")
+        if str(profile.get("transport_type") or "").strip().lower() != "own_host":
+            return {"status": "ok", "transport_type": str(profile.get("transport_type") or "")}
+    elif not own_mail:
+        return {"status": "skipped"}
+
+    from mcd_agent.local_mail import preflight_local_mail
+
+    return preflight_local_mail(cfg, domain=plan.domain)
+
+
 def install_from_image(
     cfg: AgentConfig,
     *,
@@ -902,6 +939,15 @@ def install_from_image(
         for p in problems:
             print(f"preflight_error: {p}")
         raise RuntimeError("preflight failed")
+
+    if mail_profile_id or own_mail:
+        print("Preflight: validating requested mail transport")
+        _preflight_requested_mail(
+            cfg,
+            plan,
+            own_mail=own_mail,
+            mail_profile_id=mail_profile_id,
+        )
 
     with tempfile.TemporaryDirectory(prefix="mcd-image-install-") as td:
         tmp = Path(td)

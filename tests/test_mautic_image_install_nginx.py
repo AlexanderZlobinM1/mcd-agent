@@ -127,6 +127,50 @@ class MauticImageInstallNginxTests(unittest.TestCase):
         self.assertNotIn("agent-token", " ".join(calls[0]))
         write_vhost.assert_called_once_with(plan, ssl_enabled=True)
 
+    def test_certbot_retries_when_global_lock_is_busy(self) -> None:
+        with (
+            patch.object(
+                image_install,
+                "_run",
+                side_effect=[
+                    (1, "Another instance of Certbot is already running."),
+                    (0, "deleted"),
+                ],
+            ) as run,
+            patch.object(image_install.time, "sleep") as sleep,
+        ):
+            rc, out = image_install._run_certbot(
+                ["certbot", "delete", "--cert-name", "example.test"],
+                timeout_sec=120,
+            )
+
+        self.assertEqual((rc, out), (0, "deleted"))
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(image_install._CERTBOT_LOCK_RETRY_SEC)
+
+    def test_mail_identity_preflight_runs_before_image_download(self) -> None:
+        cfg = SimpleNamespace(mcc_token="agent-token")
+        with (
+            patch.object(image_install, "_preflight", return_value=[]),
+            patch.object(
+                image_install,
+                "_preflight_requested_mail",
+                side_effect=RuntimeError("PTR mismatch"),
+            ),
+            patch.object(image_install, "_download") as download,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PTR mismatch"):
+                image_install.install_from_image(
+                    cfg,
+                    image_ref="default7",
+                    domain="vida.sales-snap.com",
+                    php_version="8.4",
+                    yes=True,
+                    mail_profile_id="profile-1",
+                )
+
+        download.assert_not_called()
+
     def test_package_install_accepts_apt_releaseinfo_changes(self) -> None:
         calls: list[list[str]] = []
 

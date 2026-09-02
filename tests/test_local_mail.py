@@ -177,6 +177,34 @@ MAILER(`smtp')dnl
         self.assertFalse(result["fcrdns"])
         self.assertIn("expected mail.nikola.sales-snap.com", result["error"])
 
+    def test_local_mail_preflight_uses_shared_identity_from_mcc(self) -> None:
+        material = {
+            "enabled": True,
+            "mail_hostname": "mail.farm03.sales-snap.com",
+            "private_key_pem": "not-returned",
+        }
+        identity = {"hostname": "mail.farm03.sales-snap.com", "fcrdns": True, "error": ""}
+        with patch.object(local_mail, "fetch_material", return_value=material), patch.object(
+            local_mail, "_mail_identity", return_value=identity
+        ):
+            result = local_mail.preflight_local_mail(SimpleNamespace(), domain="vida.sales-snap.com")
+
+        self.assertEqual(result["mail_identity_hostname"], "mail.farm03.sales-snap.com")
+        self.assertNotIn("private_key_pem", result)
+
+    def test_local_mail_preflight_rejects_mismatched_shared_identity(self) -> None:
+        with patch.object(
+            local_mail,
+            "fetch_material",
+            return_value={"enabled": True, "mail_hostname": "mail.farm03.sales-snap.com"},
+        ), patch.object(
+            local_mail,
+            "_mail_identity",
+            return_value={"fcrdns": False, "error": "PTR mismatch"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PTR mismatch"):
+                local_mail.preflight_local_mail(SimpleNamespace(), domain="vida.sales-snap.com")
+
     def test_public_dns_short_ignores_local_resolver_when_public_dns_answers(self) -> None:
         with patch.object(
             local_mail,

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.28 - 2026-09-02
+
+- Added: own-host image deployment validates the host's shared forward-confirmed
+  mail identity before downloading artifacts or creating database, filesystem,
+  nginx, and certificate resources.
+- Fixed: local-mail state stores one explicit MTA identity for the entire host
+  instead of selecting it from the alphabetically first instance domain.
+- Fixed: image deployment retries bounded Certbot operations when another
+  Certbot process temporarily owns the global lock, allowing rollback to remove
+  certificates reliably.
+
 ## 1.0.27 - 2026-09-02
 
 - Fixed: the configured MCC endpoint is now an invariant local Fail2ban

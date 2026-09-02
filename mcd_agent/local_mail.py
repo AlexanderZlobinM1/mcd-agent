@@ -174,7 +174,7 @@ def fetch_material(cfg: AgentConfig, domain: str) -> dict[str, Any]:
 
 def _load_domains() -> dict[str, Any]:
     if not DOMAINS_PATH.exists():
-        return {"schema": 1, "domains": {}}
+        return {"schema": 1, "mail_identity_hostname": "", "domains": {}}
     try:
         payload = json.loads(DOMAINS_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -184,7 +184,11 @@ def _load_domains() -> dict[str, Any]:
     domains = payload.get("domains")
     if not isinstance(domains, dict):
         domains = {}
-    return {"schema": 1, "domains": domains}
+    return {
+        "schema": 1,
+        "mail_identity_hostname": str(payload.get("mail_identity_hostname") or "").strip().lower(),
+        "domains": domains,
+    }
 
 
 def _write_atomic(path: Path, content: str, *, mode: int = 0o600) -> None:
@@ -1165,6 +1169,34 @@ def _mail_identity(mail_hostname: str) -> dict[str, Any]:
     return result
 
 
+def _preflight_local_mail_material(
+    cfg: AgentConfig,
+    clean: str,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    material = fetch_material(cfg, clean)
+    if not bool(material.get("enabled")):
+        raise RuntimeError("own-host mail is disabled in MCC")
+    mail_hostname = _domain(str(material.get("mail_hostname") or "mail." + clean))
+    identity = _mail_identity(mail_hostname)
+    if not bool(identity.get("fcrdns")):
+        raise RuntimeError(
+            "own-host mail identity is not forward-confirmed: "
+            + str(identity.get("error") or "unknown error")
+        )
+    return material, mail_hostname, identity
+
+
+def preflight_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
+    clean = _domain(domain)
+    _material, mail_hostname, identity = _preflight_local_mail_material(cfg, clean)
+    return {
+        "status": "ok",
+        "instance_domain": clean,
+        "mail_identity_hostname": mail_hostname,
+        "mail_identity": identity,
+    }
+
+
 def configure_local_mail(
     cfg: AgentConfig,
     *,
@@ -1176,9 +1208,7 @@ def configure_local_mail(
     if os.geteuid() != 0:
         raise RuntimeError("local-mail configure must run as root")
     clean = _domain(domain)
-    material = fetch_material(cfg, clean)
-    if not bool(material.get("enabled")):
-        raise RuntimeError("own-host mail is disabled in MCC")
+    material, primary_mail_hostname, _identity = _preflight_local_mail_material(cfg, clean)
     # MCC resolves local hostname aliases and validates canonical host ownership
     # plus the agent source IP before returning private DKIM material.
     local_php_path = _local_php(root)
@@ -1191,20 +1221,8 @@ def configure_local_mail(
     inbound_was_managed = INBOUND_BASELINE_MANIFEST.exists()
     firewall_was_managed = SMTP_FIREWALL_SERVICE.exists()
     selector = str(material.get("selector") or "mcd").strip()
-    requested_mail_hostname = str(material.get("mail_hostname") or "mail." + clean)
-    proposed_domains = dict(domains)
-    proposed_domains[clean] = {"mail_hostname": requested_mail_hostname}
-    primary_domain = sorted(proposed_domains)[0]
-    primary_mail_hostname = str(
-        proposed_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain
-    )
+    requested_mail_hostname = primary_mail_hostname
     mta = _apt_install()
-    identity = _mail_identity(primary_mail_hostname)
-    if not bool(identity.get("fcrdns")):
-        raise RuntimeError(
-            "own-host mail identity is not forward-confirmed: "
-            + str(identity.get("error") or "unknown error")
-        )
     CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG_ROOT, 0o700)
@@ -1221,6 +1239,7 @@ def configure_local_mail(
         "config_schema_version": int(material.get("config_schema_version") or 1),
         "mta": mta,
     }
+    payload["mail_identity_hostname"] = primary_mail_hostname
     try:
         _save_domains(payload)
         _seed_quota(clean, material)
@@ -1303,10 +1322,13 @@ def configure_local_mail(
             elif previous_domains:
                 previous_mta = _managed_mta(previous_domains, mta)
                 _configure_opendkim(previous_domains, mta=previous_mta)
-                primary_domain = sorted(previous_domains)[0]
                 _configure_mta(
                     previous_mta,
-                    str(previous_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+                    str(
+                        payload_before.get("mail_identity_hostname")
+                        or next(iter(previous_domains.values())).get("mail_hostname")
+                        or ""
+                    ),
                 )
                 if inbound_was_managed:
                     _configure_inbound(previous_domains, mta=previous_mta)
@@ -1373,10 +1395,9 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
         if domains:
             remaining_mta = _managed_mta(domains, mta)
             _configure_opendkim(domains, mta=remaining_mta)
-            primary_domain = sorted(domains)[0]
             _configure_mta(
                 remaining_mta,
-                str(domains[primary_domain].get("mail_hostname") or "mail." + primary_domain),
+                str(payload.get("mail_identity_hostname") or next(iter(domains.values())).get("mail_hostname") or ""),
             )
             _configure_inbound(domains, mta=remaining_mta)
             _configure_smtp_firewall()
@@ -1413,10 +1434,13 @@ def disable_local_mail(cfg: AgentConfig, *, domain: str) -> dict[str, Any]:
             if previous_domains:
                 previous_mta = _managed_mta(previous_domains, mta)
                 _configure_opendkim(previous_domains, mta=previous_mta)
-                primary_domain = sorted(previous_domains)[0]
                 _configure_mta(
                     previous_mta,
-                    str(previous_domains[primary_domain].get("mail_hostname") or "mail." + primary_domain)
+                    str(
+                        payload_before.get("mail_identity_hostname")
+                        or next(iter(previous_domains.values())).get("mail_hostname")
+                        or ""
+                    ),
                 )
                 if inbound_was_managed:
                     _configure_inbound(previous_domains, mta=previous_mta)
@@ -1653,9 +1677,7 @@ def local_mail_status(cfg: AgentConfig, *, domain: str, push: bool = False) -> d
     errors: list[str] = []
     mta = str(item.get("mta") or "sendmail").strip().lower()
     domains = payload.get("domains") if isinstance(payload.get("domains"), dict) else {}
-    primary_domain = sorted(domains)[0] if domains else clean
-    primary_item = domains.get(primary_domain) if isinstance(domains.get(primary_domain), dict) else item
-    primary_mail_hostname = str(primary_item.get("mail_hostname") or "mail." + primary_domain)
+    primary_mail_hostname = str(payload.get("mail_identity_hostname") or item.get("mail_hostname") or "mail." + clean)
     identity = _mail_identity(primary_mail_hostname)
     if not bool(identity.get("fcrdns")):
         errors.append(
