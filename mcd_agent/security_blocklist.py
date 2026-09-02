@@ -6,12 +6,14 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 
 import fcntl
 
@@ -105,6 +107,70 @@ def _allowlisted(value: str, allowlist: set[str]) -> bool:
         if target.subnet_of(allowed) or allowed.subnet_of(target):
             return True
     return False
+
+
+def _control_plane_addresses(cfg: AgentConfig) -> set[str]:
+    """Resolve addresses that must remain reachable for MCC synchronization."""
+    hostname = str(urlsplit(str(getattr(cfg, "mcc_url", "") or "")).hostname or "").strip()
+    if not hostname:
+        return set()
+    try:
+        return {str(ipaddress.ip_address(hostname))}
+    except ValueError:
+        pass
+
+    addresses: set[str] = set()
+    try:
+        for row in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM):
+            try:
+                addresses.add(str(ipaddress.ip_address(str(row[4][0]))))
+            except (IndexError, TypeError, ValueError):
+                continue
+    except OSError as exc:
+        logging.warning("control-plane allowlist DNS resolution failed for %s: %s", hostname, exc)
+    return addresses
+
+
+def _append_required_ignore_addresses(content: str, required: set[str]) -> str:
+    if not required:
+        return content
+    output: list[str] = []
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped.lower().startswith("ignoreip") or "=" not in line:
+            output.append(line)
+            continue
+        prefix, raw = line.split("=", 1)
+        newline = "\n" if raw.endswith("\n") else ""
+        current = raw.strip().split()
+        merged = [*current, *(item for item in sorted(required) if item not in current)]
+        output.append(f"{prefix}= {' '.join(merged)}{newline}")
+    return "".join(output)
+
+
+def _ensure_control_plane_allowlist(cfg: AgentConfig) -> set[str]:
+    """Persist and enforce MCC reachability before fetching central policy."""
+    required = _control_plane_addresses(cfg)
+    if not required:
+        return set()
+
+    client = shutil.which("fail2ban-client")
+    changed = False
+    if JAIL_PATH.is_file():
+        current = JAIL_PATH.read_text(encoding="utf-8", errors="ignore")
+        updated = _append_required_ignore_addresses(current, required)
+        changed = _atomic_write(JAIL_PATH, updated)
+
+    if client:
+        if changed:
+            _client_ok(_run(client, "-t", timeout=120), "fail2ban control-plane allowlist validation")
+            _client_ok(_run(client, "reload", timeout=120), "fail2ban control-plane allowlist reload")
+        for jail in ("sshd", "mautic-auth-nginx", JAIL_NAME):
+            if not _jail_is_active(client, jail):
+                continue
+            for batch in _address_batches(sorted(required)):
+                _run(client, "set", jail, "unbanip", *batch, timeout=120)
+    return required
 
 
 def _atomic_write(path: Path, content: str, mode: int = 0o644) -> bool:
@@ -288,12 +354,16 @@ def _address_batches(values: list[str], size: int = 250) -> list[list[str]]:
     return [batch for family in (4, 6) for batch in _chunks(by_family[family], size)]
 
 
-def apply_security_blocklist_profile(profile: dict[str, Any]) -> dict[str, Any]:
+def apply_security_blocklist_profile(
+    profile: dict[str, Any],
+    *,
+    required_allowlist: set[str] | None = None,
+) -> dict[str, Any]:
     enabled = bool(profile.get("enabled", False))
     if os.geteuid() != 0:
         return {"status": "error", "reason": "root_required", "changed": False}
 
-    allowlist = _normalize_addresses(profile.get("allowlist"))
+    allowlist = _normalize_addresses(profile.get("allowlist")) | set(required_allowlist or set())
     desired = {
         item
         for item in _normalize_addresses(profile.get("blocked"))
@@ -415,13 +485,14 @@ def sync_security_blocklist_once(cfg: AgentConfig) -> dict[str, Any]:
         except BlockingIOError:
             return {"status": "noop", "reason": "sync_already_running"}
         try:
+            required_allowlist = _ensure_control_plane_allowlist(cfg)
             fetched = fetch_security_blocklist(cfg)
             if str(fetched.get("status") or "").strip().lower() != "ok":
                 return {"status": "error", "reason": fetched.get("reason", "fetch_failed"), "fetch": fetched}
             profile = fetched.get("profile")
             if not isinstance(profile, dict):
                 return {"status": "error", "reason": "invalid profile payload", "fetch": fetched}
-            applied = apply_security_blocklist_profile(profile)
+            applied = apply_security_blocklist_profile(profile, required_allowlist=required_allowlist)
             return {"status": str(applied.get("status") or "error"), "fetch": fetched, "apply": applied}
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

@@ -10,6 +10,87 @@ from mcd_agent import security_blocklist
 
 
 class SecurityBlocklistTests(unittest.TestCase):
+    def test_control_plane_ip_is_required_even_when_central_allowlist_is_empty(self) -> None:
+        config = SimpleNamespace(mcc_url="http://65.21.54.91")
+
+        self.assertEqual(security_blocklist._control_plane_addresses(config), {"65.21.54.91"})
+
+        jail = security_blocklist._jail_config(
+            enabled=False,
+            allowlist=security_blocklist._control_plane_addresses(config),
+            action="iptables[type=allports, name={name}]",
+        )
+        self.assertEqual(jail.count("ignoreip = 127.0.0.1/8 ::1 65.21.54.91"), 3)
+
+    def test_sync_repairs_control_plane_ban_before_fetching_policy(self) -> None:
+        calls: list[str] = []
+        cfg = SimpleNamespace(mcc_url="http://65.21.54.91")
+
+        def ensure(_cfg):
+            calls.append("ensure")
+            return {"65.21.54.91"}
+
+        def fetch(_cfg):
+            calls.append("fetch")
+            return {"status": "ok", "profile": {"enabled": False, "allowlist": []}}
+
+        def apply(_profile, *, required_allowlist=None):
+            calls.append("apply")
+            self.assertEqual(required_allowlist, {"65.21.54.91"})
+            return {"status": "applied"}
+
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                patch.object(security_blocklist, "SYNC_LOCK_PATH", Path(td) / "security.lock"),
+                patch.object(security_blocklist, "_ensure_control_plane_allowlist", side_effect=ensure),
+                patch.object(security_blocklist, "fetch_security_blocklist", side_effect=fetch),
+                patch.object(security_blocklist, "apply_security_blocklist_profile", side_effect=apply),
+            ):
+                result = security_blocklist.sync_security_blocklist_once(cfg)
+
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(calls, ["ensure", "fetch", "apply"])
+
+    def test_control_plane_repair_persists_ignoreip_and_unbans_active_jail(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(*args: str, **_kwargs):
+            command = list(args)
+            commands.append(command)
+            if command[-2:] == ["status", "mautic-auth-nginx"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if len(command) >= 2 and command[1] == "status":
+                return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            jail_path = Path(td) / "98-mcd-security.local"
+            jail_path.write_text(
+                "[mautic-auth-nginx]\nignoreip = 127.0.0.1/8 ::1\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(security_blocklist, "JAIL_PATH", jail_path),
+                patch.object(security_blocklist.shutil, "which", return_value="/usr/bin/fail2ban-client"),
+                patch.object(security_blocklist, "_run", side_effect=fake_run),
+            ):
+                required = security_blocklist._ensure_control_plane_allowlist(
+                    SimpleNamespace(mcc_url="http://65.21.54.91")
+                )
+
+            self.assertEqual(required, {"65.21.54.91"})
+            self.assertIn("ignoreip = 127.0.0.1/8 ::1 65.21.54.91", jail_path.read_text())
+        self.assertIn(
+            [
+                "/usr/bin/fail2ban-client",
+                "set",
+                "mautic-auth-nginx",
+                "unbanip",
+                "65.21.54.91",
+            ],
+            commands,
+        )
+
     def test_managed_sshd_jail_is_strict_and_uses_a_unique_action_name(self) -> None:
         config = security_blocklist._jail_config(
             enabled=True,

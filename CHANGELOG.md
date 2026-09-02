@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.27 - 2026-09-02
+
+- Fixed: the configured MCC endpoint is now an invariant local Fail2ban
+  allowlist entry, independent of the centrally returned blocklist profile.
+- Added: every security synchronization repairs and unbans the control-plane
+  address before contacting MCC, preventing an existing all-ports ticket from
+  deadlocking heartbeat and policy recovery.
+- Added: regression coverage for empty central allowlists and self-recovery
+  when the control-plane address was already blocked.
+
 ## 1.0.26 - 2026-09-02
 
 - Fixed: plugin reload passes the discovered Mautic database table prefix via
