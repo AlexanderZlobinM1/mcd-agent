@@ -196,7 +196,18 @@ def _unmount(path: Path, timeout_sec: int) -> None:
     try:
         _run(["fusermount", "-u", str(path)], timeout_sec=timeout_sec, check=True)
     except Exception:
-        _run(["umount", "-l", str(path)], timeout_sec=timeout_sec, check=False)
+        # A disconnected sshfs mount can leave ordinary unmount waiting on a
+        # FUSE request forever. Detach it first so blocked backup children can
+        # unwind, then keep the generic lazy unmount as the final fallback.
+        lazy_timeout = max(1, min(int(timeout_sec or 1), 5))
+        for command in ("fusermount3", "fusermount"):
+            try:
+                _run([command, "-uz", str(path)], timeout_sec=lazy_timeout, check=False)
+            except Exception:
+                pass
+            if not _mounted(path):
+                return
+        _run(["umount", "-l", str(path)], timeout_sec=lazy_timeout, check=False)
 
 
 def _format_remote_dir(root_dir: str, instance_name: str) -> str:
@@ -1441,7 +1452,7 @@ def _mount(cfg: AgentConfig, mount_path: Path) -> None:
         _unmount(mount_path, cfg.backup_unmount_timeout_sec)
 
     opts = [
-        "reconnect",
+        "ConnectTimeout=10",
         "ServerAliveInterval=15",
         "ServerAliveCountMax=3",
         "StrictHostKeyChecking=accept-new",

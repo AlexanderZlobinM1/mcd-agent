@@ -2711,6 +2711,14 @@ def _local_time_reached(dt_local: datetime, hour: int, minute: int) -> bool:
     return dt_local >= target
 
 
+def _cluster_offsite_not_before_reached(config: AgentConfig, dt_local: datetime) -> bool:
+    return _local_time_reached(
+        dt_local,
+        int(getattr(config, "backup_cluster_offsite_not_before_hour", 2) or 0),
+        int(getattr(config, "backup_cluster_offsite_not_before_minute", 0) or 0),
+    )
+
+
 def _local_hour_in_closed_window(dt_local: datetime, start_hour: int, end_hour: int) -> bool:
     start = max(0, min(23, int(start_hour)))
     end = max(0, min(23, int(end_hour)))
@@ -8909,6 +8917,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         run_day != last_cluster_offsite_day
                         and now >= next_cluster_offsite_retry_at
                         and bool(getattr(config, "backup_cluster_remote_enabled", True))
+                        and _cluster_offsite_not_before_reached(config, dt_local)
                         and (
                             not bool(getattr(config, "backup_cluster_local_xtrabackup_enabled", True))
                             or _cluster_local_full_ready_for_offsite(config, dt_local)

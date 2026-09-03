@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.30 - 2026-09-04
+
+- Fixed: the cluster offsite scheduler now honors the configured
+  `offsite_not_before_hour` and `offsite_not_before_minute` instead of starting
+  a missed backup immediately after an earlier daemon restart.
+- Fixed: SSHFS backup mounts no longer use unbounded reconnect behavior after a
+  dead connection. Failed normal unmounts fall back to bounded lazy FUSE
+  detach, allowing backup locks and the daemon to recover for the next run.
+- Added regression coverage for the offsite start gate and stale SSHFS recovery
+  behavior.
+
 ## 1.0.29 - 2026-09-03
 
 - Changed: orphan page-hit cleanup now keeps a rolling 24-hour attribution

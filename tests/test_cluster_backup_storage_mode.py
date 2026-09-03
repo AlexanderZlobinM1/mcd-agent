@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mcd_agent.backup import _cluster_direct_storage_cfg, _cluster_release_direct_storage
+from mcd_agent.backup import _cluster_direct_storage_cfg, _cluster_release_direct_storage, _mount, _unmount
 
 
 class ClusterBackupStorageModeTests(unittest.TestCase):
@@ -27,9 +27,12 @@ class ClusterBackupStorageModeTests(unittest.TestCase):
             backup_host_name="ananas-cluster-replica-xtrabackup",
             backup_ssh_host="storagebox.example",
             backup_ssh_user="storage",
+            backup_ssh_remote_path="/",
             backup_ssh_key_file="/root/.ssh/storagebox",
             backup_ssh_password="",
             backup_sshfs_package="sshfs",
+            backup_ssh_port=22,
+            backup_mount_timeout_sec=30,
             backup_unmount_timeout_sec=10,
         )
 
@@ -58,6 +61,31 @@ class ClusterBackupStorageModeTests(unittest.TestCase):
         with patch("mcd_agent.backup._unmount") as unmount:
             _cluster_release_direct_storage(cfg, mount_path)
         unmount.assert_called_once_with(mount_path, 10)
+
+    def test_sshfs_mount_does_not_retry_disconnected_fuse_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(td)
+            mount_path = Path(td) / "mount"
+            with patch("mcd_agent.backup._mounted", side_effect=[False, True]), patch(
+                "mcd_agent.backup._run", return_value=SimpleNamespace(returncode=0)
+            ) as run:
+                _mount(cfg, mount_path)
+
+        options = run.call_args.args[0][-1]
+        self.assertIn("ConnectTimeout=10", options)
+        self.assertIn("ServerAliveInterval=15", options)
+        self.assertIn("ServerAliveCountMax=3", options)
+        self.assertNotIn("reconnect", options)
+
+    def test_unmount_uses_lazy_fuse_detach_after_bounded_failure(self) -> None:
+        mount_path = Path("/tmp/mcd-stale-storagebox-test")
+        with patch("mcd_agent.backup._mounted", side_effect=[True, True, False]), patch(
+            "mcd_agent.backup._run", side_effect=[TimeoutError("stale fuse"), None]
+        ) as run:
+            _unmount(mount_path, 20)
+
+        self.assertEqual(run.call_args_list[0].args[0], ["fusermount", "-u", str(mount_path)])
+        self.assertEqual(run.call_args_list[1].args[0], ["fusermount3", "-uz", str(mount_path)])
 
 
 if __name__ == "__main__":
