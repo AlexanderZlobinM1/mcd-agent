@@ -100,7 +100,7 @@ page_hits_orphan_cleanup_batches_per_run = 12
 # Sleep between orphan delete batches, sec.
 page_hits_orphan_cleanup_sleep_sec = 0.2
 # Keep recent orphan page_hits younger than this grace window, minutes.
-page_hits_orphan_cleanup_grace_min = 60
+page_hits_orphan_cleanup_grace_min = 1440
 # Max runtime budget of one orphan cleanup run, sec.
 page_hits_orphan_cleanup_max_run_sec = 180
 page_hits_orphan_cleanup_instance_settings = {}

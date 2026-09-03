@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.0.29 - 2026-09-03
+
+- Changed: orphan page-hit cleanup now keeps a rolling 24-hour attribution
+  window by default while preserving explicit operator overrides.
+
 ## 1.0.28 - 2026-09-02
 
 - Added: own-host image deployment validates the host's shared forward-confirmed

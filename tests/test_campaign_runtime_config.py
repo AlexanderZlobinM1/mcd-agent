@@ -125,6 +125,25 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.segment_sql_page_hits_quiet_window_min, 180)
         self.assertEqual(cfg.segment_sql_auto_long_native_min_duration_sec, 600)
 
+    def test_orphan_page_hits_default_to_rolling_24_hour_grace(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text('[runtime]\nprofile_name = "midi"\n', encoding="utf-8")
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.page_hits_orphan_cleanup_grace_min, 1440)
+
+    def test_explicit_orphan_page_hits_grace_is_preserved(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            '[runtime]\nprofile_name = "midi"\npage_hits_orphan_cleanup_grace_min = 90\n',
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.page_hits_orphan_cleanup_grace_min, 90)
+
     def test_page_hits_sql_quiet_window_can_be_explicitly_disabled(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(

@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from mcd_agent.config import (
     AgentConfig,
+    DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN,
     check_profile_drift_with_mcc,
     load_config,
     recover_config_from_mcc,
@@ -1493,7 +1494,17 @@ def _page_hits_orphan_cleanup_effective_setting(
     batch_size = max(100, int(getattr(config, "page_hits_orphan_cleanup_batch_size", 5000) or 5000))
     batches = max(1, int(getattr(config, "page_hits_orphan_cleanup_batches_per_run", 12) or 12))
     sleep_sec = max(0.0, float(getattr(config, "page_hits_orphan_cleanup_sleep_sec", 0.2) or 0.2))
-    grace_min = max(5, int(getattr(config, "page_hits_orphan_cleanup_grace_min", 60) or 60))
+    grace_min = max(
+        5,
+        int(
+            getattr(
+                config,
+                "page_hits_orphan_cleanup_grace_min",
+                DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN,
+            )
+            or DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN
+        ),
+    )
     max_run_sec = max(30, int(getattr(config, "page_hits_orphan_cleanup_max_run_sec", 180) or 180))
     settings = getattr(config, "page_hits_orphan_cleanup_instance_settings", {})
     if not isinstance(settings, dict):

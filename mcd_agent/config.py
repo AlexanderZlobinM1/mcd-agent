@@ -21,6 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover - py3.10 compatibility
 
 CURRENT_CONFIG_SCHEMA_VERSION = 2
 _CAMPAIGN_TRIGGER_AUDIT_INTERVAL_SEC = 60
+DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN = 24 * 60
 LEGACY_RUNTIME_KEYS: tuple[str, ...] = (
     "max_parallel_campaigns",
     "max_parallel_segments_idle",
@@ -2989,7 +2990,13 @@ def _load_config_inner(path: str) -> AgentConfig:
         ),
         page_hits_orphan_cleanup_grace_min=max(
             5,
-            int(runtime.get("page_hits_orphan_cleanup_grace_min", 60) or 60),
+            int(
+                runtime.get(
+                    "page_hits_orphan_cleanup_grace_min",
+                    DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN,
+                )
+                or DEFAULT_PAGE_HITS_ORPHAN_CLEANUP_GRACE_MIN
+            ),
         ),
         page_hits_orphan_cleanup_max_run_sec=max(
             30,
