@@ -137,6 +137,15 @@ def _branch_key(version: str) -> str:
     return f"{sv[0]}.{sv[1]}"
 
 
+def _release_family_label(version: str) -> str:
+    sv = _parse_semver(version)
+    if sv == (0, 0, 0):
+        return ""
+    if sv[0] == 7:
+        return "7"
+    return f"{sv[0]}.{sv[1]}.x"
+
+
 def _write_upgrade_version_cache(root: str, version: str) -> int:
     safe = str(version or "").strip()
     if not safe or safe == "0.0.0":
@@ -1484,11 +1493,11 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _latest_same_branch(config, current)
-    branch = _branch_key(current)
+    branch = _release_family_label(current)
     print(f"root={install_root}")
     print(f"current={current}")
     if branch:
-        print(f"branch={branch}.x")
+        print(f"branch={branch}")
     if target is None:
         print("next=none")
     else:
@@ -1656,18 +1665,18 @@ def run_upgrade_interactive(config: AgentConfig, root: str | None) -> int:
     install_root, console = _pick_install(config, root)
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target_next = _latest_same_branch(config, current)
-    branch = _branch_key(current)
+    branch = _release_family_label(current)
     print(f"root={install_root}")
     print(f"current={current}")
     if branch:
-        print(f"branch={branch}.x")
+        print(f"branch={branch}")
     if not target_next:
         print("next=none")
         return 0
     print(f"latest_patch={target_next}")
     print("")
     print("Select target:")
-    print("1. latest patch in current branch (recommended)")
+    print("1. latest release in current family (recommended)")
     print("0. exit")
     t_choice = _ask("Target [1/0, default 1]: ").strip() or "1"
     if t_choice == "0":

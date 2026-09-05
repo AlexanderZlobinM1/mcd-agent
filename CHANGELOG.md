@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.32 - 2026-09-05
+
+- Aligned Mautic upgrade diagnostics and CLI help with the unified Mautic 7
+  release family. Checks now report `branch=7`, and `--allow-minor` accurately
+  describes guarded forward minor upgrades rather than a one-step limit.
+
 ## 1.0.31 - 2026-09-05
 
 - Unified Mautic 7 release discovery across minor versions. Upgrade checks on

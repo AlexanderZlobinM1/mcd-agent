@@ -1792,7 +1792,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--backup", action="store_true")
     up.add_argument("--with-system-upgrade", action="store_true")
     up.add_argument("--target", help="Explicit target Mautic version")
-    up.add_argument("--allow-minor", action="store_true", help="Allow one-step minor upgrade within the current major")
+    up.add_argument("--allow-minor", action="store_true", help="Allow a forward minor upgrade within the current major")
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")

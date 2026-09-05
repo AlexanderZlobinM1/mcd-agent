@@ -19,6 +19,7 @@ from mcd_agent.mautic_upgrade import (
     _migrate_php_custom_ini,
     _normalize_mautic7_loopback_redis_cache,
     _latest_same_branch,
+    _release_family_label,
     _rewrite_nginx_php_fpm_references,
     _safe_mautic7_loopback_redis_dsn,
     _upgrade_target_relation,
@@ -26,6 +27,12 @@ from mcd_agent.mautic_upgrade import (
 
 
 class MauticUpgradeTargetTests(unittest.TestCase):
+    def test_release_family_label_unifies_mautic_7_only(self) -> None:
+        self.assertEqual(_release_family_label("7.0.2"), "7")
+        self.assertEqual(_release_family_label("7.2.0"), "7")
+        self.assertEqual(_release_family_label("6.0.9"), "6.0.x")
+        self.assertEqual(_release_family_label("invalid"), "")
+
     def test_patch_upgrade_is_allowed_without_minor_flag(self) -> None:
         self.assertEqual(_upgrade_target_relation("7.1.1", "7.1.2"), "allowed")
 
