@@ -2094,7 +2094,7 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
     m6p.add_argument("--json", action="store_true")
 
-    m713p = sub.add_parser("mautic713-import-tag-patch", help="Manage the reversible Mautic 7.1.3 import tag detach remediation")
+    m713p = sub.add_parser("mautic713-import-tag-patch", help="Manage the reversible Mautic 7.0-7.2 import tag remediation")
     m713p.add_argument("--config", default=default_cfg)
     m713p.add_argument("--root", help="Instance root or instance uid (default: all)")
     m713p.add_argument("op", choices=["status", "apply", "revert"], nargs="?", default="status")

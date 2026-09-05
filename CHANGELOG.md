@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.0.33 - 2026-09-05
+
+- Automatically reconcile the existing import-tag detached-entity workaround
+  on host-native Mautic 7.0, 7.1 and 7.2 installations. Upstream PR #17209 is
+  still unmerged and the affected assignment remains in 7.2.0.
+- Check the shipped release metadata and unique source context, skip unknown
+  versions, Docker and maintenance pauses, and leave upstream fixes untouched.
+- Serialize patch changes and refresh the verified rollback source after a core
+  update. Restore managed patches before upgrades and reapply when still needed.
+- Add regression coverage for default reconciliation, version/layout gates,
+  maintenance, upstream-fixed code, write errors and repeated upgrade cycles.
+
 ## 1.0.32 - 2026-09-05
 
 - Aligned Mautic upgrade diagnostics and CLI help with the unified Mautic 7

@@ -67,6 +67,7 @@ from mcd_agent.host_identity import resolve_agent_identity
 from mcd_agent.inventory import InstanceInventory, ensure_seeded
 from mcd_agent.instance_runtime import apply_instance_runtime
 from mcd_agent.mautic6_core_patch import ensure_m6_plugin_update_metadata_patch, should_apply_m6_plugin_update_metadata_patch
+from mcd_agent.mautic713_import_tag_patch import reconcile_import_tag_patch
 from mcd_agent.grapesjs_ckeditor_patch import ensure_grapesjs_ckeditor_gpl_patch
 from mcd_agent.mautic_locks import cleanup_stale_mautic_file_locks
 from mcd_agent.mautic_version_cache import confirmed_mautic_major, retire_zabbix_mautic_version_userparameter
@@ -9089,6 +9090,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
         if now >= next_plan_refresh_at:
             installs = inventory.list_instances()
+            reconcile_import_tag_patch(config, installs)
             _refresh_instance_db_maps(installs, db_configs_by_root, mautic_timezones_by_root)
             _apply_instance_runtime_guard(installs, reason="plan-refresh")
             for inst in installs:

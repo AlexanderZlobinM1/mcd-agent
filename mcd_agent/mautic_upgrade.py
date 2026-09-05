@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib import error as urlerror
 from urllib.parse import urlparse, urlsplit, urlunsplit
 import urllib.request
@@ -35,7 +35,10 @@ from mcd_agent.amazon_mailer_dep import (
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import write_mautic_version_cache
-from mcd_agent.mautic713_import_tag_patch import revert_patch as revert_mautic713_import_tag_patch
+from mcd_agent.mautic713_import_tag_patch import (
+    ensure_patch as ensure_import_tag_patch,
+    revert_patch as revert_mautic713_import_tag_patch,
+)
 from mcd_agent.executor import execute_mautic_command_template
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.install_readiness import _database_state, mautic7_database_compatibility
@@ -1596,17 +1599,17 @@ def run_upgrade_apply(
         # Mandatory preflight: align permissions before any upgrade action.
         _pre_upgrade_permissions_check(config, install_root)
 
-        # This narrow 7.1.3 hotfix changes a core file. Restore the exact
+        # This hotfix changes a core file. Restore the exact
         # verified original before any version change so Composer/ZIP updates
         # never inherit a local patch into a new Mautic release.
-        if current == "7.1.3" and target != "7.1.3":
+        if _parse_semver(current)[0] == 7 and current != target:
             restore = revert_mautic713_import_tag_patch(inst)
             if str(restore.get("status", "")).strip().lower() == "error":
                 raise RuntimeError(
-                    "Mautic 7.1.3 import tag remediation rollback failed: "
+                    "Mautic import tag remediation rollback failed: "
                     + str(restore.get("reason", "unknown"))
                 )
-            print("Mautic 7.1.3 import tag remediation rollback: " + str(restore.get("status", "clean")))
+            print("Mautic import tag remediation rollback: " + str(restore.get("status", "clean")))
 
         if do_backup:
             b = _backup_install(install_root)
@@ -1643,10 +1646,12 @@ def run_upgrade_apply(
             _ensure_mautic7_locale_fix(config, install_root)
 
         _post_upgrade_verify(config, inst)
-
         final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
         if _parse_semver(final_version) != _parse_semver(target):
             raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
+        import_patch = ensure_import_tag_patch(replace(inst, mautic_major=_parse_semver(final_version)[0]))
+        if import_patch.get("status") == "error":
+            raise RuntimeError("Import tag patch after upgrade failed: " + str(import_patch.get("reason")))
         cache_count = _write_upgrade_version_cache(install_root, final_version)
         print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
         print(f"Upgrade completed: {current} -> {final_version}")
