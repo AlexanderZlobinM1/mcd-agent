@@ -18,6 +18,7 @@ from mcd_agent.mautic_upgrade import (
     _normalize_mautic7_composer_constraints,
     _migrate_php_custom_ini,
     _normalize_mautic7_loopback_redis_cache,
+    _latest_same_branch,
     _rewrite_nginx_php_fpm_references,
     _safe_mautic7_loopback_redis_dsn,
     _upgrade_target_relation,
@@ -33,9 +34,28 @@ class MauticUpgradeTargetTests(unittest.TestCase):
         self.assertEqual(_upgrade_target_relation("7.0.2", "7.1.2", allow_minor=True), "allowed")
         self.assertEqual(_upgrade_target_relation("5.1.4", "5.2.11", allow_minor=True), "allowed")
 
-    def test_major_and_multi_minor_are_blocked(self) -> None:
+    def test_major_is_blocked_but_forward_multi_minor_is_explicitly_allowed(self) -> None:
         self.assertEqual(_upgrade_target_relation("7.0.2", "8.0.0", allow_minor=True), "blocked_major")
-        self.assertEqual(_upgrade_target_relation("7.0.2", "7.2.0", allow_minor=True), "blocked_minor")
+        self.assertEqual(_upgrade_target_relation("7.0.2", "7.2.0", allow_minor=True), "allowed")
+
+    def test_mautic_seven_checker_uses_latest_release_across_minor_versions(self) -> None:
+        cfg = SimpleNamespace()
+        targets = {
+            "7.0.2": "https://example.test/7.0.2-update.zip",
+            "7.2.0": "https://example.test/7.2.0-update.zip",
+        }
+        with patch("mcd_agent.mautic_upgrade._available_targets", return_value=targets):
+            self.assertEqual(_latest_same_branch(cfg, "7.0.2"), "7.2.0")
+            self.assertEqual(_latest_same_branch(cfg, "7.1.3"), "7.2.0")
+
+    def test_non_seven_checker_remains_on_minor_branch(self) -> None:
+        cfg = SimpleNamespace()
+        targets = {
+            "5.1.1": "https://example.test/5.1.1-update.zip",
+            "5.2.9": "https://example.test/5.2.9-update.zip",
+        }
+        with patch("mcd_agent.mautic_upgrade._available_targets", return_value=targets):
+            self.assertIsNone(_latest_same_branch(cfg, "5.1.1"))
 
     def test_guarded_composer_six_to_seven_major_can_be_allowed(self) -> None:
         self.assertEqual(_upgrade_target_relation("6.0.9", "7.1.2"), "blocked_major")

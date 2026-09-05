@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.31 - 2026-09-05
+
+- Unified Mautic 7 release discovery across minor versions. Upgrade checks on
+  7.0 and 7.1 now resolve the latest stable Mautic 7 target from MCC, with
+  7.2.0 as the offline fallback.
+- Allowed an explicitly authorized forward minor update to cross more than one
+  Mautic minor release, enabling the unified 7.x path while retaining the
+  existing `--allow-minor` guard.
+
 ## 1.0.30 - 2026-09-04
 
 - Fixed: the cluster offsite scheduler now honors the configured

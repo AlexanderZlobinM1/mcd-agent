@@ -61,8 +61,7 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "5.1": "5.1.1",
     "5.2": "5.2.9",
     "6.0": "6.0.7",
-    "7.0": "7.0.0",
-    "7.1": "7.1.2",
+    "7": "7.2.0",
 }
 
 PHP84_PACKAGE_SUFFIXES = [
@@ -392,7 +391,11 @@ def _latest_same_branch(config: AgentConfig, version: str) -> str | None:
     v = _parse_semver(version)
     if v == (0, 0, 0):
         return None
-    candidates = [x for x in targets.keys() if _parse_semver(x)[:2] == v[:2]]
+    candidates = [
+        x
+        for x in targets.keys()
+        if (_parse_semver(x)[0] == 7 and v[0] == 7) or _parse_semver(x)[:2] == v[:2]
+    ]
     if not candidates:
         return None
     latest = max(candidates, key=lambda x: _parse_semver(x))
@@ -424,7 +427,7 @@ def _upgrade_target_relation(
         return "blocked_major"
     if target_sv[1] == current_sv[1]:
         return "allowed"
-    if allow_minor and target_sv[1] == current_sv[1] + 1:
+    if allow_minor and target_sv[1] > current_sv[1]:
         return "allowed"
     return "blocked_minor"
 
@@ -444,13 +447,13 @@ def _ensure_upgrade_target_allowed(
     if relation == "blocked_major":
         raise RuntimeError(
             f"Major upgrade is disabled in current flow: {current} -> {target}. "
-            "Only patch updates are allowed by default; one-step minor updates require --allow-minor, "
+            "Only patch updates are allowed by default; minor updates require --allow-minor, "
             "and the Composer Mautic 6 -> 7 flow requires --allow-major."
         )
     if relation == "blocked_minor":
         raise RuntimeError(
             f"Minor upgrade is disabled in current flow: {current} -> {target}. "
-            "Pass --allow-minor for a one-step minor upgrade within the same major."
+            "Pass --allow-minor for a forward minor upgrade within the same major."
         )
     raise RuntimeError(f"Invalid Mautic upgrade target: {current} -> {target}")
 
