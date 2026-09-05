@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.35 - 2026-09-05
+
+- Require live MCC authorization for Mautic upgrade targets before maintenance
+  and again before package replacement. Explicit targets and cached ZIP files
+  cannot bypass operator approval; unavailable MCC authorization fails closed.
+- Resolve managed upgrade targets only from MCC, without merging stale local
+  fallback versions or unapproved ZIPs into the available target list.
+
 ## 1.0.34 - 2026-09-05
 
 - Defer Composer post-autoload and post-update scripts until dependencies have

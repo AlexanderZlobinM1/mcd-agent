@@ -12,7 +12,7 @@ import time
 from typing import Any
 from dataclasses import dataclass, replace
 from urllib import error as urlerror
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urlencode, urlparse, urlsplit, urlunsplit
 import urllib.request
 
 from mcd_agent.config import AgentConfig
@@ -64,7 +64,7 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "5.1": "5.1.1",
     "5.2": "5.2.9",
     "6.0": "6.0.7",
-    "7": "7.2.0",
+    "7": "7.1.3",
 }
 
 PHP84_PACKAGE_SUFFIXES = [
@@ -312,11 +312,23 @@ def _release_targets_fallback() -> dict[str, dict[str, str]]:
 
 
 def _release_targets(config: AgentConfig) -> dict[str, dict[str, str]]:
-    out = _release_targets_fallback()
-    remote = _release_targets_from_mcc(config)
-    if remote:
-        out.update(remote)
-    return out
+    if config.mcc_url:
+        return _release_targets_from_mcc(config)
+    return _release_targets_fallback()
+
+
+def _require_release_approval(config: AgentConfig, target: str) -> None:
+    if not config.mcc_url:
+        raise RuntimeError("Mautic upgrade requires a live MCC release approval")
+    url = config.mcc_url.rstrip("/") + "/api/v1/agent/mautic/releases/authorize?" + urlencode({"version": target})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {config.mcc_token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read())
+        if not isinstance(result, dict) or result.get("status") != "ok" or result.get("version") != target:
+            raise ValueError("invalid approval response")
+    except Exception as exc:
+        raise RuntimeError(f"Mautic {target} is not authorized by MCC; package replacement is blocked ({type(exc).__name__})") from exc
 
 
 def _available_targets(config: AgentConfig) -> dict[str, str]:
@@ -333,6 +345,8 @@ def _available_targets(config: AgentConfig) -> dict[str, str]:
             if not m:
                 continue
             v = m.group(1)
+            if config.mcc_url and v not in out:
+                continue
             out[v] = str(p)
     return out
 
@@ -1581,7 +1595,12 @@ def run_upgrade_apply(
         )
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
-    target = _clean_target_version(target_override) or _latest_same_branch(config, current)
+    target = _clean_target_version(target_override)
+    if not target:
+        if allow_major and _parse_semver(current)[0] == 6:
+            target = str((_release_targets(config).get("7") or {}).get("version", ""))
+        else:
+            target = _latest_same_branch(config, current)
     if not target:
         print(f"No upgrade target for current version {current}")
         return 0
@@ -1589,6 +1608,7 @@ def run_upgrade_apply(
         print(f"No upgrade target for current version {current}")
         return 0
 
+    _require_release_approval(config, target)
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = detect_install_type(install_root)
@@ -1631,8 +1651,10 @@ def run_upgrade_apply(
             print(f"Backup created: {b}")
 
         if chosen_mode == "zip":
+            _require_release_approval(config, target)
             _apply_zip(config, install_root, console, config.php_bin, target)
         elif chosen_mode == "composer":
+            _require_release_approval(config, target)
             _apply_composer(install_root, console, config.php_bin, current, target)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")
