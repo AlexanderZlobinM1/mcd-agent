@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.34 - 2026-09-05
+
+- Defer Composer post-autoload and post-update scripts until dependencies have
+  been replaced and the old Mautic production container has been removed.
+  This prevents 7.1-to-7.2 asset generation from booting stale service wiring.
+- Preserve normal Composer plugin and pre-update events, replay declared
+  deferred scripts, and require Composer 2.8.6 or newer before changing files.
+- Keep dry runs script-free and cover hook ordering, absent hooks, unsupported
+  Composer versions and failure propagation with upgrade regression tests.
+
 ## 1.0.33 - 2026-09-05
 
 - Automatically reconcile the existing import-tag detached-entity workaround

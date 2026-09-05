@@ -1280,6 +1280,9 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
         cwd=project_root,
         as_www_data=True,
     )
+    version_match = re.search(r"\bComposer(?: version)? (\d+\.\d+\.\d+)\b", composer_version)
+    if not version_match or _parse_semver(version_match.group(1)) < (2, 8, 6):
+        raise RuntimeError("Composer >= 2.8.6 is required to defer application scripts safely during upgrades")
     node_version = _command_version_line(["node", "-v"], cwd=project_root)
     npm_version = _command_version_line(["npm", "-v"], cwd=project_root)
     print(f"Composer preflight ok: {composer_version} ({composer_bin})")
@@ -1291,11 +1294,23 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     changes += constraint_changes
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
-    _run([composer_bin, *_composer_update_args(dry_run=True)], cwd=project_root, as_www_data=True)
+    _run([composer_bin, *_composer_update_args(dry_run=True), "--no-scripts"], cwd=project_root, as_www_data=True)
     print("Composer dependency dry-run ok")
-    _run([composer_bin, *_composer_update_args()], cwd=project_root, as_www_data=True)
+    # Post-update scripts boot Mautic. They must never load the previous core's
+    # compiled container after Composer has replaced its classes and services.
+    deferred_events = ("post-autoload-dump", "post-update-cmd")
+    _run(
+        ["env", "COMPOSER_SKIP_SCRIPTS=" + ",".join(deferred_events), composer_bin, *_composer_update_args()],
+        cwd=project_root,
+        as_www_data=True,
+    )
     patched = _apply_mautic7_twig_include_hotfix(project_root, target)
     _normalize_mautic7_loopback_redis_cache(project_root, target)
+    _hard_clear_prod_cache(project_root)
+    scripts = json.loads(cjson.read_text(encoding="utf-8")).get("scripts", {})
+    for event in deferred_events:
+        if event in scripts:
+            _run([composer_bin, "run-script", "--no-interaction", event], cwd=project_root, as_www_data=True)
     _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
     if patched:
         print("Mautic 7 Twig include hotfix cache refresh completed")
