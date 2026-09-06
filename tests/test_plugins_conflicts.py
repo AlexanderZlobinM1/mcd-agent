@@ -450,15 +450,15 @@ class PluginConflictPathTests(unittest.TestCase):
                 },
             }
         ]
-        db = SimpleNamespace(execute_sql_template=Mock(return_value=1))
-
-        with patch("mcd_agent.plugins.MauticDB", return_value=db):
+        with patch("mcd_agent.plugins.MauticDB") as db_cls, \
+             patch("mcd_agent.plugins.plugin_registration.unregister", return_value=1) as unregister:
             _cleanup_conflicting_plugin_rows(install, rows, extra_conflicts=["AmazonSnsCallbackBundle", "MauticAmazonSesBundle"])
 
-        sql = db.execute_sql_template.call_args.args[0]
-        self.assertNotIn("'AmazonSesBundle'", sql)
-        self.assertIn("'AmazonSnsCallbackBundle'", sql)
-        self.assertIn("'MauticAmazonSesBundle'", sql)
+        names = unregister.call_args.args[1]
+        self.assertNotIn("AmazonSesBundle", names)
+        self.assertIn("AmazonSnsCallbackBundle", names)
+        self.assertIn("MauticAmazonSesBundle", names)
+        self.assertNotIn("purge", unregister.call_args.kwargs)
 
     def test_plugin_metadata_repair_skips_when_column_is_absent(self) -> None:
         cfg = SimpleNamespace()

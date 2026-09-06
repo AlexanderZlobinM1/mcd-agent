@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-09-06
+
+- Preserve integration settings during ordinary plugin removal and mutually exclusive replacement. Remove registration references transactionally and restore them after native reinstallation without reading or changing setting values.
+- Add explicit `purge` as a separate plugin action to delete retained integration settings, including after earlier removal. Fail closed on registration database errors.
+- Keep registration-only ownership metadata in the instance database so shared-database installations use the same lifecycle state.
+
 ## 1.1.0 - 2026-09-06
 
 - Add generic declarative plugin-operation listing, validation, command execution,

@@ -1827,7 +1827,7 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--root")
         p.add_argument(
         "--action",
-        choices=["auto", "install", "update", "reinstall", "remove"],
+        choices=["auto", "install", "update", "reinstall", "remove", "purge"],
         help="Action mode for selected plugins",
         )
         p.add_argument("--select", help="Selection expression, e.g. '1-3 6 10'")

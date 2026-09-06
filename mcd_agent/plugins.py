@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 import zipfile
 
-from mcd_agent import __version__
+from mcd_agent import __version__, plugin_registration
 from mcd_agent.amazon_mailer_dep import ensure_composer_runtime_packages, ensure_mailer_packages_for_bundles
 from mcd_agent.cluster_routing import cluster_local_identity_values, cluster_route_targets
 from mcd_agent.config import AgentConfig
@@ -715,6 +715,8 @@ def _normalize_action(raw: str) -> str | None:
         "reinstall": "reinstall",
         "d": "remove",
         "remove": "remove",
+        "p": "purge",
+        "purge": "purge",
         "x": "exit",
         "q": "exit",
         "exit": "exit",
@@ -1511,6 +1513,8 @@ def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | N
     if config.plugins_post_install:
         _run_plugin_install_reload(config, install, expected_bundles=expected_bundles)
         _assert_plugin_bundles_registered(install, set(expected_bundles or set()))
+        if install.db and plugin_registration.restore(MauticDB(install.db), set(expected_bundles or set()), allow_schema_creation=not bool(getattr(config, "cluster_id", None))):
+            _run_plugin_cache_clear(config, install)
 
 
 def _run_manifest_sql_fixes(config: AgentConfig, install, selected_rows: list[dict[str, Any]]) -> None:
@@ -1547,6 +1551,7 @@ def _cleanup_conflicting_plugin_rows(
     *,
     context: dict[str, Any] | None = None,
     extra_conflicts: list[str] | None = None,
+    allow_schema_creation: bool = True,
 ) -> None:
     if not install.db:
         return
@@ -1565,16 +1570,8 @@ def _cleanup_conflicting_plugin_rows(
             conflicts.add(name)
     if not conflicts:
         return
-    escaped = []
-    for b in sorted(conflicts):
-        escaped.append("'" + b.replace("'", "''") + "'")
-    sql = f"DELETE FROM {{prefix}}plugins WHERE bundle IN ({', '.join(escaped)})"
-    try:
-        db = MauticDB(install.db)
-        affected = db.execute_sql_template(sql)
-        logging.info("[%s] plugin conflict rows cleanup affected=%s bundles=%s", install.root, affected, ",".join(sorted(conflicts)))
-    except Exception as e:
-        logging.warning("[%s] plugin conflict rows cleanup failed: %s", install.root, e)
+    affected = plugin_registration.unregister(MauticDB(install.db), sorted(conflicts), allow_schema_creation=allow_schema_creation)
+    logging.info("[%s] plugin registrations removed=%s; settings retained; bundles=%s", install.root, affected, ",".join(sorted(conflicts)))
 
 
 def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]) -> bool:
@@ -1930,7 +1927,7 @@ def _cluster_sync_bundle_names(
             or _install_bundle_for_manifest_bundle(conflict_bundle, conflict_item if isinstance(conflict_item, dict) else None)
         ).strip() or conflict_bundle
         names.extend([conflict_bundle, conflict_install])
-    if action == "remove":
+    if action in {"remove", "purge"}:
         names.extend(_selected_install_bundles(selected))
     return _dedupe_text(names)
 
@@ -1950,8 +1947,17 @@ def _apply_plugin_file_changes(
 ) -> bool:
     plugins_dir = _resolve_plugins_dir(install_root, create=False)
     changed = False
-    protected_install_paths = _protected_plugin_path_names(selected) if action != "remove" else set()
-    if action != "remove" and auto_remove_bundles:
+    if action in {"remove", "purge"} and install.db:
+        names = sorted(_protected_plugin_path_names(selected))
+        changed = bool(plugin_registration.unregister(MauticDB(install.db), names, purge=action == "purge", allow_schema_creation=not bool(getattr(config, "cluster_id", None))))
+    elif action not in {"remove", "purge"} and selected:
+        _cleanup_conflicting_plugin_rows(
+            install, selected, context=_plugin_interaction_context(install_root, plugins_dir),
+            extra_conflicts=auto_remove_bundles,
+            allow_schema_creation=not bool(getattr(config, "cluster_id", None)),
+        )
+    protected_install_paths = _protected_plugin_path_names(selected) if action not in {"remove", "purge"} else set()
+    if action not in {"remove", "purge"} and auto_remove_bundles:
         for conflict_bundle in auto_remove_bundles:
             conflict_row = rows_by_bundle.get(conflict_bundle)
             conflict_item = conflict_row.get("item") if isinstance(conflict_row, dict) else None
@@ -1989,11 +1995,11 @@ def _apply_plugin_file_changes(
         bundle = row["bundle"]
         item_dict = item if isinstance(item, dict) else None
         install_bundle = str(row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle, item_dict))
-        if action != "remove" and not isinstance(item, dict):
+        if action not in {"remove", "purge"} and not isinstance(item, dict):
             logging.info("[%s] plugin %s not in server manifest, skip for action=%s", install_root, bundle, action)
             continue
         status = row["status"]
-        if action == "remove":
+        if action in {"remove", "purge"}:
             removed_paths: list[str] = []
             for name in _dedupe_text([install_bundle, bundle]):
                 pdir = _resolve_plugins_dir(install_root, create=False) / name
@@ -2076,7 +2082,7 @@ def _apply_plugin_file_changes(
 
     compatibility_changed = False
     interaction_context = _plugin_interaction_context(install_root, plugins_dir)
-    if action != "remove" and selected:
+    if action not in {"remove", "purge"} and selected:
         # Compatibility patches are recovery steps too. A previous run can copy
         # plugin files successfully and then fail during Mautic reload, leaving
         # the plugin version at OK while core reload still needs patching.
@@ -2085,17 +2091,12 @@ def _apply_plugin_file_changes(
         compatibility_changed = _prealign_metadataless_plugin_versions(install, selected) or compatibility_changed
 
     if changed or compatibility_changed:
-        _run_manifest_sql_fixes(config, install, selected)
-        _cleanup_conflicting_plugin_rows(
-            install,
-            selected,
-            context=interaction_context,
-            extra_conflicts=auto_remove_bundles,
-        )
+        if action not in {"remove", "purge"}:
+            _run_manifest_sql_fixes(config, install, selected)
         if run_post_steps:
             expected_bundles = (
                 set()
-                if action == "remove"
+                if action in {"remove", "purge"}
                 else {
                     str(row.get("install_bundle") or row.get("bundle") or "").strip()
                     for row in selected
@@ -2137,7 +2138,7 @@ def _cluster_plugin_cli_args(
     plugin_uids = [
         str(row.get("plugin_uid", "") or "").strip()
         for row in selected
-        if str(row.get("plugin_uid", "") or "").strip() and action != "remove"
+        if str(row.get("plugin_uid", "") or "").strip() and action not in {"remove", "purge"}
     ]
     if plugin_uids and len(plugin_uids) == len(selected):
         for uid in plugin_uids:
@@ -2603,7 +2604,7 @@ def _run_cluster_plugin_operation(
             rows_by_bundle=rows_by_bundle,
             run_post_steps=False,
         )
-        if not changed and action != "remove":
+        if not changed and action not in {"remove", "purge"}:
             _cluster_plugin_set_phase(
                 config,
                 key,
@@ -2663,7 +2664,11 @@ def _run_cluster_plugin_operation(
                 message="running mautic:plugin:install on reference node",
                 node_status="plugin_install",
             )
-            _run_plugin_install_reload(config, install, expected_bundles=set(sync_bundles))
+            expected = set() if action in {"remove", "purge"} else set(_selected_install_bundles(selected))
+            _run_plugin_install_reload(config, install, expected_bundles=expected)
+            if install.db and plugin_registration.restore(MauticDB(install.db), expected, allow_schema_creation=False):
+                _cluster_plugin_cache_clear_all(config=config, install=install, key=key,
+                    request_hash=request_hash, expected_hosts=expected_hosts, reference_host=reference_host)
         _cluster_plugin_set_phase(
             config,
             key,
@@ -2865,8 +2870,8 @@ def run_plugins_interactive(
     while True:
         if action is None:
             print("Action:")
-            print("a = auto, i = install, u = update, r = reinstall, d = remove, x = exit")
-            action_in = _ask("Choose action [a/i/u/r/d/x], default=a: ")
+            print("a = auto, i = install, u = update, r = reinstall, d = remove (keep settings), p = purge settings, x = exit")
+            action_in = _ask("Choose action [a/i/u/r/d/p/x], default=a: ")
         else:
             action_in = action
         normalized = _normalize_action(action_in)
@@ -2945,7 +2950,7 @@ def run_plugins_interactive(
             continue
 
         auto_remove_bundles = []
-        if chosen_action != "remove":
+        if chosen_action not in {"remove", "purge"}:
             auto_remove_bundles = _auto_remove_conflicting_installed_bundles(
                 selected,
                 plugins_dir,
