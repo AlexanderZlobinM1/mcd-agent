@@ -141,6 +141,13 @@ from mcd_agent.mode import (
 )
 from mcd_agent.nginx_baseline import ensure_nginx_baseline
 from mcd_agent.plugins import run_plugins_interactive
+from mcd_agent.plugin_operations import (
+    effective_values,
+    operation_command_tokens,
+    operation_completion,
+    operations_for_instance,
+    validate_operation_values,
+)
 from mcd_agent.runtime_overrides import (
     apply_remote_overrides,
     fetch_runtime_overrides,
@@ -590,6 +597,62 @@ def _select_instance_for_ops(cfg, root: str | None):
         roots = ", ".join(x.root for x in installs)
         raise RuntimeError(f"Multiple installs found, pass --root: {roots}")
     return installs[0]
+
+
+def _plugin_operation_cli(cfg, args) -> int:
+    inst = _select_instance_for_ops(cfg, args.root)
+    operations = operations_for_instance(cfg, inst)
+    if args.plugin_ops_cmd == "complete":
+        values = operation_completion(cfg, inst, args.prefix)
+        print(json.dumps(values, ensure_ascii=True) if args.json else "\n".join(values))
+        return 0
+    if args.plugin_ops_cmd == "list":
+        payload = [
+            {
+                "operation_key": item.get("operation_key"),
+                "bundle": item.get("bundle"),
+                "operation": item.get("operation"),
+                "values": effective_values(cfg, inst, item),
+            }
+            for item in operations
+        ]
+        print(json.dumps(payload, ensure_ascii=True, indent=2, default=str) if args.json else "\n".join(str(row["operation_key"]) for row in payload))
+        return 0
+    key = str(args.operation_key or "").strip().lower()
+    item = next((row for row in operations if str(row.get("operation_key", "")).lower() == key), None)
+    if item is None:
+        raise RuntimeError(f"declared operation not found: {key or '<missing>'}")
+    operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+    supplied: dict[str, object] = {}
+    for expression in args.set:
+        if "=" not in expression:
+            raise RuntimeError(f"invalid --set value: {expression}")
+        field, value = expression.split("=", 1)
+        supplied[field.strip()] = value
+    values = validate_operation_values(item, {**effective_values(cfg, inst, item), **supplied})
+    if args.plugin_ops_cmd == "set":
+        settings = getattr(cfg, "plugin_operation_instance_settings", {})
+        settings = dict(settings) if isinstance(settings, dict) else {}
+        block = dict(settings.get(inst.instance_uid, {})) if isinstance(settings.get(inst.instance_uid), dict) else {}
+        block[key] = values
+        settings[inst.instance_uid] = block
+        _upsert_runtime_values(cfg.config_file_path, {"plugin_operation_instance_settings": settings})
+        cfg2 = load_config(cfg.config_file_path)
+        sync = push_runtime_overrides(cfg2, {"plugin_operation_instance_settings": settings}, merge=True, target="desired")
+        touch_poll_trigger(cfg2)
+        payload = {"status": "ok", "operation_key": key, "values": values, "mcc_sync": sync}
+        print(json.dumps(payload, ensure_ascii=True, indent=2) if args.json else json.dumps(payload, ensure_ascii=True))
+        return 0 if str(sync.get("status", "ok")).lower() in {"ok", "disabled"} else 1
+    if str(operation.get("mode", "")).lower() != "action":
+        raise RuntimeError("only action operations can be run")
+    argv = operation_command_tokens(item, values)
+    executable = shutil.which("mcd-cli") or sys.executable
+    command = [executable, *argv] if executable != sys.executable else [executable, "-m", "mcd_agent.cli", *argv]
+    result = subprocess.run(command, cwd=str(inst.root), text=True, capture_output=True)
+    output = (result.stdout or result.stderr or "").strip()
+    payload = {"status": "ok" if result.returncode == 0 else "error", "operation_key": key, "argv": argv, "output": output}
+    print(json.dumps(payload, ensure_ascii=True, indent=2) if args.json else output)
+    return int(result.returncode)
 
 
 def _run_manual_command_with_scheduler(
@@ -1783,6 +1846,17 @@ def _build_parser() -> argparse.ArgumentParser:
     plugin_alias = sub.add_parser("plugin", help=argparse.SUPPRESS)
     _add_plugins_args(plugin_alias)
 
+    plugin_ops = sub.add_parser("plugin-operations", aliases=["plugin-operation"], help="Use declared plugin operations")
+    plugin_ops_sub = plugin_ops.add_subparsers(dest="plugin_ops_cmd", required=True)
+    for name, help_text in (("list", "List declared operations"), ("complete", "Complete declared operation keys and fields"), ("set", "Set declared operation values"), ("run", "Run a declared action operation")):
+        op_parser = plugin_ops_sub.add_parser(name, help=help_text)
+        op_parser.add_argument("--config", default=default_cfg)
+        op_parser.add_argument("--root", help="Mautic root, instance uid, name, or domain")
+        op_parser.add_argument("--operation", dest="operation_key")
+        op_parser.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE")
+        op_parser.add_argument("--prefix", default="")
+        op_parser.add_argument("--json", action="store_true")
+
     up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
     up.add_argument("--config", default=default_cfg)
     up.add_argument("--root")
@@ -2897,6 +2971,18 @@ def main() -> int:
         )
         print(format_tune_result(payload))
         return 0
+
+    if args.cmd in {"plugin-operations", "plugin-operation"}:
+        cfg = load_config(args.config)
+        try:
+            return _plugin_operation_cli(cfg, args)
+        except Exception as exc:
+            payload = {"status": "error", "reason": str(exc)}
+            if bool(getattr(args, "json", False)):
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(f"plugin operation error: {exc}", file=sys.stderr)
+            return 1
 
     if args.cmd in {"plugins", "plugin"}:
         cfg = load_config(args.config)

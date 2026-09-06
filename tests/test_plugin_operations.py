@@ -13,6 +13,9 @@ from mcd_agent.plugin_operations import (
     operations_for_instance,
     schedule_due,
     scheduled_tasks,
+    operation_completion,
+    operation_command_tokens,
+    validate_operation_values,
 )
 
 
@@ -104,6 +107,27 @@ def test_missing_bundle_hides_operation(tmp_path: Path) -> None:
     config = SimpleNamespace(plugin_operations={inst.instance_uid: [item]})
 
     assert operations_for_instance(config, inst) == []
+
+
+def test_cli_surface_is_limited_to_declared_installed_operations(tmp_path: Path) -> None:
+    root = tmp_path / "mautic"
+    (root / "plugins" / "VendorBundle").mkdir(parents=True)
+    inst = _Instance(str(root))
+    item = _item("VendorBundle")
+    config = SimpleNamespace(plugin_operations={inst.instance_uid: [item]})
+
+    assert operation_completion(config, inst, "vendor:v") == ["vendor:vendor_sync"]
+    assert operation_completion(config, inst, "dry") == ["dry_run"]
+    values = validate_operation_values(item, {"interval_sec": "900", "dry_run": "true"})
+    assert values["interval_sec"] == 900
+    assert values["dry_run"] is True
+    assert operation_command_tokens(item, values) == ["vendor:sync", "tenant", "--dry-run"]
+    try:
+        validate_operation_values(item, {"undeclared": "1"})
+    except ValueError as exc:
+        assert "unknown operation field" in str(exc)
+    else:
+        raise AssertionError("undeclared operation fields must be rejected")
 
 
 def test_effective_values_continue_past_unrelated_alias_block(tmp_path: Path) -> None:

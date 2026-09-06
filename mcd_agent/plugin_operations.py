@@ -227,6 +227,108 @@ def effective_values(config: object, inst: object, item: dict[str, Any]) -> dict
     return values
 
 
+def validate_operation_values(item: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize values against the declarative operation schema.
+
+    This deliberately accepts only fields declared by the catalog operation; plugin
+    capabilities that are not declared there never become CLI operations.
+    """
+    operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+    fields = [field for field in list(operation.get("fields") or []) if isinstance(field, dict)]
+    declared = {str(field.get("id", "") or "").strip().lower(): field for field in fields if str(field.get("id", "") or "").strip()}
+    unknown = sorted(set(str(key).strip().lower() for key in values) - set(declared))
+    if unknown:
+        raise ValueError(f"unknown operation field(s): {', '.join(unknown)}")
+    out = {key: field.get("default") for key, field in declared.items()}
+    for raw_key, raw_value in values.items():
+        key = str(raw_key).strip().lower()
+        field = declared[key]
+        field_type = str(field.get("type", "string") or "string").strip().lower()
+        if field_type == "boolean":
+            if isinstance(raw_value, bool):
+                value = raw_value
+            elif str(raw_value).strip().lower() in {"1", "true", "yes", "on"}:
+                value = True
+            elif str(raw_value).strip().lower() in {"0", "false", "no", "off"}:
+                value = False
+            else:
+                raise ValueError(f"invalid boolean for {key}")
+        elif field_type == "integer":
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid integer for {key}") from exc
+            if "min" in field and value < int(field["min"]):
+                raise ValueError(f"{key} is below minimum")
+            if "max" in field and value > int(field["max"]):
+                raise ValueError(f"{key} is above maximum")
+        elif field_type in {"select", "multiselect"}:
+            choices = {str(choice.get("value", "") or "") for choice in list(field.get("choices") or []) if isinstance(choice, dict)}
+            if field_type == "select":
+                value = str(raw_value).strip()
+                if value not in choices:
+                    raise ValueError(f"invalid choice for {key}")
+            else:
+                raw_items = raw_value if isinstance(raw_value, (list, tuple)) else str(raw_value).split(",")
+                value = list(dict.fromkeys(str(entry).strip() for entry in raw_items if str(entry).strip()))
+                if any(entry not in choices for entry in value):
+                    raise ValueError(f"invalid choice for {key}")
+        elif field_type == "time":
+            value = str(raw_value).strip()
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError(f"invalid time for {key}")
+        else:
+            value = str(raw_value)
+        out[key] = value
+    return out
+
+
+def operation_command_tokens(
+    item: dict[str, Any],
+    values: dict[str, Any],
+    *,
+    command: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> list[str]:
+    """Resolve a declared command into argv without exposing undeclared commands."""
+    operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+    resolved = command if isinstance(command, dict) else operation.get("command") if isinstance(operation.get("command"), dict) else {}
+    name = str(resolved.get("name", "") or "").strip()
+    if not _COMMAND_RE.fullmatch(name):
+        raise ValueError("invalid plugin operation command")
+    runner = str(resolved.get("runner", "") or "").strip().lower()
+    if runner not in {"mcd_cli", "mautic_console"}:
+        raise ValueError("unsupported plugin operation runner")
+    argv = [name]
+    context = context or {}
+    for spec in list(resolved.get("args") or []):
+        if isinstance(spec, dict) and "context" in spec:
+            key = str(spec.get("context", "") or "")
+            if key not in context:
+                raise ValueError(f"missing command context: {key}")
+            flag = str(spec.get("flag", "") or "")
+            argv.extend(([flag] if flag else []) + [str(context[key])])
+        else:
+            argv.extend(_argument_tokens(spec, values))
+    if any("\x00" in token or "\n" in token or "\r" in token for token in argv):
+        raise ValueError("invalid plugin operation command argument")
+    return argv
+
+
+def operation_completion(config: object, inst: object, prefix: str = "") -> list[str]:
+    """Return completion candidates from the instance's cached declarations."""
+    operations = operations_for_instance(config, inst)
+    candidates: list[str] = []
+    for item in operations:
+        key = str(item.get("operation_key", "") or "")
+        if key:
+            candidates.append(key)
+        operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+        candidates.extend(str(field.get("id", "") or "") for field in list(operation.get("fields") or []) if isinstance(field, dict) and field.get("id"))
+    needle = str(prefix or "").strip().lower()
+    return sorted(dict.fromkeys(candidate for candidate in candidates if candidate.lower().startswith(needle)))
+
+
 def _argument_tokens(spec: Any, values: dict[str, Any]) -> list[str]:
     if isinstance(spec, str):
         return [spec]

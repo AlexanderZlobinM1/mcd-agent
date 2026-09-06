@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-09-06
+
+- Add generic declarative plugin-operation listing, validation, command execution,
+  and completion driven only by the installed instance catalog.
+
 ## 1.0.35 - 2026-09-05
 
 - Require live MCC authorization for Mautic upgrade targets before maintenance
