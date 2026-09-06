@@ -33,6 +33,12 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
   destructive target cleanup.
 - Instance uid is domain-based (from active nginx/apache vhost), fallback to root-based short id
 - Mautic versions supported now: 4, 5, 6, 7
+- Image provisioning uses the standard HTTPS path: after the HTTP vhost is
+  created, Certbot must obtain the domain certificate, install the HTTPS
+  vhost and pass the nginx validation/reload checks before deployment is
+  considered successful. Do not use `--no-certbot` for normal or test
+  instance creation; it is reserved only for an explicitly documented
+  recovery case.
 - DB settings extraction from Mautic `local.php`:
   - `db_host`
   - `db_table_prefix`
