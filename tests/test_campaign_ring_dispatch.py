@@ -35,6 +35,7 @@ from mcd_agent.daemon import (
     _campaign_whitelist_realtime_setting,
     _campaign_whitelist_effective_setting,
     _campaign_rebuild_waits_for_trigger,
+    _campaign_spill_prefers_priority,
     _campaign_trigger_email_progress_sql,
     _campaign_trigger_event_log_due_exists_sql,
     _campaign_trigger_event_log_progress_sql,
@@ -301,6 +302,38 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(rebuild, trigger)
         self.assertNotEqual(trigger, other)
+
+    def test_audit_rebuild_candidate_spills_ahead_of_regular_ring_when_priority_cap_is_zero(self) -> None:
+        priority = deque([40])
+        regular = deque([18])
+
+        audit_ids = _merge_campaign_trigger_audit_ids([], [40])
+
+        self.assertEqual(audit_ids, [40])
+        self.assertTrue(_campaign_spill_prefers_priority(priority, 0))
+
+        cfg = SimpleNamespace(campaign_rebuild_min_repeat_sec=0, command_timeout_sec=0)
+        store = Mock()
+        running: dict[str, RunningTask] = {}
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True):
+            launched = _fill_from_ring(
+                ring=priority,
+                ring_limit=1,
+                total_limit=1,
+                root="/var/www/avio_park/public_html",
+                task_type="campaign_rebuild",
+                running=running,
+                ring_entities={40},
+                config=cfg,
+                store=store,
+                popens={},
+                build_args=Mock(return_value=["php", "bin/console", "mautic:campaigns:rebuild", "-i", "40"]),
+                remove_on_launch=True,
+            )
+
+        self.assertEqual(launched, 1)
+        self.assertEqual(list(priority), [])
+        self.assertEqual(list(regular), [18])
 
     def test_task_lock_wraps_command_with_stable_flock_path(self) -> None:
         args = ["php", "bin/console", "mautic:segments:update", "-i", "23"]

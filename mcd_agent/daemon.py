@@ -3913,6 +3913,11 @@ def _fill_from_ring(
     return launched_count
 
 
+def _campaign_spill_prefers_priority(priority_ring: deque[int], priority_limit: int) -> bool:
+    """Keep forced campaign work from starving behind an unlimited regular ring."""
+    return bool(priority_ring) and max(0, int(priority_limit or 0)) <= 0
+
+
 def _remove_ring_entities(ring: deque[int], entity_ids: set[int]) -> int:
     if not ring or not entity_ids:
         return 0
@@ -11635,7 +11640,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 trg_cur_total = _running_count(running, root, "campaign_trigger")
                 if launched <= 0 and trg_cur_total < trg_total_limit:
                     spill = trg_total_limit - trg_cur_total
-                    if trg_reg_ring:
+                    if trg_reg_ring and not _campaign_spill_prefers_priority(
+                        trg_prio_ring,
+                        trg_prio_limit,
+                    ):
                         launched += _fill_from_ring(
                             ring=trg_reg_ring,
                             ring_limit=spill,
@@ -11754,7 +11762,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 reb_cur_total = _running_count(running, root, "campaign_rebuild")
                 if launched <= 0 and reb_cur_total < rebuild_total_limit:
                     spill = rebuild_total_limit - reb_cur_total
-                    if reb_reg_ring:
+                    if reb_reg_ring and not _campaign_spill_prefers_priority(
+                        reb_prio_ring,
+                        rebuild_prio_limit,
+                    ):
                         launched += _fill_from_ring(
                             ring=reb_reg_ring,
                             ring_limit=spill,

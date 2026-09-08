@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.1 - 2026-09-08
+
+- Fixed campaign audit liveness: forced rebuild/trigger candidates now spill
+  ahead of a continuously populated regular ring when the priority lane has no
+  dedicated workers, preventing detected campaigns from waiting indefinitely.
+
 ## 1.2.0 - 2026-09-06
 
 - Preserve integration settings during ordinary plugin removal and mutually exclusive replacement. Remove registration references transactionally and restore them after native reinstallation without reading or changing setting values.

@@ -466,6 +466,11 @@ Important:
     evaluates published campaigns against Mautic's due-work conditions and
     runs `mautic:campaigns:trigger -i ID` only for eligible IDs; passive
     profiles keep external cron ownership.
+  - When audit or due-work planning places a campaign in the priority ring but
+    its priority worker count is zero, spill capacity dispatches that priority
+    candidate before continuing an always-populated regular ring. This bounds
+    detection-to-rebuild admission by the next scheduler pass while retaining
+    host, instance, campaign and fairness limits.
   - on weak hosts start lower (e.g. `1000`) so one long campaign does not block full daemon cycle for too long.
 - Runtime tuning for catalog plugin operations:
   - canonical per-instance values live under `runtime.plugin_operation_instance_settings`;
