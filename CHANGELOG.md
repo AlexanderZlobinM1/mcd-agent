@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.4 - 2026-09-09
+
+- Fixed the Mautic 7.2 role-migration gate to match the canonical executable
+  loop signature rather than an optional docblock, while retaining exact-count
+  fail-closed behavior for duplicate, mixed or unknown source states.
+
 ## 1.2.3 - 2026-09-09
 
 - Added internal Mautic 7.1.3 to 7.2.0 patch-plan orchestration to

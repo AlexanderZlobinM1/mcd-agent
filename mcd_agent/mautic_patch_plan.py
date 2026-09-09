@@ -18,8 +18,7 @@ _RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _ROLE_PATH = "app/migrations/Version20211209022550.php"
 _BUNDLE_PATH = "app/bundles/CoreBundle/MauticCoreBundle.php"
 _ASSET_PATH = "app/bundles/CoreBundle/DependencyInjection/Compiler/AssetMapperWebRootPass.php"
-_ROLE_OLD = """/** @var Role $role */
-foreach ($roles as $role) {
+_ROLE_OLD = """foreach ($roles as $role) {
     $rawPermissions = $role->getRawPermissions();"""
 _ROLE_NEW = """foreach ($roles as $roleResult) {
     // RoleRepository adds a scalar user count to this query, so Doctrine
