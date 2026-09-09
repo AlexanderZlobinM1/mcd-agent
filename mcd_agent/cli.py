@@ -2168,6 +2168,14 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
     m6p.add_argument("--json", action="store_true")
 
+    patch_plan = sub.add_parser("mautic-patch-plan", help="Verify/apply a revision-pinned MCC Mautic patch plan")
+    patch_plan.add_argument("op", choices=["contract", "verify", "apply", "rollback"], nargs="?", default="contract")
+    patch_plan.add_argument("--root")
+    patch_plan.add_argument("--plan-json", default="")
+    patch_plan.add_argument("--phase", default="")
+    patch_plan.add_argument("--run-id", default="")
+    patch_plan.add_argument("--json", action="store_true")
+
     m713p = sub.add_parser("mautic713-import-tag-patch", help="Manage the reversible Mautic 7.0-7.2 import tag remediation")
     m713p.add_argument("--config", default=default_cfg)
     m713p.add_argument("--root", help="Instance root or instance uid (default: all)")
@@ -4195,6 +4203,18 @@ def main() -> int:
         if (not ok) and "deferred" in str(msg).strip().lower():
             return 2
         return 0 if ok else 1
+
+    if args.cmd == "mautic-patch-plan":
+        from mcd_agent.mautic_patch_plan import PatchPlanError, contract, execute, rollback
+        if args.op == "contract":
+            print(json.dumps(contract(), ensure_ascii=True, indent=2))
+            return 0
+        try:
+            result = rollback(args.root or "", args.plan_json, args.run_id) if args.op == "rollback" else execute(args.root or "", args.plan_json, args.phase, args.run_id, args.op)
+        except PatchPlanError as exc:
+            result = {"status": "error", "reason": str(exc)}
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0 if result.get("status") == "success" else 2
 
     if args.cmd == "mautic6-patch":
         cfg = load_config(args.config)

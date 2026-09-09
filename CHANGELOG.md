@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.2 - 2026-09-09
+
+- Added a fail-closed, revision-pinned Mautic 7.2 patch-plan adapter for the
+  role migration and AssetMapper webroot remediations. It accepts no commands,
+  file paths or patch payloads from the caller.
+
 ## 1.2.1 - 2026-09-08
 
 - Fixed campaign audit liveness: forced rebuild/trigger candidates now spill
