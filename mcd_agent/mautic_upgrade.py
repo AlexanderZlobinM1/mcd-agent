@@ -1640,10 +1640,11 @@ def run_upgrade_apply(
                 try:
                     evidence = execute(source_root, patch_plan_json, phase, patch_run_id, "apply")
                 except PatchPlanError as exc:
+                    print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps({"status": "error", "phase": phase, "run_id": patch_run_id, "reason": str(exc)}, sort_keys=True))
                     raise RuntimeError(f"Mautic patch plan {phase} rejected: {exc}") from exc
+                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
                 if evidence.get("status") != "success":
                     raise RuntimeError(f"Mautic patch plan {phase} failed: {evidence.get('reason', 'unknown')}")
-                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
     if not yes:
         ans = input("Proceed? [y/N]: ").strip().lower()
         if ans not in {"y", "yes"}:

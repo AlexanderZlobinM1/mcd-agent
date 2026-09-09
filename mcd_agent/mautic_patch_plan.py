@@ -7,28 +7,33 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 from typing import Any
+
+from mcd_agent.install_type import detect_install_type
 
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
-MINIMUM_AGENT_VERSION = "1.2.2"
+MINIMUM_AGENT_VERSION = "1.2.5"
 ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
 ASSET = "M7-ASSET-MAPPER-WEBROOT"
 _RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _ROLE_PATH = "app/migrations/Version20211209022550.php"
+_ROLE_720_VULNERABLE_SHA256 = "f970321517fa32eed01a031f5110f397e441bb049965efdbbeece7750df4d33c"
+_ROLE_720_FIXED_SHA256 = "b690b3cdd927a9b8257572cbb7bc42aba79f6c8b90d1ce39bac3154a928f2328"
 _BUNDLE_PATH = "app/bundles/CoreBundle/MauticCoreBundle.php"
 _ASSET_PATH = "app/bundles/CoreBundle/DependencyInjection/Compiler/AssetMapperWebRootPass.php"
-_ROLE_OLD = """foreach ($roles as $role) {
-    $rawPermissions = $role->getRawPermissions();"""
-_ROLE_NEW = """foreach ($roles as $roleResult) {
-    // RoleRepository adds a scalar user count to this query, so Doctrine
-    // hydrates each row as [Role, user_count] instead of Role.
-    $role = is_array($roleResult) ? ($roleResult[0] ?? null) : $roleResult;
-    if (!$role instanceof Role) {
-        continue;
-    }
+_ROLE_OLD = """        foreach ($roles as $role) {
+            $rawPermissions = $role->getRawPermissions();"""
+_ROLE_NEW = """        foreach ($roles as $roleResult) {
+            // RoleRepository adds a scalar user count to this query, so Doctrine
+            // hydrates each row as [Role, user_count] instead of Role.
+            $role = is_array($roleResult) ? ($roleResult[0] ?? null) : $roleResult;
+            if (!$role instanceof Role) {
+                continue;
+            }
 
-    $rawPermissions = $role->getRawPermissions();"""
+            $rawPermissions = $role->getRawPermissions();"""
 _BUNDLE_OLD = "        $container->addCompilerPass(new Compiler\\SystemThemeTemplatePathPass(), PassConfig::TYPE_BEFORE_REMOVING, 0);"
 _BUNDLE_NEW = _BUNDLE_OLD + "\n        $container->addCompilerPass(new Compiler\\AssetMapperWebRootPass(), PassConfig::TYPE_BEFORE_REMOVING, 0);"
 _ASSET_SOURCE = """<?php
@@ -153,27 +158,54 @@ def _inside(root: Path, relative: str) -> Path:
 
 
 def _source_root(root: Path) -> Path:
-    sources = [item.resolve() for item in (root, root / "docroot", root / "public") if (item / _ROLE_PATH).is_file()]
+    sources = []
+    for relative in (".", "docroot", "public"):
+        candidate = _inside(root, relative)
+        if _inside(candidate, _ROLE_PATH).is_file():
+            sources.append(candidate)
     if len(sources) != 1:
         raise PatchPlanError("ambiguous_or_missing_mautic_source_root")
     return sources[0]
 
 
 def _target_version(root: Path) -> str | None:
-    pattern = re.compile(r"7\.2\.0")
-    for relative in ("composer.lock", "app/config/local.php", "docroot/composer.lock", "docroot/app/config/local.php"):
-        path = root / relative
-        if path.is_file() and pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
-            return "7.2.0"
-    return None
+    versions = set()
+    for relative in ("composer.lock", "docroot/composer.lock", "public/composer.lock"):
+        path = _inside(root, relative)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                for package in data["packages"]:
+                    if package.get("name") in {"mautic/core-lib", "mautic/core-bundle", "mautic/core"}:
+                        versions.add(str(package.get("version", "")).removeprefix("v"))
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise PatchPlanError("invalid_version_metadata") from exc
+    for prefix in ("", "docroot/", "public/"):
+        path = _inside(root, prefix + "app/bundles/CoreBundle/release_metadata.json")
+        if path.is_file():
+            try:
+                versions.add(json.loads(path.read_text(encoding="utf-8"))["version"])
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PatchPlanError("invalid_version_metadata") from exc
+    return versions.pop() if len(versions) == 1 else None
 
 
 def _gate(source: Path, ident: str) -> dict[str, Any]:
     if ident == ROLE:
-        path = _inside(source, _ROLE_PATH); text = path.read_text(encoding="utf-8")
-        old, fixed = text.count(_ROLE_OLD), text.count("$role = is_array($roleResult)")
-        state = "vulnerable" if (old, fixed) == (1, 0) else "already" if (old, fixed) == (0, 1) else "error"
-        return {"id": ident, "state": state, "gate_logic": "exact_count_vulnerable_or_fixed", "files": [{"path": _ROLE_PATH, "sha256": _sha(text.encode()), "vulnerable_count": old, "fixed_count": fixed}]}
+        path = _inside(source, _ROLE_PATH)
+        content = path.read_bytes()
+        text = content.decode("utf-8")
+        old, fixed, sha = text.count(_ROLE_OLD), text.count(_ROLE_NEW), _sha(content)
+        state = "error"
+        if (old, fixed) == (1, 0) and sha == _ROLE_720_VULNERABLE_SHA256:
+            state = "vulnerable"
+        elif (old, fixed) == (0, 1) and sha == _ROLE_720_FIXED_SHA256:
+            state = "already"
+        return {"id": ident, "state": state, "gate_logic": "exact_count_and_file_sha256", "files": [{
+            "path": _ROLE_PATH, "sha256": sha, "vulnerable_count": old, "fixed_count": fixed,
+            "expected_count": 1, "vulnerable_sha256": _ROLE_720_VULNERABLE_SHA256,
+            "fixed_sha256": _ROLE_720_FIXED_SHA256,
+        }]}
     asset, bundle = _inside(source, _ASSET_PATH), _inside(source, _BUNDLE_PATH)
     bundle_text = bundle.read_text(encoding="utf-8"); asset_sha = _sha(asset.read_bytes()) if asset.exists() else None
     registered = bundle_text.count("new Compiler\\AssetMapperWebRootPass()")
@@ -182,14 +214,26 @@ def _gate(source: Path, ident: str) -> dict[str, Any]:
 
 
 def _save(run: Path, payload: dict[str, Any]) -> None:
+    previous_path = _inside(run, "result.json")
+    previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else {}
+    history = previous.get("history", [])
+    backups = {item["path"]: item for item in previous.get("backup_records", [])}
+    for patch in payload.get("patches", []):
+        for item in patch.get("backups", []):
+            if item["path"] in backups and backups[item["path"]] != item:
+                raise PatchPlanError("backup_evidence_changed")
+            backups[item["path"]] = item
+    stored = {**payload, "history": history + [payload], "backup_records": list(backups.values())}
     run.mkdir(parents=True, exist_ok=True); temp = run / "result.json.tmp"
-    temp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"); temp.replace(run / "result.json")
+    temp.write_text(json.dumps(stored, sort_keys=True, indent=2) + "\n", encoding="utf-8"); temp.replace(run / "result.json")
 
 
 def _backup(run: Path, source: Path, relative: str) -> dict[str, Any]:
-    path = _inside(source, relative); backup = run / "backups" / relative; backup.parent.mkdir(parents=True, exist_ok=True)
+    path = _inside(source, relative); backup = _inside(run, "backups/" + relative); backup.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists(); before = path.read_bytes() if existed else b""
-    if existed: backup.write_bytes(before)
+    if existed:
+        with backup.open("xb") as stream:
+            stream.write(before)
     return {"path": relative, "backup": str(backup), "existed": existed, "before_sha256": _sha(before) if existed else None}
 
 
@@ -198,38 +242,82 @@ def _lint(path: Path) -> None:
     if result.returncode: raise PatchPlanError("php_syntax_check_failed")
 
 
-def _apply(source: Path, run: Path, ident: str) -> dict[str, Any]:
+def _apply(source: Path, run: Path, ident: str, gate: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    for item in gate["files"]:
+        candidate = _inside(source, item["path"])
+        if (_sha(candidate.read_bytes()) if candidate.exists() else None) != item["sha256"]:
+            raise PatchPlanError("source_changed_after_gate")
     paths = [_ROLE_PATH] if ident == ROLE else [_ASSET_PATH, _BUNDLE_PATH]
+    changes = {}
+    for relative in paths:
+        path = _inside(source, relative)
+        if relative == _ROLE_PATH:
+            changes[relative] = path.read_bytes().replace(_ROLE_OLD.encode(), _ROLE_NEW.encode(), 1)
+        elif relative == _ASSET_PATH:
+            changes[relative] = _ASSET_SOURCE.encode()
+        else:
+            changes[relative] = path.read_bytes().replace(_BUNDLE_OLD.encode(), _BUNDLE_NEW.encode(), 1)
+    if ident == ROLE and _sha(changes[_ROLE_PATH]) != _ROLE_720_FIXED_SHA256:
+        raise PatchPlanError("unexpected_patch_result")
     backups = [_backup(run, source, item) for item in paths]
-    if ident == ROLE:
-        path = _inside(source, _ROLE_PATH); path.write_text(path.read_text(encoding="utf-8").replace(_ROLE_OLD, _ROLE_NEW, 1), encoding="utf-8"); _lint(path)
-    else:
-        asset, bundle = _inside(source, _ASSET_PATH), _inside(source, _BUNDLE_PATH)
-        asset.parent.mkdir(parents=True, exist_ok=True); asset.write_text(_ASSET_SOURCE, encoding="utf-8")
-        bundle.write_text(bundle.read_text(encoding="utf-8").replace(_BUNDLE_OLD, _BUNDLE_NEW, 1), encoding="utf-8"); _lint(asset); _lint(bundle)
-    for item in backups: item["after_sha256"] = _sha(_inside(source, item["path"]).read_bytes())
+    for item in backups:
+        item["after_sha256"] = _sha(changes[item["path"]])
+    _save(run, {**context, "status": "pending", "patches": [{"id": ident, "state": "pending", "backups": backups}]})
+    staged = []
+    try:
+        for relative, content in changes.items():
+            path = _inside(source, relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".mcd-patch-", suffix=".php", dir=path.parent)
+            staged.append((path, Path(temporary)))
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+            stat = path.stat() if path.exists() else path.parent.stat()
+            os.chmod(temporary, (stat.st_mode & 0o777) if path.exists() else 0o644)
+            if os.geteuid() == 0:
+                os.chown(temporary, stat.st_uid, stat.st_gid)
+            _lint(Path(temporary))
+        for path, temporary in staged:
+            original = next(item for item in backups if _inside(source, item["path"]) == path)
+            if (_sha(path.read_bytes()) if path.exists() else None) != original["before_sha256"]:
+                raise PatchPlanError("source_changed_after_gate")
+            temporary.replace(path)
+    finally:
+        for _, temporary in staged:
+            temporary.unlink(missing_ok=True)
     return {"id": ident, "state": "applied", "backups": backups}
 
 
 def rollback(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
-    parse_plan(raw_plan)
+    plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
     root = Path(root_value).resolve(strict=True); source = _source_root(root)
-    result_path = root / ".mcd" / "patch-runs" / run_id / "result.json"
+    result_path = _inside(root, ".mcd/patch-runs/" + run_id + "/result.json")
     if not result_path.is_file(): raise PatchPlanError("rollback_evidence_not_found")
     evidence = json.loads(result_path.read_text(encoding="utf-8"))
+    if evidence.get("plan_sha256") != _sha(json.dumps(plan, sort_keys=True).encode()):
+        raise PatchPlanError("stale_run_plan")
     restored: list[dict[str, Any]] = []
-    for patch in reversed(evidence.get("patches", [])):
-        for item in reversed(patch.get("backups", [])):
-            path = _inside(source, str(item["path"])); current = _sha(path.read_bytes()) if path.exists() else None
-            if current != item.get("after_sha256"):
-                return {"status": "error", "reason": "partial_application", "run_id": run_id, "rollback": restored, "path": item["path"]}
-            if item.get("existed"):
-                path.write_bytes(Path(item["backup"]).read_bytes())
-            elif path.exists():
-                path.unlink()
-            restored.append({"path": item["path"], "state": "reverted", "backup": item["backup"]})
-    payload = {"status": "success", "operation": "rollback", "run_id": run_id, "rollback": restored}
+    records = list(reversed(evidence.get("backup_records", [])))
+    for item in records:
+        if item["path"] not in {_ROLE_PATH, _ASSET_PATH, _BUNDLE_PATH}:
+            raise PatchPlanError("unknown_backup_path")
+        path = _inside(source, item["path"])
+        current = _sha(path.read_bytes()) if path.exists() else None
+        if current not in {item.get("before_sha256"), item.get("after_sha256")}:
+            return {"status": "error", "reason": "partial_application", "run_id": run_id, "rollback": [], "path": item["path"]}
+        backup = _inside(result_path.parent, "backups/" + item["path"])
+        if item.get("existed") and _sha(backup.read_bytes()) != item["before_sha256"]:
+            raise PatchPlanError("backup_checksum_mismatch")
+    for item in records:
+        path = _inside(source, item["path"])
+        backup = _inside(result_path.parent, "backups/" + item["path"])
+        if item.get("existed"):
+            path.write_bytes(backup.read_bytes())
+        elif path.exists():
+            path.unlink()
+        restored.append({"path": item["path"], "state": "reverted", "backup": str(backup)})
+    payload = {"status": "success", "operation": "rollback", "run_id": run_id, "plan_sha256": evidence["plan_sha256"], "rollback": restored}
     _save(result_path.parent, payload)
     return payload
 
@@ -238,19 +326,32 @@ def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: 
     plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
     root = Path(root_value).resolve(strict=True)
-    local_type = "composer" if (root / "composer.json").is_file() else "zip"
+    local_type = detect_install_type(str(root))
     if local_type != plan["install_type"]: raise PatchPlanError("install_type_mismatch")
     if _target_version(root) != plan["target_version"]: raise PatchPlanError("target_version_mismatch")
     source = _source_root(root); selected = [item["id"] for item in plan["patches"] if phase in item["phases"]]
     if operation not in {"verify", "apply"} or not selected: raise PatchPlanError("unsupported_operation_or_phase")
-    run = root / ".mcd" / "patch-runs" / run_id; gates = [_gate(source, ident) for ident in selected]
-    if any(item["state"] == "error" for item in gates): return {"status": "error", "reason": "ambiguous_or_unknown_gate", "run_id": run_id, "phase": phase, "patches": gates}
-    if operation == "verify": return {"status": "success", "operation": operation, "run_id": run_id, "phase": phase, "patches": gates}
+    run = _inside(root, ".mcd/patch-runs/" + run_id)
+    context = {"operation": operation, "run_id": run_id, "phase": phase, "registry_revision": REGISTRY_REVISION,
+               "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()), "resolved_source_root": str(source)}
+    previous_path = _inside(run, "result.json")
+    if previous_path.is_file():
+        previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        if previous.get("plan_sha256") != context["plan_sha256"]:
+            raise PatchPlanError("stale_run_plan")
+        if operation == "apply" and (previous.get("status") != "success" or previous.get("operation") == "rollback"):
+            raise PatchPlanError("incomplete_or_rolled_back_run")
+    gates = [_gate(source, ident) for ident in selected]
+    if any(item["state"] == "error" for item in gates):
+        return {**context, "status": "error", "reason": "ambiguous_or_unknown_gate", "patches": gates}
+    if operation == "verify": return {**context, "status": "success", "patches": gates}
     applied = []
     try:
         for gate in gates:
-            if gate["id"] == ASSET and not (run / "result.json").is_file(): raise PatchPlanError("dependency_unmet:" + ROLE)
-            applied.append(_apply(source, run, gate["id"]) if gate["state"] == "vulnerable" else {"id": gate["id"], "state": "already", "backups": []})
+            if gate["id"] == ASSET and _gate(source, ROLE)["state"] != "already": raise PatchPlanError("dependency_unmet:" + ROLE)
+            result = _apply(source, run, gate["id"], gate, context) if gate["state"] == "vulnerable" else {"id": gate["id"], "state": "already", "backups": []}
+            result.update({"phase": phase, "gate": gate})
+            applied.append(result)
     except Exception as exc:
-        payload = {"status": "error", "reason": str(exc), "run_id": run_id, "phase": phase, "patches": applied, "rollback": "required"}; _save(run, payload); return payload
-    payload = {"status": "success", "operation": operation, "run_id": run_id, "phase": phase, "registry_revision": REGISTRY_REVISION, "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()), "patches": applied}; _save(run, payload); return payload
+        payload = {**context, "status": "error", "reason": str(exc), "gates": gates, "patches": applied, "rollback": "required"}; _save(run, payload); return payload
+    payload = {**context, "status": "success", "patches": applied}; _save(run, payload); return payload

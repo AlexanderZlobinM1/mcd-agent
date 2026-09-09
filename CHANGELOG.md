@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.2.5 - 2026-09-09
+
+- Match the actual 7.2.0 role migration's 8/12-space executable block, using
+  the independently captured vulnerable file SHA and the corrected file SHA
+  together with exact occurrence counts. Unknown, mixed and changed files fail
+  closed; the original 7.2.0 file is never treated as already fixed.
+- Preserve per-phase gate evidence and original backups across repeat phase
+  calls; emit failed gate evidence before aborting an upgrade. Validate real
+  ZIP/Composer layout and version metadata, including root containment.
+- Add complete upstream source fixtures matching the disposable acceptance
+  hashes, PHP hydrated-row execution coverage and interrupted-write recovery.
+
 ## 1.2.4 - 2026-09-09
 
 - Fixed the Mautic 7.2 role-migration gate to match the canonical executable
