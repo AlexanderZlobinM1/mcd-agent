@@ -1,4 +1,20 @@
-# Mautic patch-plan boundary (MCD 1.2.5)
+# Mautic patch-plan boundary (MCD 1.2.7)
+
+## Atomic preflight handoff
+
+The managed 7.1.3 -> 7.2.0 flow uses `mcd-mautic-patch-preflight-v1`. Before
+the first patch it snapshots the role migration, CoreBundle and AssetMapper
+files, applies all mandatory phases, verifies the complete fixed state and
+restores the exact snapshot on any failure. Partial patch application cannot
+continue to Mautic migrations.
+
+`MCD_PATCH_PLAN_EVIDENCE=<JSON>` contains `snapshot_id`, `selected`, `applied`,
+`verification`, `rollback_attempted`, `rollback_succeeded`,
+`pre_patch_hashes`, `post_patch_hashes`, `restore_hashes` and
+`upgrade_started`. Failures always set `upgrade_started=false`; rollback
+failure sets `hard_incident=true` and reason
+`hard_incident:patch_preflight_rollback_failed`. MCC must preserve this object
+as the job result and keep the upgrade blocked when status is `error`.
 
 The input remains `mcd-mautic-patch-plan-v1`, pinned to Mautic-Operations
 registry revision `8829d322409c66f8ec9e9abf57c9ac42a19022cc`. The exact sanitized

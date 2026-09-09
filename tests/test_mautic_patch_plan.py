@@ -57,6 +57,75 @@ def test_real_fixture_reproduces_published_124_zero_counts(tmp_path):
     assert gate["files"][0]["fixed_count"] == 0
 
 
+def test_atomic_preflight_restores_when_second_of_three_phases_fails(tmp_path, monkeypatch):
+    source = seed(tmp_path)
+    before = {relative: (source / relative).read_bytes() if (source / relative).exists() else None
+              for relative in (ROLE_PATH, patch._BUNDLE_PATH, patch._ASSET_PATH)}
+    real_execute = patch.execute
+    calls = []
+
+    def execute(*args, **kwargs):
+        calls.append(args[2])
+        if len(calls) == 2:
+            return {"status": "error", "reason": "synthetic_second_phase_failure", "patches": []}
+        return real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(patch, "execute", execute)
+    result = patch.atomic_preflight(str(tmp_path), plan(), "atomic-second-phase")
+    assert result["status"] == "error"
+    assert result["rollback_attempted"] is True
+    assert result["rollback_succeeded"] is True
+    assert result["upgrade_started"] is False
+    assert calls == ["post_source_install", "before_doctrine_migrations"]
+    for relative, expected in before.items():
+        path = source / relative
+        assert (path.read_bytes() if path.exists() else None) == expected
+
+
+def test_atomic_preflight_verification_failure_restores_and_blocks_upgrade(tmp_path, monkeypatch):
+    source = seed(tmp_path)
+    before = (source / ROLE_PATH).read_bytes()
+    monkeypatch.setattr(patch, "_verify_preflight", lambda root: {
+        "role": {"id": patch.ROLE, "state": "already"},
+        "asset": {"id": patch.ASSET, "state": "error"},
+    })
+    result = patch.atomic_preflight(str(tmp_path), plan(), "atomic-verification")
+    assert result["status"] == "error"
+    assert result["reason"] == "patch_verification_failed"
+    assert result["rollback_succeeded"] is True
+    assert result["upgrade_started"] is False
+    assert (source / ROLE_PATH).read_bytes() == before
+
+
+def test_atomic_preflight_rollback_failure_is_hard_incident(tmp_path, monkeypatch):
+    seed(tmp_path)
+    monkeypatch.setattr(patch, "execute", lambda *args, **kwargs: {
+        "status": "error", "reason": "synthetic_apply_failure", "patches": []
+    })
+    monkeypatch.setattr(patch, "_preflight_restore", lambda *args, **kwargs: (False, [], "restore_failed"))
+    result = patch.atomic_preflight(str(tmp_path), plan(), "atomic-rollback-failure")
+    assert result["status"] == "error"
+    assert result["rollback_attempted"] is True
+    assert result["rollback_succeeded"] is False
+    assert result["hard_incident"] is True
+    assert result["reason"] == "hard_incident:patch_preflight_rollback_failed"
+    assert result["upgrade_started"] is False
+
+
+@pytest.mark.parametrize("kind", ["zip", "composer"])
+def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
+    seed(tmp_path, kind)
+    result = patch.atomic_preflight(str(tmp_path), plan(kind), "atomic-success")
+    assert result["schema"] == patch.PREFLIGHT_SCHEMA
+    assert result["status"] == "success"
+    assert result["snapshot_id"]
+    assert result["selected"] == [patch.ROLE, patch.ASSET]
+    assert result["applied"] == [patch.ROLE, patch.ASSET]
+    assert result["verification"]["role"]["state"] == "already"
+    assert result["verification"]["asset"]["state"] == "already"
+    assert result["upgrade_started"] is False
+
+
 @pytest.mark.parametrize("kind", ["zip", "composer"])
 def test_real_source_phases_and_repeat_preserve_all_backups(tmp_path, kind):
     source = seed(tmp_path, kind)
@@ -280,15 +349,15 @@ def test_monolithic_upgrade_emits_gate_before_failure(tmp_path, monkeypatch, cap
         assert upgrade.run_upgrade_apply(**kwargs) == 0
     evidence = [json.loads(line.split("=", 1)[1]) for line in capsys.readouterr().out.splitlines()
                 if line.startswith("MCD_PATCH_PLAN_EVIDENCE=")]
-    assert len(evidence) == (1 if invalid else 3)
-    assert evidence[0]["patches"][0]["id"] == patch.ROLE
+    assert len(evidence) == 1
     assert evidence[0]["status"] == ("error" if invalid else "success")
     if invalid:
         assert not finished
-        assert evidence[0]["patches"][0]["files"][0]["vulnerable_count"] == 0
+        assert evidence[0]["upgrade_started"] is False
     else:
         assert finished
-        assert evidence[0]["patches"][0]["gate"]["files"][0]["sha256"] == ORIGINAL_SHA
+        assert evidence[0]["schema"] == patch.PREFLIGHT_SCHEMA
+        assert evidence[0]["verification"]["role"]["files"][0]["sha256"] == FIXED_SHA
         assert sha(source / ROLE_PATH) == FIXED_SHA
 
 

@@ -15,6 +15,7 @@ from mcd_agent.install_type import detect_install_type
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
 MINIMUM_AGENT_VERSION = "1.2.5"
+PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
 ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
 ASSET = "M7-ASSET-MAPPER-WEBROOT"
 _RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -322,6 +323,116 @@ def rollback(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
     return payload
 
 
+def _preflight_snapshot(source: Path, run: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    snapshot_dir = _inside(run, "preflight-snapshot")
+    for relative in (_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH):
+        path = _inside(source, relative)
+        existed = path.is_file()
+        data = path.read_bytes() if existed else b""
+        backup = _inside(snapshot_dir, relative)
+        if existed:
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            with backup.open("xb") as stream:
+                stream.write(data)
+        records.append({"path": relative, "existed": existed, "sha256": _sha(data) if existed else None})
+    snapshot_id = _sha(json.dumps({"plan": plan, "files": records}, sort_keys=True).encode())
+    return {"snapshot_id": snapshot_id, "files": records}
+
+
+def _preflight_restore(source: Path, run: Path, snapshot: dict[str, Any], allowed_after: dict[str, set[str]]) -> tuple[bool, list[dict[str, Any]], str | None]:
+    records = snapshot.get("files") if isinstance(snapshot.get("files"), list) else []
+    for item in records:
+        relative = str(item.get("path", ""))
+        if relative not in {_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH}:
+            return False, [], "unknown_snapshot_path"
+        path = _inside(source, relative)
+        current = _sha(path.read_bytes()) if path.is_file() else None
+        if current not in ({item.get("sha256")} | allowed_after.get(relative, set())):
+            return False, [], "source_changed_during_patch_preflight"
+    restored: list[dict[str, Any]] = []
+    for item in records:
+        relative = str(item["path"])
+        path = _inside(source, relative)
+        if item.get("existed"):
+            backup = _inside(run, "preflight-snapshot/" + relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(backup.read_bytes())
+        elif path.exists():
+            path.unlink()
+        restored.append({"path": relative, "sha256": item.get("sha256"), "state": "restored"})
+    for item in records:
+        path = _inside(source, str(item["path"]))
+        if (_sha(path.read_bytes()) if path.is_file() else None) != item.get("sha256"):
+            return False, restored, "restore_verification_failed"
+    return True, restored, None
+
+
+def atomic_preflight(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
+    """Apply and verify the complete mandatory patch sequence atomically."""
+    plan = parse_plan(raw_plan)
+    if not _RUN.fullmatch(run_id):
+        raise PatchPlanError("invalid_run_id")
+    root = Path(root_value).resolve(strict=True)
+    if detect_install_type(str(root)) != plan["install_type"]:
+        raise PatchPlanError("install_type_mismatch")
+    if _target_version(root) != plan["target_version"]:
+        raise PatchPlanError("target_version_mismatch")
+    source = _source_root(root)
+    run = _inside(root, ".mcd/patch-runs/" + run_id)
+    snapshot = _preflight_snapshot(source, run, plan)
+    context: dict[str, Any] = {
+        "schema": PREFLIGHT_SCHEMA, "operation": "patch_preflight", "run_id": run_id,
+        "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()),
+        "snapshot_id": snapshot["snapshot_id"], "resolved_source_root": str(source),
+        "upgrade_started": False, "selected": [ROLE, ASSET], "applied": [],
+    }
+    _save(run, {**context, "status": "pending", "snapshot": snapshot})
+    evidence: list[dict[str, Any]] = []
+    allowed_after = {
+        _ROLE_PATH: {_ROLE_720_FIXED_SHA256},
+        _BUNDLE_PATH: set(),
+        _ASSET_PATH: set(),
+    }
+    try:
+        for phase in ("post_source_install", "before_doctrine_migrations", "post_source_install_before_asset_generation"):
+            result = execute(str(root), raw_plan, phase, run_id, "apply")
+            evidence.append(result)
+            if result.get("status") != "success":
+                raise PatchPlanError(f"phase_failed:{phase}:{result.get('reason', 'unknown')}")
+            for relative in allowed_after:
+                path = _inside(source, relative)
+                if path.is_file():
+                    allowed_after[relative].add(_sha(path.read_bytes()))
+            for item in result.get("patches", []):
+                if item.get("id") not in context["applied"] and item.get("state") in {"applied", "already"}:
+                    context["applied"].append(item["id"])
+        verification = _verify_preflight(source)
+        if verification["role"]["state"] != "already" or verification["asset"]["state"] != "already":
+            raise PatchPlanError("patch_verification_failed")
+        context.update({"status": "success", "verification": verification, "phases": evidence})
+        _save(run, context)
+        return context
+    except Exception as exc:
+        rollback_ok, restored, rollback_reason = _preflight_restore(source, run, snapshot, allowed_after)
+        context.update({
+            "status": "error", "reason": str(exc), "phases": evidence,
+            "rollback_attempted": True, "rollback_succeeded": rollback_ok,
+            "restored": restored, "pre_patch_hashes": {item["path"]: item["sha256"] for item in snapshot["files"]},
+            "post_patch_hashes": {relative: (_sha(_inside(source, relative).read_bytes()) if _inside(source, relative).is_file() else None) for relative in (_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH)},
+            "restore_hashes": {item["path"]: item.get("sha256") for item in restored},
+            "hard_incident": not rollback_ok, "rollback_reason": rollback_reason,
+        })
+        if not rollback_ok:
+            context["reason"] = "hard_incident:patch_preflight_rollback_failed"
+        _save(run, context)
+        return context
+
+
+def _verify_preflight(source: Path) -> dict[str, Any]:
+    return {"role": _gate(source, ROLE), "asset": _gate(source, ASSET)}
+
+
 def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply") -> dict[str, Any]:
     plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
@@ -339,7 +450,13 @@ def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: 
         previous = json.loads(previous_path.read_text(encoding="utf-8"))
         if previous.get("plan_sha256") != context["plan_sha256"]:
             raise PatchPlanError("stale_run_plan")
-        if operation == "apply" and (previous.get("status") != "success" or previous.get("operation") == "rollback"):
+        if operation == "apply" and (
+            previous.get("status") != "success"
+            or previous.get("operation") == "rollback"
+        ) and not (
+            previous.get("operation") == "patch_preflight"
+            and previous.get("status") == "pending"
+        ):
             raise PatchPlanError("incomplete_or_rolled_back_run")
     gates = [_gate(source, ident) for ident in selected]
     if any(item["state"] == "error" for item in gates):

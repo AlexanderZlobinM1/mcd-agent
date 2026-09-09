@@ -1647,18 +1647,16 @@ def run_upgrade_apply(
     if _parse_semver(current) == (7, 1, 3) and _parse_semver(target) == (7, 2, 0):
         if not patch_plan_json or not patch_run_id:
             raise RuntimeError("Mautic 7.1.3 -> 7.2.0 requires --patch-plan-json and --patch-run-id")
-        from mcd_agent.mautic_patch_plan import PatchPlanError, execute
+        from mcd_agent.mautic_patch_plan import PatchPlanError, atomic_preflight
 
         def patch_hook(source_root: str) -> None:
-            for phase in ("post_source_install", "before_doctrine_migrations", "post_source_install_before_asset_generation"):
-                try:
-                    evidence = execute(source_root, patch_plan_json, phase, patch_run_id, "apply")
-                except PatchPlanError as exc:
-                    print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps({"status": "error", "phase": phase, "run_id": patch_run_id, "reason": str(exc)}, sort_keys=True))
-                    raise RuntimeError(f"Mautic patch plan {phase} rejected: {exc}") from exc
-                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
-                if evidence.get("status") != "success":
-                    raise RuntimeError(f"Mautic patch plan {phase} failed: {evidence.get('reason', 'unknown')}")
+            try:
+                evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id)
+            except PatchPlanError as exc:
+                evidence = {"schema": "mcd-mautic-patch-preflight-v1", "status": "error", "run_id": patch_run_id, "reason": str(exc), "upgrade_started": False, "rollback_attempted": False, "rollback_succeeded": False, "hard_incident": False}
+            print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
+            if evidence.get("status") != "success":
+                raise RuntimeError(f"Mautic patch preflight rejected: {evidence.get('reason', 'unknown')}")
     if not yes:
         ans = input("Proceed? [y/N]: ").strip().lower()
         if ans not in {"y", "yes"}:

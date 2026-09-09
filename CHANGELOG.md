@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.2.7 - 2026-09-09
+
+- Add `mcd-mautic-patch-preflight-v1` evidence and rollback-safe execution for
+  the complete Mautic 7.1.3 to 7.2.0 patch sequence. Snapshot all patch files
+  before the first patch, verify the final state and restore exact pre-patch
+  bytes on phase, apply or verification failure; rollback failure is a hard
+  incident and failures report `upgrade_started=false`.
+
 ## 1.2.6 - 2026-09-09
 
 - Add an explicit root-only, MCC-preflighted manual single-instance override
