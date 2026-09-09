@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.8 - 2026-09-10
+
+- Delete and recreate the active `var/cache/prod` or legacy `app/cache/prod`
+  generation with runtime ownership and mode `0775` before the first Symfony
+  console boot after plugin filesystem mutation. Plugin reload then rebuilds a
+  clean cache and subsequent queued plugin jobs cannot inherit compiled
+  references to a removed bundle. Emit `mcd-plugin-cache-reset-v1` evidence;
+  ordinary `remove` remains non-purge and retains plugin settings.
+
 ## 1.2.7 - 2026-09-09
 
 - Add `mcd-mautic-patch-preflight-v1` evidence and rollback-safe execution for

@@ -60,6 +60,7 @@ _CLUSTER_PLUGIN_STALE_SEC = 3 * 60 * 60
 _PLUGIN_SYNC_IGNORED_NAMES = {".DS_Store", "__MACOSX", ".stfolder", ".stversions"}
 _PLUGIN_SYNC_IGNORED_RE = re.compile(r"(sync-conflict|\.sync-conflict|\.syncthing\..*\.tmp$|\.tmp$|\.part$)", re.IGNORECASE)
 _MAUTIC7_PLUGIN_RUNTIME_PACKAGES = {"nikic/php-parser:^5.0"}
+_PLUGIN_CACHE_RESET_SCHEMA = "mcd-plugin-cache-reset-v1"
 _GALERA_DANGEROUS_SQL_RE = re.compile(
     r"^\s*(ALTER|CREATE|DROP|RENAME|TRUNCATE|OPTIMIZE|ANALYZE|CHECK|REPAIR|LOCK|UNLOCK)\b",
     re.IGNORECASE,
@@ -1399,7 +1400,32 @@ def _run_plugin_template(config: AgentConfig, install, template: str) -> tuple[i
     )
 
 
+def _reset_plugin_prod_cache(install) -> dict[str, Any]:
+    root = Path(install.root).resolve()
+    reset_paths: list[str] = []
+    for relative in (Path("var/cache/prod"), Path("app/cache/prod")):
+        cache_path = root / relative
+        if not cache_path.parent.is_dir():
+            continue
+        _remove_plugin_path(cache_path)
+        cache_path.mkdir(parents=True, mode=0o775, exist_ok=True)
+        cache_path.chmod(0o775)
+        _set_owner_group(cache_path, root=str(root))
+        reset_paths.append(str(relative))
+    evidence = {
+        "schema": _PLUGIN_CACHE_RESET_SCHEMA,
+        "operation": "plugin_cache_reset",
+        "root": str(root),
+        "status": "success",
+        "reset_paths": reset_paths,
+        "mode": "0775",
+    }
+    print("MCD_PLUGIN_CACHE_RESET_EVIDENCE=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    return evidence
+
+
 def _run_plugin_cache_clear(config: AgentConfig, install) -> None:
+    _reset_plugin_prod_cache(install)
     rc, out = _run_plugin_template(config, install, "cache:clear")
     if rc != 0:
         raise RuntimeError(f"cache:clear failed: {out}")
@@ -1510,6 +1536,8 @@ def _run_plugin_install_reload(
 def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | None = None) -> None:
     if config.plugins_post_cache_clear:
         _run_plugin_cache_clear(config, install)
+    else:
+        _reset_plugin_prod_cache(install)
     if config.plugins_post_install:
         _run_plugin_install_reload(config, install, expected_bundles=expected_bundles)
         _assert_plugin_bundles_registered(install, set(expected_bundles or set()))

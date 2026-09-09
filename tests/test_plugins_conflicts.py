@@ -21,8 +21,11 @@ from mcd_agent.plugins import (
     _assert_plugin_bundles_registered,
     _ensure_plugin_reload_runtime_packages,
     _registration_aware_status,
+    _reset_plugin_prod_cache,
+    _run_plugin_cache_clear,
     _run_cluster_plugin_operation,
     _run_plugin_install_reload,
+    _run_post_steps,
     _run_plugin_template,
     _plugin_selection_digest,
     _protected_plugin_path_names,
@@ -972,6 +975,77 @@ class PluginConflictPathTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         wait_sync.assert_called_once()
+
+    def test_stale_removed_bundle_cache_is_reset_before_two_queued_plugin_jobs(self) -> None:
+        for cache_relative in (Path("var/cache/prod"), Path("app/cache/prod")):
+            with self.subTest(cache_relative=str(cache_relative)), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cache_path = root / cache_relative
+                stale = cache_path / "ContainerOld.php"
+                stale.parent.mkdir(parents=True)
+                stale.write_text(
+                    "require '/MauticPlugin/AdvancedReportsBundle/EventListener/VoidOrderSubscriber.php';\n",
+                    encoding="utf-8",
+                )
+                install = SimpleNamespace(root=str(root), db=None, mautic_major=7)
+                cfg = SimpleNamespace(plugins_post_cache_clear=True, plugins_post_install=True)
+                boots = 0
+
+                def console_boot(_config, _install, template):
+                    nonlocal boots
+                    self.assertFalse(stale.exists())
+                    self.assertEqual(cache_path.stat().st_mode & 0o777, 0o775)
+                    if template == "cache:clear":
+                        return 0, "cache cleared"
+                    boots += 1
+                    generated = cache_path / f"ContainerFresh{boots}.php"
+                    generated.write_text("<?php // clean generated cache\n", encoding="utf-8")
+                    return 0, "plugins reloaded"
+
+                with patch("mcd_agent.plugins._set_owner_group"), patch(
+                    "mcd_agent.plugins._run_plugin_template", side_effect=console_boot
+                ):
+                    _run_post_steps(cfg, install, expected_bundles=set())
+                    first_generation = cache_path / "ContainerFresh1.php"
+                    self.assertTrue(first_generation.exists())
+                    _run_post_steps(cfg, install, expected_bundles={"QueuedBundle"})
+
+                self.assertFalse(first_generation.exists())
+                self.assertTrue((cache_path / "ContainerFresh2.php").exists())
+                self.assertEqual(boots, 2)
+
+    def test_failed_cache_clear_does_not_restore_stale_compiled_container(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_path = root / "var" / "cache" / "prod"
+            stale = cache_path / "ContainerOld.php"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("MauticPlugin/RemovedBundle stale\n", encoding="utf-8")
+            install = SimpleNamespace(root=str(root))
+            cfg = SimpleNamespace()
+
+            with patch("mcd_agent.plugins._set_owner_group"), patch(
+                "mcd_agent.plugins._run_plugin_template", return_value=(1, "boot failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cache:clear failed"):
+                    _run_plugin_cache_clear(cfg, install)
+
+            self.assertTrue(cache_path.is_dir())
+            self.assertFalse(stale.exists())
+            self.assertEqual(cache_path.stat().st_mode & 0o777, 0o775)
+
+    def test_cache_reset_evidence_lists_only_existing_layouts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var" / "cache").mkdir(parents=True)
+            install = SimpleNamespace(root=str(root))
+
+            with patch("mcd_agent.plugins._set_owner_group"):
+                evidence = _reset_plugin_prod_cache(install)
+
+            self.assertEqual(evidence["schema"], "mcd-plugin-cache-reset-v1")
+            self.assertEqual(evidence["reset_paths"], ["var/cache/prod"])
+            self.assertEqual(evidence["mode"], "0775")
 
     def test_existing_state_connection_does_not_ensure_schema(self) -> None:
         sentinel = object()
