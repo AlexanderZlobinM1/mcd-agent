@@ -1868,6 +1868,8 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--target", help="Explicit target Mautic version")
     up.add_argument("--allow-minor", action="store_true", help="Allow a forward minor upgrade within the current major")
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
+    up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for the 7.1.3 to 7.2.0 flow")
+    up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the MCC patch-plan run")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
     img.add_argument("--config", default=default_cfg)
@@ -3102,6 +3104,8 @@ def main() -> int:
             target_override=str(args.target or "").strip() or None,
             allow_minor=bool(args.allow_minor),
             allow_major=bool(args.allow_major),
+            patch_plan_json=str(args.patch_plan_json or "") or None,
+            patch_run_id=str(args.patch_run_id or "") or None,
         )
         if rc == 0:
             _push_state_after_change(cfg, "mautic-upgrade-apply")

@@ -965,11 +965,13 @@ def _insert_migration_hacks_if_needed(root: str, to_ver: str) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _apply_zip(config: AgentConfig, root: str, console_path: str, php_bin: str, target: str) -> None:
+def _apply_zip(config: AgentConfig, root: str, console_path: str, php_bin: str, target: str, after_source_install=None) -> None:
     pkg = _resolve_update_package(config, target)
     dst = Path(root) / pkg.name
     shutil.copy2(pkg, dst)
     _run([php_bin, console_path, "mautic:update:apply", "--force", f"--update-package={dst.name}"], cwd=root, as_www_data=True)
+    if after_source_install:
+        after_source_install(root)
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=root, as_www_data=True)
 
 
@@ -1281,7 +1283,7 @@ def _apply_mautic7_twig_include_hotfix(root: str, target: str) -> bool:
     return changed_any
 
 
-def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str) -> None:
+def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str, after_source_install=None) -> None:
     project_root = _resolve_composer_project_root(root)
     cjson = Path(project_root) / "composer.json"
     if not cjson.exists():
@@ -1321,6 +1323,8 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     patched = _apply_mautic7_twig_include_hotfix(project_root, target)
     _normalize_mautic7_loopback_redis_cache(project_root, target)
     _hard_clear_prod_cache(project_root)
+    if after_source_install:
+        after_source_install(project_root)
     scripts = json.loads(cjson.read_text(encoding="utf-8")).get("scripts", {})
     for event in deferred_events:
         if event in scripts:
@@ -1587,6 +1591,8 @@ def run_upgrade_apply(
     target_override: str | None = None,
     allow_minor: bool = False,
     allow_major: bool = False,
+    patch_plan_json: str | None = None,
+    patch_run_id: str | None = None,
 ) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -1623,6 +1629,21 @@ def run_upgrade_apply(
         print("Mautic 7 database preflight: " + database_reason)
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
+    patch_hook = None
+    if _parse_semver(current) == (7, 1, 3) and _parse_semver(target) == (7, 2, 0):
+        if not patch_plan_json or not patch_run_id:
+            raise RuntimeError("Mautic 7.1.3 -> 7.2.0 requires --patch-plan-json and --patch-run-id")
+        from mcd_agent.mautic_patch_plan import PatchPlanError, execute
+
+        def patch_hook(source_root: str) -> None:
+            for phase in ("post_source_install", "before_doctrine_migrations", "post_source_install_before_asset_generation"):
+                try:
+                    evidence = execute(source_root, patch_plan_json, phase, patch_run_id, "apply")
+                except PatchPlanError as exc:
+                    raise RuntimeError(f"Mautic patch plan {phase} rejected: {exc}") from exc
+                if evidence.get("status") != "success":
+                    raise RuntimeError(f"Mautic patch plan {phase} failed: {evidence.get('reason', 'unknown')}")
+                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
     if not yes:
         ans = input("Proceed? [y/N]: ").strip().lower()
         if ans not in {"y", "yes"}:
@@ -1652,10 +1673,10 @@ def run_upgrade_apply(
 
         if chosen_mode == "zip":
             _require_release_approval(config, target)
-            _apply_zip(config, install_root, console, config.php_bin, target)
+            _apply_zip(config, install_root, console, config.php_bin, target, patch_hook)
         elif chosen_mode == "composer":
             _require_release_approval(config, target)
-            _apply_composer(install_root, console, config.php_bin, current, target)
+            _apply_composer(install_root, console, config.php_bin, current, target, patch_hook)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")
 

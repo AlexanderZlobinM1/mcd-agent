@@ -182,8 +182,9 @@ class Mautic713ImportTagPatchTests(unittest.TestCase):
             stack.enter_context(patch(prefix + "_read_current_version", side_effect=["7.1.3", "7.2.0"]))
             stack.enter_context(patch(prefix + "_apply_zip", side_effect=apply_zip))
             stack.enter_context(patch(prefix + "_exit_upgrade_maintenance", side_effect=resume))
+            stack.enter_context(patch("mcd_agent.mautic_patch_plan.execute", return_value={"status": "success"}))
             cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data")
-            self.assertEqual(run_upgrade_apply(config=cfg, root=str(root), mode="zip", yes=True, do_backup=False, with_system_upgrade=False, target_override="7.2.0", allow_minor=True), 0)
+            self.assertEqual(run_upgrade_apply(config=cfg, root=str(root), mode="zip", yes=True, do_backup=False, with_system_upgrade=False, target_override="7.2.0", allow_minor=True, patch_plan_json="{}", patch_run_id="test-run"), 0)
             self.assertEqual(revert_patch(install)["status"], "reverted")
             self.assertEqual(path.read_text(), upgraded)
 

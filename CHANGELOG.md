@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.3 - 2026-09-09
+
+- Added internal Mautic 7.1.3 to 7.2.0 patch-plan orchestration to
+  `mautic-upgrade apply`: role remediation runs after source install and before
+  migrations; AssetMapper runs before deferred Composer scripts/asset generation.
+
 ## 1.2.2 - 2026-09-09
 
 - Added a fail-closed, revision-pinned Mautic 7.2 patch-plan adapter for the
