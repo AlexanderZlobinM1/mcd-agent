@@ -1593,6 +1593,7 @@ def run_upgrade_apply(
     allow_major: bool = False,
     patch_plan_json: str | None = None,
     patch_run_id: str | None = None,
+    mcc_preflighted_single_instance: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -1602,6 +1603,18 @@ def run_upgrade_apply(
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _clean_target_version(target_override)
+    if mcc_preflighted_single_instance:
+        from mcd_agent.mautic_manual_upgrade import validate_preflighted_single_instance
+
+        def validate_manual_invocation(source_version: str) -> None:
+            validate_preflighted_single_instance(
+                root=root, install_root=install_root, current=source_version,
+                target=target_override, mode=mode, raw_plan=patch_plan_json,
+                run_id=patch_run_id, yes=yes, allow_minor=allow_minor,
+                allow_major=allow_major, with_system_upgrade=with_system_upgrade,
+            )
+
+        validate_manual_invocation(current)
     if not target:
         if allow_major and _parse_semver(current)[0] == 6:
             target = str((_release_targets(config).get("7") or {}).get("version", ""))
@@ -1614,7 +1627,8 @@ def run_upgrade_apply(
         print(f"No upgrade target for current version {current}")
         return 0
 
-    _require_release_approval(config, target)
+    if not mcc_preflighted_single_instance:
+        _require_release_approval(config, target)
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = detect_install_type(install_root)
@@ -1653,6 +1667,12 @@ def run_upgrade_apply(
 
     guard = _enter_upgrade_maintenance(config)
     try:
+        if mcc_preflighted_single_instance:
+            # Maintenance admission may take time. Recheck before permissions
+            # alignment or reverting a core patch, which also mutate source.
+            validate_manual_invocation(
+                _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
+            )
         # Mandatory preflight: align permissions before any upgrade action.
         _pre_upgrade_permissions_check(config, install_root)
 
@@ -1673,10 +1693,12 @@ def run_upgrade_apply(
             print(f"Backup created: {b}")
 
         if chosen_mode == "zip":
-            _require_release_approval(config, target)
+            if not mcc_preflighted_single_instance:
+                _require_release_approval(config, target)
             _apply_zip(config, install_root, console, config.php_bin, target, patch_hook)
         elif chosen_mode == "composer":
-            _require_release_approval(config, target)
+            if not mcc_preflighted_single_instance:
+                _require_release_approval(config, target)
             _apply_composer(install_root, console, config.php_bin, current, target, patch_hook)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")

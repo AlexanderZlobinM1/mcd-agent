@@ -1870,6 +1870,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
     up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for the 7.1.3 to 7.2.0 flow")
     up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the MCC patch-plan run")
+    up.add_argument("--mcc-preflighted-single-instance", action="store_true", help="Root-only manual 7.1.3 to 7.2.0 apply: assert MCC single-instance preflight and explicit operator risk acknowledgement; bypass global release callbacks only for this exact invocation")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
     img.add_argument("--config", default=default_cfg)
@@ -3083,6 +3084,9 @@ def main() -> int:
             return 0 if str(payload.get("status")) == "ok" else 1
 
     if args.cmd == "mautic-upgrade":
+        if args.mcc_preflighted_single_instance and args.op != "apply":
+            print("--mcc-preflighted-single-instance is valid only with mautic-upgrade apply")
+            return 2
         cfg = load_config(args.config)
         note = maybe_notify_update(cfg)
         if note:
@@ -3106,6 +3110,7 @@ def main() -> int:
             allow_major=bool(args.allow_major),
             patch_plan_json=str(args.patch_plan_json or "") or None,
             patch_run_id=str(args.patch_run_id or "") or None,
+            mcc_preflighted_single_instance=bool(args.mcc_preflighted_single_instance),
         )
         if rc == 0:
             _push_state_after_change(cfg, "mautic-upgrade-apply")

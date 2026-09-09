@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.2.6 - 2026-09-09
+
+- Add an explicit root-only, MCC-preflighted manual single-instance override
+  for the exact Mautic 7.1.3 to 7.2.0 upgrade. Validate canonical root,
+  installed version/layout, strict pinned patch plan and run ID before
+  maintenance and again before source mutation. Ordinary upgrade paths retain
+  global release authorization; no shared release exception is introduced.
+- Require prior MCC plugin preflight and explicit operator risk acknowledgement
+  as the manual dispatch contract. This path adds no token, secret argument or
+  network authorization protocol and cannot perform a major/system upgrade.
+
 ## 1.2.5 - 2026-09-09
 
 - Match the actual 7.2.0 role migration's 8/12-space executable block, using
