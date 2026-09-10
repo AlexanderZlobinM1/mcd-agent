@@ -61,6 +61,7 @@ _PLUGIN_SYNC_IGNORED_NAMES = {".DS_Store", "__MACOSX", ".stfolder", ".stversions
 _PLUGIN_SYNC_IGNORED_RE = re.compile(r"(sync-conflict|\.sync-conflict|\.syncthing\..*\.tmp$|\.tmp$|\.part$)", re.IGNORECASE)
 _MAUTIC7_PLUGIN_RUNTIME_PACKAGES = {"nikic/php-parser:^5.0"}
 _PLUGIN_CACHE_RESET_SCHEMA = "mcd-plugin-cache-reset-v1"
+_PLUGIN_APPLY_RESULT_SCHEMA = "mcd-plugin-apply-result-v1"
 _GALERA_DANGEROUS_SQL_RE = re.compile(
     r"^\s*(ALTER|CREATE|DROP|RENAME|TRUNCATE|OPTIMIZE|ANALYZE|CHECK|REPAIR|LOCK|UNLOCK)\b",
     re.IGNORECASE,
@@ -1424,11 +1425,148 @@ def _reset_plugin_prod_cache(install) -> dict[str, Any]:
     return evidence
 
 
+def _plugin_apply_selection(selected: list[dict[str, Any]]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for row in selected:
+        item = row.get("item")
+        item_dict = item if isinstance(item, dict) else {}
+        bundle = str(row.get("bundle", "") or "").strip()
+        result.append(
+            {
+                "bundle": bundle,
+                "install_bundle": str(
+                    row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle, item_dict)
+                ).strip(),
+                "expected_version": str(item_dict.get("version", "") or "").strip(),
+            }
+        )
+    return result
+
+
+def _emit_plugin_apply_result(
+    *,
+    operation_id: str,
+    install_root: str,
+    action: str,
+    selected: list[dict[str, Any]],
+    event: str,
+    files_applied: bool,
+    post_step_status: str,
+    cache_inventory_confirmed: bool,
+    overall_status: str,
+    rc: int | None,
+    inventory: list[dict[str, Any]] | None = None,
+    error: str = "",
+) -> dict[str, Any]:
+    payload = {
+        "schema": _PLUGIN_APPLY_RESULT_SCHEMA,
+        "operation": "plugin_apply",
+        "operation_id": operation_id,
+        "root": str(Path(install_root).resolve()),
+        "action": action,
+        "event": event,
+        "terminal": event == "completed",
+        "selected": _plugin_apply_selection(selected),
+        "files_applied": files_applied,
+        "post_step_status": post_step_status,
+        "cache_inventory_confirmed": cache_inventory_confirmed,
+        "overall_status": overall_status,
+        "rc": rc,
+        "inventory": list(inventory or []),
+        "error": error,
+    }
+    print(
+        "MCD_PLUGIN_APPLY_RESULT="
+        + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+    return payload
+
+
+def _plugin_files_applied_observed(
+    install_root: str,
+    action: str,
+    selected: list[dict[str, Any]],
+) -> bool:
+    plugins_dir = _resolve_plugins_dir(install_root, create=False)
+    for row in selected:
+        item = row.get("item")
+        item_dict = item if isinstance(item, dict) else {}
+        bundle = str(row.get("bundle", "") or "").strip()
+        install_bundle = str(
+            row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle, item_dict)
+        ).strip()
+        path = plugins_dir / install_bundle
+        if action in {"remove", "purge"}:
+            if not path.exists():
+                return True
+            continue
+        expected_version = str(item_dict.get("version", "") or "").strip()
+        if expected_version and path.exists() and _read_installed_version(path) == expected_version:
+            return True
+    return False
+
+
+def _confirm_plugin_apply_inventory(
+    *,
+    config: AgentConfig,
+    install_root: str,
+    action: str,
+    selected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    plugins_dir = _resolve_plugins_dir(install_root, create=False)
+    inventory: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for row in selected:
+        item = row.get("item")
+        if not isinstance(item, dict):
+            continue
+        bundle = str(row.get("bundle", "") or "").strip()
+        install_bundle = str(
+            row.get("install_bundle") or _install_bundle_for_manifest_bundle(bundle, item)
+        ).strip()
+        if action in {"remove", "purge"}:
+            confirmed = not (plugins_dir / install_bundle).exists()
+            status = "MISSING" if confirmed else "PRESENT"
+            installed_version = "-"
+            reason = "removed" if confirmed else "plugin path remains"
+        else:
+            status, reason, installed_version = _plugin_status(
+                plugins_dir,
+                item,
+                config.plugins_state_filename,
+                install_bundle=install_bundle,
+            )
+            confirmed = status == "OK"
+        inventory.append(
+            {
+                "bundle": bundle,
+                "install_bundle": install_bundle,
+                "expected_version": str(item.get("version", "") or "").strip(),
+                "installed_version": installed_version,
+                "status": status,
+                "confirmed": confirmed,
+                "reason": reason,
+            }
+        )
+        if not confirmed:
+            failures.append(f"{bundle}:{status}:{reason}")
+    if failures:
+        raise RuntimeError("plugin cache inventory confirmation failed: " + ", ".join(failures))
+    return inventory
+
+
 def _run_plugin_cache_clear(config: AgentConfig, install) -> None:
     _reset_plugin_prod_cache(install)
     rc, out = _run_plugin_template(config, install, "cache:clear")
     if rc != 0:
         raise RuntimeError(f"cache:clear failed: {out}")
+
+
+def _run_plugin_cache_warmup(config: AgentConfig, install) -> None:
+    rc, out = _run_plugin_template(config, install, "cache:warmup")
+    if rc != 0:
+        raise RuntimeError(f"cache:warmup failed: {out}")
 
 
 def _run_plugin_install_reload(
@@ -1543,6 +1681,7 @@ def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | N
         _assert_plugin_bundles_registered(install, set(expected_bundles or set()))
         if install.db and plugin_registration.restore(MauticDB(install.db), set(expected_bundles or set()), allow_schema_creation=not bool(getattr(config, "cluster_id", None))):
             _run_plugin_cache_clear(config, install)
+    _run_plugin_cache_warmup(config, install)
 
 
 def _run_manifest_sql_fixes(config: AgentConfig, install, selected_rows: list[dict[str, Any]]) -> None:
@@ -1960,7 +2099,7 @@ def _cluster_sync_bundle_names(
     return _dedupe_text(names)
 
 
-def _apply_plugin_file_changes(
+def _apply_plugin_file_changes_impl(
     *,
     config: AgentConfig,
     install,
@@ -1972,6 +2111,7 @@ def _apply_plugin_file_changes(
     auto_remove_bundles: list[str],
     rows_by_bundle: dict[str, dict[str, Any]],
     run_post_steps: bool,
+    operation_id: str,
 ) -> bool:
     plugins_dir = _resolve_plugins_dir(install_root, create=False)
     changed = False
@@ -2118,21 +2258,131 @@ def _apply_plugin_file_changes(
         compatibility_changed = _apply_plugin_config_metadata_patch(install, selected) or compatibility_changed
         compatibility_changed = _prealign_metadataless_plugin_versions(install, selected) or compatibility_changed
 
-    if changed or compatibility_changed:
-        if action not in {"remove", "purge"}:
-            _run_manifest_sql_fixes(config, install, selected)
-        if run_post_steps:
-            expected_bundles = (
-                set()
-                if action in {"remove", "purge"}
-                else {
-                    str(row.get("install_bundle") or row.get("bundle") or "").strip()
-                    for row in selected
-                    if isinstance(row.get("item"), dict)
-                }
+    files_applied = changed or compatibility_changed
+    if files_applied and run_post_steps:
+        _emit_plugin_apply_result(
+            operation_id=operation_id,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+            event="files_applied",
+            files_applied=True,
+            post_step_status="pending",
+            cache_inventory_confirmed=False,
+            overall_status="pending",
+            rc=None,
+        )
+    try:
+        if files_applied:
+            if action not in {"remove", "purge"}:
+                _run_manifest_sql_fixes(config, install, selected)
+            if run_post_steps:
+                expected_bundles = (
+                    set()
+                    if action in {"remove", "purge"}
+                    else {
+                        str(row.get("install_bundle") or row.get("bundle") or "").strip()
+                        for row in selected
+                        if isinstance(row.get("item"), dict)
+                    }
+                )
+                _run_post_steps(config, install, expected_bundles=expected_bundles)
+                inventory = _confirm_plugin_apply_inventory(
+                    config=config,
+                    install_root=install_root,
+                    action=action,
+                    selected=selected,
+                )
+                _emit_plugin_apply_result(
+                    operation_id=operation_id,
+                    install_root=install_root,
+                    action=action,
+                    selected=selected,
+                    event="completed",
+                    files_applied=True,
+                    post_step_status="success",
+                    cache_inventory_confirmed=True,
+                    overall_status="success",
+                    rc=0,
+                    inventory=inventory,
+                )
+        elif run_post_steps:
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=False,
+                post_step_status="skipped",
+                cache_inventory_confirmed=True,
+                overall_status="success",
+                rc=0,
             )
-            _run_post_steps(config, install, expected_bundles=expected_bundles)
-    return changed or compatibility_changed
+    except Exception as exc:
+        if run_post_steps:
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=files_applied,
+                post_step_status="failed",
+                cache_inventory_confirmed=False,
+                overall_status="failed",
+                rc=1,
+                error=str(exc),
+            )
+            setattr(exc, "_mcd_plugin_apply_result_emitted", True)
+        raise
+    return files_applied
+
+
+def _apply_plugin_file_changes(
+    *,
+    config: AgentConfig,
+    install,
+    install_root: str,
+    manifest_dir: str,
+    fallback_ip: str | None,
+    action: str,
+    selected: list[dict[str, Any]],
+    auto_remove_bundles: list[str],
+    rows_by_bundle: dict[str, dict[str, Any]],
+    run_post_steps: bool,
+) -> bool:
+    operation_id = uuid.uuid4().hex
+    try:
+        return _apply_plugin_file_changes_impl(
+            config=config,
+            install=install,
+            install_root=install_root,
+            manifest_dir=manifest_dir,
+            fallback_ip=fallback_ip,
+            action=action,
+            selected=selected,
+            auto_remove_bundles=auto_remove_bundles,
+            rows_by_bundle=rows_by_bundle,
+            run_post_steps=run_post_steps,
+            operation_id=operation_id,
+        )
+    except Exception as exc:
+        if run_post_steps and not bool(getattr(exc, "_mcd_plugin_apply_result_emitted", False)):
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=_plugin_files_applied_observed(install_root, action, selected),
+                post_step_status="failed",
+                cache_inventory_confirmed=False,
+                overall_status="failed",
+                rc=1,
+                error=str(exc),
+            )
+        raise
 
 
 def _cluster_plugin_cli_args(

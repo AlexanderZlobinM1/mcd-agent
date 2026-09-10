@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.2.9 - 2026-09-10
+
+- Add the fail-closed `mcd-plugin-apply-result-v1` callback/result contract.
+  Emit `files_applied` immediately before post-steps, require cache clear,
+  native plugin install/reload, cache warmup and final inventory confirmation,
+  and preserve any nonzero post-step result as terminal failure even when the
+  new plugin version is already visible in filesystem inventory.
+
 ## 1.2.8 - 2026-09-10
 
 - Delete and recreate the active `var/cache/prod` or legacy `app/cache/prod`

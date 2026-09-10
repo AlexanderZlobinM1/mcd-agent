@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +24,10 @@ from mcd_agent.plugins import (
     _assert_plugin_bundles_registered,
     _ensure_plugin_reload_runtime_packages,
     _registration_aware_status,
+    _read_installed_version,
     _reset_plugin_prod_cache,
     _run_plugin_cache_clear,
+    _run_plugin_cache_warmup,
     _run_cluster_plugin_operation,
     _run_plugin_install_reload,
     _run_post_steps,
@@ -751,7 +756,8 @@ class PluginConflictPathTests(unittest.TestCase):
         ]
 
         with patch("mcd_agent.plugins._prealign_metadataless_plugin_versions", return_value=True) as prealign, \
-             patch("mcd_agent.plugins._run_post_steps") as post_steps:
+             patch("mcd_agent.plugins._run_post_steps") as post_steps, \
+             patch("mcd_agent.plugins._confirm_plugin_apply_inventory", return_value=[]):
             changed = _apply_plugin_file_changes(
                 config=cfg,
                 install=install,
@@ -801,6 +807,7 @@ class PluginConflictPathTests(unittest.TestCase):
             patch("mcd_agent.plugins._run_manifest_sql_fixes"),
             patch("mcd_agent.plugins._cleanup_conflicting_plugin_rows"),
             patch("mcd_agent.plugins._run_post_steps") as post_steps,
+            patch("mcd_agent.plugins._confirm_plugin_apply_inventory", return_value=[]) as confirm_inventory,
         ):
             changed = _apply_plugin_file_changes(
                 config=cfg,
@@ -822,6 +829,136 @@ class PluginConflictPathTests(unittest.TestCase):
             install,
             expected_bundles={"OracleHospitalityBundle"},
         )
+        confirm_inventory.assert_called_once()
+
+    def test_files_applied_then_cache_warmup_fatal_remains_terminal_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var" / "cache").mkdir(parents=True)
+            install = SimpleNamespace(root=str(root), db=None, mautic_major=6, console_path=str(root / "bin/console"))
+            cfg = SimpleNamespace(
+                plugins_post_cache_clear=True,
+                plugins_post_install=True,
+                plugins_state_filename=".mcd-plugin.json",
+                mcc_token="",
+                cluster_id="",
+            )
+            selected = [{
+                "bundle": "SalesSnapBundle",
+                "install_bundle": "SalesSnapBundle",
+                "item": {"bundle": "SalesSnapBundle", "version": "2.8.3", "url": "https://mcc.example/SalesSnapBundle.zip"},
+                "package": "SalesSnapBundle.zip",
+                "status": "UPDATE",
+            }]
+            output = io.StringIO()
+
+            def install_files(**_kwargs):
+                bundle = root / "plugins" / "SalesSnapBundle"
+                config_file = bundle / "Config" / "config.php"
+                config_file.parent.mkdir(parents=True)
+                config_file.write_text("<?php return ['version' => '2.8.3'];\n", encoding="utf-8")
+                (bundle / "SalesSnapBundle.php").write_text("<?php class SalesSnapBundle {}\n", encoding="utf-8")
+
+            def post_step(_config, _install, template):
+                if template == "cache:clear":
+                    return 0, "cleared"
+                if template == "mautic:plugin:install":
+                    return 0, "reloaded"
+                if template == "cache:warmup":
+                    self.assertIn('"event":"files_applied"', output.getvalue())
+                    return 1, "PHP Fatal error during warmup"
+                self.fail(f"unexpected post-step {template}")
+
+            with redirect_stdout(output), patch("mcd_agent.plugins._ensure_plugin_reload_runtime_packages"), patch(
+                "mcd_agent.plugins.ensure_mailer_packages_for_bundles"
+            ), patch("mcd_agent.plugins._install_or_replace_plugin", side_effect=install_files), patch(
+                "mcd_agent.plugins._apply_plugin_config_metadata_patch", return_value=False
+            ), patch("mcd_agent.plugins._prealign_metadataless_plugin_versions", return_value=False), patch(
+                "mcd_agent.plugins._run_manifest_sql_fixes"
+            ), patch("mcd_agent.plugins._cleanup_conflicting_plugin_rows"), patch(
+                "mcd_agent.plugins._set_owner_group"
+            ), patch("mcd_agent.plugins._run_plugin_template", side_effect=post_step):
+                with self.assertRaisesRegex(RuntimeError, "cache:warmup failed"):
+                    _apply_plugin_file_changes(
+                        config=cfg,
+                        install=install,
+                        install_root=str(root),
+                        manifest_dir="https://mcc.example/",
+                        fallback_ip=None,
+                        action="update",
+                        selected=selected,
+                        auto_remove_bundles=[],
+                        rows_by_bundle={},
+                        run_post_steps=True,
+                    )
+
+            self.assertEqual(_read_installed_version(root / "plugins" / "SalesSnapBundle"), "2.8.3")
+            results = [
+                json.loads(line.split("=", 1)[1])
+                for line in output.getvalue().splitlines()
+                if line.startswith("MCD_PLUGIN_APPLY_RESULT=")
+            ]
+            self.assertEqual(len(results), 2)
+            self.assertTrue(results[0]["files_applied"])
+            self.assertEqual(results[0]["post_step_status"], "pending")
+            self.assertEqual(results[0]["overall_status"], "pending")
+            self.assertIsNone(results[0]["rc"])
+            self.assertEqual(results[1]["post_step_status"], "failed")
+            self.assertFalse(results[1]["cache_inventory_confirmed"])
+            self.assertEqual(results[1]["overall_status"], "failed")
+            self.assertEqual(results[1]["rc"], 1)
+            self.assertIn("PHP Fatal error during warmup", results[1]["error"])
+
+    def test_file_phase_exception_still_emits_terminal_failed_result(self) -> None:
+        root = "/tmp/mcd-plugin-apply-result-missing"
+        cfg = SimpleNamespace(
+            plugins_post_cache_clear=True,
+            plugins_post_install=True,
+            plugins_state_filename=".mcd-plugin.json",
+            mcc_token="",
+            cluster_id="",
+        )
+        install = SimpleNamespace(root=root, db=None, mautic_major=6, console_path=f"{root}/bin/console")
+        selected = [{
+            "bundle": "DemoBundle",
+            "install_bundle": "DemoBundle",
+            "item": {"bundle": "DemoBundle", "version": "2.0.0", "url": "https://mcc.example/DemoBundle.zip"},
+            "package": "DemoBundle.zip",
+            "status": "UPDATE",
+        }]
+        output = io.StringIO()
+
+        with redirect_stdout(output), patch("mcd_agent.plugins._ensure_plugin_reload_runtime_packages"), patch(
+            "mcd_agent.plugins.ensure_mailer_packages_for_bundles"
+        ), patch("mcd_agent.plugins._install_or_replace_plugin", side_effect=RuntimeError("download failed")), patch(
+            "mcd_agent.plugins._plugin_files_applied_observed", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                _apply_plugin_file_changes(
+                    config=cfg,
+                    install=install,
+                    install_root=root,
+                    manifest_dir="https://mcc.example/",
+                    fallback_ip=None,
+                    action="update",
+                    selected=selected,
+                    auto_remove_bundles=[],
+                    rows_by_bundle={},
+                    run_post_steps=True,
+                )
+
+        results = [
+            json.loads(line.split("=", 1)[1])
+            for line in output.getvalue().splitlines()
+            if line.startswith("MCD_PLUGIN_APPLY_RESULT=")
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["terminal"])
+        self.assertFalse(results[0]["files_applied"])
+        self.assertEqual(results[0]["post_step_status"], "failed")
+        self.assertFalse(results[0]["cache_inventory_confirmed"])
+        self.assertEqual(results[0]["overall_status"], "failed")
+        self.assertEqual(results[0]["rc"], 1)
 
     def test_cluster_node_status_is_written_to_node_scoped_runtime_row(self) -> None:
         calls = []
@@ -997,6 +1134,8 @@ class PluginConflictPathTests(unittest.TestCase):
                     self.assertEqual(cache_path.stat().st_mode & 0o777, 0o775)
                     if template == "cache:clear":
                         return 0, "cache cleared"
+                    if template == "cache:warmup":
+                        return 0, "cache warmed"
                     boots += 1
                     generated = cache_path / f"ContainerFresh{boots}.php"
                     generated.write_text("<?php // clean generated cache\n", encoding="utf-8")
