@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.11 - 2026-09-11
+
+- Publish durable recurring plugin-operation runtime state with lifecycle
+  timestamps, heartbeat, resource ownership, result output and next run.
+- Isolate recurring plugin operations from unrelated campaign/import capacity;
+  only an identical resource key can block a run, with an explicit skip reason.
+- Exempt recurring plugin operations from generic wall-clock termination and
+  derive stale state from heartbeat and process ownership instead.
+
 ## 1.2.10 - 2026-09-11
 
 - Make plugin production-cache reset race-safe: atomically detach the active

@@ -458,6 +458,50 @@ def schedule_due(
     return True
 
 
+def next_run_epoch(
+    item: dict[str, Any],
+    values: dict[str, Any],
+    *,
+    now_epoch: float,
+    now_local: datetime,
+    last_epoch: float,
+    task: dict[str, Any] | None = None,
+) -> float:
+    operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+    schedule = (
+        task.get("schedule")
+        if isinstance(task, dict) and isinstance(task.get("schedule"), dict)
+        else operation.get("schedule") if isinstance(operation.get("schedule"), dict) else {}
+    )
+    interval_field = str(schedule.get("interval_field", "") or "")
+    try:
+        interval = max(
+            1,
+            int(values.get(interval_field, 60) or 60)
+            if interval_field
+            else int(schedule.get("interval_sec", 60) or 60),
+        )
+    except Exception:
+        interval = 60
+    earliest = max(float(now_epoch) + 1.0, float(last_epoch) + float(interval))
+    if str(schedule.get("type", "interval") or "interval") == "interval":
+        return earliest
+    candidate = (int(earliest) // 60 + 1) * 60
+    for _ in range(8 * 24 * 60):
+        candidate_local = datetime.fromtimestamp(candidate, tz=now_local.tzinfo)
+        if schedule_due(
+            item,
+            values,
+            now_epoch=float(candidate),
+            now_local=candidate_local,
+            last_epoch=float(last_epoch),
+            task=task,
+        ):
+            return float(candidate)
+        candidate += 60
+    return earliest
+
+
 def cron_matches(expression: str, now_local: datetime) -> bool:
     parts = str(expression or "").strip().split()
     if len(parts) != 5:

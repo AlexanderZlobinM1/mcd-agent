@@ -10,6 +10,7 @@ from mcd_agent.plugin_operations import (
     cron_matches,
     effective_values,
     legacy_cron_rules,
+    next_run_epoch,
     operations_for_instance,
     schedule_due,
     scheduled_tasks,
@@ -247,3 +248,6 @@ def test_composite_tasks_support_fixed_intervals_and_conditional_joined_argument
     assert schedule_due(
         installed[0], values, task=task, now_epoch=107, now_local=datetime(2026, 1, 1), last_epoch=100
     )
+    assert next_run_epoch(
+        installed[0], values, task=task, now_epoch=107, now_local=datetime(2026, 1, 1), last_epoch=107
+    ) == 114

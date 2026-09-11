@@ -97,6 +97,7 @@ from mcd_agent.plugin_operations import (
     effective_values as plugin_operation_effective_values,
     instance_runtime_keys as plugin_operation_instance_runtime_keys,
     legacy_cron_rules as plugin_operation_legacy_cron_rules,
+    next_run_epoch as plugin_operation_next_run_epoch,
     operations_for_instance as plugin_operations_for_instance,
     schedule_due as plugin_operation_schedule_due,
     scheduled_tasks as plugin_operation_scheduled_tasks,
@@ -880,7 +881,111 @@ def _plugin_operation_bootstrap_digest_from_task(task: "RunningTask") -> str:
     prefix = "job:plugin_operation_bootstrap:"
     task_type = str(task.task_type or "")
     digest = task_type[len(prefix) :] if task_type.startswith(prefix) else ""
+    digest = digest.split(":", 1)[0]
     return digest if re.fullmatch(r"[a-f0-9]{24}", digest) else ""
+
+
+_PLUGIN_OPERATION_RUNTIME_SCHEMA = "mcd-plugin-operation-runtime-v1"
+_PLUGIN_OPERATION_RUNTIME_PREFIX = "plugin_operation_runtime:"
+
+
+def _plugin_operation_resource_key(operation_key: str, task: dict[str, Any]) -> str:
+    explicit = str(task.get("resource_key", "") or "").strip()
+    task_id = str(task.get("id", "operation") or "operation").strip()
+    return explicit or f"plugin:{operation_key}:{task_id}"
+
+
+def _plugin_operation_resource_digest(root: str, resource_key: str) -> str:
+    return hashlib.sha256(f"{root}|{resource_key}".encode("utf-8")).hexdigest()[:32]
+
+
+def _plugin_operation_runtime_key(digest: str) -> str:
+    return f"{_PLUGIN_OPERATION_RUNTIME_PREFIX}{digest}"
+
+
+def _plugin_operation_runtime_digest_from_task(task: "RunningTask") -> str:
+    task_type = str(task.task_type or "")
+    if not task_type.startswith("job:plugin_operation"):
+        return ""
+    digest = task_type.rsplit(":", 1)[-1]
+    return digest if re.fullmatch(r"[a-f0-9]{32}", digest) else ""
+
+
+def _plugin_operation_runtime_update(
+    store: "TaskStore",
+    digest: str,
+    updates: dict[str, object],
+) -> dict[str, object]:
+    key = _plugin_operation_runtime_key(digest)
+    current = store.get_runtime_sync(key) or {}
+    payload: dict[str, object] = {**current, "schema": _PLUGIN_OPERATION_RUNTIME_SCHEMA, **updates}
+    store.put_runtime_sync(key, payload)
+    return payload
+
+
+def _plugin_operation_output_paths(config: AgentConfig, digest: str) -> tuple[str, str]:
+    directory = Path(config.state_db_path).resolve().parent / "plugin-operation-runtime"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+    return str(directory / f"{digest}.stdout"), str(directory / f"{digest}.stderr")
+
+
+def _plugin_operation_read_output(path: str, limit: int = 2000) -> str:
+    if not path:
+        return ""
+    try:
+        value = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return value[-max(1, int(limit)):].strip()
+
+
+def _plugin_operation_runtime_finish(
+    store: "TaskStore",
+    task: "RunningTask",
+    *,
+    state: str,
+    rc: int | None,
+    skipped_reason: str = "",
+    stale: bool = False,
+    now_ts: float | None = None,
+) -> None:
+    digest = _plugin_operation_runtime_digest_from_task(task)
+    if not digest:
+        return
+    now = time.time() if now_ts is None else float(now_ts)
+    current = store.get_runtime_sync(_plugin_operation_runtime_key(digest)) or {}
+    stdout_path = str(task.stdout_path or current.get("_stdout_path") or "")
+    stderr_path = str(task.stderr_path or current.get("_stderr_path") or "")
+    _plugin_operation_runtime_update(
+        store,
+        digest,
+        {
+            "state": state,
+            "last_finished_at": now,
+            "rc": rc,
+            "duration_sec": max(0.0, now - float(task.started_at or now)),
+            "stdout": _plugin_operation_read_output(stdout_path),
+            "stderr": _plugin_operation_read_output(stderr_path),
+            "skipped_reason": skipped_reason,
+            "heartbeat_at": now,
+            "owner_pid": int(task.pid or 0),
+            "stale": bool(stale),
+        },
+    )
+
+
+def _plugin_operation_runtime_heartbeat(store: "TaskStore", task: "RunningTask", now_ts: float) -> None:
+    digest = _plugin_operation_runtime_digest_from_task(task)
+    if not digest:
+        return
+    current = store.get_runtime_sync(_plugin_operation_runtime_key(digest)) or {}
+    if int(current.get("owner_pid") or 0) != int(task.pid or 0):
+        return
+    _plugin_operation_runtime_update(
+        store,
+        digest,
+        {"state": "running", "heartbeat_at": float(now_ts), "stale": False},
+    )
 
 
 def _segment_whitelist_effective_setting(config: AgentConfig, inst: object) -> set[int]:
@@ -1957,9 +2062,9 @@ def _scheduler_host_slots_available(
     running: dict[str, "RunningTask"],
     task_type: str | None = None,
 ) -> int | None:
-    if str(task_type or "").strip().lower() in _SCHEDULER_RESERVED_SAFETY_TASK_TYPES:
-        return None
     normalized = str(task_type or "").strip().lower()
+    if normalized in _SCHEDULER_RESERVED_SAFETY_TASK_TYPES or normalized.startswith("job:plugin_operation"):
+        return None
     host_limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
     if (
         bool(getattr(config, "scheduler_elastic_slots_enabled", True))
@@ -2784,6 +2889,8 @@ class RunningTask:
     pid: int
     manual_request_id: int | None = None
     external: bool = False
+    stdout_path: str = ""
+    stderr_path: str = ""
 
 
 def _load_id_file(path: str | None) -> set[int]:
@@ -5845,15 +5952,29 @@ def _kill_pid(pid: int, grace_sec: int) -> None:
             return
 
 
-def _spawn_command(*, root: str, args: list[str]) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
-        args,
-        cwd=root,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+def _spawn_command(
+    *,
+    root: str,
+    args: list[str],
+    stdout_path: str = "",
+    stderr_path: str = "",
+) -> subprocess.Popen[bytes]:
+    stdout_handle = open(stdout_path, "wb") if stdout_path else None
+    stderr_handle = open(stderr_path, "wb") if stderr_path else None
+    try:
+        return subprocess.Popen(
+            args,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle or subprocess.DEVNULL,
+            stderr=stderr_handle or subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        if stdout_handle is not None:
+            stdout_handle.close()
+        if stderr_handle is not None:
+            stderr_handle.close()
 
 
 def _task_key(root: str, task_type: str, entity_id: int | None) -> str:
@@ -6953,6 +7074,8 @@ def _submit_if_slot(
     ignore_limit: bool = False,
     manual_request_id: int | None = None,
     bypass_repeat_guard: bool = False,
+    stdout_path: str = "",
+    stderr_path: str = "",
 ) -> bool:
     if not _campaign_dispatch_begin(root, task_type):
         return False
@@ -6971,6 +7094,8 @@ def _submit_if_slot(
             ignore_limit=ignore_limit,
             manual_request_id=manual_request_id,
             bypass_repeat_guard=bypass_repeat_guard,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
         )
     finally:
         _campaign_dispatch_end(root, task_type)
@@ -6991,6 +7116,8 @@ def _submit_if_slot_uncoordinated(
     ignore_limit: bool = False,
     manual_request_id: int | None = None,
     bypass_repeat_guard: bool = False,
+    stdout_path: str = "",
+    stderr_path: str = "",
 ) -> bool:
     key = _task_key(root, task_type, entity_id)
     if key in running:
@@ -7025,7 +7152,7 @@ def _submit_if_slot_uncoordinated(
         root=root,
         task_type=task_type,
     )
-    proc = _spawn_command(root=root, args=args)
+    proc = _spawn_command(root=root, args=args, stdout_path=stdout_path, stderr_path=stderr_path)
     task = RunningTask(
         row_id=0,
         root=root,
@@ -7038,6 +7165,8 @@ def _submit_if_slot_uncoordinated(
         started_at=time.time(),
         pid=proc.pid,
         manual_request_id=manual_request_id,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
     task.row_id = store.add_running(task)
     running[key] = task
@@ -7082,7 +7211,12 @@ def _respawn_task(
     try:
         try:
             args = task.command_str.split(_CMD_SEP)
-            proc = _spawn_command(root=task.root, args=args)
+            proc = _spawn_command(
+                root=task.root,
+                args=args,
+                stdout_path=task.stdout_path,
+                stderr_path=task.stderr_path,
+            )
         except Exception as e:  # pragma: no cover - defensive
             logging.warning("[%s] respawn failed %s: %s", task.root, task.task_type, e)
             return False
@@ -7099,6 +7233,8 @@ def _respawn_task(
             started_at=time.time(),
             pid=proc.pid,
             manual_request_id=task.manual_request_id,
+            stdout_path=task.stdout_path,
+            stderr_path=task.stderr_path,
         )
         next_task.row_id = store.add_running(next_task)
         running[next_task.task_key] = next_task
@@ -7259,6 +7395,7 @@ def _monitor_running(
     tz_by_root = mautic_timezones_by_root or {}
     progress_watchdog = campaign_progress_watchdog if campaign_progress_watchdog is not None else {}
     for key, task in list(running.items()):
+        _plugin_operation_runtime_heartbeat(store, task, now)
         if bool(getattr(task, "external", False)):
             alive = _is_pid_alive(task.pid)
             if alive and _pid_matches_task_command(task.pid, task.command_str):
@@ -7284,6 +7421,14 @@ def _monitor_running(
                 state = "done" if rc == 0 or lock_busy else "failed"
                 note = "task_lock_busy" if lock_busy else (None if rc == 0 else "non_zero_exit")
                 store.finish(task.row_id, state=state, rc=rc, note=note)
+                _plugin_operation_runtime_finish(
+                    store,
+                    task,
+                    state="skipped" if lock_busy else state,
+                    rc=rc,
+                    skipped_reason="resource_lock_busy" if lock_busy else "",
+                    now_ts=now,
+                )
                 progress_watchdog.pop(key, None)
                 if rc == 0 and task.task_type == "segment":
                     _mark_segment_finished(task.root, task.entity_id, now_ts=now)
@@ -7329,6 +7474,15 @@ def _monitor_running(
         alive = _is_pid_alive(task.pid)
         if alive and proc is None and not _pid_matches_task_command(task.pid, task.command_str):
             store.finish(task.row_id, state="lost", rc=None, note="pid_cmd_mismatch")
+            _plugin_operation_runtime_finish(
+                store,
+                task,
+                state="lost",
+                rc=None,
+                skipped_reason="owner_pid_command_mismatch",
+                stale=True,
+                now_ts=now,
+            )
             progress_watchdog.pop(key, None)
             running.pop(key, None)
             popens.pop(key, None)
@@ -7366,6 +7520,9 @@ def _monitor_running(
         elif config.worker_watchdog_sec > 0:
             timeout_threshold = config.worker_watchdog_sec
 
+        if _plugin_operation_runtime_digest_from_task(task):
+            timeout_threshold = None
+
         if alive and (timeout_threshold is None or elapsed <= timeout_threshold):
             continue
 
@@ -7389,6 +7546,15 @@ def _monitor_running(
 
         if not alive:
             store.finish(task.row_id, state="lost", rc=None, note="pid_not_alive")
+            _plugin_operation_runtime_finish(
+                store,
+                task,
+                state="lost",
+                rc=None,
+                skipped_reason="owner_pid_not_alive",
+                stale=True,
+                now_ts=now,
+            )
             progress_watchdog.pop(key, None)
             if task.task_type == "import":
                 _mark_import_settle(config, task.root, now, elapsed_sec=now - float(task.started_at))
@@ -12329,6 +12495,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     for plugin_task in plugin_operation_scheduled_tasks(plugin_item):
                         task_id = str(plugin_task.get("id", "") or "")
                         run_key = f"{operation_key}:{task_id}"
+                        resource_key = _plugin_operation_resource_key(operation_key, plugin_task)
+                        resource_digest = _plugin_operation_resource_digest(root, resource_key)
                         previous = jobs_last_run.get((root, run_key), 0.0)
                         bootstrap = (
                             plugin_task.get("bootstrap")
@@ -12359,6 +12527,28 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 continue
                             guard = plugin_task.get("guard")
                             if guard is not None and not _plugin_operation_guard_matches(db, guard, inst_now):
+                                _plugin_operation_runtime_update(
+                                    store,
+                                    resource_digest,
+                                    {
+                                        "root": root,
+                                        "operation_key": operation_key,
+                                        "task_id": task_id,
+                                        "resource_key": resource_key,
+                                        "state": "skipped",
+                                        "skipped_reason": "guard_not_met",
+                                        "next_run_at": plugin_operation_next_run_epoch(
+                                            plugin_item,
+                                            values,
+                                            now_epoch=now,
+                                            now_local=dt,
+                                            last_epoch=now,
+                                            task=plugin_task,
+                                        ),
+                                        "heartbeat_at": now,
+                                        "stale": False,
+                                    },
+                                )
                                 jobs_last_run[(root, run_key)] = now
                                 continue
                             selected_command = (
@@ -12398,6 +12588,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                         else selected_command
                                     )
                                     task_type = f"job:plugin_operation_bootstrap:{digest}"
+                            task_type = f"{task_type}:{resource_digest}"
                             template = plugin_operation_command_template(
                                 plugin_item,
                                 values,
@@ -12410,6 +12601,37 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 root=root,
                                 template=template,
                             )
+                            next_run_at = plugin_operation_next_run_epoch(
+                                plugin_item,
+                                values,
+                                now_epoch=now,
+                                now_local=dt,
+                                last_epoch=now,
+                                task=plugin_task,
+                            )
+                            runtime_base: dict[str, object] = {
+                                "root": root,
+                                "operation_key": operation_key,
+                                "task_id": task_id,
+                                "resource_key": resource_key,
+                                "next_run_at": next_run_at,
+                            }
+                            task_key = _task_key(root, task_type, None)
+                            if task_key in running or store.has_running_task_key(task_key):
+                                _plugin_operation_runtime_update(
+                                    store,
+                                    resource_digest,
+                                    {
+                                        **runtime_base,
+                                        "state": "skipped",
+                                        "skipped_reason": f"resource_busy:{resource_key}",
+                                        "heartbeat_at": now,
+                                        "stale": False,
+                                    },
+                                )
+                                jobs_last_run[(root, run_key)] = now
+                                continue
+                            stdout_path, stderr_path = _plugin_operation_output_paths(config, resource_digest)
                             if _submit_if_slot(
                                 config=config,
                                 store=store,
@@ -12421,7 +12643,44 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 timeout_sec=config.command_timeout_sec,
                                 max_parallel_for_type=1,
                                 popens=popens,
+                                bypass_repeat_guard=True,
+                                stdout_path=stdout_path,
+                                stderr_path=stderr_path,
                             ):
+                                jobs_last_run[(root, run_key)] = now
+                                launched = running.get(task_key)
+                                _plugin_operation_runtime_update(
+                                    store,
+                                    resource_digest,
+                                    {
+                                        **runtime_base,
+                                        "state": "running",
+                                        "last_started_at": now,
+                                        "last_finished_at": None,
+                                        "rc": None,
+                                        "duration_sec": None,
+                                        "stdout": "",
+                                        "stderr": "",
+                                        "skipped_reason": "",
+                                        "heartbeat_at": now,
+                                        "owner_pid": int(launched.pid if launched is not None else 0),
+                                        "stale": False,
+                                        "_stdout_path": stdout_path,
+                                        "_stderr_path": stderr_path,
+                                    },
+                                )
+                            else:
+                                _plugin_operation_runtime_update(
+                                    store,
+                                    resource_digest,
+                                    {
+                                        **runtime_base,
+                                        "state": "skipped",
+                                        "skipped_reason": f"resource_busy:{resource_key}",
+                                        "heartbeat_at": now,
+                                        "stale": False,
+                                    },
+                                )
                                 jobs_last_run[(root, run_key)] = now
                         except Exception as exc:
                             logging.warning(

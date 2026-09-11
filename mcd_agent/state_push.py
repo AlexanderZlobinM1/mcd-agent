@@ -1715,6 +1715,25 @@ class MCCStatePusher:
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
 
+    def _plugin_operations_runtime(self, root: str) -> list[dict[str, Any]]:
+        if self.runtime_store is None:
+            return []
+        try:
+            rows = self.runtime_store.list_runtime_sync("plugin_operation_runtime:")
+        except Exception:
+            return []
+        result: list[dict[str, Any]] = []
+        for _key, raw in rows:
+            if not isinstance(raw, dict) or raw.get("schema") != "mcd-plugin-operation-runtime-v1":
+                continue
+            if str(raw.get("root") or "") != str(root):
+                continue
+            result.append({str(key): value for key, value in raw.items() if not str(key).startswith("_")})
+        return sorted(
+            result,
+            key=lambda item: (str(item.get("operation_key") or ""), str(item.get("task_id") or "")),
+        )
+
     def set_signals(self, payload: dict[str, Any], now_ts: float) -> None:
         self.latest_signals = payload
         self.latest_signals_ts = now_ts
@@ -2175,6 +2194,7 @@ class MCCStatePusher:
                         runtime_store=self.runtime_store,
                     ),
                     "message_queue": collect_message_queue_snapshot(i),
+                    "plugin_operations_runtime": self._plugin_operations_runtime(i.root),
                 }
             )
         instances.sort(key=lambda x: str(x["instance_uid"]))
