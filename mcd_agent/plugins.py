@@ -1569,7 +1569,10 @@ def _confirm_plugin_apply_inventory(
                 config.plugins_state_filename,
                 install_bundle=install_bundle,
             )
-            confirmed = status == "OK"
+            expected_version = str(item.get("version", "") or "").strip()
+            confirmed = bool(expected_version) and installed_version == expected_version
+            if not confirmed:
+                reason = f"target version mismatch expected={expected_version or '-'} installed={installed_version}"
         inventory.append(
             {
                 "bundle": bundle,
@@ -2339,6 +2342,22 @@ def _apply_plugin_file_changes_impl(
                     inventory=inventory,
                 )
         elif run_post_steps:
+            expected_bundles = (
+                set()
+                if action in {"remove", "purge"}
+                else {
+                    str(row.get("install_bundle") or row.get("bundle") or "").strip()
+                    for row in selected
+                    if isinstance(row.get("item"), dict)
+                }
+            )
+            _run_post_steps(config, install, expected_bundles=expected_bundles)
+            inventory = _confirm_plugin_apply_inventory(
+                config=config,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+            )
             _emit_plugin_apply_result(
                 operation_id=operation_id,
                 install_root=install_root,
@@ -2346,10 +2365,11 @@ def _apply_plugin_file_changes_impl(
                 selected=selected,
                 event="completed",
                 files_applied=False,
-                post_step_status="skipped",
+                post_step_status="success",
                 cache_inventory_confirmed=True,
                 overall_status="success",
                 rc=0,
+                inventory=inventory,
             )
     except Exception as exc:
         if run_post_steps:

@@ -17,6 +17,12 @@ plugin inventory confirmation. Only completion of every required step emits a
 terminal record with `post_step_status=success`,
 `cache_inventory_confirmed=true`, and `overall_status=success`.
 
+For install and update actions, inventory confirmation requires exact equality
+between each selected `expected_version` and the corresponding
+`installed_version`. A catalog `OK` status, bundle presence, or a no-op file
+phase is not sufficient. No-op file phases still run post-steps and exact
+inventory confirmation before terminal success.
+
 Any exception or nonzero result from SQL fixes, cache clear, plugin
 install/reload, cache warmup or inventory confirmation emits a terminal record
 with `post_step_status=failed`, `cache_inventory_confirmed=false`, and

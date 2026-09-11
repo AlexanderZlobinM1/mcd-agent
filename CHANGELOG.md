@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.12 - 2026-09-11
+
+- Require exact selected target-version confirmation before a plugin apply can
+  emit terminal success; catalog status alone is no longer sufficient.
+- Run post-steps and inventory confirmation for no-op file phases, preventing
+  stale installed plugin versions from returning `rc=0` with false success.
+
 ## 1.2.11 - 2026-09-11
 
 - Publish durable recurring plugin-operation runtime state with lifecycle

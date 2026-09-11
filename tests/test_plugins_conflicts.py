@@ -14,6 +14,7 @@ from mcd_agent.plugins import (
     _auto_remove_conflicting_installed_bundles,
     _apply_plugin_file_changes,
     _cleanup_conflicting_plugin_rows,
+    _confirm_plugin_apply_inventory,
     _cluster_plugin_cache_clear_all,
     _cluster_pre_sql_is_dangerous,
     _cluster_plugin_note_node,
@@ -909,6 +910,80 @@ class PluginConflictPathTests(unittest.TestCase):
             self.assertEqual(results[1]["overall_status"], "failed")
             self.assertEqual(results[1]["rc"], 1)
             self.assertIn("PHP Fatal error during warmup", results[1]["error"])
+
+    def test_inventory_confirmation_requires_exact_selected_target_version(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "plugins" / "DemoBundle"
+            config_file = plugin / "Config" / "config.php"
+            config_file.parent.mkdir(parents=True)
+            config_file.write_text("<?php return ['version' => '2.0.3'];\n", encoding="utf-8")
+            (plugin / "DemoBundle.php").write_text("<?php class DemoBundle {}\n", encoding="utf-8")
+            cfg = SimpleNamespace(plugins_state_filename=".mcd-plugin.json")
+            selected = [{
+                "bundle": "DemoBundle",
+                "install_bundle": "DemoBundle",
+                "item": {"bundle": "DemoBundle", "version": "2.0.4"},
+            }]
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "target version mismatch expected=2.0.4 installed=2.0.3",
+            ):
+                _confirm_plugin_apply_inventory(
+                    config=cfg,
+                    install_root=str(root),
+                    action="update",
+                    selected=selected,
+                )
+
+    def test_no_file_change_runs_post_steps_and_rejects_stale_target(self) -> None:
+        root = "/tmp/mcd-plugin-target-version-noop"
+        cfg = SimpleNamespace(plugins_state_filename=".mcd-plugin.json", mcc_token="")
+        install = SimpleNamespace(root=root, db=None, mautic_major=6)
+        selected = [{
+            "bundle": "DemoBundle",
+            "install_bundle": "DemoBundle",
+            "item": {"bundle": "DemoBundle", "version": "2.0.4"},
+            "package": "DemoBundle.zip",
+            "status": "OK",
+        }]
+        output = io.StringIO()
+
+        with redirect_stdout(output), patch(
+            "mcd_agent.plugins._apply_hostnet_mautic4_tx_patch", return_value=False
+        ), patch(
+            "mcd_agent.plugins._apply_plugin_config_metadata_patch", return_value=False
+        ), patch(
+            "mcd_agent.plugins._prealign_metadataless_plugin_versions", return_value=False
+        ), patch("mcd_agent.plugins._run_post_steps") as post_steps, patch(
+            "mcd_agent.plugins._confirm_plugin_apply_inventory",
+            side_effect=RuntimeError("target version mismatch expected=2.0.4 installed=2.0.3"),
+        ) as confirm_inventory:
+            with self.assertRaisesRegex(RuntimeError, "target version mismatch"):
+                _apply_plugin_file_changes(
+                    config=cfg,
+                    install=install,
+                    install_root=root,
+                    manifest_dir="https://mcc.example/",
+                    fallback_ip=None,
+                    action="update",
+                    selected=selected,
+                    auto_remove_bundles=[],
+                    rows_by_bundle={},
+                    run_post_steps=True,
+                )
+
+        post_steps.assert_called_once_with(cfg, install, expected_bundles={"DemoBundle"})
+        confirm_inventory.assert_called_once()
+        result = [
+            json.loads(line.split("=", 1)[1])
+            for line in output.getvalue().splitlines()
+            if line.startswith("MCD_PLUGIN_APPLY_RESULT=")
+        ][-1]
+        self.assertEqual(result["overall_status"], "failed")
+        self.assertFalse(result["cache_inventory_confirmed"])
+        self.assertEqual(result["rc"], 1)
 
     def test_file_phase_exception_still_emits_terminal_failed_result(self) -> None:
         root = "/tmp/mcd-plugin-apply-result-missing"
