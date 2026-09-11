@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.13 - 2026-09-11
+
+- Make cluster plugin operations own the complete structured apply-result
+  lifecycle, including delegated and wait-success paths.
+- Remove the cluster no-change early success: synchronize nodes, run post-steps
+  and require exact per-selected-bundle inventory before terminal `rc=0`.
+
 ## 1.2.12 - 2026-09-11
 
 - Require exact selected target-version confirmation before a plugin apply can

@@ -23,6 +23,12 @@ between each selected `expected_version` and the corresponding
 phase is not sufficient. No-op file phases still run post-steps and exact
 inventory confirmation before terminal success.
 
+Starting with MCD 1.2.13, cluster operations follow the same callback contract.
+A cluster no-change, delegated-success or wait-success path cannot return
+`rc=0` before emitting a terminal result containing one exact confirmed
+inventory row per selected bundle. The reference no-change path still verifies
+file synchronization and runs configured post-steps before confirmation.
+
 Any exception or nonzero result from SQL fixes, cache clear, plugin
 install/reload, cache warmup or inventory confirmation emits a terminal record
 with `post_step_status=failed`, `cache_inventory_confirmed=false`, and

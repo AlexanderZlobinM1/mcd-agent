@@ -1137,6 +1137,7 @@ class PluginConflictPathTests(unittest.TestCase):
              patch("mcd_agent.plugins._cluster_plugin_expected_hosts", return_value=["host-a", "host-b"]), \
              patch("mcd_agent.plugins._cluster_plugin_local_is_reference", return_value=False), \
              patch("mcd_agent.plugins._cluster_plugin_delegate_to_reference", return_value=0) as delegate, \
+             patch("mcd_agent.plugins._confirm_plugin_apply_inventory", return_value=[{"bundle": "DemoBundle", "expected_version": "1.0.0", "installed_version": "1.0.0", "confirmed": True}]), \
              patch("mcd_agent.plugins._apply_plugin_file_changes") as apply_local:
             rc = _run_cluster_plugin_operation(
                 config=cfg,
@@ -1153,6 +1154,91 @@ class PluginConflictPathTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         delegate.assert_called_once()
         apply_local.assert_not_called()
+
+    def test_cluster_no_change_emits_exact_confirmed_inventory_after_post_steps(self) -> None:
+        cfg = SimpleNamespace(
+            cluster_id="cluster-a",
+            plugins_post_cache_clear=True,
+            plugins_post_install=True,
+            command_timeout_sec=60,
+        )
+        install = SimpleNamespace(root="/var/www/ss/public_html", db=None)
+        selected = [{
+            "bundle": "DemoBundle",
+            "install_bundle": "DemoBundle",
+            "item": {"bundle": "DemoBundle", "version": "2.0.4"},
+        }]
+        inventory = [{
+            "bundle": "DemoBundle",
+            "install_bundle": "DemoBundle",
+            "expected_version": "2.0.4",
+            "installed_version": "2.0.4",
+            "status": "OK",
+            "confirmed": True,
+            "reason": "version match",
+        }]
+        output = io.StringIO()
+
+        with redirect_stdout(output), patch(
+            "mcd_agent.plugins.mysql_state_enabled", return_value=True
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_reference_host", return_value="host-a"
+        ), patch(
+            "mcd_agent.plugins._cluster_local_host_name", return_value="host-a"
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_expected_hosts", return_value=["host-a", "host-b"]
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_local_is_reference", return_value=True
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_begin_reference", return_value={"action": "execute"}
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_set_phase"
+        ), patch(
+            "mcd_agent.plugins._apply_plugin_file_changes", return_value=False
+        ), patch(
+            "mcd_agent.plugins._cluster_sync_bundle_names", return_value=["DemoBundle"]
+        ), patch(
+            "mcd_agent.plugins._plugin_selection_digest", return_value={"digest": "exact-digest", "status": "ok"}
+        ), patch(
+            "mcd_agent.plugins._cluster_plugin_wait_file_sync"
+        ) as wait_sync, patch(
+            "mcd_agent.plugins._cluster_plugin_cache_clear_all"
+        ) as cache_clear, patch(
+            "mcd_agent.plugins._run_plugin_install_reload"
+        ) as plugin_reload, patch(
+            "mcd_agent.plugins._run_plugin_cache_warmup"
+        ) as cache_warmup, patch(
+            "mcd_agent.plugins._confirm_plugin_apply_inventory", return_value=inventory
+        ) as confirm_inventory:
+            rc = _run_cluster_plugin_operation(
+                config=cfg,
+                install=install,
+                install_root=install.root,
+                manifest_dir="https://mcc.example/manifest/",
+                fallback_ip=None,
+                action="update",
+                selected=selected,
+                auto_remove_bundles=[],
+                rows_by_bundle={},
+            )
+
+        self.assertEqual(rc, 0)
+        wait_sync.assert_called_once()
+        cache_clear.assert_called_once()
+        plugin_reload.assert_called_once_with(cfg, install, expected_bundles={"DemoBundle"})
+        cache_warmup.assert_called_once_with(cfg, install)
+        confirm_inventory.assert_called_once()
+        results = [
+            json.loads(line.split("=", 1)[1])
+            for line in output.getvalue().splitlines()
+            if line.startswith("MCD_PLUGIN_APPLY_RESULT=")
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["files_applied"])
+        self.assertEqual(results[0]["post_step_status"], "success")
+        self.assertTrue(results[0]["cache_inventory_confirmed"])
+        self.assertEqual(results[0]["overall_status"], "success")
+        self.assertEqual(results[0]["inventory"], inventory)
 
     def test_cluster_remove_verifies_sync_even_when_reference_already_absent(self) -> None:
         cfg = SimpleNamespace(

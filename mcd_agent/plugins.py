@@ -1552,6 +1552,19 @@ def _confirm_plugin_apply_inventory(
     for row in selected:
         item = row.get("item")
         if not isinstance(item, dict):
+            bundle = str(row.get("bundle", "") or "").strip()
+            inventory.append(
+                {
+                    "bundle": bundle,
+                    "install_bundle": str(row.get("install_bundle") or bundle).strip(),
+                    "expected_version": "",
+                    "installed_version": "-",
+                    "status": "INVALID",
+                    "confirmed": False,
+                    "reason": "selected manifest item missing",
+                }
+            )
+            failures.append(f"{bundle}:INVALID:selected manifest item missing")
             continue
         bundle = str(row.get("bundle", "") or "").strip()
         install_bundle = str(
@@ -2875,16 +2888,55 @@ def _run_cluster_plugin_operation(
     expected_hosts = _cluster_plugin_expected_hosts(config)
     key = _cluster_plugin_sync_key(config, install.root)
     request_hash = _cluster_plugin_row_signature(action, selected, auto_remove_bundles)
+    operation_id = uuid.uuid4().hex
     if not _cluster_plugin_local_is_reference(config):
-        return _cluster_plugin_delegate_to_reference(
-            config=config,
-            install=install,
-            action=action,
-            selected=selected,
-            key=key,
-            request_hash=request_hash,
-            reference_host=reference_host,
-        )
+        try:
+            rc = _cluster_plugin_delegate_to_reference(
+                config=config,
+                install=install,
+                action=action,
+                selected=selected,
+                key=key,
+                request_hash=request_hash,
+                reference_host=reference_host,
+            )
+            if rc != 0:
+                raise RuntimeError(f"cluster reference operation failed rc={rc}")
+            inventory = _confirm_plugin_apply_inventory(
+                config=config,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+            )
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=False,
+                post_step_status="success",
+                cache_inventory_confirmed=True,
+                overall_status="success",
+                rc=0,
+                inventory=inventory,
+            )
+            return 0
+        except Exception as exc:
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=False,
+                post_step_status="failed",
+                cache_inventory_confirmed=False,
+                overall_status="failed",
+                rc=1,
+                error=str(exc),
+            )
+            raise
 
     invocation_id = uuid.uuid4().hex
     begin = _cluster_plugin_begin_reference(
@@ -2907,11 +2959,46 @@ def _run_cluster_plugin_operation(
             timeout_sec=max(60, int(getattr(config, "command_timeout_sec", 1800) or 1800)),
         )
         print(msg)
-        return 0 if ok else 1
+        if not ok:
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="completed",
+                files_applied=False,
+                post_step_status="failed",
+                cache_inventory_confirmed=False,
+                overall_status="failed",
+                rc=1,
+                error=msg,
+            )
+            return 1
+        inventory = _confirm_plugin_apply_inventory(
+            config=config,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+        )
+        _emit_plugin_apply_result(
+            operation_id=operation_id,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+            event="completed",
+            files_applied=False,
+            post_step_status="success",
+            cache_inventory_confirmed=True,
+            overall_status="success",
+            rc=0,
+            inventory=inventory,
+        )
+        return 0
     if begin_action == "busy":
         raise RuntimeError(str((begin or {}).get("message") or "another cluster plugin operation is active"))
 
     print(f"Cluster plugin operation reference={reference_host} local={local_host} nodes={','.join(expected_hosts)}")
+    changed = False
     try:
         _cluster_plugin_set_phase(
             config,
@@ -2934,18 +3021,19 @@ def _run_cluster_plugin_operation(
             rows_by_bundle=rows_by_bundle,
             run_post_steps=False,
         )
-        if not changed and action not in {"remove", "purge"}:
-            _cluster_plugin_set_phase(
-                config,
-                key,
-                phase="done",
-                local_host=local_host,
-                request_hash=request_hash,
-                message="No plugin changes required",
-                node_status="done",
+        if changed:
+            _emit_plugin_apply_result(
+                operation_id=operation_id,
+                install_root=install_root,
+                action=action,
+                selected=selected,
+                event="files_applied",
+                files_applied=True,
+                post_step_status="pending",
+                cache_inventory_confirmed=False,
+                overall_status="pending",
+                rc=None,
             )
-            print("No plugin changes required")
-            return 0
 
         sync_bundles = _cluster_sync_bundle_names(
             selected,
@@ -2999,6 +3087,27 @@ def _run_cluster_plugin_operation(
             if install.db and plugin_registration.restore(MauticDB(install.db), expected, allow_schema_creation=False):
                 _cluster_plugin_cache_clear_all(config=config, install=install, key=key,
                     request_hash=request_hash, expected_hosts=expected_hosts, reference_host=reference_host)
+        if config.plugins_post_cache_clear or config.plugins_post_install:
+            _run_plugin_cache_warmup(config, install)
+        inventory = _confirm_plugin_apply_inventory(
+            config=config,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+        )
+        _emit_plugin_apply_result(
+            operation_id=operation_id,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+            event="completed",
+            files_applied=changed,
+            post_step_status="success",
+            cache_inventory_confirmed=True,
+            overall_status="success",
+            rc=0,
+            inventory=inventory,
+        )
         _cluster_plugin_set_phase(
             config,
             key,
@@ -3011,6 +3120,19 @@ def _run_cluster_plugin_operation(
         print("Cluster plugin operation completed")
         return 0
     except Exception as e:
+        _emit_plugin_apply_result(
+            operation_id=operation_id,
+            install_root=install_root,
+            action=action,
+            selected=selected,
+            event="completed",
+            files_applied=changed,
+            post_step_status="failed",
+            cache_inventory_confirmed=False,
+            overall_status="failed",
+            rc=1,
+            error=str(e),
+        )
         try:
             _cluster_plugin_set_phase(
                 config,
