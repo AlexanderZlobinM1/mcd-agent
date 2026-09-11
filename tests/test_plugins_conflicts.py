@@ -21,6 +21,7 @@ from mcd_agent.plugins import (
     _cluster_plugin_reference_host,
     _cluster_plugin_row_signature,
     _cluster_plugin_wait_file_sync,
+    _canonical_plugin_uid,
     _assert_plugin_bundles_registered,
     _ensure_plugin_reload_runtime_packages,
     _registration_aware_status,
@@ -1185,6 +1186,46 @@ class PluginConflictPathTests(unittest.TestCase):
             self.assertEqual(evidence["schema"], "mcd-plugin-cache-reset-v1")
             self.assertEqual(evidence["reset_paths"], ["var/cache/prod"])
             self.assertEqual(evidence["mode"], "0775")
+
+    def test_cache_reset_ignores_disposable_retired_cleanup_race(self) -> None:
+        import errno
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_path = root / "var" / "cache" / "prod"
+            cache_path.mkdir(parents=True)
+            stale = cache_path / "stale.php"
+            stale.write_text("stale", encoding="utf-8")
+            install = SimpleNamespace(root=str(root))
+
+            def fail_retired_cleanup(path: Path) -> None:
+                raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path / "system"))
+
+            with patch("mcd_agent.plugins._set_owner_group"), patch(
+                "mcd_agent.plugins._remove_plugin_path", side_effect=fail_retired_cleanup
+            ):
+                evidence = _reset_plugin_prod_cache(install)
+
+            self.assertTrue(cache_path.is_dir())
+            self.assertFalse(stale.exists())
+            self.assertEqual(cache_path.stat().st_mode & 0o777, 0o775)
+            self.assertEqual(len(evidence["cleanup_pending_paths"]), 1)
+
+    def test_canonical_plugin_uid_matches_catalog_selector_contract(self) -> None:
+        self.assertEqual(
+            _canonical_plugin_uid({}, "AiEmailSectionsBundle"),
+            "aiemailsectionsbundle:5-6-7",
+        )
+        self.assertEqual(
+            _canonical_plugin_uid(
+                {"mautic_majors": [7, 5, 6]}, "MauticLocaleFixBundle"
+            ),
+            "mauticlocalefixbundle:5-6-7",
+        )
+        self.assertEqual(
+            _canonical_plugin_uid({"plugin_uid": "Vendor.Custom:6"}, "IgnoredBundle"),
+            "vendor.custom:6",
+        )
 
     def test_existing_state_connection_does_not_ensure_schema(self) -> None:
         sentinel = object()

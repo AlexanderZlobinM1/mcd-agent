@@ -98,6 +98,24 @@ def _valid_plugin_uid(uid: str) -> bool:
     return bool(_PLUGIN_UID_RE.match(str(uid or "").strip()))
 
 
+def _canonical_plugin_uid(item: dict[str, Any], bundle: str) -> str:
+    explicit = _normalize_plugin_uid(str(item.get("plugin_uid", "") or ""))
+    if _valid_plugin_uid(explicit):
+        return explicit
+
+    raw_majors = item.get("mautic_majors")
+    if raw_majors is None:
+        raw_majors = item.get("mautic_versions")
+    if raw_majors is None:
+        raw_majors = item.get("mautic_major")
+    if isinstance(raw_majors, (str, int)):
+        raw_majors = re.findall(r"\d+", str(raw_majors))
+    majors = sorted({int(value) for value in (raw_majors or []) if str(value).isdigit()})
+    if not majors:
+        majors = [5, 6, 7]
+    return _normalize_plugin_uid(f"{bundle}:{'-'.join(str(value) for value in majors)}")
+
+
 def _install_bundle_for_manifest_bundle(bundle: str, item: dict[str, Any] | None = None) -> str:
     """
     Resolve filesystem install directory for a manifest bundle key.
@@ -1192,7 +1210,7 @@ def _build_plugin_rows(
         rows.append(
             {
                 "idx": selectable_idx,
-                "plugin_uid": _normalize_plugin_uid(str(item.get("plugin_uid", "")).strip()),
+                "plugin_uid": _canonical_plugin_uid(item, bundle),
                 "bundle": bundle,
                 "display_name": str(item.get("display_name", "")).strip() or bundle,
                 "install_bundle": install_bundle,
@@ -1404,21 +1422,35 @@ def _run_plugin_template(config: AgentConfig, install, template: str) -> tuple[i
 def _reset_plugin_prod_cache(install) -> dict[str, Any]:
     root = Path(install.root).resolve()
     reset_paths: list[str] = []
+    cleanup_pending_paths: list[str] = []
     for relative in (Path("var/cache/prod"), Path("app/cache/prod")):
         cache_path = root / relative
         if not cache_path.parent.is_dir():
             continue
-        _remove_plugin_path(cache_path)
+        retired_path: Path | None = None
+        if cache_path.exists() or cache_path.is_symlink():
+            retired_path = cache_path.with_name(f".{cache_path.name}.mcd-retired-{uuid.uuid4().hex}")
+            try:
+                cache_path.rename(retired_path)
+            except FileNotFoundError:
+                retired_path = None
         cache_path.mkdir(parents=True, mode=0o775, exist_ok=True)
         cache_path.chmod(0o775)
         _set_owner_group(cache_path, root=str(root))
         reset_paths.append(str(relative))
+        if retired_path is not None:
+            try:
+                _remove_plugin_path(retired_path)
+            except OSError as exc:
+                cleanup_pending_paths.append(str(retired_path.relative_to(root)))
+                logging.warning("Disposable retired cache cleanup deferred for %s: %s", retired_path, exc)
     evidence = {
         "schema": _PLUGIN_CACHE_RESET_SCHEMA,
         "operation": "plugin_cache_reset",
         "root": str(root),
         "status": "success",
         "reset_paths": reset_paths,
+        "cleanup_pending_paths": cleanup_pending_paths,
         "mode": "0775",
     }
     print("MCD_PLUGIN_CACHE_RESET_EVIDENCE=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))

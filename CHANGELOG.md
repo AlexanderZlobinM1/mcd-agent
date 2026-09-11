@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.10 - 2026-09-11
+
+- Make plugin production-cache reset race-safe: atomically detach the active
+  disposable cache generation, immediately recreate `prod` with runtime
+  ownership and mode `0775`, and keep best-effort cleanup from failing the job.
+- Generate the stable plugin UID from the bundle and supported Mautic majors
+  when a manifest omits `plugin_uid`, using the same canonical value for
+  catalog output and `--plugin-uid` selection.
+
 ## 1.2.9 - 2026-09-10
 
 - Add the fail-closed `mcd-plugin-apply-result-v1` callback/result contract.
