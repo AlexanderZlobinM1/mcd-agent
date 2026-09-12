@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,34 @@ from mcd_agent.state_push import MCCStatePusher
 
 
 class ViberStatsSchedulerTests(unittest.TestCase):
+    def test_runtime_output_retains_complete_terminal_plugin_apply_result(self) -> None:
+        terminal_payload = {
+            "schema": "mcd-plugin-apply-result-v1",
+            "operation": "plugin_apply",
+            "operation_id": "operation-1",
+            "selected": [{"bundle": "SalesSnapViberBundle"}],
+            "files_applied": True,
+            "post_step_status": "success",
+            "cache_inventory_confirmed": True,
+            "overall_status": "success",
+            "rc": 0,
+            "inventory": [{"bundle": "SalesSnapViberBundle", "details": "x" * 3000}],
+        }
+        terminal_line = "MCD_PLUGIN_APPLY_RESULT=" + json.dumps(
+            terminal_payload, separators=(",", ":"), sort_keys=True
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "plugin.stdout"
+            output_path.write_text(
+                terminal_line + "\n" + ("generic completion output\n" * 120),
+                encoding="utf-8",
+            )
+
+            retained = daemon._plugin_operation_read_output(str(output_path), limit=2000)
+
+        self.assertIn(terminal_line, retained.splitlines())
+        self.assertGreater(len(retained), 2000)
+
     def test_requires_mautic_registered_bundle_for_scheduled_plugin_operation(self) -> None:
         db = Mock()
         item = {"bundle": "SalesSnapViberBundle"}

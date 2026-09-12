@@ -7,6 +7,11 @@ operations. It writes newline-delimited callback/result records as:
 MCD_PLUGIN_APPLY_RESULT=<JSON>
 ```
 
+When a plugin operation runs through the daemon runtime scheduler, MCD retains
+the complete final record in the persisted operation output even if the JSON is
+larger than the normal bounded stdout tail. This makes the terminal callback
+and its exact inventory available to MCC in one completion observation.
+
 After selected plugin files are installed, replaced or removed, MCD immediately
 flushes a non-terminal record with `event=files_applied`, `files_applied=true`,
 `post_step_status=pending`, `cache_inventory_confirmed=false`, and

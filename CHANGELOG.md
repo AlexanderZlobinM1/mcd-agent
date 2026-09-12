@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.2.14 - 2026-09-11
+
+- Retain the complete terminal `mcd-plugin-apply-result-v1` record in recurring
+  plugin-operation output even when its inventory exceeds the bounded stdout
+  tail, so MCC receives post-step and exact inventory evidence atomically.
+- Keep non-plugin output bounded and leave all command timeout policies
+  unchanged.
+
 ## 1.2.13 - 2026-09-11
 
 - Make cluster plugin operations own the complete structured apply-result

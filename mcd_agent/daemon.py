@@ -887,6 +887,14 @@ def _plugin_operation_bootstrap_digest_from_task(task: "RunningTask") -> str:
 
 _PLUGIN_OPERATION_RUNTIME_SCHEMA = "mcd-plugin-operation-runtime-v1"
 _PLUGIN_OPERATION_RUNTIME_PREFIX = "plugin_operation_runtime:"
+_PLUGIN_APPLY_RESULT_PREFIX = "MCD_PLUGIN_APPLY_RESULT="
+_PLUGIN_APPLY_RESULT_REQUIRED_FIELDS = {
+    "overall_status",
+    "post_step_status",
+    "cache_inventory_confirmed",
+    "rc",
+    "inventory",
+}
 
 
 def _plugin_operation_resource_key(operation_key: str, task: dict[str, Any]) -> str:
@@ -936,7 +944,29 @@ def _plugin_operation_read_output(path: str, limit: int = 2000) -> str:
         value = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    return value[-max(1, int(limit)):].strip()
+    tail = value[-max(1, int(limit)):].strip()
+    terminal_result = ""
+    for raw in reversed(value.splitlines()):
+        line = raw.strip()
+        if not line.startswith(_PLUGIN_APPLY_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(line[len(_PLUGIN_APPLY_RESULT_PREFIX) :])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("schema") != "mcd-plugin-apply-result-v1":
+            continue
+        if payload.get("operation") != "plugin_apply":
+            continue
+        if not _PLUGIN_APPLY_RESULT_REQUIRED_FIELDS.issubset(payload):
+            continue
+        terminal_result = line
+        break
+    if not terminal_result or terminal_result in tail.splitlines():
+        return tail
+    return f"{tail}\n{terminal_result}".strip()
 
 
 def _plugin_operation_runtime_finish(
