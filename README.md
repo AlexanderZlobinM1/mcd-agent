@@ -555,6 +555,12 @@ Important:
 - Backup module:
   - section `[backup]` in system config
   - host-level direct write to remote share via `sshfs` (no local dump staging)
+  - opt-in instance backup transport `[backup.storage].kind = "local"` writes
+    directly to an already-mounted absolute `local_path`; MCD does not manage
+    mounts, encryption, credentials or storage lifecycle
+  - local targets are root-owned, non-symlink, non-world-writable active
+    mountpoints by default; unsafe broad paths, traversal and instance/target
+    overlap fail closed
   - one run includes all discovered instance databases (with DB creds) + optional system files archive
   - remote layout: `/<remote_root_dir>/<host_name>/<YYYY-MM-DD>/...`
   - startup hygiene: stale `/.incomplete-*` directories from failed/aborted runs are cleaned automatically before a new backup starts

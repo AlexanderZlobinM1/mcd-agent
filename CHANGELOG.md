@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.2.15 - 2026-09-13
+
+- Add the opt-in `backup.storage.kind=local` transport for direct Mydumper and
+  persistent-file instance backups into a caller-mounted filesystem target.
+- Preserve the SFTP profile and backup format while adding root-owned path,
+  mountpoint, traversal, symlink, overlap and atomic-publication guards plus
+  local restore through the existing parallel Myloader path.
+- Accept profile-level Mydumper/Myloader thread counts for local and SFTP
+  transports without changing existing defaults.
+
 ## 1.2.14 - 2026-09-11
 
 - Retain the complete terminal `mcd-plugin-apply-result-v1` record in recurring

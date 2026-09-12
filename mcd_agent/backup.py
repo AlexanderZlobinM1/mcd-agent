@@ -228,7 +228,7 @@ def _host_backup_remote_root_dir(cfg: AgentConfig) -> str:
     root = str(cfg.backup_remote_root_dir or "backup").strip().strip("/")
     if _is_deleted_instances_remote_root(root):
         return "backup"
-    return root or "backup"
+    return _validate_storage_relative(root or "backup", field="remote_root_dir")
 
 
 def _instance_backup_retention_enabled(cfg: AgentConfig, remote_root_dir: str | None = None) -> bool:
@@ -508,6 +508,8 @@ def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path
     root = Path(inst.root)
     if not root.exists() or not root.is_dir():
         raise RuntimeError(f"instance root not found: {inst.root}")
+    if root.is_symlink():
+        raise RuntimeError(f"instance root must not resolve through symlinks: {inst.root}")
     target = out_dir / "files.tar.gz"
     cmd = [
         "tar",
@@ -1064,7 +1066,7 @@ def _profile_storage_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(src, dict):
         return {}
     out: dict[str, Any] = {}
-    for key in ("host", "user", "remote_path", "key_file", "password"):
+    for key in ("kind", "local_path", "host", "user", "remote_path", "key_file", "password"):
         if key in src:
             out[key] = str(src.get(key) or "").strip() if key != "password" else str(src.get(key) or "")
     if "port" in src:
@@ -1072,6 +1074,22 @@ def _profile_storage_payload(payload: dict[str, Any]) -> dict[str, Any]:
             out["port"] = int(src.get("port")) if src.get("port") is not None else 22
         except Exception:
             pass
+    if "require_mount" in src:
+        out["require_mount"] = bool(src.get("require_mount"))
+    return out
+
+
+def _profile_mydumper_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    src = payload.get("mydumper")
+    if not isinstance(src, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("threads", "myloader_threads"):
+        if key in src:
+            value = int(src.get(key) or 0)
+            if value < 1:
+                raise RuntimeError(f"backup.mydumper.{key} must be at least 1")
+            out[key] = value
     return out
 
 
@@ -1143,6 +1161,10 @@ def _sync_profile_payload_to_config(cfg: AgentConfig, payload: dict[str, Any]) -
     if storage:
         _, c = upsert_section_values(cfg.config_file_path, "backup.storage", storage)
         changed = changed or c
+    mydumper = _profile_mydumper_payload(payload)
+    if mydumper:
+        _, c = upsert_section_values(cfg.config_file_path, "backup.mydumper", mydumper)
+        changed = changed or c
     mysql = _profile_mysql_payload(payload)
     if mysql:
         _, c = upsert_section_values(cfg.config_file_path, "backup.mysql", mysql)
@@ -1171,8 +1193,14 @@ def _config_profile_payload(cfg: AgentConfig) -> dict[str, Any]:
         return {}
     out: dict[str, Any] = {}
     storage = _profile_storage_payload({"storage": backup.get("storage", {})})
-    if storage and str(storage.get("host") or "").strip() and str(storage.get("user") or "").strip():
+    if storage and (
+        str(storage.get("kind") or "sftp").strip().lower() == "local"
+        or (str(storage.get("host") or "").strip() and str(storage.get("user") or "").strip())
+    ):
         out["storage"] = storage
+    mydumper = _profile_mydumper_payload({"mydumper": backup.get("mydumper", {})})
+    if mydumper:
+        out["mydumper"] = mydumper
     mysql = _profile_mysql_payload({"mysql": backup.get("mysql", {})})
     if mysql and any(str(mysql.get(k) or "").strip() for k in ("host", "user", "password", "database")):
         out["mysql"] = mysql
@@ -1203,6 +1231,7 @@ def backup_profile_sync_from_config(cfg: AgentConfig) -> dict[str, Any]:
 
 def _cfg_with_profile_payload(cfg: AgentConfig, payload: dict[str, Any]) -> AgentConfig:
     storage = payload.get("storage") if isinstance(payload.get("storage"), dict) else {}
+    mydumper = payload.get("mydumper") if isinstance(payload.get("mydumper"), dict) else {}
     mysql = payload.get("mysql") if isinstance(payload.get("mysql"), dict) else {}
     archive = payload.get("archive") if isinstance(payload.get("archive"), dict) else {}
     backup = _profile_backup_payload(payload)
@@ -1226,12 +1255,23 @@ def _cfg_with_profile_payload(cfg: AgentConfig, payload: dict[str, Any]) -> Agen
     if storage:
         out = replace(
             out,
+            backup_storage_kind=str(storage.get("kind") or out.backup_storage_kind).strip().lower(),
+            backup_local_path=str(storage.get("local_path") or out.backup_local_path).strip(),
+            backup_local_require_mount=bool(storage.get("require_mount"))
+            if "require_mount" in storage
+            else out.backup_local_require_mount,
             backup_ssh_host=str(storage.get("host")).strip() if storage.get("host") else out.backup_ssh_host,
             backup_ssh_port=int(storage.get("port")) if storage.get("port") is not None else out.backup_ssh_port,
             backup_ssh_user=str(storage.get("user")).strip() if storage.get("user") else out.backup_ssh_user,
             backup_ssh_remote_path=str(storage.get("remote_path")).strip() if storage.get("remote_path") else out.backup_ssh_remote_path,
             backup_ssh_key_file=str(storage.get("key_file")).strip() if storage.get("key_file") else out.backup_ssh_key_file,
             backup_ssh_password=str(storage.get("password")) if storage.get("password") else out.backup_ssh_password,
+        )
+    if mydumper:
+        out = replace(
+            out,
+            backup_mydumper_threads=int(mydumper.get("threads") or out.backup_mydumper_threads),
+            backup_myloader_threads=int(mydumper.get("myloader_threads") or out.backup_myloader_threads),
         )
     if mysql:
         out = replace(
@@ -1276,6 +1316,7 @@ def _backup_profile_prepare_check(cfg: AgentConfig, payload: dict[str, Any]) -> 
         checked_dbs.append(db.name)
 
     mount_path = Path(check_cfg.backup_mount_base_dir) / _host_slug(check_cfg)
+    storage_attached = False
     lock_path = _lock_path(check_cfg)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -1284,7 +1325,7 @@ def _backup_profile_prepare_check(cfg: AgentConfig, payload: dict[str, Any]) -> 
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("backup lock is busy; cannot verify backup profile now")
-        _mount(check_cfg, mount_path)
+        mount_path, storage_attached = _open_backup_storage(check_cfg)
         remote_parent = mount_path / _format_remote_dir(check_cfg.backup_remote_root_dir, _host_name(check_cfg))
         remote_parent.mkdir(parents=True, exist_ok=True)
         probe_path = remote_parent / f".mcd-profile-check-{int(time.time())}.tmp"
@@ -1292,7 +1333,8 @@ def _backup_profile_prepare_check(cfg: AgentConfig, payload: dict[str, Any]) -> 
         probe_path.unlink(missing_ok=True)
     finally:
         try:
-            _unmount(mount_path, check_cfg.backup_unmount_timeout_sec)
+            if storage_attached:
+                _unmount(mount_path, check_cfg.backup_unmount_timeout_sec)
         except Exception:
             pass
         try:
@@ -1386,10 +1428,87 @@ def _validate_cfg(cfg: AgentConfig) -> None:
         raise RuntimeError("backup is disabled in config ([backup].enabled=false)")
     if _backup_method(cfg) not in {"mydumper", "xtrabackup"}:
         raise RuntimeError("backup method must be 'mydumper' or 'xtrabackup'")
+    kind = _backup_storage_kind(cfg)
+    if kind == "local":
+        _validate_local_storage_root(cfg)
+        return
     if not cfg.backup_ssh_host or not cfg.backup_ssh_user:
         raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
     if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
         raise RuntimeError("backup storage auth is not configured (key_file or password required)")
+
+
+def _backup_storage_kind(cfg: AgentConfig) -> str:
+    kind = str(getattr(cfg, "backup_storage_kind", "sftp") or "sftp").strip().lower()
+    if kind in {"sftp", "sshfs"}:
+        return "sftp"
+    if kind == "local":
+        return "local"
+    raise RuntimeError("backup storage kind must be 'sftp' or 'local'")
+
+
+def _validate_storage_relative(value: str, *, field: str) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        raise RuntimeError(f"{field} must be a non-empty relative path")
+    parts = [part for part in raw.split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise RuntimeError(f"{field} contains unsafe traversal")
+    return "/".join(parts)
+
+
+def _validate_local_storage_root(cfg: AgentConfig) -> Path:
+    raw = str(getattr(cfg, "backup_local_path", "") or "").strip()
+    path = Path(raw)
+    if not raw or not path.is_absolute():
+        raise RuntimeError("backup local_path must be absolute")
+    if not path.exists() or not path.is_dir() or path.is_symlink():
+        raise RuntimeError("backup local_path must be an existing non-symlink directory")
+    resolved = path.resolve(strict=True)
+    if resolved != path.absolute() or len(resolved.parts) < 3:
+        raise RuntimeError("backup local_path is a symlinked or broad unsafe target")
+    if resolved in {Path("/"), Path("/etc"), Path("/home"), Path("/mnt"), Path("/opt"), Path("/root"), Path("/srv"), Path("/usr"), Path("/var")}:
+        raise RuntimeError("backup local_path is a broad unsafe target")
+    st = resolved.stat()
+    if int(st.st_uid) != 0:
+        raise RuntimeError("backup local_path must be root-owned")
+    if st.st_mode & 0o002:
+        raise RuntimeError("backup local_path must not be world-writable")
+    if bool(getattr(cfg, "backup_local_require_mount", True)) and not _mounted(resolved):
+        raise RuntimeError("backup local_path is not an active mountpoint")
+    return resolved
+
+
+def _open_backup_storage(cfg: AgentConfig) -> tuple[Path, bool]:
+    if _backup_storage_kind(cfg) == "local":
+        root = _validate_local_storage_root(cfg)
+        probe = root / f".mcd-write-check-{os.getpid()}"
+        try:
+            with probe.open("xb") as fh:
+                fh.write(b"mcd-backup-storage-check\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        finally:
+            probe.unlink(missing_ok=True)
+        return root, False
+    root = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    _mount(cfg, root)
+    return root, True
+
+
+def _validate_local_destination(base: Path, destination: Path) -> None:
+    base_resolved = base.resolve(strict=True)
+    current = destination
+    while current != base and current != current.parent:
+        if current.exists() and current.is_symlink():
+            raise RuntimeError(f"backup destination contains symlink: {current}")
+        current = current.parent
+    parent = destination
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    resolved_parent = parent.resolve(strict=True)
+    if not resolved_parent.is_relative_to(base_resolved):
+        raise RuntimeError("backup destination escapes configured local_path")
 
 
 def _normalize_backup_method(raw: Any) -> str:
@@ -1420,7 +1539,7 @@ def _apt_install_packages(packages: list[str]) -> None:
 def _ensure_backup_tools(cfg: AgentConfig) -> dict[str, Any]:
     method = _backup_method(cfg)
     required: list[tuple[str, str]] = []
-    if cfg.backup_ssh_host and cfg.backup_ssh_user:
+    if _backup_storage_kind(cfg) == "sftp" and cfg.backup_ssh_host and cfg.backup_ssh_user:
         required.append(("sshfs", cfg.backup_sshfs_package))
     if method == "mydumper":
         required.append((cfg.backup_mydumper_bin, cfg.backup_mydumper_package))
@@ -2182,12 +2301,19 @@ def _resolve_restore_source(
     remote_parent: Path,
     date: str | None,
     path: str | None,
+    restrict_to_parent: bool = False,
 ) -> Path:
     if path:
         p = Path(path)
-        if p.exists() and p.is_dir():
-            return p
-        rel = remote_parent / path.strip().strip("/")
+        candidate = p if p.is_absolute() else remote_parent / _validate_storage_relative(path, field="restore path")
+        if candidate.exists() and candidate.is_dir():
+            resolved = candidate.resolve(strict=True)
+            if restrict_to_parent and not resolved.is_relative_to(remote_parent.resolve(strict=True)):
+                raise RuntimeError("restore source escapes configured local backup base")
+            if candidate.is_symlink():
+                raise RuntimeError("restore source must not be a symlink")
+            return resolved
+        rel = remote_parent / _validate_storage_relative(path, field="restore path")
         if rel.exists() and rel.is_dir():
             return rel
         raise RuntimeError(f"restore source not found: {path}")
@@ -2199,13 +2325,21 @@ def _resolve_restore_source(
         p = remote_parent / d
         if not p.exists() or not p.is_dir():
             raise RuntimeError(f"backup date not found: {d}")
-        return p
+        if p.is_symlink():
+            raise RuntimeError("restore source must not be a symlink")
+        resolved = p.resolve(strict=True)
+        if restrict_to_parent and not resolved.is_relative_to(remote_parent.resolve(strict=True)):
+            raise RuntimeError("restore source escapes configured local backup base")
+        return resolved
 
-    candidates = [x for x in remote_parent.iterdir() if x.is_dir() and _DATE_RE.match(x.name)]
+    candidates = [x for x in remote_parent.iterdir() if x.is_dir() and not x.is_symlink() and _DATE_RE.match(x.name)]
     if not candidates:
         raise RuntimeError(f"no backups found in {remote_parent}")
     candidates.sort(key=lambda x: x.name, reverse=True)
-    return candidates[0]
+    resolved = candidates[0].resolve(strict=True)
+    if restrict_to_parent and not resolved.is_relative_to(remote_parent.resolve(strict=True)):
+        raise RuntimeError("restore source escapes configured local backup base")
+    return resolved
 
 
 def _read_backup_marker(backup_dir: Path) -> dict[str, Any]:
@@ -4767,7 +4901,10 @@ def _instance_remote_parent(
     *,
     remote_root_dir: str | None = None,
 ) -> Path:
-    base = str(remote_root_dir or cfg.backup_remote_root_dir or "backup").strip().strip("/")
+    base = _validate_storage_relative(
+        str(remote_root_dir or cfg.backup_remote_root_dir or "backup"),
+        field="remote_root_dir",
+    )
     parts = [p for p in [base, host_name, "instances", _instance_slug(inst)] if p]
     current = mount_path
     for part in parts:
@@ -4797,13 +4934,13 @@ def backup_instance_run(
 
     tmp_dir: Path | None = None
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
+    storage_attached = False
     run_state = dict(state)
     try:
-        if not cfg.backup_ssh_host or not cfg.backup_ssh_user:
-            raise RuntimeError("backup storage is not configured ([backup.storage].host/user)")
-        if not cfg.backup_ssh_key_file and not cfg.backup_ssh_password:
-            raise RuntimeError("backup storage auth is not configured (key_file or password required)")
-        tool_state = _ensure_cluster_tools(cfg, {"sshfs", "mydumper"})
+        _validate_cfg(cfg)
+        storage_kind = _backup_storage_kind(cfg)
+        tools = {"mydumper"} if storage_kind == "local" else {"sshfs", "mydumper"}
+        tool_state = _ensure_cluster_tools(cfg, tools)
         if not shutil.which("tar") or not shutil.which("gzip"):
             raise RuntimeError("tar/gzip are required for instance backup")
         instances = _list_instances(cfg)
@@ -4811,7 +4948,13 @@ def backup_instance_run(
         if not inst.db:
             raise RuntimeError(f"instance has no DB credentials: {inst.name}")
         effective_db = _effective_db_for_instance(cfg, inst)
+        mount_path, storage_attached = _open_backup_storage(cfg)
+        instance_root = Path(inst.root).resolve(strict=True)
+        if mount_path == instance_root or mount_path.is_relative_to(instance_root) or instance_root.is_relative_to(mount_path):
+            raise RuntimeError("backup local_path and instance root must not overlap")
         remote_parent = _instance_remote_parent(cfg, mount_path, host_name, inst, remote_root_dir=remote_root_dir)
+        if storage_kind == "local":
+            _validate_local_destination(mount_path, remote_parent)
         backup_name = _fmt_local_ts()
         tmp_dir = remote_parent / f".incomplete-{backup_name}"
         final_dir = remote_parent / backup_name
@@ -4830,8 +4973,9 @@ def backup_instance_run(
         )
         _json_write(state_path, run_state)
 
-        _mount(cfg, mount_path)
         remote_parent.mkdir(parents=True, exist_ok=True)
+        if storage_kind == "local":
+            _validate_local_destination(mount_path, remote_parent)
         _removed_incomplete, failed_incomplete = _cleanup_incomplete_dirs(remote_parent)
         if failed_incomplete:
             raise RuntimeError(
@@ -4850,6 +4994,8 @@ def backup_instance_run(
             raise RuntimeError(f"instance backup verification failed for {effective_db.name}: {verify_msg}")
         file_bytes = _asset_bytes(files_archive)
         bytes_written = int(db_bytes) + int(file_bytes)
+        if storage_kind == "local":
+            _validate_local_storage_root(cfg)
         os.replace(tmp_dir, final_dir)
         tmp_dir = None
         retention_removed: list[str] = []
@@ -4985,7 +5131,8 @@ def backup_instance_run(
         return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
     finally:
         try:
-            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+            if storage_attached:
+                _unmount(mount_path, cfg.backup_unmount_timeout_sec)
         except Exception:
             pass
         try:
@@ -5522,7 +5669,7 @@ def backup_restore(
     state = _json_read(state_path)
     host_name = _host_name(cfg)
     mount_path = Path(cfg.backup_mount_base_dir) / _host_slug(cfg)
-    remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), host_name)
+    storage_attached = False
     start_monotonic = time.monotonic()
 
     lock_fh = lock_path.open("w", encoding="utf-8")
@@ -5536,9 +5683,15 @@ def backup_restore(
         )
 
     try:
-        _mount(cfg, mount_path)
+        mount_path, storage_attached = _open_backup_storage(cfg)
+        remote_parent = mount_path / _format_remote_dir(_host_backup_remote_root_dir(cfg), host_name)
         remote_parent.mkdir(parents=True, exist_ok=True)
-        source_dir = _resolve_restore_source(remote_parent=remote_parent, date=date, path=path)
+        source_dir = _resolve_restore_source(
+            remote_parent=remote_parent,
+            date=date,
+            path=path,
+            restrict_to_parent=_backup_storage_kind(cfg) == "local",
+        )
         marker = _read_backup_marker(source_dir)
 
         if cfg.backup_restore_apply_files:
@@ -5551,7 +5704,10 @@ def backup_restore(
             db_root = source_dir / "databases"
             if db_root.exists() and db_root.is_dir():
                 instances = _list_instances(cfg, force_rescan=True)
-                for dump_dir in sorted([x for x in db_root.iterdir() if x.is_dir()], key=lambda p: p.name):
+                for dump_dir in sorted(
+                    [x for x in db_root.iterdir() if x.is_dir() and not x.is_symlink()],
+                    key=lambda p: p.name,
+                ):
                     db = _candidate_db(dump_dir, instances, cfg)
                     if db is None:
                         continue
@@ -5619,7 +5775,8 @@ def backup_restore(
         return BackupResult(ok=False, message=str(e), state_path=str(state_path), duration_sec=duration)
     finally:
         try:
-            _unmount(mount_path, cfg.backup_unmount_timeout_sec)
+            if storage_attached:
+                _unmount(mount_path, cfg.backup_unmount_timeout_sec)
         except Exception:
             pass
         try:
@@ -5788,6 +5945,9 @@ def backup_profile_for_push(config: AgentConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "enabled": bool(cfg.backup_enabled),
         "storage": {
+            "kind": _backup_storage_kind(cfg),
+            "local_path": cfg.backup_local_path,
+            "require_mount": bool(cfg.backup_local_require_mount),
             "host": cfg.backup_ssh_host,
             "port": int(cfg.backup_ssh_port),
             "user": cfg.backup_ssh_user,

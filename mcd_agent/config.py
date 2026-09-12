@@ -729,6 +729,9 @@ class AgentConfig:
     backup_state_dir: str
     backup_lock_dir: str
     backup_mount_base_dir: str
+    backup_storage_kind: str
+    backup_local_path: str
+    backup_local_require_mount: bool
     backup_remote_root_dir: str
     backup_host_name: str | None
     backup_instance_name: str | None
@@ -3327,6 +3330,9 @@ def _load_config_inner(path: str) -> AgentConfig:
         backup_state_dir=str(backup.get("state_dir", "/opt/mcd/var/state/backup")),
         backup_lock_dir=str(backup.get("lock_dir", "/opt/mcd/var/locks")),
         backup_mount_base_dir=str(backup.get("mount_base_dir", "/opt/mcd/var/backup/mounts")),
+        backup_storage_kind=str(backup_storage.get("kind", "sftp")).strip().lower() or "sftp",
+        backup_local_path=str(backup_storage.get("local_path", "")).strip(),
+        backup_local_require_mount=bool(backup_storage.get("require_mount", True)),
         backup_remote_root_dir=str(backup.get("remote_root_dir", "backup")),
         backup_host_name=str(backup.get("host_name")).strip() if backup.get("host_name") else None,
         backup_instance_name=str(backup.get("instance_name")).strip() if backup.get("instance_name") else None,

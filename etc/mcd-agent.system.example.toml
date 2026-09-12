@@ -597,7 +597,13 @@ pre_pause_sec = 3600
 key_path = "/opt/mcd/var/keys/backup-secrets.key"
 
 [backup.storage]
-# SSHFS target credentials/path.
+# Transport: sftp (existing SSHFS behavior) or local (pre-mounted filesystem).
+kind = "sftp"
+# For kind=local: absolute root-owned target. MCD does not mount/unmount it.
+local_path = ""
+# Fail closed if local_path is not currently a mountpoint.
+require_mount = true
+# SSHFS target credentials/path for kind=sftp.
 host = ""
 port = 22
 user = ""
