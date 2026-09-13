@@ -88,6 +88,12 @@ def build_runtime_profile(
     install_name = normalize_install_type(install_type)
     declared = normalize_capabilities(capabilities)
     effective = _HOST_DEFAULT_CAPABILITIES if runtime_name == "host" and not declared else declared
+    if (
+        runtime_name == "host"
+        and install_name in KNOWN_INSTALL_TYPES
+        and {"filesystem", "console"}.issubset(effective)
+    ):
+        effective = effective | {MAUTIC_PATCH_PREFLIGHT_OPERATION}
     blockers: list[str] = []
     if runtime_name not in KNOWN_RUNTIMES:
         blockers.append(f"unsupported runtime: {runtime_name}")
@@ -120,7 +126,9 @@ def build_runtime_profile(
         if "filesystem" in effective:
             operations.add("filesystem-operations")
         if install_name in KNOWN_INSTALL_TYPES and "host-managed-upgrade" in effective:
-            operations.update({"core-upgrade", MAUTIC_PATCH_PREFLIGHT_OPERATION})
+            operations.add("core-upgrade")
+        if install_name in KNOWN_INSTALL_TYPES and {"filesystem", "console"}.issubset(effective):
+            operations.add(MAUTIC_PATCH_PREFLIGHT_OPERATION)
         if install_name == "zip" and {"filesystem", "database", "console"}.issubset(effective):
             operations.add("composer-move")
         if install_name in KNOWN_INSTALL_TYPES and "filesystem" in effective:

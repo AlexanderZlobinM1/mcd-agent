@@ -14,7 +14,7 @@ from mcd_agent.install_type import detect_install_type
 
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
-MINIMUM_AGENT_VERSION = "1.2.17"
+MINIMUM_AGENT_VERSION = "1.2.18"
 PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
 ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
 ASSET = "M7-ASSET-MAPPER-WEBROOT"

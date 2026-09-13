@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.18 - 2026-09-13
+
+- Advertise `mcd-mautic-patch-preflight-v1` in outbound runtime capabilities
+  and derived operations for supported host ZIP/Composer profiles that
+  explicitly declare filesystem and console, without requiring the optional
+  `host-managed-upgrade` policy token.
+- Keep Docker/image-managed profiles fail-closed and retain `core-upgrade` as a
+  separately declared host-managed operation.
+
 ## 1.2.17 - 2026-09-13
 
 - Advertise the versioned `mcd-mautic-patch-preflight-v1` capability and its

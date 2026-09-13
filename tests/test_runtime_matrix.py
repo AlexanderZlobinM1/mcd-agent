@@ -30,6 +30,23 @@ def test_host_zip_supports_composer_move_but_host_composer_does_not() -> None:
     assert composer.allows("backup")
 
 
+def test_host_explicit_runtime_advertises_atomic_patch_preflight() -> None:
+    declared = ["console", "database", "filesystem", "plugin-read", "plugin-write"]
+    for install_type in ("zip", "composer"):
+        profile = build_runtime_profile(
+            runtime="host", install_type=install_type, capabilities=declared
+        )
+        assert profile.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
+        assert MAUTIC_PATCH_PREFLIGHT_OPERATION in profile.capabilities
+        assert not profile.allows("core-upgrade")
+
+    missing_filesystem = build_runtime_profile(
+        runtime="host", install_type="composer", capabilities=["console", "database"]
+    )
+    assert not missing_filesystem.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
+    assert MAUTIC_PATCH_PREFLIGHT_OPERATION not in missing_filesystem.capabilities
+
+
 def test_docker_composer_uses_image_upgrade_and_explicit_plugin_capability() -> None:
     profile = build_runtime_profile(
         runtime="docker",

@@ -1,11 +1,15 @@
-# Mautic patch-plan boundary (MCD 1.2.17)
+# Mautic patch-plan boundary (MCD 1.2.18)
 
 ## Atomic preflight handoff
 
 The managed 7.1.3 -> 7.2.0 flow uses `mcd-mautic-patch-preflight-v1`. MCD
-1.2.17 advertises that exact capability in host ZIP/Composer
-`runtime_profile.operations` and its minimum version in `mcd-cli
+1.2.18 advertises that exact capability in host ZIP/Composer outbound
+`runtime_capabilities` and derived `runtime_profile.operations`, and its
+minimum version in `mcd-cli
 mautic-patch-plan contract --json`; MCC must fail closed when it is absent.
+Explicit host runtime descriptors require `filesystem` and `console`; they do
+not need the separate `host-managed-upgrade` policy token to advertise the
+atomic patch-stage executor. Docker/image-managed profiles never advertise it.
 Before
 the first patch it snapshots the role migration, CoreBundle and AssetMapper
 files, applies all mandatory phases, verifies the complete fixed state and
