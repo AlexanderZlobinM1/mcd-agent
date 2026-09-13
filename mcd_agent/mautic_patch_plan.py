@@ -14,7 +14,7 @@ from mcd_agent.install_type import detect_install_type
 
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
-MINIMUM_AGENT_VERSION = "1.2.5"
+MINIMUM_AGENT_VERSION = "1.2.17"
 PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
 ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
 ASSET = "M7-ASSET-MAPPER-WEBROOT"
@@ -133,6 +133,7 @@ def _sha(data: bytes) -> str:
 
 def contract() -> dict[str, Any]:
     return {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "minimum_agent_version": MINIMUM_AGENT_VERSION,
+            "capabilities": [PREFLIGHT_SCHEMA],
             "source_version": "7.1.3", "target_version": "7.2.0", "install_types": ["zip", "composer"],
             "patches": [{"id": key, **value, "conflicts_with": []} for key, value in _PATCHES.items()]}
 
@@ -149,6 +150,45 @@ def parse_plan(raw: str) -> dict[str, Any]:
     if set(plan) != {"schema", "registry_revision", "source_version", "target_version", "install_type", "patches"} or plan["patches"] != patches:
         raise PatchPlanError("unknown_patch_id_or_plan_order")
     return plan
+
+
+def validate_upgrade_plan(raw: str, source_version: str, target_version: str, install_type: str) -> dict[str, Any]:
+    """Validate catalog selection before the upgrade mutates the installation."""
+    plan = parse_plan(raw)
+    if plan["source_version"] != source_version:
+        raise PatchPlanError("source_version_mismatch")
+    if plan["target_version"] != target_version:
+        raise PatchPlanError("target_version_mismatch")
+    if plan["install_type"] != install_type:
+        raise PatchPlanError("install_type_mismatch")
+    return plan
+
+
+def rejected_preflight(run_id: str | None, reason: str) -> dict[str, Any]:
+    """Return the stable terminal evidence shape for rejection before snapshot."""
+    return {
+        "schema": PREFLIGHT_SCHEMA,
+        "operation": "patch_preflight",
+        "run_id": run_id or "",
+        "plan_sha256": None,
+        "snapshot_id": None,
+        "resolved_source_root": None,
+        "upgrade_started": False,
+        "selected": [],
+        "applied": [],
+        "status": "error",
+        "reason": reason,
+        "phases": [],
+        "verification": {},
+        "rollback_attempted": False,
+        "rollback_succeeded": False,
+        "hard_incident": False,
+        "rollback_reason": None,
+        "pre_patch_hashes": {},
+        "post_patch_hashes": {},
+        "restore_hashes": {},
+        "restored": [],
+    }
 
 
 def _inside(root: Path, relative: str) -> Path:
@@ -386,6 +426,10 @@ def atomic_preflight(root_value: str, raw_plan: str, run_id: str) -> dict[str, A
         "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()),
         "snapshot_id": snapshot["snapshot_id"], "resolved_source_root": str(source),
         "upgrade_started": False, "selected": [ROLE, ASSET], "applied": [],
+        "rollback_attempted": False, "rollback_succeeded": False,
+        "hard_incident": False, "rollback_reason": None,
+        "pre_patch_hashes": {item["path"]: item["sha256"] for item in snapshot["files"]},
+        "post_patch_hashes": {}, "restore_hashes": {}, "restored": [],
     }
     _save(run, {**context, "status": "pending", "snapshot": snapshot})
     evidence: list[dict[str, Any]] = []

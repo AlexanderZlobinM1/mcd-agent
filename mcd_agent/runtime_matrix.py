@@ -5,6 +5,7 @@ from typing import Iterable
 
 
 MATRIX_SCHEMA = "mautic-runtime-matrix-v1"
+MAUTIC_PATCH_PREFLIGHT_OPERATION = "mcd-mautic-patch-preflight-v1"
 KNOWN_RUNTIMES = frozenset({"host", "docker"})
 KNOWN_INSTALL_TYPES = frozenset({"zip", "composer"})
 
@@ -119,7 +120,7 @@ def build_runtime_profile(
         if "filesystem" in effective:
             operations.add("filesystem-operations")
         if install_name in KNOWN_INSTALL_TYPES and "host-managed-upgrade" in effective:
-            operations.add("core-upgrade")
+            operations.update({"core-upgrade", MAUTIC_PATCH_PREFLIGHT_OPERATION})
         if install_name == "zip" and {"filesystem", "database", "console"}.issubset(effective):
             operations.add("composer-move")
         if install_name in KNOWN_INSTALL_TYPES and "filesystem" in effective:
@@ -131,6 +132,7 @@ def build_runtime_profile(
         operations.difference_update(
             {
                 "core-upgrade",
+                MAUTIC_PATCH_PREFLIGHT_OPERATION,
                 "composer-move",
                 "filesystem-operations",
                 "image-sync",
@@ -144,6 +146,7 @@ def build_runtime_profile(
         operations.difference_update(
             {
                 "core-upgrade",
+                MAUTIC_PATCH_PREFLIGHT_OPERATION,
                 "composer-move",
                 "image-sync",
                 "migration-source",

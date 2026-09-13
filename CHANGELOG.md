@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.2.17 - 2026-09-13
+
+- Advertise the versioned `mcd-mautic-patch-preflight-v1` capability and its
+  minimum agent version through the patch-plan contract.
+- Validate the complete catalog plan against the actual source, target and
+  install type before upgrade mutation, and emit a stable terminal evidence
+  shape for every success and fail-closed rejection.
+- Run the atomic patch hook whenever a strict plan is explicitly supplied while
+  preserving the mandatory managed Mautic 7.1.3 to 7.2.0 plan requirement.
+
 ## 1.2.16 - 2026-09-13
 
 - Restore instance backup files into the exact managed instance root and load

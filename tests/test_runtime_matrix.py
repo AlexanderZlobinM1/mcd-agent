@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mcd_agent.runtime_matrix import build_runtime_profile
+from mcd_agent.runtime_matrix import MAUTIC_PATCH_PREFLIGHT_OPERATION, build_runtime_profile
 
 
 def test_four_runtime_layout_combinations_have_stable_distinct_styles() -> None:
@@ -24,6 +24,8 @@ def test_host_zip_supports_composer_move_but_host_composer_does_not() -> None:
     assert not composer.allows("composer-move")
     assert zipped.allows("core-upgrade")
     assert composer.allows("core-upgrade")
+    assert zipped.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
+    assert composer.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
     assert zipped.allows("backup")
     assert composer.allows("backup")
 
@@ -46,6 +48,7 @@ def test_docker_composer_uses_image_upgrade_and_explicit_plugin_capability() -> 
     assert profile.allows("plugin-install")
     assert profile.allows("image-sync")
     assert not profile.allows("core-upgrade")
+    assert not profile.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
     assert not profile.allows("composer-move")
     assert not profile.allows("runtime-package-mutation")
 

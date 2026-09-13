@@ -1868,8 +1868,8 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--target", help="Explicit target Mautic version")
     up.add_argument("--allow-minor", action="store_true", help="Allow a forward minor upgrade within the current major")
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
-    up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for the 7.1.3 to 7.2.0 flow")
-    up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the MCC patch-plan run")
+    up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for an atomic patch stage")
+    up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the atomic MCC patch-plan run")
     up.add_argument("--mcc-preflighted-single-instance", action="store_true", help="Root-only manual 7.1.3 to 7.2.0 apply: assert MCC single-instance preflight and explicit operator risk acknowledgement; bypass global release callbacks only for this exact invocation")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")

@@ -1644,16 +1644,30 @@ def run_upgrade_apply(
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
     patch_hook = None
-    if _parse_semver(current) == (7, 1, 3) and _parse_semver(target) == (7, 2, 0):
+    requires_patch_plan = _parse_semver(current) == (7, 1, 3) and _parse_semver(target) == (7, 2, 0)
+    has_patch_plan_input = bool(patch_plan_json or patch_run_id)
+    if requires_patch_plan or has_patch_plan_input:
         if not patch_plan_json or not patch_run_id:
-            raise RuntimeError("Mautic 7.1.3 -> 7.2.0 requires --patch-plan-json and --patch-run-id")
-        from mcd_agent.mautic_patch_plan import PatchPlanError, atomic_preflight
+            raise RuntimeError("Atomic Mautic patch stage requires --patch-plan-json and --patch-run-id")
+        from mcd_agent.mautic_patch_plan import (
+            PatchPlanError,
+            atomic_preflight,
+            rejected_preflight,
+            validate_upgrade_plan,
+        )
+
+        try:
+            validate_upgrade_plan(patch_plan_json, current, target, chosen_mode)
+        except PatchPlanError as exc:
+            evidence = rejected_preflight(patch_run_id, str(exc))
+            print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
+            raise RuntimeError(f"Mautic patch preflight rejected: {exc}") from exc
 
         def patch_hook(source_root: str) -> None:
             try:
                 evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id)
             except PatchPlanError as exc:
-                evidence = {"schema": "mcd-mautic-patch-preflight-v1", "status": "error", "run_id": patch_run_id, "reason": str(exc), "upgrade_started": False, "rollback_attempted": False, "rollback_succeeded": False, "hard_incident": False}
+                evidence = rejected_preflight(patch_run_id, str(exc))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
             if evidence.get("status") != "success":
                 raise RuntimeError(f"Mautic patch preflight rejected: {evidence.get('reason', 'unknown')}")

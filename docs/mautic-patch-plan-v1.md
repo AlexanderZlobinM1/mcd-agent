@@ -1,8 +1,12 @@
-# Mautic patch-plan boundary (MCD 1.2.7)
+# Mautic patch-plan boundary (MCD 1.2.17)
 
 ## Atomic preflight handoff
 
-The managed 7.1.3 -> 7.2.0 flow uses `mcd-mautic-patch-preflight-v1`. Before
+The managed 7.1.3 -> 7.2.0 flow uses `mcd-mautic-patch-preflight-v1`. MCD
+1.2.17 advertises that exact capability in host ZIP/Composer
+`runtime_profile.operations` and its minimum version in `mcd-cli
+mautic-patch-plan contract --json`; MCC must fail closed when it is absent.
+Before
 the first patch it snapshots the role migration, CoreBundle and AssetMapper
 files, applies all mandatory phases, verifies the complete fixed state and
 restores the exact snapshot on any failure. Partial patch application cannot
@@ -15,6 +19,11 @@ continue to Mautic migrations.
 failure sets `hard_incident=true` and reason
 `hard_incident:patch_preflight_rollback_failed`. MCC must preserve this object
 as the job result and keep the upgrade blocked when status is `error`.
+Every terminal result has the same contract fields, including early plan
+rejection before a snapshot exists. The plan is checked against the actual
+source version, requested target and detected install type before maintenance
+or source mutation. Supplying either plan argument requires both; an explicit
+strict plan enables the same atomic hook on its supported transition.
 
 The input remains `mcd-mautic-patch-plan-v1`, pinned to Mautic-Operations
 registry revision `8829d322409c66f8ec9e9abf57c9ac42a19022cc`. The exact sanitized

@@ -124,6 +124,30 @@ def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
     assert result["verification"]["role"]["state"] == "already"
     assert result["verification"]["asset"]["state"] == "already"
     assert result["upgrade_started"] is False
+    assert result["rollback_attempted"] is False
+    assert result["hard_incident"] is False
+    assert set(("schema", "operation", "run_id", "plan_sha256", "snapshot_id",
+                "resolved_source_root", "upgrade_started", "selected", "applied", "status",
+                "phases", "verification", "rollback_attempted", "rollback_succeeded",
+                "hard_incident", "rollback_reason", "pre_patch_hashes", "post_patch_hashes",
+                "restore_hashes", "restored")) <= set(result)
+
+
+def test_contract_advertises_atomic_preflight_capability():
+    advertised = patch.contract()
+    assert advertised["minimum_agent_version"] == "1.2.17"
+    assert advertised["capabilities"] == [patch.PREFLIGHT_SCHEMA]
+
+
+def test_upgrade_plan_validation_is_version_and_layout_pinned():
+    raw = plan("composer")
+    assert patch.validate_upgrade_plan(raw, "7.1.3", "7.2.0", "composer")["patches"]
+    with pytest.raises(patch.PatchPlanError, match="source_version_mismatch"):
+        patch.validate_upgrade_plan(raw, "7.1.2", "7.2.0", "composer")
+    with pytest.raises(patch.PatchPlanError, match="target_version_mismatch"):
+        patch.validate_upgrade_plan(raw, "7.1.3", "7.2.1", "composer")
+    with pytest.raises(patch.PatchPlanError, match="install_type_mismatch"):
+        patch.validate_upgrade_plan(raw, "7.1.3", "7.2.0", "zip")
 
 
 @pytest.mark.parametrize("kind", ["zip", "composer"])
