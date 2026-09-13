@@ -561,6 +561,9 @@ Important:
   - local targets are root-owned, non-symlink, non-world-writable active
     mountpoints by default; unsafe broad paths, traversal and instance/target
     overlap fail closed
+  - instance restore uses the generation marker to restore persistent files to
+    the exact managed instance root and Myloader data to the exact tenant DB;
+    missing targets or artifacts fail instead of returning a zero-work success
   - one run includes all discovered instance databases (with DB creds) + optional system files archive
   - remote layout: `/<remote_root_dir>/<host_name>/<YYYY-MM-DD>/...`
   - startup hygiene: stale `/.incomplete-*` directories from failed/aborted runs are cleaned automatically before a new backup starts

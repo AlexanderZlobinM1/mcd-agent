@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.2.16 - 2026-09-13
+
+- Restore instance backup files into the exact managed instance root and load
+  the marker-declared tenant database instead of applying host-level restore
+  heuristics.
+- Fail instance restore when its managed target, files archive or DB dump is
+  missing, and never use host/system MariaDB root authentication for this path.
+
 ## 1.2.15 - 2026-09-13
 
 - Add the opt-in `backup.storage.kind=local` transport for direct Mydumper and

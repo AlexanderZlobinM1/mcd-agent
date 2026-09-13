@@ -126,17 +126,26 @@ class BackupLocalStorageTests(unittest.TestCase):
             self.assertFalse(any(p.name.startswith(".incomplete-") for p in final.parent.iterdir()))
 
             loader = Mock()
+            tar_run = Mock()
+            cfg.backup_restore_apply_files = True
             with patch.object(backup, "_effective_cfg", return_value=cfg), patch.object(
                 backup, "_validate_cfg"
             ), patch.object(backup, "_validate_local_storage_root", return_value=target), patch.object(
                 backup, "_list_instances", return_value=[inst]
-            ), patch.object(backup, "_candidate_db", return_value=db), patch.object(
+            ), patch.object(backup, "_run", tar_run), patch.object(
                 backup, "_run_mysql_sql"
-            ), patch.object(backup, "_run_myloader", loader):
+            ) as mysql_sql, patch.object(backup, "_run_myloader", loader):
                 restored = backup.backup_restore(cfg, path=str(final))
 
             self.assertTrue(restored.ok, restored.message)
             loader.assert_called_once_with(cfg, db, final / "databases" / "tenant")
+            mysql_sql.assert_not_called()
+            self.assertEqual(tar_run.call_args.args[0][-2:], ["-C", str(source)])
+
+    def test_instance_restore_fails_when_marker_target_is_not_managed(self) -> None:
+        marker = {"dumped_instances": [{"root": "/srv/missing", "instance_uid": "missing", "database": "tenant"}]}
+        with self.assertRaisesRegex(RuntimeError, "not exactly present"):
+            backup._instance_restore_target(marker, [], None)
 
     def test_partial_failure_preserves_previous_completed_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_raw:

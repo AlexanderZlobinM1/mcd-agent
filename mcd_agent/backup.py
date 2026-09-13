@@ -2353,6 +2353,29 @@ def _read_backup_marker(backup_dir: Path) -> dict[str, Any]:
         return {}
 
 
+def _instance_restore_target(marker: dict[str, Any], instances: list[MauticInstall], requested_root: str | None) -> tuple[MauticInstall, DBConfig, str] | None:
+    rows = marker.get("dumped_instances")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return None
+    row = rows[0]
+    marker_root = str(row.get("root") or "").strip()
+    marker_uid = str(row.get("instance_uid") or "").strip()
+    database = str(row.get("database") or "").strip()
+    if not marker_root or not database:
+        raise RuntimeError("instance backup marker is missing root or database")
+    if requested_root and Path(requested_root).resolve() != Path(marker_root).resolve():
+        raise RuntimeError("requested restore root does not match instance backup marker")
+    matches = [inst for inst in instances if Path(inst.root).resolve() == Path(marker_root).resolve() or (marker_uid and str(inst.instance_uid or "") == marker_uid)]
+    if len(matches) != 1:
+        raise RuntimeError("instance backup target is not exactly present in managed inventory")
+    inst = matches[0]
+    if not inst.db:
+        raise RuntimeError("instance restore target has no tenant DB credentials")
+    if str(inst.db.name) != database:
+        raise RuntimeError("instance backup database does not match managed tenant DB")
+    return inst, inst.db, database
+
+
 def _safe_slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-") or "cluster"
 
@@ -5660,7 +5683,6 @@ def backup_restore(
     date: str | None = None,
     path: str | None = None,
 ) -> BackupResult:
-    _ = root
     cfg = _effective_cfg(config)
     _validate_cfg(cfg)
     lock_path = _lock_path(cfg)
@@ -5693,27 +5715,48 @@ def backup_restore(
             restrict_to_parent=_backup_storage_kind(cfg) == "local",
         )
         marker = _read_backup_marker(source_dir)
-
-        if cfg.backup_restore_apply_files:
-            files_archive = source_dir / cfg.backup_archive_name
-            if files_archive.exists():
-                _run(["tar", "-xzf", str(files_archive), "-C", "/"], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
-
         restored_dbs = 0
-        if cfg.backup_restore_apply_databases:
-            db_root = source_dir / "databases"
-            if db_root.exists() and db_root.is_dir():
-                instances = _list_instances(cfg, force_rescan=True)
-                for dump_dir in sorted(
-                    [x for x in db_root.iterdir() if x.is_dir() and not x.is_symlink()],
-                    key=lambda p: p.name,
-                ):
-                    db = _candidate_db(dump_dir, instances, cfg)
-                    if db is None:
-                        continue
-                    _run_mysql_sql(cfg, db, f"CREATE DATABASE IF NOT EXISTS `{db.name}`")
-                    _run_myloader(cfg, db, dump_dir)
-                    restored_dbs += 1
+        restored_files = False
+        instances = _list_instances(cfg, force_rescan=True)
+        instance_target = _instance_restore_target(marker, instances, root)
+        if instance_target is not None:
+            inst, db, database = instance_target
+            if cfg.backup_restore_apply_files:
+                files_archive = source_dir / "files.tar.gz"
+                if not files_archive.is_file() or files_archive.is_symlink():
+                    raise RuntimeError("instance backup files archive is missing or unsafe")
+                target_root = Path(inst.root)
+                if not target_root.is_dir() or target_root.is_symlink():
+                    raise RuntimeError("managed instance restore root is missing or unsafe")
+                _run(["tar", "-xzf", str(files_archive), "-C", str(target_root)], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+                restored_files = True
+            if cfg.backup_restore_apply_databases:
+                dump_dir = source_dir / "databases" / database
+                if not dump_dir.is_dir() or dump_dir.is_symlink():
+                    raise RuntimeError("instance backup database dump is missing or unsafe")
+                _run_myloader(cfg, db, dump_dir)
+                restored_dbs = 1
+            if not restored_files and restored_dbs == 0:
+                raise RuntimeError("instance restore performed no enabled recovery step")
+        else:
+            if cfg.backup_restore_apply_files:
+                files_archive = source_dir / cfg.backup_archive_name
+                if files_archive.exists():
+                    _run(["tar", "-xzf", str(files_archive), "-C", "/"], timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+                    restored_files = True
+            if cfg.backup_restore_apply_databases:
+                db_root = source_dir / "databases"
+                if db_root.exists() and db_root.is_dir():
+                    for dump_dir in sorted(
+                        [x for x in db_root.iterdir() if x.is_dir() and not x.is_symlink()],
+                        key=lambda p: p.name,
+                    ):
+                        db = _candidate_db(dump_dir, instances, cfg)
+                        if db is None:
+                            continue
+                        _run_mysql_sql(cfg, db, f"CREATE DATABASE IF NOT EXISTS `{db.name}`")
+                        _run_myloader(cfg, db, dump_dir)
+                        restored_dbs += 1
 
         duration = int(time.monotonic() - start_monotonic)
         last = dict(state)
@@ -5726,6 +5769,7 @@ def backup_restore(
             "duration_sec": duration,
             "backup_path": str(source_dir),
             "restored_databases": restored_dbs,
+            "restored_files": restored_files,
         }
         history = [hist_item] + history[:19]
         last.update(
@@ -5736,6 +5780,7 @@ def backup_restore(
                 "last_restore_path": str(source_dir),
                 "last_restore_duration_sec": duration,
                 "last_restore_databases": restored_dbs,
+                "last_restore_files": restored_files,
                 "history": history,
             }
         )
