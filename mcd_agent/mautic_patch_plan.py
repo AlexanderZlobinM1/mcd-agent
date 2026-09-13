@@ -14,7 +14,7 @@ from mcd_agent.install_type import detect_install_type
 
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
-MINIMUM_AGENT_VERSION = "1.2.18"
+MINIMUM_AGENT_VERSION = "1.2.19"
 PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
 ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
 ASSET = "M7-ASSET-MAPPER-WEBROOT"
@@ -129,6 +129,11 @@ class PatchPlanError(RuntimeError):
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _plan_sha(plan: dict[str, Any]) -> str:
+    canonical = json.dumps(plan, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return _sha(canonical.encode("utf-8"))
 
 
 def contract() -> dict[str, Any]:
@@ -336,7 +341,7 @@ def rollback(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
     result_path = _inside(root, ".mcd/patch-runs/" + run_id + "/result.json")
     if not result_path.is_file(): raise PatchPlanError("rollback_evidence_not_found")
     evidence = json.loads(result_path.read_text(encoding="utf-8"))
-    if evidence.get("plan_sha256") != _sha(json.dumps(plan, sort_keys=True).encode()):
+    if evidence.get("plan_sha256") != _plan_sha(plan):
         raise PatchPlanError("stale_run_plan")
     restored: list[dict[str, Any]] = []
     records = list(reversed(evidence.get("backup_records", [])))
@@ -423,7 +428,7 @@ def atomic_preflight(root_value: str, raw_plan: str, run_id: str) -> dict[str, A
     snapshot = _preflight_snapshot(source, run, plan)
     context: dict[str, Any] = {
         "schema": PREFLIGHT_SCHEMA, "operation": "patch_preflight", "run_id": run_id,
-        "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()),
+        "plan_sha256": _plan_sha(plan),
         "snapshot_id": snapshot["snapshot_id"], "resolved_source_root": str(source),
         "upgrade_started": False, "selected": [ROLE, ASSET], "applied": [],
         "rollback_attempted": False, "rollback_succeeded": False,
@@ -488,7 +493,7 @@ def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: 
     if operation not in {"verify", "apply"} or not selected: raise PatchPlanError("unsupported_operation_or_phase")
     run = _inside(root, ".mcd/patch-runs/" + run_id)
     context = {"operation": operation, "run_id": run_id, "phase": phase, "registry_revision": REGISTRY_REVISION,
-               "plan_sha256": _sha(json.dumps(plan, sort_keys=True).encode()), "resolved_source_root": str(source)}
+               "plan_sha256": _plan_sha(plan), "resolved_source_root": str(source)}
     previous_path = _inside(run, "result.json")
     if previous_path.is_file():
         previous = json.loads(previous_path.read_text(encoding="utf-8"))

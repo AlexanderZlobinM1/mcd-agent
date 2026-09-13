@@ -39,6 +39,50 @@ class MauticVersionCacheTest(unittest.TestCase):
                 self.assertEqual(actual, "6.0.9")
                 self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "6.0.9")
 
+    def test_newer_same_major_metadata_refreshes_stale_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site" / "public_html"
+            root.mkdir(parents=True)
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.2.0"}]}',
+                encoding="utf-8",
+            )
+            generated = Path(td) / "generated"
+
+            with (
+                patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", generated),
+                patch.object(mautic_version_cache, "_read_version_from_mcd_source", return_value="7.2.0") as runtime,
+            ):
+                mautic_version_cache.write_mautic_version_cache(root, "7.1.3")
+                actual = mautic_version_cache.collect_mautic_version(
+                    str(root), "/usr/bin/php", expected_major=7
+                )
+
+                self.assertEqual(actual, "7.2.0")
+                self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "7.2.0")
+                runtime.assert_called_once()
+
+    def test_older_package_metadata_does_not_downgrade_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            root.mkdir()
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}',
+                encoding="utf-8",
+            )
+            generated = Path(td) / "generated"
+
+            with (
+                patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", generated),
+                patch.object(mautic_version_cache, "_read_version_from_mcd_source") as runtime,
+            ):
+                mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
+                self.assertEqual(
+                    mautic_version_cache.collect_mautic_version(str(root), "/usr/bin/php"),
+                    "7.2.0",
+                )
+                runtime.assert_not_called()
+
     def test_migrates_legacy_cache_outside_instance_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "var" / "www" / "site" / "public_html"

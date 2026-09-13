@@ -285,6 +285,7 @@ Notes:
 - `php_fpm` apply includes FPM pool/opcache/redis tuning. Global managed `98-mcd-php.ini` baseline is no longer used; legacy files are removed on apply if present.
 - APT profile includes one-time Zabbix DB monitor bootstrap (`zbx_monitor@127.0.0.1`) with marker tracking and manual override via `mcd-cli zabbix bootstrap-mysql-user --force`.
 - Zabbix monitors host services and hardware only. It does not receive per-instance Mautic version cache files; MCD keeps its internal, non-migrated state cache under `/opt/mcd/generated/`.
+- Inventory keeps that cache lightweight, but invalidates it when local Composer or release metadata proves the installation advanced; the authoritative runtime is then probed before the next state payload.
 - APT profile includes modular one-time repo profiles with local markers (`/opt/mcd/var/apt-repo-profiles.json`):
   - `db_repo_profile` (auto-detect: MariaDB/Percona/MySQL families),
   - `ondrej_php_profile`,

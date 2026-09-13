@@ -99,6 +99,51 @@ def _version_major(version: str | None) -> int | None:
         return None
 
 
+def _version_tuple(version: str | None) -> tuple[int, int, int] | None:
+    match = _SEMVER_RE.search(str(version or ""))
+    if not match:
+        return None
+    try:
+        parts = match.group(1).split(".")
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+def _read_version_from_release_metadata(root: Path) -> str | None:
+    versions: list[str] = []
+    for relative in (
+        "app/release_metadata.json",
+        "app/bundles/CoreBundle/release_metadata.json",
+        "docroot/app/release_metadata.json",
+        "docroot/app/bundles/CoreBundle/release_metadata.json",
+        "public/app/release_metadata.json",
+        "public/app/bundles/CoreBundle/release_metadata.json",
+    ):
+        path = root / relative
+        if not path.is_file():
+            continue
+        try:
+            value = str(json.loads(path.read_text(encoding="utf-8")).get("version", "")).strip()
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if _version_tuple(value) is not None:
+            versions.append(value)
+    return max(versions, key=lambda value: _version_tuple(value) or (0, 0, 0)) if versions else None
+
+
+def _newer_local_version_metadata(root: Path, cached: str) -> str | None:
+    cached_version = _version_tuple(cached)
+    if cached_version is None:
+        return None
+    candidates = [
+        value
+        for value in (_read_version_from_composer_lock(root), _read_version_from_release_metadata(root))
+        if value is not None and (_version_tuple(value) or (0, 0, 0)) > cached_version
+    ]
+    return max(candidates, key=lambda value: _version_tuple(value) or (0, 0, 0)) if candidates else None
+
+
 def _read_version_from_composer_lock(root: Path) -> str | None:
     lock = root / "composer.lock"
     if not lock.exists():
@@ -322,6 +367,9 @@ def collect_mautic_version(
             if version and expected_major is not None and _version_major(version) != int(expected_major):
                 version = None
             if version:
+                if _newer_local_version_metadata(candidate, version):
+                    version = None
+                    break
                 detected_root = candidate
                 break
 

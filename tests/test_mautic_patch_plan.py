@@ -135,8 +135,16 @@ def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
 
 def test_contract_advertises_atomic_preflight_capability():
     advertised = patch.contract()
-    assert advertised["minimum_agent_version"] == "1.2.18"
+    assert advertised["minimum_agent_version"] == "1.2.19"
     assert advertised["capabilities"] == [patch.PREFLIGHT_SCHEMA]
+
+
+def test_plan_checksum_uses_compact_sorted_canonical_json():
+    payload = json.loads(plan())
+    expected = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert patch._plan_sha(payload) == expected
 
 
 def test_upgrade_plan_validation_is_version_and_layout_pinned():

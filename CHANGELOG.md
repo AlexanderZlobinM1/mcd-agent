@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.2.19 - 2026-09-14
+
+- Reconcile a cached Mautic version when local Composer or release metadata
+  proves that the installation has advanced, then refresh from the authoritative
+  runtime before the next inventory payload. Never downgrade a newer cache from
+  older package metadata.
+- Define patch-plan evidence SHA-256 over compact, key-sorted canonical JSON so
+  MCC and MCD verify the same plan bytes after a successful atomic patch stage.
+- Keep stale-source admission fail-closed; a preflighted 7.1.3 to 7.2.0 job is
+  rejected when the authoritative runtime has already advanced.
+
 ## 1.2.18 - 2026-09-13
 
 - Advertise `mcd-mautic-patch-preflight-v1` in outbound runtime capabilities

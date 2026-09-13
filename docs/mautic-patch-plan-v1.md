@@ -1,4 +1,4 @@
-# Mautic patch-plan boundary (MCD 1.2.18)
+# Mautic patch-plan boundary (MCD 1.2.19)
 
 ## Atomic preflight handoff
 
@@ -10,6 +10,9 @@ mautic-patch-plan contract --json`; MCC must fail closed when it is absent.
 Explicit host runtime descriptors require `filesystem` and `console`; they do
 not need the separate `host-managed-upgrade` policy token to advertise the
 atomic patch-stage executor. Docker/image-managed profiles never advertise it.
+Patch-plan SHA-256 uses compact, key-sorted JSON with ASCII escaping, matching
+the MCC job payload checksum independently of insignificant whitespace or key
+order.
 Before
 the first patch it snapshots the role migration, CoreBundle and AssetMapper
 files, applies all mandatory phases, verifies the complete fixed state and
