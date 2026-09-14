@@ -13,6 +13,7 @@ MIN_INTERVAL_SEC = 10
 class RecurringPrioritySegment:
     segment_id: int
     max_interval_sec: int
+    instance_uid: str
 
 
 def _instance_keys(inst: object) -> list[str]:
@@ -33,9 +34,11 @@ def entries_for_instance(settings: object, inst: object) -> list[RecurringPriori
     if not isinstance(settings, dict):
         return []
     raw: object = None
+    matched_scope_key = ""
     for key in _instance_keys(inst):
         if key in settings:
             raw = settings[key]
+            matched_scope_key = key
             break
     if raw is None:
         aliases = set(_instance_keys(inst))
@@ -45,7 +48,8 @@ def entries_for_instance(settings: object, inst: object) -> list[RecurringPriori
             if "@" in str(key) and str(key).split("@", 1)[0] in aliases
         ]
         if len(canonical) == 1:
-            raw = settings[canonical[0]]
+            matched_scope_key = canonical[0]
+            raw = settings[matched_scope_key]
     if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
         return []
 
@@ -62,7 +66,11 @@ def entries_for_instance(settings: object, inst: object) -> list[RecurringPriori
             continue
         intervals[segment_id] = min(interval_sec, intervals.get(segment_id, interval_sec))
     return [
-        RecurringPrioritySegment(segment_id=segment_id, max_interval_sec=intervals[segment_id])
+        RecurringPrioritySegment(
+            segment_id=segment_id,
+            max_interval_sec=intervals[segment_id],
+            instance_uid=matched_scope_key or str(getattr(inst, "instance_uid", "") or ""),
+        )
         for segment_id in sorted(intervals)
     ]
 

@@ -7106,7 +7106,7 @@ def _dispatch_recurring_priority_segments(
     enabled: bool,
 ) -> int:
     root = str(getattr(inst, "root", "") or "")
-    instance_uid = str(getattr(inst, "instance_uid", "") or "")
+    local_instance_uid = str(getattr(inst, "instance_uid", "") or "")
     expected_keys = {recurring_priority_state_key(root, int(getattr(entry, "segment_id"))) for entry in entries}
     stale_keys = [key for key, _payload in store.list_runtime_sync(f"segment_recurring_priority:{root}:") if key not in expected_keys]
     if stale_keys:
@@ -7118,6 +7118,7 @@ def _dispatch_recurring_priority_segments(
     for entry in entries:
         segment_id = int(getattr(entry, "segment_id"))
         interval_sec = int(getattr(entry, "max_interval_sec"))
+        instance_uid = str(getattr(entry, "instance_uid", "") or local_instance_uid)
         key = recurring_priority_state_key(root, segment_id)
         current = store.get_runtime_sync(key) or {}
         now = time.time()

@@ -33,6 +33,7 @@ def test_entries_are_explicit_instance_scoped_deduplicated_and_validated() -> No
     entries = entries_for_instance(settings, _inst())
 
     assert [(entry.segment_id, entry.max_interval_sec) for entry in entries] == [(86, 30)]
+    assert entries[0].instance_uid == "electronic.sales-snap.com@MauticFarm-02"
     assert entries_for_instance({"default": settings["default"]}, _inst()) == []
 
 
@@ -49,6 +50,7 @@ def test_entries_match_canonical_uid_when_local_inventory_uid_is_legacy() -> Non
     )
 
     assert [(entry.segment_id, entry.max_interval_sec) for entry in entries] == [(86, 60)]
+    assert entries[0].instance_uid == "electronic.sales-snap.com@MauticFarm-02"
 
 
 def test_state_payload_exposes_complete_observation_contract() -> None:
@@ -118,6 +120,7 @@ def test_dispatch_uses_isolated_lane_and_publishes_completion() -> None:
     assert executor.launch.call_args.kwargs["max_parallel"] == 1
     assert executor.launch.call_args.kwargs["interval_sec"] == 59
     assert store.put_runtime_sync.call_args_list[-1].args[1]["last_status"] == "ok"
+    assert store.put_runtime_sync.call_args_list[-1].args[1]["instance_uid"] == inst.instance_uid
 
 
 def test_dispatch_waits_for_existing_regular_segment_without_launching() -> None:

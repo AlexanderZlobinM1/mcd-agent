@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.24 - 2026-09-14
+
+- Publish recurring segment observations with the matched canonical instance
+  scope key so MCC can correlate delivery and telemetry when local inventory
+  still contains a legacy unqualified UID.
+
 ## 1.2.23 - 2026-09-14
 
 - Include canonical host-qualified instance UIDs in runtime override polls when
