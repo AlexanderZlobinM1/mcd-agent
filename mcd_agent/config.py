@@ -525,6 +525,7 @@ class AgentConfig:
     segment_whitelist: list[int]
     segment_whitelist_file: str | None
     segment_whitelist_instance_settings: dict[str, Any]
+    segment_recurring_priority_v1: dict[str, Any]
     campaign_whitelist: list[int]
     campaign_whitelist_file: str | None
     campaign_whitelist_instance_settings: dict[str, Any]
@@ -2102,6 +2103,7 @@ _RUNTIME_TO_ATTR: dict[str, str] = {
     "segment_whitelist": "segment_whitelist",
     "segment_whitelist_file": "segment_whitelist_file",
     "segment_whitelist_instance_settings": "segment_whitelist_instance_settings",
+    "segment_recurring_priority_v1": "segment_recurring_priority_v1",
     "campaign_whitelist": "campaign_whitelist",
     "campaign_whitelist_file": "campaign_whitelist_file",
     "campaign_whitelist_instance_settings": "campaign_whitelist_instance_settings",
@@ -2887,6 +2889,11 @@ def _load_config_inner(path: str) -> AgentConfig:
         segment_whitelist_instance_settings=(
             dict(runtime.get("segment_whitelist_instance_settings", {}))
             if isinstance(runtime.get("segment_whitelist_instance_settings", {}), dict)
+            else {}
+        ),
+        segment_recurring_priority_v1=(
+            dict(runtime.get("segment_recurring_priority_v1", {}))
+            if isinstance(runtime.get("segment_recurring_priority_v1", {}), dict)
             else {}
         ),
         campaign_whitelist=_normalize_int_list(runtime.get("campaign_whitelist", [])),

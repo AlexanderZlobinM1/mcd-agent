@@ -43,11 +43,15 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             {
                 "segment_whitelist_instance_settings": {
                     "/var/www/old/public_html": {"segment_whitelist": [86]},
-                }
+                },
+                "segment_recurring_priority_v1": {
+                    "/var/www/old/public_html": {"segments": [{"id": 86, "max_interval_sec": 60}]},
+                },
             },
             [inst],
         )
         self.assertEqual(states["app.sales-snap.com"]["segment_whitelist_instance_settings"]["segment_whitelist"], [86])
+        self.assertEqual(states["app.sales-snap.com"]["segment_recurring_priority_v1"]["segments"][0]["id"], 86)
         merged = merge_instance_desired_states(
             {},
             {
@@ -60,6 +64,10 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
         self.assertEqual(
             merged["segment_whitelist_instance_settings"]["app.sales-snap.com"]["segment_whitelist"],
             [86],
+        )
+        self.assertEqual(
+            merged["segment_recurring_priority_v1"]["app.sales-snap.com"]["segments"][0]["max_interval_sec"],
+            60,
         )
 
 

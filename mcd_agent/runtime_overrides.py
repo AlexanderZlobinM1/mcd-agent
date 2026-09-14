@@ -32,6 +32,7 @@ def _api_base(cfg: AgentConfig) -> str | None:
 
 _INSTANCE_RUNTIME_KEYS = {
     "segment_whitelist_instance_settings",
+    "segment_recurring_priority_v1",
     "campaign_whitelist_instance_settings",
     "page_hits_orphan_cleanup_instance_settings",
     "plugin_operation_instance_settings",

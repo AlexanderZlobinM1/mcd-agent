@@ -35,6 +35,7 @@ def test_segment_whitelist_instance_runtime_keys_are_stable() -> None:
     expected = {
         "segment_whitelist_instance_settings",
         "campaign_whitelist_instance_settings",
+        "segment_recurring_priority_v1",
     }
 
     assert expected <= daemon._STABLE_RUNTIME_KEYS

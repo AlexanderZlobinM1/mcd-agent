@@ -15,6 +15,7 @@ from mcd_agent.config import AgentConfig
 
 _SCHEDULER_MONITOR_PLAN_PREFIX = "scheduler_monitor_plan:"
 _SCHEDULER_FAIRNESS_KEY = "scheduler_fairness_state"
+_SEGMENT_RECURRING_PRIORITY_PREFIX = "segment_recurring_priority:"
 
 
 def _empty_scheduler_shadow() -> dict[str, Any]:
@@ -26,6 +27,7 @@ def _empty_scheduler_shadow() -> dict[str, Any]:
         "recent": [],
         "planned": [],
         "fairness": {},
+        "segment_recurring_priority_v1": [],
     }
 
 
@@ -225,6 +227,7 @@ def _shadow_running_tasks(
         return _empty_scheduler_shadow()
     planned_rows: list[sqlite3.Row] = []
     fairness: dict[str, Any] = {}
+    recurring_priority: list[dict[str, Any]] = []
     try:
         planned_rows = conn.execute(
             """
@@ -245,9 +248,19 @@ def _shadow_running_tasks(
             parsed_fairness = json.loads(raw_fairness) if raw_fairness else {}
             if isinstance(parsed_fairness, dict):
                 fairness = parsed_fairness
+        recurring_rows = conn.execute(
+            "SELECT payload_json FROM runtime_sync WHERE key LIKE ? ORDER BY key ASC",
+            (_SEGMENT_RECURRING_PRIORITY_PREFIX + "%",),
+        ).fetchall()
+        for recurring_row in recurring_rows:
+            raw_recurring = str(recurring_row["payload_json"] or "").strip()
+            parsed_recurring = json.loads(raw_recurring) if raw_recurring else {}
+            if isinstance(parsed_recurring, dict) and parsed_recurring.get("schema") == "mcd-segment-recurring-priority-v1":
+                recurring_priority.append(parsed_recurring)
     except Exception:
         planned_rows = []
         fairness = {}
+        recurring_priority = []
     finally:
         try:
             conn.close()
@@ -366,6 +379,7 @@ def _shadow_running_tasks(
         "recent": recent,
         "planned": planned,
         "fairness": fairness,
+        "segment_recurring_priority_v1": recurring_priority,
     }
 
 
@@ -669,6 +683,7 @@ def collect_signals(window_min: int = 15, cfg: AgentConfig | None = None) -> dic
             "recent": scheduler_shadow.get("recent", []),
             "planned": scheduler_shadow.get("planned", []),
             "fairness": scheduler_shadow.get("fairness", {}),
+            "segment_recurring_priority_v1": scheduler_shadow.get("segment_recurring_priority_v1", []),
         },
         "php_console_recent": console_rows[:20],
         "swap": swap_state,

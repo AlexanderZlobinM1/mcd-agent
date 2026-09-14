@@ -39,6 +39,10 @@ disable_throttle = true
 # Ignore all whitelist sources (true|false).
 disable_whitelist = true
 
+# Dedicated recurring lane, disabled when empty. Example:
+# segment_recurring_priority_v1 = { "site.example.com@host" = { segments = [{ id = 86, max_interval_sec = 60 }] } }
+segment_recurring_priority_v1 = {}
+
 # Segment weight threshold for entering priority ring.
 segment_priority_weight_threshold = 999999
 # Number of priority segment ids by score.

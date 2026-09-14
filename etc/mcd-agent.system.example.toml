@@ -137,6 +137,9 @@ segment_whitelist_file = "/etc/mcd/segment-whitelist.txt"
 # A setting may include a separately bounded realtime subset:
 # { segment_whitelist = [330], realtime = { ids = [332, 333], interval_sec = 15, parallel = 2 } }
 segment_whitelist_instance_settings = {}
+# Dedicated non-overlapping recurring segment lane, keyed by immutable instance UID.
+# segment_recurring_priority_v1 = { "site.example.com@host" = { segments = [{ id = 86, max_interval_sec = 60 }] } }
+segment_recurring_priority_v1 = {}
 # Campaign ids forced to priority ring.
 campaign_whitelist = []
 # Path to campaign whitelist file (one id per line).

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.22 - 2026-09-14
+
+- Add the opt-in `segment_recurring_priority_v1` instance/segment contract for
+  a dedicated MCD-managed single-flight lane with bounded start cadence.
+- Exclude configured recurring IDs from ordinary segment rings and share their
+  process lock so unrelated tenants and host-wide parallelism remain unchanged.
+- Publish active process, last/next run and terminal failure state through the
+  `mcd-segment-recurring-priority-v1` scheduler signal contract.
+
 ## 1.2.21 - 2026-09-14
 
 - Reject an already-installed target in the MCC-preflighted single-instance

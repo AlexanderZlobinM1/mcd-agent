@@ -126,6 +126,9 @@ from mcd_agent.ring_utils import reconcile_ring as _reconcile_ring
 from mcd_agent.service_profiles import service_profiles_apply_once
 from mcd_agent.self_update import _ensure_mcd_service_kill_mode, maybe_auto_update
 from mcd_agent.segment_filter_safety import format_segment_filter_issues, segment_invalid_filter_issues
+from mcd_agent.segment_recurring_priority import entries_for_instance as recurring_priority_entries_for_instance
+from mcd_agent.segment_recurring_priority import state_key as recurring_priority_state_key
+from mcd_agent.segment_recurring_priority import state_payload as recurring_priority_state_payload
 from mcd_agent.segment_sql_auto import DetectedSQLSegmentRule, detect_auto_sql_segment_rules
 from mcd_agent.segment_dependencies import (
     dependency_expanded_segment_plan,
@@ -414,6 +417,7 @@ _MESSAGE_QUEUE_STABLE_RUNTIME_KEYS = {
 _SEGMENT_WHITELIST_STABLE_RUNTIME_KEYS = {
     "segment_whitelist_instance_settings",
     "campaign_whitelist_instance_settings",
+    "segment_recurring_priority_v1",
 }
 _EMPTY_LEADS_CLEANUP_STABLE_RUNTIME_KEYS = {
     "empty_leads_cleanup_enabled",
@@ -6059,6 +6063,8 @@ def _campaign_fallback_end(root: str) -> None:
 def _task_execution_lock_key(root: str, task_type: str, entity_id: int | None) -> str:
     if task_type in _CAMPAIGN_EXACT_TASK_TYPES:
         return _task_key(root, "campaign", entity_id)
+    if task_type == "segment_recurring_priority":
+        return _task_key(root, "segment", entity_id)
     return _task_key(root, task_type, entity_id)
 
 
@@ -7086,6 +7092,167 @@ def _submit_import_if_segment_slot(
             int(import_pending_count or 0),
             max(0, int(segment_slot_limit or 0)),
         )
+    return launched
+
+
+def _dispatch_recurring_priority_segments(
+    *,
+    config: AgentConfig,
+    inst: object,
+    store: TaskStore,
+    running: dict[str, RunningTask],
+    priority_executor: _PriorityTaskExecutor,
+    entries: list[object],
+    enabled: bool,
+) -> int:
+    root = str(getattr(inst, "root", "") or "")
+    instance_uid = str(getattr(inst, "instance_uid", "") or "")
+    expected_keys = {recurring_priority_state_key(root, int(getattr(entry, "segment_id"))) for entry in entries}
+    stale_keys = [key for key, _payload in store.list_runtime_sync(f"segment_recurring_priority:{root}:") if key not in expected_keys]
+    if stale_keys:
+        store.delete_runtime_sync(stale_keys)
+    if not enabled:
+        return 0
+
+    launched = 0
+    for entry in entries:
+        segment_id = int(getattr(entry, "segment_id"))
+        interval_sec = int(getattr(entry, "max_interval_sec"))
+        key = recurring_priority_state_key(root, segment_id)
+        current = store.get_runtime_sync(key) or {}
+        now = time.time()
+        if _is_running(running, root, "segment", segment_id) or _segment_sql_worker_running(root, segment_id):
+            if str(current.get("last_status") or "") != "waiting_overlap":
+                store.put_runtime_sync(
+                    key,
+                    recurring_priority_state_payload(
+                        root=root,
+                        instance_uid=instance_uid,
+                        segment_id=segment_id,
+                        max_interval_sec=interval_sec,
+                        active=False,
+                        pid=None,
+                        last_started_at=current.get("last_started_at"),
+                        last_finished_at=current.get("last_finished_at"),
+                        last_status="waiting_overlap",
+                        last_rc=current.get("last_rc"),
+                        last_error="",
+                        next_run_at=now,
+                        updated_at=now,
+                    ),
+                )
+            continue
+        if priority_executor.is_active(root, "segment_recurring_priority", segment_id):
+            continue
+
+        def _on_start(
+            pid: int,
+            *,
+            state_key: str = key,
+            started_at: float = now,
+            root_value: str = root,
+            uid_value: str = instance_uid,
+            sid: int = segment_id,
+            interval: int = interval_sec,
+            previous: dict[str, object] = dict(current),
+        ) -> None:
+            store.put_runtime_sync(
+                state_key,
+                recurring_priority_state_payload(
+                    root=root_value,
+                    instance_uid=uid_value,
+                    segment_id=sid,
+                    max_interval_sec=interval,
+                    active=True,
+                    pid=pid,
+                    last_started_at=started_at,
+                    last_finished_at=previous.get("last_finished_at"),
+                    last_status="running",
+                    last_rc=previous.get("last_rc"),
+                    last_error="",
+                    next_run_at=started_at + interval,
+                    updated_at=time.time(),
+                ),
+            )
+
+        def _on_complete(
+            rc: int | None,
+            *,
+            state_key: str = key,
+            started_at: float = now,
+            root_value: str = root,
+            uid_value: str = instance_uid,
+            sid: int = segment_id,
+            interval: int = interval_sec,
+        ) -> None:
+            finished_at = time.time()
+            lock_busy = rc == _TASK_LOCK_BUSY_RC
+            success = rc == 0
+            status = "ok" if success else ("waiting_overlap" if lock_busy else "failed")
+            next_run_at = finished_at if lock_busy else max(started_at + interval, finished_at)
+            store.put_runtime_sync(
+                state_key,
+                recurring_priority_state_payload(
+                    root=root_value,
+                    instance_uid=uid_value,
+                    segment_id=sid,
+                    max_interval_sec=interval,
+                    active=False,
+                    pid=None,
+                    last_started_at=started_at,
+                    last_finished_at=finished_at,
+                    last_status=status,
+                    last_rc=rc,
+                    last_error="" if success or lock_busy else (f"exit_{rc}" if rc is not None else "spawn_or_timeout"),
+                    next_run_at=next_run_at,
+                    updated_at=finished_at,
+                ),
+            )
+
+        dispatch_window = max(1, int(getattr(config, "dispatch_interval_sec", 1) or 1))
+        admission_interval = max(1, interval_sec - dispatch_window)
+        started = priority_executor.launch(
+            config,
+            root=root,
+            task_type="segment_recurring_priority",
+            entity_id=segment_id,
+            args=render_mautic_command(
+                php_bin=config.php_bin,
+                run_as_user=config.mautic_run_as_user,
+                root=root,
+                template=config.cmd_segment_update_template,
+                id=segment_id,
+                batch_limit=config.segment_batch_limit,
+            ),
+            interval_sec=admission_interval,
+            max_parallel=1,
+            on_start=_on_start,
+            on_complete=_on_complete,
+            timeout_sec=config.command_timeout_sec,
+            capacity_lane="segment_recurring_priority",
+            log_label="recurring-priority",
+        )
+        if started:
+            launched += 1
+        elif not current:
+            store.put_runtime_sync(
+                key,
+                recurring_priority_state_payload(
+                    root=root,
+                    instance_uid=instance_uid,
+                    segment_id=segment_id,
+                    max_interval_sec=interval_sec,
+                    active=False,
+                    pid=None,
+                    last_started_at=None,
+                    last_finished_at=None,
+                    last_status="scheduled",
+                    last_rc=None,
+                    last_error="",
+                    next_run_at=now,
+                    updated_at=now,
+                ),
+            )
     return launched
 
 
@@ -10961,6 +11128,22 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
+        # Admit recurring segment work before any tenant performs DB planning.
+        # This lane must not inherit latency from the ordinary per-instance pass.
+        for recurring_inst in dispatch_installs:
+            recurring_entries = recurring_priority_entries_for_instance(
+                getattr(config, "segment_recurring_priority_v1", {}),
+                recurring_inst,
+            )
+            _dispatch_recurring_priority_segments(
+                config=config,
+                inst=recurring_inst,
+                store=store,
+                running=running,
+                priority_executor=priority_executor,
+                entries=recurring_entries,
+                enabled=cluster_cron_allowed,
+            )
         for inst in dispatch_installs:
             if not inst.db:
                 logging.warning("[%s] skip install without db config", inst.root)
@@ -10968,6 +11151,10 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
             root = inst.root
             segment_whitelist_for_inst = _segment_whitelist_effective_setting(config, inst)
+            recurring_priority_entries = recurring_priority_entries_for_instance(
+                getattr(config, "segment_recurring_priority_v1", {}),
+                inst,
+            )
             campaign_whitelist_for_inst = _campaign_whitelist_effective_setting(config, inst)
             db = MauticDB(inst.db)
             now_utc = datetime.now(timezone.utc)
@@ -11005,6 +11192,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             segment_blocked_ids |= set(segment_invalid_filter_sets.get(root, set()))
             segment_blocked_ids |= set(segment_failure_blocked_sets.get(root, set()))
             segment_blocked_ids |= set(segment_logical_issue_blocked_sets.get(root, set()))
+            segment_blocked_ids |= {entry.segment_id for entry in recurring_priority_entries}
             active_import_target_ids: set[int] = set()
             for targets in _import_monitor_target_segment_ids(
                 import_monitor_cache.get(root),
