@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.25 - 2026-09-14
+
+- Preserve canonical recurring segment observations in the frequent
+  monitor-only scheduler signal payload so MCC does not replace them with an
+  otherwise valid partial scheduler snapshot.
+
 ## 1.2.24 - 2026-09-14
 
 - Publish recurring segment observations with the matched canonical instance

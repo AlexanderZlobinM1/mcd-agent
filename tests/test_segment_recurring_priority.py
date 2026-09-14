@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from mcd_agent import daemon
 from mcd_agent.segment_recurring_priority import entries_for_instance, state_payload
+from mcd_agent.signals import collect_monitor_signals
 
 
 def _inst() -> SimpleNamespace:
@@ -175,3 +176,29 @@ def test_disabled_or_removed_entries_are_pruned_without_launch() -> None:
     assert launched == 0
     store.delete_runtime_sync.assert_called_once_with([stale_key])
     executor.launch.assert_not_called()
+
+
+def test_monitor_signal_transport_keeps_canonical_recurring_observation() -> None:
+    row = state_payload(
+        root="/var/www/electronic/public_html",
+        instance_uid="electronic.sales-snap.com@MauticFarm-02",
+        segment_id=86,
+        max_interval_sec=60,
+        active=False,
+        pid=None,
+        last_started_at=10.0,
+        last_finished_at=11.0,
+        last_status="ok",
+        last_rc=0,
+        last_error="",
+        next_run_at=69.0,
+        updated_at=11.0,
+    )
+    with patch("mcd_agent.signals._ps_console_processes", return_value=[]), patch(
+        "mcd_agent.signals._shadow_running_tasks",
+        return_value={"segment_recurring_priority_v1": [row]},
+    ):
+        payload = collect_monitor_signals(SimpleNamespace())
+
+    assert payload["monitor_only"] is True
+    assert payload["details"]["scheduler"]["segment_recurring_priority_v1"] == [row]

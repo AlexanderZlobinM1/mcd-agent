@@ -708,6 +708,7 @@ def collect_monitor_signals(
             "recent": scheduler_shadow.get("recent", []),
             "planned": scheduler_shadow.get("planned", []),
             "fairness": scheduler_shadow.get("fairness", {}),
+            "segment_recurring_priority_v1": scheduler_shadow.get("segment_recurring_priority_v1", []),
         },
         "php_console_recent": console_rows[:20],
     }
