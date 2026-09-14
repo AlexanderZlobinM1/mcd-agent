@@ -7257,6 +7257,79 @@ def _dispatch_recurring_priority_segments(
     return launched
 
 
+class _RecurringSegmentPriorityLoop:
+    """Run recurring segment admission independently from tenant DB planning."""
+
+    def __init__(self, priority_executor: _PriorityTaskExecutor, *, start: bool = True) -> None:
+        self._priority_executor = priority_executor
+        self._guard = threading.Lock()
+        self._wake = threading.Event()
+        self._snapshot: tuple[AgentConfig, list[tuple[object, list[object]]], TaskStore, dict[str, RunningTask], bool] | None = None
+        if start:
+            threading.Thread(
+                target=self._run,
+                name="mcd-segment-recurring-priority",
+                daemon=True,
+            ).start()
+
+    def update(
+        self,
+        *,
+        config: AgentConfig,
+        installs: list[object],
+        store: TaskStore,
+        running: dict[str, RunningTask],
+        enabled: bool,
+    ) -> None:
+        planned = [
+            (
+                inst,
+                list(
+                    recurring_priority_entries_for_instance(
+                        getattr(config, "segment_recurring_priority_v1", {}),
+                        inst,
+                    )
+                ),
+            )
+            for inst in installs
+        ]
+        with self._guard:
+            self._snapshot = (config, planned, store, running, bool(enabled))
+        self._wake.set()
+
+    def run_once(self) -> int:
+        with self._guard:
+            snapshot = self._snapshot
+        if snapshot is None:
+            return 0
+        config, planned, store, running, enabled = snapshot
+        launched = 0
+        for inst, entries in planned:
+            try:
+                launched += _dispatch_recurring_priority_segments(
+                    config=config,
+                    inst=inst,
+                    store=store,
+                    running=running,
+                    priority_executor=self._priority_executor,
+                    entries=entries,
+                    enabled=enabled,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[%s] recurring priority admission failed: %s",
+                    str(getattr(inst, "root", "") or ""),
+                    exc,
+                )
+        return launched
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait(timeout=1.0)
+            self._wake.clear()
+            self.run_once()
+
+
 def _is_running(running: dict[str, RunningTask], root: str, task_type: str, entity_id: int | None) -> bool:
     if task_type in {"segment", "segment_sql"} and entity_id is not None:
         if _segment_sql_worker_running(root, int(entity_id)):
@@ -8345,6 +8418,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     pusher = MCCStatePusher(config, runtime_store=store)
 
     priority_executor = _PriorityTaskExecutor()
+    recurring_segment_priority_loop = _RecurringSegmentPriorityLoop(priority_executor)
     priority_trigger_last_checked: dict[str, float] = {}
     priority_trigger_checked_rebuild: dict[str, float] = {}
     priority_campaign_due_ids: dict[str, list[int]] = {}
@@ -11129,22 +11203,13 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         )
         if dispatch_installs:
             dispatch_instance_cursor = (dispatch_instance_cursor + 1) % len(dispatch_installs)
-        # Admit recurring segment work before any tenant performs DB planning.
-        # This lane must not inherit latency from the ordinary per-instance pass.
-        for recurring_inst in dispatch_installs:
-            recurring_entries = recurring_priority_entries_for_instance(
-                getattr(config, "segment_recurring_priority_v1", {}),
-                recurring_inst,
-            )
-            _dispatch_recurring_priority_segments(
-                config=config,
-                inst=recurring_inst,
-                store=store,
-                running=running,
-                priority_executor=priority_executor,
-                entries=recurring_entries,
-                enabled=cluster_cron_allowed,
-            )
+        recurring_segment_priority_loop.update(
+            config=config,
+            installs=list(dispatch_installs),
+            store=store,
+            running=running,
+            enabled=cluster_cron_allowed,
+        )
         for inst in dispatch_installs:
             if not inst.db:
                 logging.warning("[%s] skip install without db config", inst.root)

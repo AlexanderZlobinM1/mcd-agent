@@ -202,3 +202,24 @@ def test_monitor_signal_transport_keeps_canonical_recurring_observation() -> Non
 
     assert payload["monitor_only"] is True
     assert payload["details"]["scheduler"]["segment_recurring_priority_v1"] == [row]
+
+
+def test_independent_loop_dispatches_snapshot_without_waiting_for_planner() -> None:
+    inst = _inst()
+    cfg = SimpleNamespace(
+        segment_recurring_priority_v1={
+            inst.instance_uid: {"segments": [{"id": 86, "max_interval_sec": 60}]},
+        }
+    )
+    executor = Mock()
+    loop = daemon._RecurringSegmentPriorityLoop(executor, start=False)
+    store = Mock()
+    running: dict[str, object] = {}
+
+    loop.update(config=cfg, installs=[inst], store=store, running=running, enabled=True)
+    with patch.object(daemon, "_dispatch_recurring_priority_segments", return_value=1) as dispatch:
+        assert loop.run_once() == 1
+
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["entries"][0].segment_id == 86
+    assert dispatch.call_args.kwargs["enabled"] is True

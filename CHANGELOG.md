@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.26 - 2026-09-14
+
+- Move recurring segment admission into an independent one-second daemon loop
+  so long multi-tenant DB planning cycles cannot violate the configured maximum
+  start interval.
+
 ## 1.2.25 - 2026-09-14
 
 - Preserve canonical recurring segment observations in the frequent
