@@ -6442,6 +6442,51 @@ def _dispatch_due_campaign_triggers(
     return launched
 
 
+def _dispatch_due_campaign_rebuilds(
+    *,
+    config: AgentConfig,
+    root: str,
+    due_ids: list[int],
+    running: dict[str, RunningTask],
+    priority_executor: _PriorityTaskExecutor,
+    on_success: Callable[[int], None],
+) -> list[int]:
+    """Admit due rebuilds outside the segment/plugin scheduler lanes."""
+    launched: list[int] = []
+    rebuild_interval = max(1, int(config.campaign_rebuild_min_repeat_sec or 0))
+    rebuild_parallel = max(1, int(config.campaign_rebuild_priority_parallel or 1))
+    for campaign_id in dict.fromkeys(int(value) for value in due_ids if int(value) > 0):
+        if (
+            _is_running(running, root, "campaign_rebuild", campaign_id)
+            or _is_running(running, root, "campaign_trigger", campaign_id)
+            or priority_executor.is_active(root, "campaign_rebuild", campaign_id)
+            or priority_executor.is_active(root, "campaign_trigger", campaign_id)
+        ):
+            continue
+        started = priority_executor.launch(
+            config,
+            root=root,
+            task_type="campaign_rebuild",
+            entity_id=campaign_id,
+            args=render_mautic_command(
+                php_bin=config.php_bin,
+                run_as_user=config.mautic_run_as_user,
+                root=root,
+                template=config.cmd_campaign_rebuild_template,
+                id=campaign_id,
+            ),
+            interval_sec=rebuild_interval,
+            max_parallel=rebuild_parallel,
+            on_success=lambda campaign_id=campaign_id: on_success(campaign_id),
+            capacity_lane="campaign_rebuild_liveness",
+            log_label="liveness",
+        )
+        if started:
+            launched.append(campaign_id)
+            logging.info("[%s] due campaign rebuild dispatched by liveness lane entity=%s", root, campaign_id)
+    return launched
+
+
 def _task_repeat_interval_sec(config: AgentConfig, task_type: str) -> int:
     if task_type == "segment":
         return max(0, int(getattr(config, "segment_full_scan_interval_sec", 0) or 0))
@@ -8137,6 +8182,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     priority_campaign_due_ids: dict[str, list[int]] = {}
     priority_campaign_due_scanned_at: dict[str, float] = {}
     priority_campaign_due_error_at: dict[str, float] = {}
+    campaign_rebuild_liveness_scanned_at: dict[str, float] = {}
+    campaign_rebuild_liveness_error_at: dict[str, float] = {}
     last_campaign_native_fallback_ts: dict[str, float] = {}
 
     def _priority_trigger_completed(root: str, campaign_id: int, db_cfg: object) -> None:
@@ -8546,8 +8593,116 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         )
             time.sleep(1.0)
 
+    def _campaign_rebuild_liveness_scheduler() -> None:
+        while True:
+            cfg = config
+            profile = str(getattr(cfg, "profile_name", "") or "").strip().lower()
+            if (
+                profile == "passive"
+                or not bool(getattr(cfg, "enable_campaign_rebuild", False))
+                or not cluster_route_allows(cfg, "cron")
+            ):
+                time.sleep(1.0)
+                continue
+            try:
+                if Path(cfg.scheduler_pause_flag_path).exists() or (cfg.backup_enabled and backup_lock_active(cfg)):
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+            scan_now = time.time()
+            scan_interval = max(
+                30,
+                min(300, int(getattr(cfg, "campaign_rebuild_poll_interval_sec", 300) or 300)),
+            )
+            for inst in list(installs):
+                if not getattr(inst, "db", None):
+                    continue
+                root = str(getattr(inst, "root", "") or "").strip()
+                if not root:
+                    continue
+                last_scan = float(campaign_rebuild_liveness_scanned_at.get(root, 0.0) or 0.0)
+                if scan_now - last_scan < scan_interval:
+                    continue
+                campaign_rebuild_liveness_scanned_at[root] = scan_now
+                scanned_at = datetime.fromtimestamp(scan_now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                pusher.set_campaign_scheduler_liveness_runtime(
+                    root,
+                    {
+                        "schema": 1,
+                        "status": "scanning",
+                        "lane": "campaign_rebuild_liveness",
+                        "scanned_at": scanned_at,
+                        "scan_interval_sec": scan_interval,
+                    },
+                )
+                try:
+                    due_sql = _campaign_sql_for_major(
+                        cfg.sql_campaign_rebuilds_due,
+                        getattr(inst, "mautic_major", None),
+                    )
+                    due_ids = MauticDB(inst.db).fetch_ids(
+                        due_sql,
+                        limit=5000,
+                        context=campaign_sql_time_context(
+                            datetime.now(timezone.utc),
+                            getattr(inst, "mautic_timezone", None),
+                            getattr(inst, "mautic_major", None),
+                        ),
+                    )
+                except Exception as exc:
+                    error_text = str(exc)[:500]
+                    pusher.set_campaign_scheduler_liveness_runtime(
+                        root,
+                        {
+                            "schema": 1,
+                            "status": "error",
+                            "lane": "campaign_rebuild_liveness",
+                            "scanned_at": scanned_at,
+                            "scan_interval_sec": scan_interval,
+                            "error": error_text,
+                        },
+                    )
+                    last_error_at = float(campaign_rebuild_liveness_error_at.get(root, 0.0) or 0.0)
+                    if scan_now - last_error_at >= 300.0:
+                        campaign_rebuild_liveness_error_at[root] = scan_now
+                        logging.warning("[%s] campaign rebuild liveness scan failed: %s", root, exc)
+                    continue
+
+                planned_ids = list(dict.fromkeys(int(value) for value in (due_ids or []) if int(value) > 0))
+                launched_ids = _dispatch_due_campaign_rebuilds(
+                    config=cfg,
+                    root=root,
+                    due_ids=planned_ids,
+                    running=running,
+                    priority_executor=priority_executor,
+                    on_success=lambda campaign_id, root=root: _mark_campaign_rebuild_finished(root, campaign_id),
+                )
+                pusher.set_campaign_scheduler_liveness_runtime(
+                    root,
+                    {
+                        "schema": 1,
+                        "status": "dispatched" if launched_ids else ("pending" if planned_ids else "idle"),
+                        "lane": "campaign_rebuild_liveness",
+                        "scanned_at": scanned_at,
+                        "scan_interval_sec": scan_interval,
+                        "pending_count": len(planned_ids),
+                        "pending_ids": planned_ids[:50],
+                        "launched_count": len(launched_ids),
+                        "launched_ids": launched_ids[:50],
+                    },
+                )
+            time.sleep(1.0)
+
     if not single_cycle:
         threading.Thread(target=_priority_scheduler, name="mcd-priority-scheduler", daemon=True).start()
+        threading.Thread(
+            target=_campaign_rebuild_liveness_scheduler,
+            name="mcd-campaign-rebuild-liveness",
+            daemon=True,
+        ).start()
 
     while True:
         _monitor_running(

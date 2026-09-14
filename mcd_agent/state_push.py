@@ -1711,6 +1711,7 @@ class MCCStatePusher:
         # scheduler-log firehose.
         self._campaign_native_fallback_events_pending: list[dict[str, Any]] = []
         self._campaign_native_fallback_runtime: dict[str, dict[str, Any]] = {}
+        self._campaign_scheduler_liveness_runtime: dict[str, dict[str, Any]] = {}
 
     def enabled(self) -> bool:
         return bool(self.cfg.mcc_push_enabled and self.cfg.mcc_url and self.cfg.mcc_token)
@@ -1754,6 +1755,17 @@ class MCCStatePusher:
         item = dict(payload)
         item["root"] = key
         self._campaign_native_fallback_runtime[key] = item
+
+    def set_campaign_scheduler_liveness_runtime(self, root: str, payload: dict[str, Any] | None) -> None:
+        key = str(root or "").strip()
+        if not key:
+            return
+        if payload is None:
+            self._campaign_scheduler_liveness_runtime.pop(key, None)
+            return
+        item = dict(payload)
+        item["root"] = key
+        self._campaign_scheduler_liveness_runtime[key] = item
 
     def add_fs_permissions_fix(
         self,
@@ -1963,6 +1975,14 @@ class MCCStatePusher:
             details["campaign_native_fallback_runtime"] = [
                 dict(self._campaign_native_fallback_runtime[root])
                 for root in sorted(self._campaign_native_fallback_runtime)
+            ]
+            out["details"] = details
+        if self._campaign_scheduler_liveness_runtime:
+            details_raw = out.get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            details["campaign_scheduler_liveness_runtime"] = [
+                dict(self._campaign_scheduler_liveness_runtime[root])
+                for root in sorted(self._campaign_scheduler_liveness_runtime)
             ]
             out["details"] = details
         return out

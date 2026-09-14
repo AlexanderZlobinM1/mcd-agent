@@ -46,6 +46,7 @@ from mcd_agent.daemon import (
     _campaign_trigger_waits_for_rebuild,
     _classify_import_monitor_row,
     _dispatch_due_campaign_triggers,
+    _dispatch_due_campaign_rebuilds,
     _effective_segment_slot_limit,
     _fetch_import_monitor_snapshot,
     _fill_from_ring,
@@ -454,6 +455,68 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(launched, [8, 11])
         self.assertEqual(executor.launch.call_count, 2)
+
+    def test_due_campaign_rebuild_liveness_ignores_saturated_segment_lane(self) -> None:
+        root = "/var/www/apotekajankovic/public_html"
+        running = {
+            f"segment-{idx}": SimpleNamespace(
+                root=root,
+                task_type="segment",
+                entity_id=idx,
+            )
+            for idx in range(8)
+        }
+        executor = Mock()
+        executor.is_active.return_value = False
+        executor.launch.return_value = True
+        cfg = SimpleNamespace(
+            campaign_rebuild_min_repeat_sec=15,
+            campaign_rebuild_priority_parallel=3,
+            php_bin="php",
+            mautic_run_as_user="www-data",
+            cmd_campaign_rebuild_template="mautic:campaigns:rebuild -i {id}",
+        )
+
+        with patch.object(daemon_mod, "render_mautic_command", return_value=["php", "bin/console"]):
+            launched = _dispatch_due_campaign_rebuilds(
+                config=cfg,
+                root=root,
+                due_ids=[222],
+                running=running,
+                priority_executor=executor,
+                on_success=Mock(),
+            )
+
+        self.assertEqual(launched, [222])
+        kwargs = executor.launch.call_args.kwargs
+        self.assertEqual(kwargs["capacity_lane"], "campaign_rebuild_liveness")
+        self.assertEqual(kwargs["log_label"], "liveness")
+
+    def test_due_campaign_rebuild_liveness_waits_for_same_campaign_trigger(self) -> None:
+        root = "/var/www/site"
+        executor = Mock()
+        executor.is_active.return_value = False
+        cfg = SimpleNamespace(
+            campaign_rebuild_min_repeat_sec=15,
+            campaign_rebuild_priority_parallel=3,
+            php_bin="php",
+            mautic_run_as_user="www-data",
+            cmd_campaign_rebuild_template="mautic:campaigns:rebuild -i {id}",
+        )
+
+        launched = _dispatch_due_campaign_rebuilds(
+            config=cfg,
+            root=root,
+            due_ids=[222],
+            running={
+                "trigger": SimpleNamespace(root=root, task_type="campaign_trigger", entity_id=222),
+            },
+            priority_executor=executor,
+            on_success=Mock(),
+        )
+
+        self.assertEqual(launched, [])
+        executor.launch.assert_not_called()
 
     def test_due_campaign_priority_dispatch_waits_for_same_campaign_rebuild(self) -> None:
         root = "/var/www/cvetana/public_html"

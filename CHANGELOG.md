@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.2.20 - 2026-09-14
+
+- Scan campaign rebuild eligibility in a dedicated liveness thread so long
+  segment planning, plugin work and message-queue jobs cannot prevent campaign
+  membership from being initialized.
+- Dispatch exact rebuild-due campaign IDs through isolated priority capacity
+  while preserving cluster cron routing, campaign locks and active-window SQL;
+  expired campaigns are not recovered or triggered late.
+- Publish per-instance rebuild scan status, errors, pending IDs and dispatch
+  evidence in `campaign_scheduler_liveness_runtime` signals.
+
 ## 1.2.19 - 2026-09-14
 
 - Reconcile a cached Mautic version when local Composer or release metadata

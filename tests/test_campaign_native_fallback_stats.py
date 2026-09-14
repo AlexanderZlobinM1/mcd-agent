@@ -90,6 +90,19 @@ class CampaignNativeFallbackStatsTests(unittest.TestCase):
         restarted.set_campaign_native_fallback_runtime("/var/www/example/public_html", None)
         self.assertNotIn("campaign_native_fallback_runtime", restarted._signals_payload()["details"])
 
+        restarted.set_campaign_scheduler_liveness_runtime(
+            "/var/www/example/public_html",
+            {
+                "schema": 1,
+                "status": "pending",
+                "pending_count": 1,
+                "pending_ids": [222],
+            },
+        )
+        liveness = restarted._signals_payload()["details"]["campaign_scheduler_liveness_runtime"][0]
+        self.assertEqual(liveness["status"], "pending")
+        self.assertEqual(liveness["pending_ids"], [222])
+
     def test_event_retention_removes_rows_older_than_thirty_days(self) -> None:
         pusher = MCCStatePusher(self.cfg)  # type: ignore[arg-type]
         pusher.add_campaign_native_fallback(
