@@ -37,6 +37,15 @@ def entries_for_instance(settings: object, inst: object) -> list[RecurringPriori
         if key in settings:
             raw = settings[key]
             break
+    if raw is None:
+        aliases = set(_instance_keys(inst))
+        canonical = [
+            str(key)
+            for key in settings
+            if "@" in str(key) and str(key).split("@", 1)[0] in aliases
+        ]
+        if len(canonical) == 1:
+            raw = settings[canonical[0]]
     if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
         return []
 

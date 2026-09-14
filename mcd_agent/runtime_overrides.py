@@ -56,6 +56,32 @@ def _instance_keys(inst: object) -> list[str]:
     return list(dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip()))
 
 
+def _matching_instance_entry(entries: dict[str, Any], keys: list[str]) -> str | None:
+    for key in keys:
+        if key in entries:
+            return key
+    aliases = set(keys)
+    canonical = [
+        str(key)
+        for key in entries
+        if "@" in str(key) and str(key).split("@", 1)[0] in aliases
+    ]
+    return canonical[0] if len(canonical) == 1 else None
+
+
+def _expanded_instance_uids(instance_uids: list[str], host_name: str) -> list[str]:
+    expanded: list[str] = []
+    host = str(host_name or "").strip()
+    for raw_uid in instance_uids:
+        uid = str(raw_uid or "").strip()
+        if not uid:
+            continue
+        expanded.append(uid)
+        if host and "@" not in uid:
+            expanded.append(f"{uid}@{host}")
+    return list(dict.fromkeys(expanded))
+
+
 def instance_desired_states(runtime: dict[str, Any], installs: list[object]) -> dict[str, dict[str, Any]]:
     """Extract instance-scoped settings using immutable UIDs as canonical keys."""
     out: dict[str, dict[str, Any]] = {}
@@ -69,10 +95,11 @@ def instance_desired_states(runtime: dict[str, Any], installs: list[object]) -> 
             entries = runtime.get(runtime_key)
             if not isinstance(entries, dict):
                 continue
-            for key in keys:
-                if key in entries:
-                    scoped[runtime_key] = entries[key]
-                    break
+            matched_key = _matching_instance_entry(entries, keys)
+            if matched_key is not None:
+                scoped[runtime_key] = entries[matched_key]
+                if "@" in matched_key:
+                    uid = matched_key
         if scoped:
             out[uid] = scoped
     return out
@@ -105,6 +132,8 @@ def fetch_runtime_overrides(cfg: AgentConfig, *, instance_uids: list[str] | None
     if not base:
         return {"status": "disabled", "reason": "mcc_url_not_set"}
     ident = resolve_agent_identity(cfg)
+    effective_host_name = str(ident.get("effective_mcc_host_name") or ident.get("effective_hostname") or "").strip()
+    expanded_instance_uids = _expanded_instance_uids(instance_uids or [], effective_host_name)
     payload = {
         "hostname": str(ident.get("effective_hostname") or ""),
         "mcc_host_name": str(ident.get("effective_mcc_host_name") or ""),
@@ -112,7 +141,7 @@ def fetch_runtime_overrides(cfg: AgentConfig, *, instance_uids: list[str] | None
         "configured_host_name": str(ident.get("configured_host_name") or ""),
         "agent_version": __version__,
         "desired_state_protocol": 1,
-        "instance_uids": list(dict.fromkeys(str(uid or "").strip() for uid in (instance_uids or []) if str(uid or "").strip())),
+        "instance_uids": expanded_instance_uids,
     }
     url = base + "/api/v1/agent/runtime-overrides"
     try:

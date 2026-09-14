@@ -36,6 +36,21 @@ def test_entries_are_explicit_instance_scoped_deduplicated_and_validated() -> No
     assert entries_for_instance({"default": settings["default"]}, _inst()) == []
 
 
+def test_entries_match_canonical_uid_when_local_inventory_uid_is_legacy() -> None:
+    inst = _inst()
+    inst.instance_uid = "electronic.sales-snap.com"
+    entries = entries_for_instance(
+        {
+            "electronic.sales-snap.com@MauticFarm-02": {
+                "segments": [{"id": 86, "max_interval_sec": 60}],
+            }
+        },
+        inst,
+    )
+
+    assert [(entry.segment_id, entry.max_interval_sec) for entry in entries] == [(86, 60)]
+
+
 def test_state_payload_exposes_complete_observation_contract() -> None:
     payload = state_payload(
         root="/var/www/electronic/public_html",

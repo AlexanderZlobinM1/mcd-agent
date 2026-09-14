@@ -4,10 +4,29 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mcd_agent.runtime_overrides import instance_desired_states, merge_instance_desired_states, push_runtime_overrides
+from mcd_agent.runtime_overrides import fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, push_runtime_overrides
 
 
 class RuntimeOverrideDirectionTests(unittest.TestCase):
+    def test_poll_includes_canonical_host_qualified_instance_uid(self) -> None:
+        cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="token")
+        identity = {
+            "effective_hostname": "MauticFarm-02",
+            "effective_mcc_host_name": "MauticFarm-02",
+            "local_hostname": "MauticFarm-02",
+            "configured_host_name": "",
+        }
+        with patch("mcd_agent.runtime_overrides.resolve_agent_identity", return_value=identity), patch(
+            "mcd_agent.runtime_overrides._post_json", return_value={"status": "ok"}
+        ) as post:
+            fetch_runtime_overrides(cfg, instance_uids=["electronic.sales-snap.com"])
+
+        payload = post.call_args.args[1]
+        self.assertEqual(
+            payload["instance_uids"],
+            ["electronic.sales-snap.com", "electronic.sales-snap.com@MauticFarm-02"],
+        )
+
     def test_local_runtime_push_targets_canonical_desired_state_when_requested(self) -> None:
         cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="token")
         identity = {
@@ -69,6 +88,27 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             merged["segment_recurring_priority_v1"]["app.sales-snap.com"]["segments"][0]["max_interval_sec"],
             60,
         )
+
+    def test_canonical_desired_state_matches_legacy_local_inventory_uid_and_acks_canonical_uid(self) -> None:
+        inst = SimpleNamespace(
+            instance_uid="electronic.sales-snap.com",
+            root="/var/www/electronic/public_html",
+            name="electronic.sales-snap.com",
+            primary_domain="electronic.sales-snap.com",
+            domains=["electronic.sales-snap.com"],
+        )
+        canonical_uid = "electronic.sales-snap.com@MauticFarm-02"
+        states = instance_desired_states(
+            {
+                "segment_recurring_priority_v1": {
+                    canonical_uid: {"segments": [{"id": 86, "max_interval_sec": 60}]},
+                }
+            },
+            [inst],
+        )
+
+        self.assertEqual(list(states), [canonical_uid])
+        self.assertEqual(states[canonical_uid]["segment_recurring_priority_v1"]["segments"][0]["id"], 86)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.23 - 2026-09-14
+
+- Include canonical host-qualified instance UIDs in runtime override polls when
+  legacy local inventory still stores an unqualified UID.
+- Materialize and acknowledge canonical instance desired state against the
+  matching local instance without adding a host-global fallback.
+
 ## 1.2.22 - 2026-09-14
 
 - Add the opt-in `segment_recurring_priority_v1` instance/segment contract for
