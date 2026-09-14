@@ -1604,15 +1604,24 @@ def run_upgrade_apply(
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _clean_target_version(target_override)
     if mcc_preflighted_single_instance:
-        from mcd_agent.mautic_manual_upgrade import validate_preflighted_single_instance
+        from mcd_agent.mautic_manual_upgrade import ManualUpgradePreflightError, validate_preflighted_single_instance
+        from mcd_agent.mautic_patch_plan import rejected_preflight
 
         def validate_manual_invocation(source_version: str) -> None:
-            validate_preflighted_single_instance(
-                root=root, install_root=install_root, current=source_version,
-                target=target_override, mode=mode, raw_plan=patch_plan_json,
-                run_id=patch_run_id, yes=yes, allow_minor=allow_minor,
-                allow_major=allow_major, with_system_upgrade=with_system_upgrade,
-            )
+            try:
+                validate_preflighted_single_instance(
+                    root=root, install_root=install_root, current=source_version,
+                    target=target, mode=mode, raw_plan=patch_plan_json,
+                    run_id=patch_run_id, yes=yes, allow_minor=allow_minor,
+                    allow_major=allow_major, with_system_upgrade=with_system_upgrade,
+                )
+            except ManualUpgradePreflightError as exc:
+                evidence = rejected_preflight(patch_run_id, exc.reason)
+                print(
+                    "MCD_PATCH_PLAN_EVIDENCE="
+                    + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+                )
+                raise
 
         validate_manual_invocation(current)
     if not target:

@@ -135,7 +135,7 @@ def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
 
 def test_contract_advertises_atomic_preflight_capability():
     advertised = patch.contract()
-    assert advertised["minimum_agent_version"] == "1.2.19"
+    assert advertised["minimum_agent_version"] == "1.2.21"
     assert advertised["capabilities"] == [patch.PREFLIGHT_SCHEMA]
 
 

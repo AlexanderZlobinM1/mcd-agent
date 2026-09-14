@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.2.21 - 2026-09-14
+
+- Reject an already-installed target in the MCC-preflighted single-instance
+  path before maintenance, backup, permissions or source mutation, using the
+  stable `target_already_installed` reason.
+- Emit one terminal `mcd-mautic-patch-preflight-v1` evidence record for every
+  manual admission rejection so MCC can classify a fail-closed no-mutation
+  result instead of reporting missing patch-stage evidence.
+- Keep the managed patch plan pinned to Mautic 7.1.3 to 7.2.0 and raise its
+  minimum compatible agent version to 1.2.21.
+
 ## 1.2.20 - 2026-09-14
 
 - Scan campaign rebuild eligibility in a dedicated liveness thread so long

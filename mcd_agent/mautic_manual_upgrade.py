@@ -14,6 +14,16 @@ from mcd_agent.install_type import detect_install_type
 from mcd_agent.mautic_patch_plan import _RUN, _target_version, parse_plan
 
 
+class ManualUpgradePreflightError(RuntimeError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = str(reason or "manual_preflight_rejected")
+
+
+def _reject(prefix: str, reason: str, message: str) -> None:
+    raise ManualUpgradePreflightError(reason, prefix + message)
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -44,19 +54,25 @@ def validate_preflighted_single_instance(
     """Reject any invocation outside the narrow manual 7.1.3 -> 7.2.0 path."""
     prefix = "MCC preflighted single-instance upgrade rejected: "
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        raise RuntimeError(prefix + "root execution is required")
+        _reject(prefix, "root_execution_required", "root execution is required")
     if not yes or not allow_minor or allow_major or with_system_upgrade:
-        raise RuntimeError(prefix + "require --yes/--allow-minor, without major/system upgrade")
+        _reject(
+            prefix,
+            "unsafe_upgrade_flags",
+            "require --yes/--allow-minor, without major/system upgrade",
+        )
+    if current == target:
+        _reject(prefix, "target_already_installed", f"target {target} is already installed")
     if current != "7.1.3" or target != "7.2.0":
-        raise RuntimeError(prefix + "only explicit 7.1.3 -> 7.2.0 is supported")
+        _reject(prefix, "unsupported_transition", "only explicit 7.1.3 -> 7.2.0 is supported")
     if mode not in {"zip", "composer"}:
-        raise RuntimeError(prefix + "an explicit zip or composer mode is required")
+        _reject(prefix, "unsupported_install_type", "an explicit zip or composer mode is required")
     if not isinstance(root, str) or not root or not Path(root).is_absolute():
-        raise RuntimeError(prefix + "an explicit absolute project root is required")
+        _reject(prefix, "invalid_project_root", "an explicit absolute project root is required")
     if not isinstance(run_id, str) or not _RUN.fullmatch(run_id):
-        raise RuntimeError(prefix + "a safe nonempty patch-run-id is required")
+        _reject(prefix, "invalid_patch_run_id", "a safe nonempty patch-run-id is required")
     if not isinstance(raw_plan, str) or not raw_plan or len(raw_plan.encode("utf-8")) > 16_384:
-        raise RuntimeError(prefix + "an explicit bounded patch plan is required")
+        _reject(prefix, "invalid_patch_plan", "an explicit bounded patch plan is required")
     try:
         canonical = Path(root).resolve(strict=True)
         if root != str(canonical) or not canonical.is_dir() or canonical == Path("/"):
@@ -74,5 +90,7 @@ def validate_preflighted_single_instance(
             raise ValueError("patch-plan mode does not match the installed layout")
         if _target_version(canonical) != current:
             raise ValueError("installed source-version metadata is missing or inconsistent")
+    except ManualUpgradePreflightError:
+        raise
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        raise RuntimeError(prefix + str(exc)) from exc
+        raise ManualUpgradePreflightError("invalid_manual_preflight", prefix + str(exc)) from exc

@@ -52,6 +52,13 @@ def test_non_root_rejected(invocation, monkeypatch):
         manual.validate_preflighted_single_instance(**invocation)
 
 
+def test_same_version_has_stable_no_mutation_reason(invocation):
+    invocation.update(current="7.2.0", target="7.2.0")
+    with pytest.raises(manual.ManualUpgradePreflightError) as caught:
+        manual.validate_preflighted_single_instance(**invocation)
+    assert caught.value.reason == "target_already_installed"
+
+
 def test_noncanonical_alias_and_wrong_instance_rejected(invocation, tmp_path):
     alias = tmp_path / "alias"
     alias.symlink_to(invocation["root"], target_is_directory=True)
@@ -163,12 +170,51 @@ def test_ordinary_blocked_release_never_mutates_source(invocation, monkeypatch, 
     assert events == ["global_authorization"]
 
 
-def test_invalid_manual_plan_rejected_before_maintenance(invocation, monkeypatch):
+def test_invalid_manual_plan_rejected_before_maintenance(invocation, monkeypatch, capsys):
     args, events = wire_upgrade(invocation, monkeypatch)
     args["patch_plan_json"] = "{}"
     with pytest.raises(RuntimeError):
         upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True)
     assert events == []
+    evidence = [
+        json.loads(line.split("=", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("MCD_PATCH_PLAN_EVIDENCE=")
+    ]
+    assert len(evidence) == 1
+    assert evidence[0]["schema"] == "mcd-mautic-patch-preflight-v1"
+    assert evidence[0]["operation"] == "patch_preflight"
+    assert evidence[0]["run_id"] == invocation["run_id"]
+    assert evidence[0]["status"] == "error"
+    assert evidence[0]["reason"] == "invalid_manual_preflight"
+    assert evidence[0]["upgrade_started"] is False
+    assert evidence[0]["selected"] == evidence[0]["applied"] == evidence[0]["phases"] == []
+    assert evidence[0]["rollback_attempted"] is False
+
+
+def test_same_version_manual_job_emits_terminal_rejection_before_maintenance(
+    invocation, monkeypatch, capsys
+):
+    args, events = wire_upgrade(invocation, monkeypatch)
+    monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: "7.2.0")
+
+    with pytest.raises(manual.ManualUpgradePreflightError) as caught:
+        upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True)
+
+    assert caught.value.reason == "target_already_installed"
+    assert events == []
+    evidence = [
+        json.loads(line.split("=", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("MCD_PATCH_PLAN_EVIDENCE=")
+    ]
+    assert len(evidence) == 1
+    assert evidence[0]["reason"] == "target_already_installed"
+    assert evidence[0]["status"] == "error"
+    assert evidence[0]["upgrade_started"] is False
+    assert evidence[0]["rollback_attempted"] is False
+    assert evidence[0]["rollback_succeeded"] is False
+    assert evidence[0]["hard_incident"] is False
 
 
 def test_source_change_during_maintenance_aborts_before_first_mutation(invocation, monkeypatch):
