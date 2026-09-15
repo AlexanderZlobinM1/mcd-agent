@@ -2039,6 +2039,9 @@ _SCHEDULER_BACKGROUND_TASK_TYPES = frozenset({"segment", "segment_sql"})
 _SCHEDULER_WORK_TASK_TYPES = _SCHEDULER_SEGMENT_TASK_TYPES | _SCHEDULER_CAMPAIGN_TASK_TYPES
 _SCHEDULER_RESERVED_SAFETY_TASK_TYPES = frozenset({"job:plugin_operation_safety"})
 _SCHEDULER_PRIORITY_PENDING_ROOTS: frozenset[str] = frozenset()
+_SCHEDULER_FAIRNESS_PROMOTED_ROOTS: frozenset[str] = frozenset()
+_SCHEDULER_FAIRNESS_CLAIMED_ROOTS: set[str] = set()
+_SCHEDULER_FAIRNESS_LOCK = threading.Lock()
 
 
 def _scheduler_task_lane(task_type: str | None) -> str | None:
@@ -2095,6 +2098,8 @@ def _scheduler_host_slots_available(
     config: AgentConfig,
     running: dict[str, "RunningTask"],
     task_type: str | None = None,
+    *,
+    root: str = "",
 ) -> int | None:
     normalized = str(task_type or "").strip().lower()
     if normalized in _SCHEDULER_RESERVED_SAFETY_TASK_TYPES or normalized.startswith("job:plugin_operation"):
@@ -2112,6 +2117,13 @@ def _scheduler_host_slots_available(
         running_total = sum(
             1 for task in running.values() if str(task.task_type or "").strip().lower() in _SCHEDULER_WORK_TASK_TYPES
         ) + _segment_sql_worker_total_count()
+        with _SCHEDULER_FAIRNESS_LOCK:
+            waiting_promoted_roots = _SCHEDULER_FAIRNESS_PROMOTED_ROOTS.difference(
+                _SCHEDULER_FAIRNESS_CLAIMED_ROOTS
+            )
+        reserved_for_other_roots = len(waiting_promoted_roots) - int(root in waiting_promoted_roots)
+        if reserved_for_other_roots > 0:
+            effective_limit = max(0, effective_limit - min(effective_limit, reserved_for_other_roots))
         return max(0, effective_limit - running_total)
     limit = _scheduler_host_lane_limit(config, task_type)
     if limit <= 0:
@@ -2122,6 +2134,31 @@ def _scheduler_host_slots_available(
 def _set_scheduler_priority_pending_roots(roots: set[str]) -> None:
     global _SCHEDULER_PRIORITY_PENDING_ROOTS
     _SCHEDULER_PRIORITY_PENDING_ROOTS = frozenset(str(root) for root in roots if str(root))
+
+
+def _set_scheduler_fairness_promoted_roots(roots: set[str]) -> None:
+    global _SCHEDULER_FAIRNESS_PROMOTED_ROOTS
+    normalized = frozenset(str(root) for root in roots if str(root))
+    with _SCHEDULER_FAIRNESS_LOCK:
+        _SCHEDULER_FAIRNESS_PROMOTED_ROOTS = normalized
+        _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.intersection_update(normalized)
+
+
+def _mark_scheduler_fairness_claim(root: str, task_type: str) -> None:
+    normalized_root = str(root or "").strip()
+    normalized_task_type = str(task_type or "").strip().lower()
+    if not normalized_root or normalized_task_type not in _SCHEDULER_WORK_TASK_TYPES:
+        return
+    with _SCHEDULER_FAIRNESS_LOCK:
+        if normalized_root in _SCHEDULER_FAIRNESS_PROMOTED_ROOTS:
+            _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.add(normalized_root)
+
+
+def _take_scheduler_fairness_claimed_roots() -> set[str]:
+    with _SCHEDULER_FAIRNESS_LOCK:
+        claimed = set(_SCHEDULER_FAIRNESS_CLAIMED_ROOTS)
+        _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.clear()
+    return claimed
 
 
 def _scheduler_instance_slots_available(
@@ -7448,7 +7485,7 @@ def _submit_if_slot_uncoordinated(
             prev = store.last_task_started_at(key)
             if prev > 0 and time.time() - float(prev) < float(min_repeat):
                 return False
-    host_slots = _scheduler_host_slots_available(config, running, task_type)
+    host_slots = _scheduler_host_slots_available(config, running, task_type, root=root)
     if host_slots is not None and host_slots <= 0:
         return False
     instance_slots = _scheduler_instance_slots_available(
@@ -7486,6 +7523,7 @@ def _submit_if_slot_uncoordinated(
     )
     task.row_id = store.add_running(task)
     running[key] = task
+    _mark_scheduler_fairness_claim(root, task_type)
     if popens is not None:
         popens[key] = proc
     _ENTITY_LAUNCH_GUARD[_entity_launch_guard_key(root, task_type, entity_id)] = task.started_at
@@ -11156,6 +11194,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             ),
             import_pending_cache,
         )
+        for progressed_root in _take_scheduler_fairness_claimed_roots():
+            scheduler_pending_since_by_root.pop(progressed_root, None)
         dispatch_installs, promoted_roots = _fairness_watchdog_dispatch_installs(
             dispatch_installs,
             pending_roots=pending_roots,
@@ -11163,6 +11203,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             now_ts=now,
             watchdog_sec=int(getattr(config, "scheduler_fairness_watchdog_sec", 300) or 300),
         )
+        _set_scheduler_fairness_promoted_roots(set(promoted_roots))
         promoted_signature = frozenset(promoted_roots)
         oldest_wait_sec = max(
             [max(0, int(now - started_at)) for started_at in scheduler_pending_since_by_root.values()],
@@ -11187,7 +11228,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         store.put_runtime_sync(
             "scheduler_fairness_state",
             {
-                "version": 1,
+                "version": 2,
                 "updated_at": float(now),
                 "host_limit": max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0)),
                 "emergency_reserved_slots": max(
@@ -11198,6 +11239,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 "pending_roots": sorted(pending_roots),
                 "priority_pending_roots": sorted(priority_pending_roots),
                 "promoted_roots": promoted_roots,
+                "reserved_roots": promoted_roots,
                 "oldest_wait_sec": oldest_wait_sec,
             },
         )

@@ -77,7 +77,9 @@ from mcd_agent.daemon import (
     _run_sql_segment_ring,
     _scheduler_host_slots_available,
     _scheduler_instance_slots_available,
+    _set_scheduler_fairness_promoted_roots,
     _set_scheduler_priority_pending_roots,
+    _take_scheduler_fairness_claimed_roots,
     _segment_sql_active_db_rebuild_query_count,
     _segment_shared_slots_available,
     _segment_task_limit_after_import,
@@ -109,6 +111,8 @@ class CampaignRingDispatchTests(unittest.TestCase):
             daemon_mod._CAMPAIGN_FALLBACK_ACTIVE_ROOTS.clear()
             daemon_mod._CAMPAIGN_DISPATCHING_ROOTS.clear()
         _set_scheduler_priority_pending_roots(set())
+        _set_scheduler_fairness_promoted_roots(set())
+        _take_scheduler_fairness_claimed_roots()
 
     def test_missing_optional_campaign_whitelist_file_is_quiet(self) -> None:
         missing = "/tmp/mcd-missing-campaign-whitelist"
@@ -186,6 +190,52 @@ class CampaignRingDispatchTests(unittest.TestCase):
             _scheduler_instance_slots_available(cfg, two_segments, root=root, task_type="campaign_trigger"),
             1,
         )
+
+    def test_host_fairness_reserves_next_slot_for_promoted_root(self) -> None:
+        starving_root = "/var/www/prodajadelova/public_html"
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=3,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+        )
+        running = {
+            "a": SimpleNamespace(root="/var/www/a", task_type="campaign_rebuild"),
+            "b": SimpleNamespace(root="/var/www/b", task_type="campaign_trigger"),
+        }
+        _set_scheduler_fairness_promoted_roots({starving_root})
+
+        self.assertEqual(
+            _scheduler_host_slots_available(cfg, running, "segment", root="/var/www/a"),
+            0,
+        )
+        self.assertEqual(
+            _scheduler_host_slots_available(cfg, running, "segment", root=starving_root),
+            1,
+        )
+
+    def test_host_fairness_advances_after_promoted_root_claims_slot(self) -> None:
+        first_root = "/var/www/first/public_html"
+        second_root = "/var/www/second/public_html"
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=3,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+        )
+        running = {
+            "busy": SimpleNamespace(root="/var/www/busy", task_type="campaign_trigger"),
+        }
+        _set_scheduler_fairness_promoted_roots({first_root, second_root})
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=first_root), 1)
+        daemon_mod._mark_scheduler_fairness_claim(first_root, "segment")
+        running["first"] = SimpleNamespace(root=first_root, task_type="segment")
+
+        self.assertEqual(
+            _scheduler_host_slots_available(cfg, running, "segment", root="/var/www/ordinary"),
+            0,
+        )
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=second_root), 1)
+        self.assertEqual(_take_scheduler_fairness_claimed_roots(), {first_root})
 
     def test_dispatch_rotation_changes_first_instance_each_tick(self) -> None:
         installs = ["a", "b", "c"]

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.27 - 2026-09-15
+
+- Reserve newly available host capacity for fairness-watchdog promoted instances
+  and reset their wait age only after a successful scheduler launch, preventing
+  continuous work on other instances from starving published segment rebuilds.
+
 ## 1.2.26 - 2026-09-14
 
 - Move recurring segment admission into an independent one-second daemon loop

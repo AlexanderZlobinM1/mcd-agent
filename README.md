@@ -179,7 +179,11 @@ Preset rules:
 All active profiles use one elastic host budget. Segment rebuilds may borrow idle
 capacity but leave one emergency slot when the host has at least two slots;
 campaign and import work may claim that slot immediately. The fairness watchdog
-promotes any instance whose queued work has waited for five minutes.
+promotes any instance whose queued work has waited for five minutes. While a
+promoted instance has not launched work, ordinary instances cannot refill the
+host capacity reserved for it. A successful launch resets that instance's wait
+age so other overdue instances receive the next protected admission. This does
+not consume or alter the isolated recurring segment priority lane.
 
 Segment stale-priority rule (all non-passive profiles):
 - segments with `last_built_date` older than 24h (or missing) are force-added to priority ring;
