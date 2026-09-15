@@ -2035,13 +2035,18 @@ def _segment_sql_worker_total_count() -> int:
 
 _SCHEDULER_SEGMENT_TASK_TYPES = frozenset({"segment", "segment_sql", "import"})
 _SCHEDULER_CAMPAIGN_TASK_TYPES = frozenset({"campaign_update", "campaign_trigger", "campaign_rebuild"})
+_SCHEDULER_BASELINE_SEGMENT_TASK_TYPES = _SCHEDULER_SEGMENT_TASK_TYPES
+_SCHEDULER_BASELINE_CAMPAIGN_TASK_TYPES = _SCHEDULER_CAMPAIGN_TASK_TYPES
 _SCHEDULER_BACKGROUND_TASK_TYPES = frozenset({"segment", "segment_sql"})
 _SCHEDULER_WORK_TASK_TYPES = _SCHEDULER_SEGMENT_TASK_TYPES | _SCHEDULER_CAMPAIGN_TASK_TYPES
 _SCHEDULER_RESERVED_SAFETY_TASK_TYPES = frozenset({"job:plugin_operation_safety"})
 _SCHEDULER_PRIORITY_PENDING_ROOTS: frozenset[str] = frozenset()
 _SCHEDULER_FAIRNESS_PROMOTED_ROOTS: frozenset[str] = frozenset()
+_SCHEDULER_FAIRNESS_RESERVED_ROOT = ""
 _SCHEDULER_FAIRNESS_CLAIMED_ROOTS: set[str] = set()
 _SCHEDULER_FAIRNESS_LOCK = threading.Lock()
+_SCHEDULER_BASELINE_ADMISSION_INTERVAL_SEC = 5.0
+_SCHEDULER_BASELINE_LAST_LAUNCH_BY_LANE: dict[str, float] = {}
 
 
 def _scheduler_task_lane(task_type: str | None) -> str | None:
@@ -2049,6 +2054,15 @@ def _scheduler_task_lane(task_type: str | None) -> str | None:
     if normalized in _SCHEDULER_SEGMENT_TASK_TYPES:
         return "segment"
     if normalized in _SCHEDULER_CAMPAIGN_TASK_TYPES:
+        return "campaign"
+    return None
+
+
+def _scheduler_baseline_lane(task_type: str | None) -> str | None:
+    normalized = str(task_type or "").strip().lower()
+    if normalized in _SCHEDULER_BASELINE_SEGMENT_TASK_TYPES:
+        return "segment"
+    if normalized in _SCHEDULER_BASELINE_CAMPAIGN_TASK_TYPES:
         return "campaign"
     return None
 
@@ -2094,6 +2108,37 @@ def _scheduler_host_running_count(
     return len(running) + _segment_sql_worker_total_count()
 
 
+def _scheduler_root_lane_running_count(
+    running: dict[str, "RunningTask"],
+    root: str,
+    lane: str,
+) -> int:
+    count = sum(
+        1
+        for task in running.values()
+        if task.root == root and _scheduler_baseline_lane(task.task_type) == lane
+    )
+    if lane == "segment":
+        count += _segment_sql_worker_count(root)
+    return count
+
+
+def _scheduler_baseline_running_count(
+    running: dict[str, "RunningTask"],
+    lane: str | None = None,
+) -> int:
+    occupied = {
+        (task.root, task_lane)
+        for task in running.values()
+        if (task_lane := _scheduler_baseline_lane(task.task_type)) is not None
+        and (lane is None or task_lane == lane)
+    }
+    if lane in {None, "segment"}:
+        with _SEGMENT_SQL_WORKERS_LOCK:
+            occupied.update((root, "segment") for root, _sid in _SEGMENT_SQL_WORKERS)
+    return len(occupied)
+
+
 def _scheduler_host_slots_available(
     config: AgentConfig,
     running: dict[str, "RunningTask"],
@@ -2104,6 +2149,12 @@ def _scheduler_host_slots_available(
     normalized = str(task_type or "").strip().lower()
     if normalized in _SCHEDULER_RESERVED_SAFETY_TASK_TYPES or normalized.startswith("job:plugin_operation"):
         return None
+    lane = _scheduler_task_lane(normalized)
+    baseline_lane = _scheduler_baseline_lane(normalized)
+    if baseline_lane is not None and root and _scheduler_root_lane_running_count(running, root, baseline_lane) <= 0:
+        # Every instance owns one lightweight segment lane and one lightweight
+        # campaign lane. Shared host capacity applies only above that baseline.
+        return 1
     host_limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
     if (
         bool(getattr(config, "scheduler_elastic_slots_enabled", True))
@@ -2117,18 +2168,21 @@ def _scheduler_host_slots_available(
         running_total = sum(
             1 for task in running.values() if str(task.task_type or "").strip().lower() in _SCHEDULER_WORK_TASK_TYPES
         ) + _segment_sql_worker_total_count()
+        shared_running_total = max(0, running_total - _scheduler_baseline_running_count(running))
         with _SCHEDULER_FAIRNESS_LOCK:
-            waiting_promoted_roots = _SCHEDULER_FAIRNESS_PROMOTED_ROOTS.difference(
-                _SCHEDULER_FAIRNESS_CLAIMED_ROOTS
-            )
-        reserved_for_other_roots = len(waiting_promoted_roots) - int(root in waiting_promoted_roots)
-        if reserved_for_other_roots > 0:
-            effective_limit = max(0, effective_limit - min(effective_limit, reserved_for_other_roots))
-        return max(0, effective_limit - running_total)
+            reserved_root = _SCHEDULER_FAIRNESS_RESERVED_ROOT
+            reservation_claimed = reserved_root in _SCHEDULER_FAIRNESS_CLAIMED_ROOTS
+        if reserved_root and not reservation_claimed and root != reserved_root:
+            effective_limit = max(0, effective_limit - 1)
+        return max(0, effective_limit - shared_running_total)
     limit = _scheduler_host_lane_limit(config, task_type)
     if limit <= 0:
         return None
-    return max(0, limit - _scheduler_host_running_count(running, task_type))
+    shared_lane_running = max(
+        0,
+        _scheduler_host_running_count(running, task_type) - _scheduler_baseline_running_count(running, lane),
+    )
+    return max(0, limit - shared_lane_running)
 
 
 def _set_scheduler_priority_pending_roots(roots: set[str]) -> None:
@@ -2136,12 +2190,14 @@ def _set_scheduler_priority_pending_roots(roots: set[str]) -> None:
     _SCHEDULER_PRIORITY_PENDING_ROOTS = frozenset(str(root) for root in roots if str(root))
 
 
-def _set_scheduler_fairness_promoted_roots(roots: set[str]) -> None:
-    global _SCHEDULER_FAIRNESS_PROMOTED_ROOTS
-    normalized = frozenset(str(root) for root in roots if str(root))
+def _set_scheduler_fairness_promoted_roots(roots: object) -> None:
+    global _SCHEDULER_FAIRNESS_PROMOTED_ROOTS, _SCHEDULER_FAIRNESS_RESERVED_ROOT
+    normalized_order = tuple(dict.fromkeys(str(root) for root in roots if str(root)))
+    normalized = frozenset(normalized_order)
     with _SCHEDULER_FAIRNESS_LOCK:
         _SCHEDULER_FAIRNESS_PROMOTED_ROOTS = normalized
-        _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.intersection_update(normalized)
+        _SCHEDULER_FAIRNESS_RESERVED_ROOT = normalized_order[0] if normalized_order else ""
+        _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.intersection_update({_SCHEDULER_FAIRNESS_RESERVED_ROOT})
 
 
 def _mark_scheduler_fairness_claim(root: str, task_type: str) -> None:
@@ -2150,7 +2206,7 @@ def _mark_scheduler_fairness_claim(root: str, task_type: str) -> None:
     if not normalized_root or normalized_task_type not in _SCHEDULER_WORK_TASK_TYPES:
         return
     with _SCHEDULER_FAIRNESS_LOCK:
-        if normalized_root in _SCHEDULER_FAIRNESS_PROMOTED_ROOTS:
+        if normalized_root == _SCHEDULER_FAIRNESS_RESERVED_ROOT:
             _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.add(normalized_root)
 
 
@@ -2159,6 +2215,18 @@ def _take_scheduler_fairness_claimed_roots() -> set[str]:
         claimed = set(_SCHEDULER_FAIRNESS_CLAIMED_ROOTS)
         _SCHEDULER_FAIRNESS_CLAIMED_ROOTS.clear()
     return claimed
+
+
+def _scheduler_baseline_launch_due(lane: str, now_ts: float | None = None) -> bool:
+    now = float(time.time() if now_ts is None else now_ts)
+    with _SCHEDULER_FAIRNESS_LOCK:
+        previous = float(_SCHEDULER_BASELINE_LAST_LAUNCH_BY_LANE.get(lane, 0.0) or 0.0)
+    return previous <= 0 or now - previous >= _SCHEDULER_BASELINE_ADMISSION_INTERVAL_SEC
+
+
+def _mark_scheduler_baseline_launch(lane: str, started_at: float) -> None:
+    with _SCHEDULER_FAIRNESS_LOCK:
+        _SCHEDULER_BASELINE_LAST_LAUNCH_BY_LANE[str(lane)] = float(started_at)
 
 
 def _scheduler_instance_slots_available(
@@ -2171,6 +2239,9 @@ def _scheduler_instance_slots_available(
     normalized = str(task_type or "").strip().lower()
     if normalized not in _SCHEDULER_WORK_TASK_TYPES:
         return None
+    lane = _scheduler_baseline_lane(normalized)
+    if lane is not None and _scheduler_root_lane_running_count(running, root, lane) <= 0:
+        return 1
     limit = max(0, int(getattr(config, "scheduler_instance_max_parallel", 0) or 0))
     if limit <= 0:
         return None
@@ -7485,6 +7556,13 @@ def _submit_if_slot_uncoordinated(
             prev = store.last_task_started_at(key)
             if prev > 0 and time.time() - float(prev) < float(min_repeat):
                 return False
+    baseline_lane = _scheduler_baseline_lane(task_type)
+    baseline_admission = bool(
+        baseline_lane is not None
+        and _scheduler_root_lane_running_count(running, root, baseline_lane) <= 0
+    )
+    if baseline_admission and not _scheduler_baseline_launch_due(str(baseline_lane)):
+        return False
     host_slots = _scheduler_host_slots_available(config, running, task_type, root=root)
     if host_slots is not None and host_slots <= 0:
         return False
@@ -7523,6 +7601,8 @@ def _submit_if_slot_uncoordinated(
     )
     task.row_id = store.add_running(task)
     running[key] = task
+    if baseline_admission:
+        _mark_scheduler_baseline_launch(str(baseline_lane), task.started_at)
     _mark_scheduler_fairness_claim(root, task_type)
     if popens is not None:
         popens[key] = proc
@@ -11203,7 +11283,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             now_ts=now,
             watchdog_sec=int(getattr(config, "scheduler_fairness_watchdog_sec", 300) or 300),
         )
-        _set_scheduler_fairness_promoted_roots(set(promoted_roots))
+        _set_scheduler_fairness_promoted_roots(promoted_roots)
         promoted_signature = frozenset(promoted_roots)
         oldest_wait_sec = max(
             [max(0, int(now - started_at)) for started_at in scheduler_pending_since_by_root.values()],
@@ -11239,7 +11319,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 "pending_roots": sorted(pending_roots),
                 "priority_pending_roots": sorted(priority_pending_roots),
                 "promoted_roots": promoted_roots,
-                "reserved_roots": promoted_roots,
+                "reserved_roots": promoted_roots[:1],
                 "oldest_wait_sec": oldest_wait_sec,
             },
         )
@@ -11845,10 +11925,25 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 _remove_ring_entities(seg_resume_ring, sql_managed_segment_ids)
 
                 if segment_throttled_active and config.segment_throttle_whitelist_only and config.segment_throttle_kill_non_whitelist:
-                    for key, task in list(running.items()):
-                        if task.root != root or task.task_type != "segment":
-                            continue
-                        if task.entity_id is None or task.entity_id in segment_whitelist_for_inst:
+                    non_whitelist_tasks = [
+                        (key, task)
+                        for key, task in running.items()
+                        if task.root == root
+                        and task.task_type == "segment"
+                        and task.entity_id is not None
+                        and task.entity_id not in segment_whitelist_for_inst
+                    ]
+                    whitelist_running = any(
+                        task.root == root
+                        and task.task_type == "segment"
+                        and task.entity_id in segment_whitelist_for_inst
+                        for task in running.values()
+                    ) or _segment_sql_worker_count(root) > 0
+                    keep_baseline_key = None
+                    if non_whitelist_tasks and not whitelist_running:
+                        keep_baseline_key = min(non_whitelist_tasks, key=lambda item: item[1].started_at)[0]
+                    for key, task in non_whitelist_tasks:
+                        if key == keep_baseline_key:
                             continue
                         _kill_pid(task.pid, config.segment_kill_grace_sec)
                         store.finish(task.row_id, state="timeout", rc=None, note="throttle_kill")
@@ -11914,6 +12009,37 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         on_launch=_mark_segment_cycle,
                         max_launches=seg_prio_limit,
                     )
+                    if _scheduler_root_lane_running_count(running, root, "segment") <= 0:
+                        for baseline_ring, baseline_entities in (
+                            (seg_prio_ring, seg_prio_set),
+                            (seg_reg_ring, seg_reg_set),
+                        ):
+                            if segment_launched_this_tick > 0:
+                                break
+                            segment_launched_this_tick += _fill_from_ring(
+                                ring=baseline_ring,
+                                ring_limit=1,
+                                total_limit=1,
+                                root=root,
+                                task_type="segment",
+                                running=running,
+                                ring_entities=baseline_entities,
+                                config=config,
+                                store=store,
+                                popens=popens,
+                                build_args=lambda sid: render_mautic_command(
+                                    php_bin=config.php_bin,
+                                    run_as_user=config.mautic_run_as_user,
+                                    root=root,
+                                    template=config.cmd_segment_update_template,
+                                    id=sid,
+                                    batch_limit=config.segment_batch_limit,
+                                ),
+                                blocked_entities=segment_blocked_ids,
+                                dynamic_blocked=_segment_chain_running_conflict,
+                                on_launch=_mark_segment_cycle,
+                                max_launches=1,
+                            )
                     seg_cur_total = _running_count(running, root, "segment")
                     if seg_cur_total >= seg_total_limit:
                         pass

@@ -113,6 +113,8 @@ class CampaignRingDispatchTests(unittest.TestCase):
         _set_scheduler_priority_pending_roots(set())
         _set_scheduler_fairness_promoted_roots(set())
         _take_scheduler_fairness_claimed_roots()
+        with daemon_mod._SCHEDULER_FAIRNESS_LOCK:
+            daemon_mod._SCHEDULER_BASELINE_LAST_LAUNCH_BY_LANE.clear()
 
     def test_missing_optional_campaign_whitelist_file_is_quiet(self) -> None:
         missing = "/tmp/mcd-missing-campaign-whitelist"
@@ -141,7 +143,7 @@ class CampaignRingDispatchTests(unittest.TestCase):
             segment_regular_parallel_idle=1,
         )
 
-        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment"), 1)
 
     def test_elastic_host_budget_keeps_one_emergency_slot_for_priority_work(self) -> None:
         cfg = SimpleNamespace(
@@ -167,10 +169,10 @@ class CampaignRingDispatchTests(unittest.TestCase):
             for campaign_id in range(6)
         }
 
-        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "segment"), 0)
-        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "campaign_rebuild"), 1)
-        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "import"), 1)
-        self.assertEqual(_scheduler_host_slots_available(cfg, six_campaigns, "campaign_rebuild"), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "segment"), 5)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "campaign_rebuild"), 6)
+        self.assertEqual(_scheduler_host_slots_available(cfg, five_segments, "import"), 6)
+        self.assertEqual(_scheduler_host_slots_available(cfg, six_campaigns, "campaign_rebuild"), 1)
         self.assertEqual(_scheduler_host_slots_available(cfg, six_campaigns, "segment"), 0)
 
     def test_farm_instance_limit_reserves_root_slot_when_priority_work_is_pending(self) -> None:
@@ -193,19 +195,20 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
     def test_host_fairness_reserves_next_slot_for_promoted_root(self) -> None:
         starving_root = "/var/www/prodajadelova/public_html"
+        ordinary_root = "/var/www/ordinary/public_html"
         cfg = SimpleNamespace(
-            scheduler_host_max_parallel=3,
+            scheduler_host_max_parallel=1,
             scheduler_elastic_slots_enabled=True,
             scheduler_emergency_reserved_slots=0,
         )
         running = {
-            "a": SimpleNamespace(root="/var/www/a", task_type="campaign_rebuild"),
-            "b": SimpleNamespace(root="/var/www/b", task_type="campaign_trigger"),
+            "starving-baseline": SimpleNamespace(root=starving_root, task_type="segment"),
+            "ordinary-baseline": SimpleNamespace(root=ordinary_root, task_type="segment"),
         }
         _set_scheduler_fairness_promoted_roots({starving_root})
 
         self.assertEqual(
-            _scheduler_host_slots_available(cfg, running, "segment", root="/var/www/a"),
+            _scheduler_host_slots_available(cfg, running, "segment", root=ordinary_root),
             0,
         )
         self.assertEqual(
@@ -217,25 +220,102 @@ class CampaignRingDispatchTests(unittest.TestCase):
         first_root = "/var/www/first/public_html"
         second_root = "/var/www/second/public_html"
         cfg = SimpleNamespace(
+            scheduler_host_max_parallel=1,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+        )
+        running = {
+            "first-baseline": SimpleNamespace(root=first_root, task_type="segment"),
+            "second-baseline": SimpleNamespace(root=second_root, task_type="segment"),
+        }
+        _set_scheduler_fairness_promoted_roots([first_root, second_root])
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=first_root), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=second_root), 0)
+        daemon_mod._mark_scheduler_fairness_claim(first_root, "segment")
+        running["first-extra"] = SimpleNamespace(root=first_root, task_type="segment")
+
+        self.assertEqual(_take_scheduler_fairness_claimed_roots(), {first_root})
+        running.pop("first-extra")
+        _set_scheduler_fairness_promoted_roots([second_root])
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=second_root), 1)
+
+    def test_many_promoted_roots_reserve_only_one_shared_slot(self) -> None:
+        cfg = SimpleNamespace(
             scheduler_host_max_parallel=3,
             scheduler_elastic_slots_enabled=True,
             scheduler_emergency_reserved_slots=0,
         )
         running = {
-            "busy": SimpleNamespace(root="/var/www/busy", task_type="campaign_trigger"),
+            "owner-baseline": SimpleNamespace(root="/promoted-0", task_type="segment"),
+            "ordinary-baseline": SimpleNamespace(root="/ordinary", task_type="segment"),
+            "a": SimpleNamespace(root="/a", task_type="import"),
+            "a-extra-1": SimpleNamespace(root="/a", task_type="import"),
+            "a-extra-2": SimpleNamespace(root="/a", task_type="import"),
         }
-        _set_scheduler_fairness_promoted_roots({first_root, second_root})
+        roots = [f"/promoted-{idx}" for idx in range(20)]
+        _set_scheduler_fairness_promoted_roots(roots)
 
-        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=first_root), 1)
-        daemon_mod._mark_scheduler_fairness_claim(first_root, "segment")
-        running["first"] = SimpleNamespace(root=first_root, task_type="segment")
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=roots[0]), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root="/ordinary"), 0)
 
-        self.assertEqual(
-            _scheduler_host_slots_available(cfg, running, "segment", root="/var/www/ordinary"),
-            0,
+    def test_each_root_has_segment_and_campaign_baseline_outside_shared_pool(self) -> None:
+        root = "/var/www/prodajadelova/public_html"
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=1,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+            scheduler_instance_max_parallel=1,
         )
-        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=second_root), 1)
-        self.assertEqual(_take_scheduler_fairness_claimed_roots(), {first_root})
+        running = {
+            "shared": SimpleNamespace(root="/other", task_type="import"),
+        }
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=root), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "campaign_trigger", root=root), 1)
+        self.assertEqual(_scheduler_instance_slots_available(cfg, running, root=root, task_type="segment"), 1)
+        self.assertEqual(_scheduler_instance_slots_available(cfg, running, root=root, task_type="campaign_rebuild"), 1)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "import", root=root), 1)
+
+    def test_additional_lightweight_work_uses_shared_pool(self) -> None:
+        root = "/var/www/prodajadelova/public_html"
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=1,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+        )
+        running = {
+            "segment-baseline": SimpleNamespace(root=root, task_type="segment"),
+            "segment-extra": SimpleNamespace(root=root, task_type="import"),
+            "campaign-baseline": SimpleNamespace(root=root, task_type="campaign_trigger"),
+        }
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=root), 0)
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "campaign_rebuild", root=root), 0)
+
+    def test_import_owns_segment_baseline_before_segment_work(self) -> None:
+        root = "/var/www/prodajadelova/public_html"
+        cfg = SimpleNamespace(
+            scheduler_host_max_parallel=1,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=0,
+        )
+        running = {
+            "root-import-baseline": SimpleNamespace(root=root, task_type="import"),
+            "other-import-baseline": SimpleNamespace(root="/other", task_type="import"),
+            "other-import-extra": SimpleNamespace(root="/other", task_type="import"),
+        }
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=root), 0)
+        self.assertEqual(_segment_task_limit_after_import(running, root, 1), 0)
+
+    def test_baseline_admissions_are_staggered_per_lane(self) -> None:
+        self.assertTrue(daemon_mod._scheduler_baseline_launch_due("segment", 100.0))
+        daemon_mod._mark_scheduler_baseline_launch("segment", 100.0)
+
+        self.assertFalse(daemon_mod._scheduler_baseline_launch_due("segment", 104.9))
+        self.assertTrue(daemon_mod._scheduler_baseline_launch_due("segment", 105.0))
+        self.assertTrue(daemon_mod._scheduler_baseline_launch_due("campaign", 100.0))
 
     def test_dispatch_rotation_changes_first_instance_each_tick(self) -> None:
         installs = ["a", "b", "c"]

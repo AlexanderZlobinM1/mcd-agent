@@ -179,11 +179,19 @@ Preset rules:
 All active profiles use one elastic host budget. Segment rebuilds may borrow idle
 capacity but leave one emergency slot when the host has at least two slots;
 campaign and import work may claim that slot immediately. The fairness watchdog
-promotes any instance whose queued work has waited for five minutes. While a
-promoted instance has not launched work, ordinary instances cannot refill the
-host capacity reserved for it. A successful launch resets that instance's wait
-age so other overdue instances receive the next protected admission. This does
-not consume or alter the isolated recurring segment priority lane.
+promotes any instance whose queued work has waited for five minutes. Every
+instance owns one segment/import slot and one combined campaign
+trigger/rebuild slot independently of shared-pool occupancy. Additional work
+borrows the dynamic host pool. The oldest promoted owner also protects one
+shared slot until it launches; a successful launch resets its wait age so the
+next overdue instance advances. Queue throttle can reduce additional segment
+capacity to whitelist-only, but retains one automatic segment baseline per
+instance. Baseline starts in each lane are globally spaced by five seconds in
+deterministic scheduler order. Pending imports are dispatched before segment
+rings and own the shared segment/import baseline while active; segments may use
+only remaining dynamic capacity. Exact-task locks, plugin operations,
+migrations and the isolated recurring segment priority lane keep their existing
+safety rules.
 
 Segment stale-priority rule (all non-passive profiles):
 - segments with `last_built_date` older than 24h (or missing) are force-added to priority ring;

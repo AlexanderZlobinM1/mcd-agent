@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.28 - 2026-09-15
+
+- Guarantee one per-instance segment/import slot and one per-instance campaign
+  slot outside the dynamic shared host pool while preserving exact-task locks
+  and bounded additional concurrency.
+- Keep one non-whitelist segment baseline alive during queue throttle and fix
+  multi-root fairness promotion so it reserves one owned slot instead of
+  reducing every promoted root's host limit to zero.
+
 ## 1.2.27 - 2026-09-15
 
 - Reserve newly available host capacity for fairness-watchdog promoted instances
