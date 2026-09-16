@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.29 - 2026-09-16
+
+- Publish the read-only `mcd-contact-field-metadata-v1` report contract for
+  instance-local Mautic field definitions and safe database storage metadata.
+  The report excludes contact rows, stored values, defaults and serialized
+  field properties, and returns structured per-instance errors for MCC jobs.
+
 ## 1.2.28 - 2026-09-15
 
 - Guarantee one per-instance segment/import slot and one per-instance campaign

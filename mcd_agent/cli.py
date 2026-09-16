@@ -58,6 +58,10 @@ from mcd_agent.cluster_routing import (
     cluster_route_targets,
 )
 from mcd_agent.contact_count_report import collect_contact_count_report
+from mcd_agent.contact_field_metadata_report import (
+    collect_contact_field_metadata_report,
+    contact_field_metadata_error,
+)
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
@@ -1815,6 +1819,14 @@ def _build_parser() -> argparse.ArgumentParser:
     contact_count.add_argument("--root", help="Mautic root, instance uid, name, or domain")
     contact_count.add_argument("--json", action="store_true")
 
+    contact_field_metadata = sub.add_parser(
+        "report:contact-field-metadata",
+        help="Collect read-only Mautic contact field definitions and storage metadata",
+    )
+    contact_field_metadata.add_argument("--config", default=default_cfg)
+    contact_field_metadata.add_argument("--root", help="Mautic root, instance uid, name, or domain")
+    contact_field_metadata.add_argument("--json", action="store_true")
+
     tune = sub.add_parser("tune-segments", help="Benchmark and tune segment parallelism")
     tune.add_argument("--config", default=default_cfg)
     tune.add_argument("--root")
@@ -2950,6 +2962,45 @@ def main() -> int:
                     mobile_only=int(payload.get("mobile_only", 0) or 0),
                     both=int(payload.get("email_and_mobile", 0) or 0),
                     excluded=int(payload.get("excluded_without_email_or_mobile", 0) or 0),
+                )
+            )
+        return 0
+
+    if args.cmd == "report:contact-field-metadata":
+        cfg = load_config(args.config)
+        note = maybe_notify_update(cfg)
+        if note and not bool(getattr(args, "json", False)):
+            print(f"NOTICE: {note}")
+        inst = None
+        try:
+            inst = _select_instance_for_ops(cfg, getattr(args, "root", None))
+            if not inst.db:
+                raise RuntimeError(f"Mautic install has no DB config: {inst.root}")
+            payload = collect_contact_field_metadata_report(MauticDB(inst.db))
+        except Exception as e:
+            payload = contact_field_metadata_error(str(e))
+            if inst is not None:
+                payload["root"] = inst.root
+                payload["instance_uid"] = inst.instance_uid
+                payload["name"] = inst.name
+                payload["primary_domain"] = inst.primary_domain
+            if bool(getattr(args, "json", False)):
+                print(json.dumps(payload, ensure_ascii=True, indent=2))
+            else:
+                print(f"contact field metadata report failed: {e}")
+            return 1
+        payload["root"] = inst.root
+        payload["instance_uid"] = inst.instance_uid
+        payload["name"] = inst.name
+        payload["primary_domain"] = inst.primary_domain
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=True, indent=2, default=str))
+        else:
+            print(
+                "contact-field-metadata: root={root} fields={fields} schema={schema}".format(
+                    root=str(payload.get("root") or ""),
+                    fields=int(payload.get("field_count", 0) or 0),
+                    schema=str(payload.get("schema") or ""),
                 )
             )
         return 0

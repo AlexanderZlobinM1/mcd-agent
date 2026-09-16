@@ -7,6 +7,12 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 - connected (managed by MCC over SSH and event callbacks)
 
 ## Current capabilities
+
+- `mcd-cli report:contact-field-metadata --root <instance> --json` publishes
+  `mcd-contact-field-metadata-v1`: instance-local Mautic contact field aliases,
+  labels, native/custom classification, types and safe physical column sizes.
+  It never reads contact rows, field values, defaults, properties or options;
+  see `docs/contact-field-metadata-v1.md` for the JSON and error contract.
 - CLI entrypoint
 - Config loader (TOML)
 - Mautic instance discovery from web roots
