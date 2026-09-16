@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.2.30 - 2026-09-16
+
+- Fix the contact field metadata report to read Mautic's canonical
+  `lead_fields.label` column. The failed 1.2.29 test build was not promoted.
+
 ## 1.2.29 - 2026-09-16
 
 - Publish the read-only `mcd-contact-field-metadata-v1` report contract for

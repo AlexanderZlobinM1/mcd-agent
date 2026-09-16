@@ -52,7 +52,7 @@ def collect_contact_field_metadata_report(db: MauticDB) -> dict[str, Any]:
         f"""
         SELECT
           lf.`alias` AS field_alias,
-          lf.`name` AS field_label,
+          lf.`label` AS field_label,
           CASE WHEN COALESCE(lf.`fixed`, 0) = 1 THEN 'native' ELSE 'custom' END AS field_classification,
           lf.`type` AS field_type,
           NULLIF(TRIM(COALESCE(lf.`group`, '')), '') AS field_group,
