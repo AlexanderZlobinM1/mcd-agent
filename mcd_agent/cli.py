@@ -62,6 +62,7 @@ from mcd_agent.contact_field_metadata_report import (
     collect_contact_field_metadata_report,
     contact_field_metadata_error,
 )
+from mcd_agent.mautic_version_cache import collect_mautic_version
 from mcd_agent.custom_scripts import fetch_custom_manifest, format_custom_scripts_list, run_custom_script_by_key
 from mcd_agent.db import MauticDB
 from mcd_agent.daemon import TaskStore, list_external_runtime_task_summaries, run_loop
@@ -2977,6 +2978,13 @@ def main() -> int:
             if not inst.db:
                 raise RuntimeError(f"Mautic install has no DB config: {inst.root}")
             payload = collect_contact_field_metadata_report(MauticDB(inst.db))
+            payload["mautic_version"] = collect_mautic_version(
+                inst.root,
+                cfg.php_bin,
+                console_path=inst.console_path,
+                run_as_user=cfg.mautic_run_as_user,
+                expected_major=inst.mautic_major,
+            )
         except Exception as e:
             payload = contact_field_metadata_error(str(e))
             if inst is not None:

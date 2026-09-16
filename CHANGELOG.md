@@ -8,6 +8,8 @@
   instance-local Mautic field definitions and safe database storage metadata.
   The report excludes contact rows, stored values, defaults and serialized
   field properties, and returns structured per-instance errors for MCC jobs.
+- Advertise the report in DB-capable instance runtime capabilities and
+  operations, and include explicit schema, MCD and Mautic versions in results.
 
 ## 1.2.28 - 2026-09-15
 

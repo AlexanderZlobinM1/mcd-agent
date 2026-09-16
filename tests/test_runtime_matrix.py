@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from mcd_agent.runtime_matrix import MAUTIC_PATCH_PREFLIGHT_OPERATION, build_runtime_profile
+from mcd_agent.runtime_matrix import (
+    CONTACT_FIELD_METADATA_OPERATION,
+    MAUTIC_PATCH_PREFLIGHT_OPERATION,
+    build_runtime_profile,
+)
 
 
 def test_four_runtime_layout_combinations_have_stable_distinct_styles() -> None:
@@ -28,6 +32,25 @@ def test_host_zip_supports_composer_move_but_host_composer_does_not() -> None:
     assert composer.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
     assert zipped.allows("backup")
     assert composer.allows("backup")
+    assert zipped.allows(CONTACT_FIELD_METADATA_OPERATION)
+    assert CONTACT_FIELD_METADATA_OPERATION in zipped.capabilities
+
+
+def test_contact_field_metadata_is_advertised_for_every_database_runtime() -> None:
+    for runtime, install_type in (("host", "zip"), ("host", "composer"), ("docker", "composer")):
+        profile = build_runtime_profile(
+            runtime=runtime,
+            install_type=install_type,
+            capabilities=["database"],
+        )
+        assert profile.allows(CONTACT_FIELD_METADATA_OPERATION)
+        assert CONTACT_FIELD_METADATA_OPERATION in profile.capabilities
+
+    without_database = build_runtime_profile(
+        runtime="docker", install_type="composer", capabilities=["console"]
+    )
+    assert not without_database.allows(CONTACT_FIELD_METADATA_OPERATION)
+    assert CONTACT_FIELD_METADATA_OPERATION not in without_database.capabilities
 
 
 def test_host_explicit_runtime_advertises_atomic_patch_preflight() -> None:

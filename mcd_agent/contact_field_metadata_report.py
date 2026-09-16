@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from mcd_agent import __version__
 from mcd_agent.db import MauticDB
 
 
@@ -26,7 +27,9 @@ def _optional_int(value: Any) -> int | None:
 def contact_field_metadata_error(message: str, *, code: str = "collection_failed") -> dict[str, Any]:
     return {
         "schema": SCHEMA,
+        "schema_version": "1",
         "capability": CAPABILITY,
+        "mcd_version": __version__,
         "status": "error",
         "generated_at": _generated_at(),
         "field_count": 0,
@@ -79,6 +82,8 @@ def collect_contact_field_metadata_report(db: MauticDB) -> dict[str, Any]:
             {
                 "alias": alias,
                 "label": str(row.get("field_label") or ""),
+                "type": str(row.get("field_type") or ""),
+                "custom": classification == "custom",
                 "classification": classification,
                 "field_type": str(row.get("field_type") or ""),
                 "group": str(row.get("field_group")) if row.get("field_group") is not None else None,
@@ -91,7 +96,9 @@ def collect_contact_field_metadata_report(db: MauticDB) -> dict[str, Any]:
         )
     return {
         "schema": SCHEMA,
+        "schema_version": "1",
         "capability": CAPABILITY,
+        "mcd_version": __version__,
         "status": "ok",
         "generated_at": _generated_at(),
         "field_count": len(fields),

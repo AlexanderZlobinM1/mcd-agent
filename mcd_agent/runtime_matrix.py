@@ -6,6 +6,7 @@ from typing import Iterable
 
 MATRIX_SCHEMA = "mautic-runtime-matrix-v1"
 MAUTIC_PATCH_PREFLIGHT_OPERATION = "mcd-mautic-patch-preflight-v1"
+CONTACT_FIELD_METADATA_OPERATION = "mcd-contact-field-metadata-v1"
 KNOWN_RUNTIMES = frozenset({"host", "docker"})
 KNOWN_INSTALL_TYPES = frozenset({"zip", "composer"})
 
@@ -88,6 +89,8 @@ def build_runtime_profile(
     install_name = normalize_install_type(install_type)
     declared = normalize_capabilities(capabilities)
     effective = _HOST_DEFAULT_CAPABILITIES if runtime_name == "host" and not declared else declared
+    if "database" in effective:
+        effective = effective | {CONTACT_FIELD_METADATA_OPERATION}
     if (
         runtime_name == "host"
         and install_name in KNOWN_INSTALL_TYPES
@@ -104,7 +107,7 @@ def build_runtime_profile(
     if "console" in effective:
         operations.update({"console-jobs", "cache", "reset-password"})
     if "database" in effective:
-        operations.add("database-operations")
+        operations.update({"database-operations", CONTACT_FIELD_METADATA_OPERATION})
     if {"database", "filesystem"}.issubset(effective):
         operations.add("backup")
     if "plugin-read" in effective:

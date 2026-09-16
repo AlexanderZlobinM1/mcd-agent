@@ -68,11 +68,15 @@ class ContactFieldMetadataReportTests(unittest.TestCase):
         payload = collect_contact_field_metadata_report(db)
 
         self.assertEqual(payload["schema"], SCHEMA)
+        self.assertEqual(payload["schema_version"], "1")
         self.assertEqual(payload["capability"], SCHEMA)
+        self.assertEqual(payload["mcd_version"], "1.2.29")
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["field_count"], 2)
         self.assertEqual(payload["errors"], [])
         self.assertEqual(payload["fields"][0]["classification"], "native")
+        self.assertFalse(payload["fields"][0]["custom"])
+        self.assertEqual(payload["fields"][0]["type"], "email")
         self.assertEqual(payload["fields"][0]["max_length"], 191)
         self.assertEqual(payload["fields"][1]["numeric_precision"], 18)
         self.assertEqual(payload["fields"][1]["numeric_scale"], 2)
@@ -99,6 +103,7 @@ class ContactFieldMetadataReportTests(unittest.TestCase):
         payload = contact_field_metadata_error("database unavailable")
 
         self.assertEqual(payload["schema"], SCHEMA)
+        self.assertEqual(payload["schema_version"], "1")
         self.assertEqual(payload["status"], "error")
         self.assertEqual(payload["fields"], [])
         self.assertEqual(payload["errors"][0]["code"], "collection_failed")
