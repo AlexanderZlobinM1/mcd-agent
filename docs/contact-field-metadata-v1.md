@@ -1,6 +1,6 @@
 # Contact field metadata report v1
 
-MCD 1.2.30 publishes the read-only `mcd-contact-field-metadata-v1`
+MCD 1.2.31 publishes the read-only `mcd-contact-field-metadata-v1`
 capability for MCC report jobs.
 
 ```bash
@@ -28,10 +28,11 @@ An instance failure returns exit status 1 and the same top-level envelope with
 `status=error`, empty `fields`, `field_count=0`, and one or more structured
 `errors` entries containing `code`, `message` and `retryable`. MCC should check
 the exact `mcd-contact-field-metadata-v1` value in both `runtime_capabilities`
-and `runtime_profile.operations`, and require MCD 1.2.30 or newer before
+and `runtime_profile.operations`, and require MCD 1.2.31 or newer before
 dispatching this report.
 
-The contract targets the shared Mautic 6 and 7 `lead_fields` schema. A field
+The contract targets the shared Mautic 6 and 7 `lead_fields` schema, including
+`label`, `is_fixed`, `field_group`, `field_order` and `char_length_limit`. A field
 whose alias has no physical `leads` column remains present, with nullable
 storage metadata. The report is instance-local and does not aggregate or infer
 fields across hosts.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.31 - 2026-09-16
+
+- Use the shared Mautic 6/7 `lead_fields` schema names for native/custom,
+  group, ordering and declared character length metadata. The failed 1.2.30
+  test build was not promoted.
+
 ## 1.2.30 - 2026-09-16
 
 - Fix the contact field metadata report to read Mautic's canonical

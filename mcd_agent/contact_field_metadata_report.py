@@ -53,12 +53,12 @@ def collect_contact_field_metadata_report(db: MauticDB) -> dict[str, Any]:
         SELECT
           lf.`alias` AS field_alias,
           lf.`label` AS field_label,
-          CASE WHEN COALESCE(lf.`fixed`, 0) = 1 THEN 'native' ELSE 'custom' END AS field_classification,
+          CASE WHEN COALESCE(lf.`is_fixed`, 0) = 1 THEN 'native' ELSE 'custom' END AS field_classification,
           lf.`type` AS field_type,
-          NULLIF(TRIM(COALESCE(lf.`group`, '')), '') AS field_group,
+          NULLIF(TRIM(COALESCE(lf.`field_group`, '')), '') AS field_group,
           NULLIF(TRIM(COALESCE(lf.`object`, '')), '') AS field_object,
           c.`DATA_TYPE` AS storage_type,
-          c.`CHARACTER_MAXIMUM_LENGTH` AS max_length,
+          COALESCE(NULLIF(lf.`char_length_limit`, 0), c.`CHARACTER_MAXIMUM_LENGTH`) AS max_length,
           c.`NUMERIC_PRECISION` AS numeric_precision,
           c.`NUMERIC_SCALE` AS numeric_scale
         FROM `{field_table}` lf
@@ -66,7 +66,7 @@ def collect_contact_field_metadata_report(db: MauticDB) -> dict[str, Any]:
           ON c.`TABLE_SCHEMA` = DATABASE()
          AND c.`TABLE_NAME` = '{contact_table}'
          AND c.`COLUMN_NAME` = lf.`alias`
-        ORDER BY lf.`ordering`, lf.`id`
+        ORDER BY lf.`field_order`, lf.`id`
         """,
         limit=5000,
     )
