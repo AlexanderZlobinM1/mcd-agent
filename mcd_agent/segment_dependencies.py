@@ -125,36 +125,15 @@ def mautic7_terminal_segment_plan(
     children_by_parent: dict[int, set[int]],
 ) -> tuple[list[int], set[int]]:
     """
-    Replace internal dependency segments with terminal segments for Mautic 7.
+    Preserve every published due segment in the Mautic 7 plan.
 
-    Mautic 7 recursively rebuilds leadlist-filter dependencies inside
-    `mautic:segments:update -i <terminal>`, so MCD should schedule only the
-    highest requested terminal segment for each dependency chain.
+    A terminal segment command can traverse leadlist-filter dependencies, but
+    that traversal is not evidence that each referenced customer-visible lead
+    list was rebuilt. Dependency maps still serialize related work; they must
+    never suppress a due segment from the scheduler plan.
     """
     ordered = list(dict.fromkeys(int(x) for x in candidate_ids if int(x) > 0))
-    if not ordered or not children_by_parent:
-        return ordered, set()
-
-    planned: list[int] = []
-    suppressed: set[int] = set()
-    for sid in ordered:
-        terminals = terminal_dependent_segment_ids(sid, children_by_parent)
-        if terminals == {sid}:
-            planned.append(sid)
-            continue
-        suppressed.add(sid)
-        planned.extend(sorted(terminals))
-
-    planned = list(dict.fromkeys(planned))
-    # If a terminal and one of its dependencies were both candidates, keep the
-    # terminal once and mark the dependency as covered by that terminal command.
-    planned_set = set(planned)
-    for sid in ordered:
-        if sid in planned_set:
-            continue
-        if terminal_dependent_segment_ids(sid, children_by_parent) & planned_set:
-            suppressed.add(sid)
-    return planned, suppressed
+    return ordered, set()
 
 
 def dependency_expanded_segment_plan(

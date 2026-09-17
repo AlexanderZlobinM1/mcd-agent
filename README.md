@@ -8,6 +8,10 @@ MCD (MauticControlDaemon) is a host-level service that can run in two modes:
 
 ## Current capabilities
 
+- Mautic 7 dependency planning preserves every published due customer-visible
+  segment as explicit work. A terminal lead-list dependency may serialize the
+  chain but never counts the referenced segment as rebuilt or removes it from
+  the scheduler plan.
 - `mcd-cli report:contact-field-metadata --root <instance> --json` publishes
   `mcd-contact-field-metadata-v1`: instance-local Mautic contact field aliases,
   labels, native/custom classification, types and safe physical column sizes.

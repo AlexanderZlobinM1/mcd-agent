@@ -76,7 +76,7 @@ class SegmentDependencyTests(unittest.TestCase):
         self.assertEqual(planned, [9, 10])
         self.assertEqual(suppressed, {6, 8})
 
-    def test_mautic7_plans_terminal_segments_from_internal_due_ids(self) -> None:
+    def test_mautic7_preserves_visible_due_segments_with_terminal_dependents(self) -> None:
         rows = [
             {"id": 11, "filters": "a:0:{}"},
             {
@@ -108,8 +108,19 @@ class SegmentDependencyTests(unittest.TestCase):
 
         planned, suppressed = mautic7_terminal_segment_plan([57, 200], children)
 
-        self.assertEqual(planned, [61, 200])
-        self.assertEqual(suppressed, {57})
+        self.assertEqual(planned, [57, 200])
+        self.assertEqual(suppressed, set())
+
+    def test_mautic7_dnc_visible_segments_are_not_covered_only_by_children(self) -> None:
+        children = {
+            3: {28, 30, 34},
+            4: {29, 32, 33, 35},
+        }
+
+        planned, suppressed = mautic7_terminal_segment_plan([3, 4, 28, 29], children)
+
+        self.assertEqual(planned, [3, 4, 28, 29])
+        self.assertEqual(suppressed, set())
 
     def test_older_mautic_plan_expands_dependencies_before_child(self) -> None:
         rows = [

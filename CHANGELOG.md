@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.32 - 2026-09-17
+
+- Keep every published due Mautic 7 segment in the scheduler plan even when a
+  terminal segment references it through a lead-list filter. Recursive Mautic
+  dependency traversal no longer suppresses customer-visible unsubscribe,
+  bounce or other lead lists without a dedicated rebuild.
+
 ## 1.2.31 - 2026-09-16
 
 - Use the shared Mautic 6/7 `lead_fields` schema names for native/custom,
