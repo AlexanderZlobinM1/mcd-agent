@@ -40,6 +40,16 @@ def seed(root, kind="composer", version="7.2.0"):
     (bundle_dir / "release_metadata.json").write_text(json.dumps({"version": version}))
     shutil.copyfile(FIXTURES / "Version20211209022550-7.2.0.php", source / ROLE_PATH)
     shutil.copyfile(FIXTURES / "MauticCoreBundle-7.2.0.php", bundle_dir / "MauticCoreBundle.php")
+    grapes = source / "plugins/GrapesJsBuilderBundle"
+    (grapes / "Config").mkdir(parents=True)
+    (grapes / "EventSubscriber").mkdir(parents=True)
+    dist = grapes / "Assets/library/js/dist"
+    dist.mkdir(parents=True)
+    shutil.copyfile(FIXTURES / "grapesjs/services.php", grapes / "Config/services.php")
+    shutil.copyfile(FIXTURES / "grapesjs/AssetsSubscriber.php", grapes / "EventSubscriber/AssetsSubscriber.php")
+    shutil.copyfile(FIXTURES / "grapesjs/manifest.json", dist / "manifest.json")
+    shutil.copyfile(FIXTURES / "grapesjs/builder.js", dist / "builder.js")
+    shutil.copyfile(FIXTURES / "grapesjs/builder.dd554a8e.css", dist / "builder.dd554a8e.css")
     return source.resolve()
 
 
@@ -119,8 +129,8 @@ def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
     assert result["schema"] == patch.PREFLIGHT_SCHEMA
     assert result["status"] == "success"
     assert result["snapshot_id"]
-    assert result["selected"] == [patch.ROLE, patch.ASSET]
-    assert result["applied"] == [patch.ROLE, patch.ASSET]
+    assert result["selected"] == [patch.ROLE, patch.ASSET, patch.GRAPESJS]
+    assert result["applied"] == [patch.ROLE, patch.ASSET, patch.GRAPESJS]
     assert result["verification"]["role"]["state"] == "already"
     assert result["verification"]["asset"]["state"] == "already"
     assert result["upgrade_started"] is False
@@ -179,7 +189,7 @@ def test_real_source_phases_and_repeat_preserve_all_backups(tmp_path, kind):
     repeated = patch.execute(str(tmp_path), raw, "post_source_install_before_asset_generation", "upgrade-72")
     assert repeated["patches"][0]["state"] == "already"
     evidence = json.loads((tmp_path / ".mcd/patch-runs/upgrade-72/result.json").read_text())
-    assert len(evidence["backup_records"]) == 3
+    assert len(evidence["backup_records"]) == 5
     assert patch.rollback(str(tmp_path), raw, "upgrade-72")["status"] == "success"
     assert (source / ROLE_PATH).read_bytes() == before
     assert not (source / patch._ASSET_PATH).exists()

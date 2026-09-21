@@ -1,0 +1,1 @@
+window.GrapesJsBuilder = window.GrapesJsBuilder || {};

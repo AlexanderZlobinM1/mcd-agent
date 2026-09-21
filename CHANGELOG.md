@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.33 - 2026-09-21
+
+- Add the revision-pinned Mautic 7.2.0 GrapesJS asset-path remediation to the
+  standard patch-plan contract, including exact vulnerable/fixed gates,
+  enabled-plugin and compiled-asset preflight, evidence, backup and rollback.
+
 ## 1.2.32 - 2026-09-17
 
 - Keep every published due Mautic 7 segment in the scheduler plan even when a
