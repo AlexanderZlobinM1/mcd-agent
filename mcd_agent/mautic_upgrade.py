@@ -1423,7 +1423,7 @@ def run_upgrade_preflight(
     composer_ok = composer.get("status") in {"not_required", "reused", "success"}
     php_ok = php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"}
     json_ok = json_repair.get("status") in {"unsupported", "supported"}
-    status = "ready" if version_source == "read_only_metadata" and composer_ok and php_ok and json_ok else "needs_attention"
+    status = "ready" if version_source == "static_metadata" and composer_ok and php_ok and json_ok else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1445,8 +1445,8 @@ def run_upgrade_preflight(
         "json_schema_repair": json_repair,
         "backup_prerequisite": json_repair.get("backup_prerequisite", {}),
     }
-    if version_source != "read_only_metadata":
-        payload["reason"] = "Mautic version is unavailable from read-only metadata"
+    if version_source != "static_metadata":
+        payload["reason"] = "authoritative on-disk Mautic version evidence is unavailable"
     print(
         "MCD_UPGRADE_PREFLIGHT_EVIDENCE="
         + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -1464,8 +1464,9 @@ def run_upgrade_composer_prepare(
 ) -> int:
     """Perform only the pinned Composer bootstrap/readiness stage."""
     inst = _pick_install_record(config, root)
-    current = _read_current_version_read_only(inst.root)
-    version_source = "read_only_metadata" if _parse_semver(current) != (0, 0, 0) else "unavailable_read_only"
+    version_evidence = read_mautic_version_evidence_read_only(inst.root)
+    current = str(version_evidence.get("version") or "0.0.0")
+    version_source = str(version_evidence.get("source") or "unavailable_read_only")
     target = _clean_target_version(target_override)
     if mode != "composer":
         composer = {"status": "not_required", "compatible": True, "path": "", "version": ""}
@@ -1473,10 +1474,10 @@ def run_upgrade_composer_prepare(
     else:
         composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=False)
         php = _php_target_readiness(composer.get("php", {}), target, with_system_upgrade=with_system_upgrade)
-    if mode == "composer" and php.get("decision") in {"ready", "allow_with_system_upgrade"} and composer.get("status") not in {"reused", "success"}:
+    if version_source == "static_metadata" and mode == "composer" and php.get("decision") in {"ready", "allow_with_system_upgrade"} and composer.get("status") not in {"reused", "success"}:
         composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=True)
     composer["php"] = php
-    status = "ready" if version_source == "read_only_metadata" and composer.get("status") in {"not_required", "reused", "success"} and php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"} else "needs_attention"
+    status = "ready" if version_source == "static_metadata" and composer.get("status") in {"not_required", "reused", "success"} and php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"} else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1489,8 +1490,8 @@ def run_upgrade_composer_prepare(
         "instance": {"instance_uid": inst.instance_uid, "root": inst.root, "current_version": current, "target_version": target, "mode": mode},
         "composer": {"schema": "mcd-mautic-composer-readiness-v1", **composer},
     }
-    if version_source != "read_only_metadata":
-        payload["reason"] = "Mautic version is unavailable from read-only metadata"
+    if version_source != "static_metadata":
+        payload["reason"] = "authoritative on-disk Mautic version evidence is unavailable"
     print(
         "MCD_UPGRADE_PREFLIGHT_EVIDENCE="
         + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -1510,7 +1511,10 @@ def run_upgrade_authorize_repair(
 ) -> int:
     """Issue a short-lived context only after verifying a real local backup marker."""
     inst = _pick_install_record(config, root)
-    current = _read_current_version_read_only(inst.root)
+    version_evidence = read_mautic_version_evidence_read_only(inst.root)
+    if version_evidence.get("source") != "static_metadata":
+        raise RuntimeError("repair authorization requires authoritative on-disk Mautic version evidence")
+    current = str(version_evidence.get("version") or "0.0.0")
     target = _clean_target_version(target_override)
     if _parse_semver(current)[0] != 6 or _parse_semver(target)[0] != 7:
         raise RuntimeError("repair authorization is only supported for Mautic 6 to 7")
@@ -1717,8 +1721,9 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
         print("next=image-managed")
         return 0
     install_root, console = inst.root, inst.console_path
-    current = _read_current_version_read_only(install_root)
-    version_source = "read_only_metadata" if _parse_semver(current) != (0, 0, 0) else "unavailable_read_only"
+    version_evidence = read_mautic_version_evidence_read_only(install_root)
+    current = str(version_evidence.get("version") or "0.0.0")
+    version_source = str(version_evidence.get("source") or "unavailable_read_only")
     target = _latest_same_branch(config, current)
     branch = _release_family_label(current)
     evidence = {

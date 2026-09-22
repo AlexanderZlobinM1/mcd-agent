@@ -1,14 +1,96 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+from contextlib import redirect_stdout
+from io import StringIO
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from mcd_agent import mautic_version_cache
 
+try:
+    from mcd_agent import mautic_upgrade
+except ModuleNotFoundError:
+    mautic_upgrade = None
+
 
 class MauticVersionCacheTest(unittest.TestCase):
+    @unittest.skipIf(mautic_upgrade is None, "upgrade check dependencies are not installed")
+    def test_upgrade_check_marks_static_evidence_authoritative(self) -> None:
+        install = SimpleNamespace(root="/var/www/site", console_path="/var/www/site/bin/console", runtime="host")
+        with (
+            patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
+            patch.object(mautic_upgrade, "_latest_same_branch", return_value=None),
+            patch.object(
+                mautic_upgrade,
+                "read_mautic_version_evidence_read_only",
+                return_value={"version": "7.1.3", "source": "static_metadata"},
+            ),
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(mautic_upgrade.run_upgrade_check(SimpleNamespace(), None), 0)
+            marker = next(line for line in output.getvalue().splitlines() if line.startswith("MCD_UPGRADE_VERSION_EVIDENCE="))
+            evidence = json.loads(marker.split("=", 1)[1])
+            self.assertEqual(evidence["version_source"], "static_metadata")
+            self.assertTrue(evidence["authoritative"])
+
+    @unittest.skipIf(mautic_upgrade is None, "upgrade check dependencies are not installed")
+    def test_upgrade_check_marks_cache_fallback_non_authoritative(self) -> None:
+        install = SimpleNamespace(root="/var/www/site", console_path="/var/www/site/bin/console", runtime="host")
+        with (
+            patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
+            patch.object(mautic_upgrade, "_latest_same_branch", return_value=None),
+            patch.object(
+                mautic_upgrade,
+                "read_mautic_version_evidence_read_only",
+                return_value={"version": "7.2.0", "source": "cache_fallback"},
+            ),
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(mautic_upgrade.run_upgrade_check(SimpleNamespace(), None), 0)
+            marker = next(line for line in output.getvalue().splitlines() if line.startswith("MCD_UPGRADE_VERSION_EVIDENCE="))
+            evidence = json.loads(marker.split("=", 1)[1])
+            self.assertEqual(evidence["version_source"], "cache_fallback")
+            self.assertFalse(evidence["authoritative"])
+
+    @unittest.skipIf(mautic_upgrade is None, "upgrade dependencies are not installed")
+    def test_composer_prepare_does_not_bootstrap_for_cache_fallback(self) -> None:
+        install = SimpleNamespace(root="/var/www/site", console_path="/var/www/site/bin/console", runtime="host", instance_uid="site")
+        config = SimpleNamespace(php_bin="php")
+        with (
+            patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
+            patch.object(mautic_upgrade, "read_mautic_version_evidence_read_only", return_value={"version": "7.2.0", "source": "cache_fallback"}),
+            patch.object(mautic_upgrade, "composer_readiness", return_value={"status": "missing", "php": {}}) as readiness,
+            patch.object(mautic_upgrade, "_php_target_readiness", return_value={"decision": "ready"}),
+        ):
+            self.assertEqual(
+                mautic_upgrade.run_upgrade_composer_prepare(
+                    config=config, root=None, mode="composer", target_override="7.2.0"
+                ),
+                1,
+            )
+            self.assertEqual(readiness.call_count, 1)
+            self.assertFalse(readiness.call_args.kwargs["allow_bootstrap"])
+
+    @unittest.skipIf(mautic_upgrade is None, "upgrade dependencies are not installed")
+    def test_repair_authorization_rejects_cache_fallback(self) -> None:
+        install = SimpleNamespace(root="/var/www/site", console_path="/var/www/site/bin/console", runtime="host", instance_uid="site")
+        with (
+            patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
+            patch.object(mautic_upgrade, "read_mautic_version_evidence_read_only", return_value={"version": "6.0.9", "source": "cache_fallback"}),
+            patch.object(mautic_upgrade, "issue_repair_authorization_context") as authorize,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "authoritative on-disk"):
+                mautic_upgrade.run_upgrade_authorize_repair(
+                    config=SimpleNamespace(), root=None, target_override="7.1.3", repair_plan_json="{}", backup_manifest_path="/tmp/backup"
+                )
+            authorize.assert_not_called()
+
     def test_candidate_roots_do_not_escape_to_shared_var_www(self) -> None:
         self.assertEqual(
             mautic_version_cache._candidate_roots("/var/www/client/public_html"),

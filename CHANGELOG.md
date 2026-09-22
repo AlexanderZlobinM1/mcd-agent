@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.2.41 - 2026-09-22
+
+- Require authoritative static Mautic version evidence before Composer
+  preparation or Mautic 6 to 7 repair authorization; stale cache-only evidence
+  cannot trigger bootstrap or issue an authorization context.
+
+## 1.2.40 - 2026-09-22
+
+- Fix `mautic-upgrade check` to consume structured read-only version evidence
+  directly, so static metadata is marked authoritative and cache fallback is
+  visibly non-authoritative.
+
 ## 1.2.39 - 2026-09-22
 
 - Distinguish authoritative static Mautic version evidence from cache fallback

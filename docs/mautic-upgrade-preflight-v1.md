@@ -22,6 +22,10 @@ authoritative result; `cache_fallback`, `unavailable_read_only`, and
 refresh uses the same authoritative metadata and may rewrite the MCD version
 cache downward after a rollback.
 
+Composer preparation and Mautic 6 to 7 repair authorization apply the same
+authoritative evidence gate and do not bootstrap or issue authorization from a
+cache-only result.
+
 The `composer.php` object also exposes the existing target-runtime policy as
 `required_version`, `compatible`, `status`, `remediation`, and `decision`.
 Mautic 7 uses the established PHP 8.4 policy and Mautic 6 uses PHP 8.3. An
