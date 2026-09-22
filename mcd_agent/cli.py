@@ -111,7 +111,14 @@ from mcd_agent.hardware_profile import (
 )
 from mcd_agent.mautic_composer_move import move_zip_to_composer
 from mcd_agent.mautic_image_install import install_from_image
-from mcd_agent.mautic_upgrade import run_upgrade_apply, run_upgrade_check, run_upgrade_interactive, run_upgrade_preflight
+from mcd_agent.mautic_upgrade import (
+    run_upgrade_apply,
+    run_upgrade_authorize_repair,
+    run_upgrade_check,
+    run_upgrade_composer_prepare,
+    run_upgrade_interactive,
+    run_upgrade_preflight,
+)
 from mcd_agent.mautic6_core_patch import (
     ensure_m6_plugin_update_metadata_patch,
     patch_status as mautic6_patch_status,
@@ -1873,7 +1880,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
     up.add_argument("--config", default=default_cfg)
     up.add_argument("--root")
-    up.add_argument("op", choices=["check", "preflight", "apply", "interactive"], nargs="?", default="interactive")
+    up.add_argument("op", choices=["check", "preflight", "composer-prepare", "authorize-repair", "apply", "interactive"], nargs="?", default="interactive")
     up.add_argument("--mode", choices=["auto", "zip", "composer"], default="auto")
     up.add_argument("--yes", action="store_true")
     up.add_argument("--backup", action="store_true")
@@ -1883,7 +1890,11 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
     up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for an atomic patch stage")
     up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the atomic MCC patch-plan run")
-    up.add_argument("--repair-plan-json", default="", help="Strict versioned JSON-schema repair plan for read-only validation")
+    up.add_argument("--repair-plan-json", default="", help="Strict versioned JSON-schema repair plan")
+    up.add_argument("--repair-auth-context-file", default="", help="Root-owned signed MCC authorization context file for JSON repair")
+    up.add_argument("--repair-auth-key-file", default="/etc/mcd/mcc-operation-signing.key", help="Root-owned MCC operation signing key file")
+    up.add_argument("--backup-manifest-path", default="", help="MCD backup marker path for authorize-repair")
+    up.add_argument("--repair-auth-output-file", default="", help="Optional root-owned output path for authorize-repair context")
     up.add_argument("--json", action="store_true", help="Emit the machine-readable preflight contract")
     up.add_argument("--mcc-preflighted-single-instance", action="store_true", help="Root-only manual 7.1.3 to 7.2.0 apply: assert MCC single-instance preflight and explicit operator risk acknowledgement; bypass global release callbacks only for this exact invocation")
 
@@ -3162,6 +3173,26 @@ def main() -> int:
                 target_override=str(args.target or "").strip() or None,
                 repair_plan_json=str(args.repair_plan_json or "").strip() or None,
             )
+        if args.op == "composer-prepare":
+            return run_upgrade_composer_prepare(
+                config=cfg,
+                root=args.root,
+                mode=args.mode,
+                target_override=str(args.target or "").strip() or None,
+            )
+        if args.op == "authorize-repair":
+            if not args.target or not args.repair_plan_json or not args.backup_manifest_path:
+                print("authorize-repair requires --target, --repair-plan-json and --backup-manifest-path")
+                return 2
+            return run_upgrade_authorize_repair(
+                config=cfg,
+                root=args.root,
+                target_override=str(args.target or "").strip(),
+                repair_plan_json=str(args.repair_plan_json),
+                backup_manifest_path=str(args.backup_manifest_path),
+                key_path=str(args.repair_auth_key_file or "/etc/mcd/mcc-operation-signing.key"),
+                output_path=str(args.repair_auth_output_file or "").strip() or None,
+            )
         if args.op == "interactive":
             rc = run_upgrade_interactive(cfg, args.root)
             if rc == 0:
@@ -3179,6 +3210,9 @@ def main() -> int:
             allow_major=bool(args.allow_major),
             patch_plan_json=str(args.patch_plan_json or "") or None,
             patch_run_id=str(args.patch_run_id or "") or None,
+            repair_plan_json=str(args.repair_plan_json or "") or None,
+            repair_auth_context_file=str(args.repair_auth_context_file or "") or None,
+            repair_auth_key_file=str(args.repair_auth_key_file or "/etc/mcd/mcc-operation-signing.key"),
             mcc_preflighted_single_instance=bool(args.mcc_preflighted_single_instance),
         )
         if rc == 0:
@@ -4627,6 +4661,10 @@ def main() -> int:
                             "backup_path": res.backup_path,
                             "duration_sec": res.duration_sec,
                             "bytes_written": res.bytes_written,
+                            "backup_id": res.backup_id,
+                            "manifest_path": res.manifest_path,
+                            "sha256": res.sha256,
+                            "completed_at": res.completed_at,
                         },
                         ensure_ascii=True,
                         indent=2,

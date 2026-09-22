@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,10 @@ class BackupResult:
     backup_path: str | None = None
     duration_sec: int | None = None
     bytes_written: int | None = None
+    backup_id: str | None = None
+    manifest_path: str | None = None
+    sha256: str | None = None
+    completed_at: str | None = None
 
 
 @dataclass
@@ -5036,6 +5041,7 @@ def backup_instance_run(
         marker = {
             "status": "ok",
             "ts_utc": _utc_now_iso(),
+            "backup_id": f"{inst.instance_uid}:{backup_name}",
             "host_name": host_name,
             "path": str(final_dir),
             "bytes_written": bytes_written,
@@ -5074,6 +5080,8 @@ def backup_instance_run(
                 "checked_at": str(storage_usage.get("checked_at") or ""),
             }
         _write_marker(final_dir, marker)
+        marker_path = final_dir / ".mcd-backup.json"
+        marker_sha256 = hashlib.sha256(marker_path.read_bytes()).hexdigest()
         _write_storage_backup_manifest_and_index(
             mount_path=mount_path,
             backup_dir=final_dir,
@@ -5124,6 +5132,10 @@ def backup_instance_run(
             backup_path=str(final_dir),
             duration_sec=duration,
             bytes_written=bytes_written,
+            backup_id=str(marker["backup_id"]),
+            manifest_path=str(marker_path),
+            sha256=marker_sha256,
+            completed_at=str(marker["ts_utc"]),
         )
     except Exception as e:
         duration = int(time.monotonic() - start_monotonic)

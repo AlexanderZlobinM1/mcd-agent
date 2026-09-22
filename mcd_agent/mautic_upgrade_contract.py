@@ -78,10 +78,14 @@ def _probe_version(command: list[str], *, timeout_sec: int = 30) -> tuple[int, s
 
 
 def _composer_path() -> str:
-    preferred = Path("/usr/local/bin/composer")
+    preferred = _composer_install_path()
     if preferred.is_file() and os.access(preferred, os.X_OK):
         return str(preferred)
     return str(shutil.which("composer") or "")
+
+
+def _composer_install_path() -> Path:
+    return Path("/usr/local/bin/composer")
 
 
 def _composer_observation(path: str, version_line: str, *, source: str = "existing") -> dict[str, Any]:
@@ -130,10 +134,11 @@ def _bootstrap_composer(php_bin: str) -> dict[str, Any]:
         php_exec = str(shutil.which(php_exec) or "")
     if not php_exec:
         raise ComposerReadinessError("bootstrap_failure", "configured PHP executable is unavailable")
-    install_dir = Path("/usr/local/bin")
+    install_path = _composer_install_path()
+    install_dir = install_path.parent
     if not install_dir.is_dir():
         raise ComposerReadinessError("bootstrap_failure", "Composer install directory is unavailable")
-    with tempfile.TemporaryDirectory(prefix="mcd-composer-bootstrap-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="mcd-composer-bootstrap-", dir=str(install_dir)) as temp_dir:
         artifact = Path(temp_dir) / "composer.phar"
         checksum = Path(temp_dir) / "composer.phar.sha256sum"
         _download(COMPOSER_PHAR_URL, artifact)
@@ -147,23 +152,20 @@ def _bootstrap_composer(php_bin: str) -> dict[str, Any]:
         actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
         if actual.lower() != expected_match.group(1).lower():
             raise ComposerReadinessError("signature_failure", "Composer checksum verification failed")
+        staged = Path(temp_dir) / "composer"
         try:
-            proc = subprocess.run(
-                [php_exec, str(artifact), "--install-dir=/usr/local/bin", "--filename=composer"],
-                cwd="/",
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-            )
+            with staged.open("wb") as stream:
+                stream.write(artifact.read_bytes())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(staged, 0o755)
+            os.replace(staged, install_path)
         except (OSError, subprocess.SubprocessError) as exc:
-            raise ComposerReadinessError("bootstrap_failure", "Composer bootstrap process failed") from exc
-        if proc.returncode != 0:
-            raise ComposerReadinessError("bootstrap_failure", "Composer installer returned a failure")
-    path = _composer_path()
+            raise ComposerReadinessError("bootstrap_failure", "Composer executable install failed") from exc
+    path = str(install_path) if install_path.is_file() else _composer_path()
     if not path:
         raise ComposerReadinessError("bootstrap_failure", "Composer was not present after bootstrap")
-    rc, version_line = _probe_version([path, "--version", "--no-interaction", "--no-ansi"])
+    rc, version_line = _probe_version([php_exec, path, "--version", "--no-interaction", "--no-ansi"])
     if rc != 0:
         raise ComposerReadinessError("bootstrap_failure", "Composer version probe failed after bootstrap")
     result = _composer_observation(path, version_line, source="bootstrapped")
@@ -367,6 +369,11 @@ def inspect_json_schema_repair(
         payload.update({"status": "needs_attention", "reason": "database identity is unavailable"})
         return payload
     payload["table_prefix"] = prefix
+    accepted_plan = payload.get("repair_plan", {})
+    plan_value = accepted_plan.get("plan") if isinstance(accepted_plan, dict) else None
+    if isinstance(plan_value, dict) and plan_value.get("table_prefix") != prefix:
+        payload.update({"status": "needs_attention", "reason": "repair plan table prefix does not match the instance"})
+        return payload
     required_db_keys = ("db_name", "db_user")
     if not all(str(config.get(key) or "").strip() for key in required_db_keys):
         payload.update({"status": "needs_attention", "reason": "database credentials are incomplete"})

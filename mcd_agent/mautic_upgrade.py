@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 import json
 import logging
 import os
@@ -1352,6 +1354,7 @@ def run_upgrade_preflight(
     repair_plan_json: str | None = None,
 ) -> int:
     """Emit the read-only MCC-facing upgrade contract."""
+    run_id = "preflight-" + uuid4().hex
     inst = _pick_install_record(config, root)
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
@@ -1363,20 +1366,52 @@ def run_upgrade_preflight(
     composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=False)
     if chosen_mode != "composer":
         composer = {"status": "not_required", "compatible": True, "path": "", "version": "", "php": composer.get("php", {})}
-    json_repair = inspect_json_schema_repair(
-        root=install_root,
-        current_version=current,
-        target_version=target,
-        local_php_path=inst.local_php_path,
-        repair_plan_json=repair_plan_json,
-    )
+    major_6_to_7 = _parse_semver(current)[0] == 6 and _parse_semver(target)[0] == 7
+    if major_6_to_7 and not repair_plan_json:
+        json_repair = inspect_json_schema_repair(
+            root=install_root,
+            current_version=current,
+            target_version=target,
+            local_php_path=inst.local_php_path,
+        )
+        discovered_prefix = str(json_repair.get("table_prefix") or "")
+        if discovered_prefix or json_repair.get("status") == "supported":
+            effective_repair_plan_json = json.dumps(
+                build_json_repair_plan(discovered_prefix),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            json_repair = inspect_json_schema_repair(
+                root=install_root,
+                current_version=current,
+                target_version=target,
+                local_php_path=inst.local_php_path,
+                repair_plan_json=effective_repair_plan_json,
+            )
+    else:
+        json_repair = inspect_json_schema_repair(
+            root=install_root,
+            current_version=current,
+            target_version=target,
+            local_php_path=inst.local_php_path,
+            repair_plan_json=repair_plan_json,
+        )
+    if json_repair.get("repair_plan", {}).get("status") == "accepted":
+        plan = json_repair["repair_plan"].get("plan")
+        if isinstance(plan, dict):
+            json_repair["repair_plan"]["sha256"] = repair_plan_digest(plan)
     composer_ok = composer.get("status") in {"not_required", "reused", "success"}
     json_ok = json_repair.get("status") in {"unsupported", "supported"}
     status = "ready" if composer_ok and json_ok else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
+        "run_id": run_id,
         "status": status,
+        "root": install_root,
+        "source_version": current,
+        "target_version": target,
         "instance": {
             "instance_uid": inst.instance_uid,
             "root": install_root,
@@ -1389,8 +1424,75 @@ def run_upgrade_preflight(
         "json_schema_repair": json_repair,
         "backup_prerequisite": json_repair.get("backup_prerequisite", {}),
     }
-    print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    print(
+        "MCD_UPGRADE_PREFLIGHT_EVIDENCE="
+        + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
     return 0 if status == "ready" else 1
+
+
+def run_upgrade_composer_prepare(
+    *,
+    config: AgentConfig,
+    root: str | None,
+    mode: str,
+    target_override: str | None = None,
+) -> int:
+    """Perform only the pinned Composer bootstrap/readiness stage."""
+    inst = _pick_install_record(config, root)
+    current = _read_current_version(inst.root, inst.console_path, config.php_bin, config.mautic_run_as_user)
+    target = _clean_target_version(target_override)
+    if mode != "composer":
+        composer = {"status": "not_required", "compatible": True, "path": "", "version": ""}
+    else:
+        composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=True)
+    status = "ready" if composer.get("status") in {"not_required", "reused", "success"} else "needs_attention"
+    payload = {
+        "schema": "mcd-mautic-upgrade-preflight-v1",
+        "contract_version": 1,
+        "run_id": "composer-prepare-" + uuid4().hex,
+        "status": status,
+        "root": inst.root,
+        "source_version": current,
+        "target_version": target,
+        "instance": {"instance_uid": inst.instance_uid, "root": inst.root, "current_version": current, "target_version": target, "mode": mode},
+        "composer": {"schema": "mcd-mautic-composer-readiness-v1", **composer},
+    }
+    print(
+        "MCD_UPGRADE_PREFLIGHT_EVIDENCE="
+        + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+    return 0 if status == "ready" else 1
+
+
+def run_upgrade_authorize_repair(
+    *,
+    config: AgentConfig,
+    root: str | None,
+    target_override: str,
+    repair_plan_json: str,
+    backup_manifest_path: str,
+    key_path: str = "/etc/mcd/mcc-operation-signing.key",
+    output_path: str | None = None,
+) -> int:
+    """Issue a short-lived context only after verifying a real local backup marker."""
+    inst = _pick_install_record(config, root)
+    current = _read_current_version(inst.root, inst.console_path, config.php_bin, config.mautic_run_as_user)
+    target = _clean_target_version(target_override)
+    if _parse_semver(current)[0] != 6 or _parse_semver(target)[0] != 7:
+        raise RuntimeError("repair authorization is only supported for Mautic 6 to 7")
+    result = issue_repair_authorization_context(
+        root=inst.root,
+        instance_uid=inst.instance_uid,
+        source_version=current,
+        target_version=target,
+        repair_plan_json=repair_plan_json,
+        backup_manifest_path=backup_manifest_path,
+        key_path=key_path,
+        output_path=output_path,
+    )
+    print("MCD_JSON_REPAIR_AUTHORIZATION=" + json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
 def _permissions_check(config: AgentConfig, root: str, *, stage_label: str) -> None:
@@ -1648,6 +1750,9 @@ def run_upgrade_apply(
     allow_major: bool = False,
     patch_plan_json: str | None = None,
     patch_run_id: str | None = None,
+    repair_plan_json: str | None = None,
+    repair_auth_context_file: str | None = None,
+    repair_auth_key_file: str = "/etc/mcd/mcc-operation-signing.key",
     mcc_preflighted_single_instance: bool = False,
 ) -> int:
     inst = _pick_install_record(config, root)
@@ -1705,6 +1810,17 @@ def run_upgrade_apply(
         if not database_ok:
             raise RuntimeError("Mautic 6 to 7 upgrade is blocked: " + database_reason)
         print("Mautic 7 database preflight: " + database_reason)
+
+    if _parse_semver(current)[0] == 6 and _parse_semver(target)[0] == 7:
+        preflight_rc = run_upgrade_preflight(
+            config=config,
+            root=install_root,
+            mode=chosen_mode,
+            target_override=target,
+            repair_plan_json=repair_plan_json,
+        )
+        if preflight_rc != 0:
+            raise RuntimeError("Mautic upgrade preflight rejected")
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
     patch_hook = None
@@ -1767,6 +1883,51 @@ def run_upgrade_apply(
         if do_backup:
             b = _backup_install(install_root)
             print(f"Backup created: {b}")
+
+        if _parse_semver(current)[0] == 6 and _parse_semver(target)[0] == 7:
+            repair_run_id = "json-repair-" + uuid4().hex
+            if not repair_plan_json or not repair_auth_context_file:
+                repair_evidence = {
+                    "schema": "mcd-mautic-json-schema-repair-execution-v1",
+                    "status": "needs_attention",
+                    "run_id": repair_run_id,
+                    "root": install_root,
+                    "source_version": current,
+                    "target_version": target,
+                    "reason": "authorized backup context and repair plan are required",
+                }
+                print("MCD_JSON_REPAIR_EVIDENCE=" + json.dumps(repair_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+                raise RuntimeError("Mautic JSON repair authorization is required")
+            try:
+                context, signing_key = load_authorization_context(
+                    repair_auth_context_file,
+                    key_path=repair_auth_key_file,
+                )
+                repair_evidence = execute_json_schema_repair(
+                    root=install_root,
+                    current_version=current,
+                    target_version=target,
+                    repair_plan_json=repair_plan_json,
+                    authorization_context=context,
+                    signing_key=signing_key,
+                    instance_uid=inst.instance_uid,
+                    run_id=repair_run_id,
+                    local_php_path=inst.local_php_path,
+                )
+            except (OSError, RepairAuthorizationError) as exc:
+                repair_evidence = {
+                    "schema": "mcd-mautic-json-schema-repair-execution-v1",
+                    "status": "needs_attention",
+                    "run_id": repair_run_id,
+                    "root": install_root,
+                    "source_version": current,
+                    "target_version": target,
+                    "reason": "authorized MCC context could not be loaded",
+                    "error_type": type(exc).__name__,
+                }
+            print("MCD_JSON_REPAIR_EVIDENCE=" + json.dumps(repair_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+            if repair_evidence.get("status") != "success":
+                raise RuntimeError("Mautic JSON schema repair rejected or failed")
 
         if chosen_mode == "zip":
             if not mcc_preflighted_single_instance:
@@ -1888,3 +2049,11 @@ def _ask(prompt: str) -> str:
         return input(prompt)
     except EOFError:
         return ""
+from mcd_agent.mautic_json_repair import (
+    RepairAuthorizationError,
+    build_json_repair_plan,
+    execute_json_schema_repair,
+    issue_repair_authorization_context,
+    load_authorization_context,
+    repair_plan_digest,
+)

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.2.35 - 2026-09-22
+
+- Add the signed, allowlisted `mcd-mautic-json-schema-repair-execution-v1`
+  executor for the validated Mautic 6 to 7 JSON/collation repair plan, with
+  idempotent nullable/non-nullable handling, before/after evidence, JSON
+  validity counts, backup authorization and fail-closed outcomes.
+- Add one-line `MCD_UPGRADE_PREFLIGHT_EVIDENCE` markers, the guarded
+  `mautic-upgrade composer-prepare` operation, and automatic repair admission
+  before Composer/Doctrine work in the major upgrade path.
+
 ## 1.2.34 - 2026-09-22
 
 - Add the read-only `mcd-mautic-upgrade-preflight-v1` contract with sanitized
