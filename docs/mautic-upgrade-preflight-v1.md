@@ -15,9 +15,12 @@ cache files. If static evidence is unavailable, the marker is
 `status=needs_attention` with `version_source=unavailable_read_only`.
 
 `mcd-cli mautic-upgrade check --root INSTANCE` is also bootstrap-free and emits
-`MCD_UPGRADE_VERSION_EVIDENCE=` with `current_version` and `version_source`.
-Inventory refresh uses the same authoritative metadata and may rewrite the MCD
-version cache downward after a rollback.
+`MCD_UPGRADE_VERSION_EVIDENCE=` with `current_version`, `version_source`,
+`authoritative`, and `status`. `version_source=static_metadata` is the only
+authoritative result; `cache_fallback`, `unavailable_read_only`, and
+`conflicting_static_metadata` require MCC to reject a manual Refresh. Inventory
+refresh uses the same authoritative metadata and may rewrite the MCD version
+cache downward after a rollback.
 
 The `composer.php` object also exposes the existing target-runtime policy as
 `required_version`, `compatible`, `status`, `remediation`, and `decision`.

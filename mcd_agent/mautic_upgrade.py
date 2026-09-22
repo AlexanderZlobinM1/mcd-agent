@@ -36,7 +36,11 @@ from mcd_agent.amazon_mailer_dep import (
 )
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
-from mcd_agent.mautic_version_cache import read_mautic_version_read_only, write_mautic_version_cache
+from mcd_agent.mautic_version_cache import (
+    read_mautic_version_evidence_read_only,
+    read_mautic_version_read_only,
+    write_mautic_version_cache,
+)
 from mcd_agent.mautic713_import_tag_patch import (
     ensure_patch as ensure_import_tag_patch,
     revert_patch as revert_mautic713_import_tag_patch,
@@ -1368,8 +1372,9 @@ def run_upgrade_preflight(
     run_id = "preflight-" + uuid4().hex
     inst = _pick_install_record(config, root)
     install_root, console = inst.root, inst.console_path
-    current = _read_current_version_read_only(install_root)
-    version_source = "read_only_metadata" if _parse_semver(current) != (0, 0, 0) else "unavailable_read_only"
+    version_evidence = read_mautic_version_evidence_read_only(install_root)
+    current = str(version_evidence.get("version") or "0.0.0")
+    version_source = str(version_evidence.get("source") or "unavailable_read_only")
     target = _clean_target_version(target_override)
     if not target and _parse_semver(current)[0] == 6:
         target = str((_release_targets(config).get("7") or {}).get("version", ""))
@@ -1721,8 +1726,12 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
         "root": install_root,
         "current_version": current,
         "version_source": version_source,
+        "authoritative": version_source == "static_metadata",
+        "status": "ready" if version_source == "static_metadata" else "needs_attention",
         "target_version": target or "",
     }
+    if version_source != "static_metadata":
+        evidence["reason"] = "authoritative on-disk Mautic version evidence is unavailable"
     print("MCD_UPGRADE_VERSION_EVIDENCE=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
     print(f"root={install_root}")
     print(f"current={current}")

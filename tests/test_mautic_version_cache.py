@@ -88,6 +88,31 @@ class MauticVersionCacheTest(unittest.TestCase):
                 mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
                 self.assertEqual(mautic_version_cache.read_mautic_version_read_only(root), "7.1.3")
 
+    def test_read_only_evidence_marks_cache_fallback_non_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            root.mkdir(parents=True)
+            with patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", root / "generated"):
+                mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
+                self.assertEqual(
+                    mautic_version_cache.read_mautic_version_evidence_read_only(root),
+                    {"version": "7.2.0", "source": "cache_fallback"},
+                )
+
+    def test_read_only_evidence_fails_closed_on_conflicting_static_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            (root / "docroot/app").mkdir(parents=True)
+            (root / "docroot/app/release_metadata.json").write_text('{"version":"7.1.3"}', encoding="utf-8")
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.2.0"}]}',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                mautic_version_cache.read_mautic_version_evidence_read_only(root),
+                {"version": None, "source": "conflicting_static_metadata"},
+            )
+
     def test_inventory_refreshes_cache_downward_from_static_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "site"

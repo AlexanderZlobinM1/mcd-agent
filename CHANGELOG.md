@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.2.39 - 2026-09-22
+
+- Distinguish authoritative static Mautic version evidence from cache fallback
+  in inventory and `mautic-upgrade check`; manual refresh evidence is no longer
+  marked authoritative when only the MCD cache exists.
+- Fail closed on conflicting `release_metadata.json` and `composer.lock`
+  versions.
+
 ## 1.2.38 - 2026-09-22
 
 - Make inventory and `mautic-upgrade check` prefer authoritative on-disk

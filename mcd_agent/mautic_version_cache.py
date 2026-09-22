@@ -144,29 +144,43 @@ def _newer_local_version_metadata(root: Path, cached: str) -> str | None:
     return max(candidates, key=lambda value: _version_tuple(value) or (0, 0, 0)) if candidates else None
 
 
-def _read_static_mautic_version(root: Path) -> str | None:
+def _read_static_mautic_version_evidence(root: Path) -> tuple[str | None, str]:
     static_versions = [
         value
         for value in (_read_version_from_release_metadata(root), _read_version_from_composer_lock(root))
         if value
     ]
-    if static_versions:
-        if len({_version_tuple(value) for value in static_versions}) != 1:
-            return None
-        return max(static_versions, key=lambda value: _version_tuple(value) or (0, 0, 0))
-    return None
+    if not static_versions:
+        return None, "unavailable_read_only"
+    if len({_version_tuple(value) for value in static_versions}) != 1:
+        return None, "conflicting_static_metadata"
+    return max(static_versions, key=lambda value: _version_tuple(value) or (0, 0, 0)), "static_metadata"
+
+
+def _read_static_mautic_version(root: Path) -> str | None:
+    version, source = _read_static_mautic_version_evidence(root)
+    return version if source == "static_metadata" else None
+
+
+def read_mautic_version_evidence_read_only(root: str | Path) -> dict[str, str | None]:
+    """Return read-only version evidence and distinguish cache fallback."""
+    candidates = _candidate_roots(str(root))
+    for candidate in candidates:
+        version, source = _read_static_mautic_version_evidence(candidate)
+        if source == "conflicting_static_metadata":
+            return {"version": None, "source": source}
+        if source == "static_metadata":
+            return {"version": version, "source": source}
+    for candidate in candidates:
+        cached = read_cached_mautic_version(candidate)
+        if cached:
+            return {"version": cached, "source": "cache_fallback"}
+    return {"version": None, "source": "unavailable_read_only"}
 
 
 def read_mautic_version_read_only(root: str | Path) -> str | None:
     """Read version evidence without invoking PHP, Symfony or Mautic code."""
-    for candidate in _candidate_roots(str(root)):
-        static_version = _read_static_mautic_version(candidate)
-        if static_version:
-            return static_version
-        cached = read_cached_mautic_version(candidate)
-        if cached:
-            return cached
-    return None
+    return read_mautic_version_evidence_read_only(root).get("version")
 
 
 def _read_version_from_composer_lock(root: Path) -> str | None:
@@ -382,18 +396,19 @@ def collect_mautic_version(
 ) -> str:
     detected_root: Path | None = None
     version: str | None = None
+    read_only_evidence = read_mautic_version_evidence_read_only(root)
+    if read_only_evidence.get("source") == "conflicting_static_metadata":
+        return "-"
 
     # Regular state pushes must be lightweight and must not start Mautic console
     # every few seconds. A forced refresh is used by the explicit Zabbix/cache
     # guard and runs the console as the Mautic runtime user, not root.
     if not force_refresh:
-        for candidate in _candidate_roots(root):
-            version = _read_static_mautic_version(candidate) or read_cached_mautic_version(candidate)
-            if version and expected_major is not None and _version_major(version) != int(expected_major):
-                version = None
-            if version:
-                detected_root = candidate
-                break
+        version = str(read_only_evidence.get("version") or "") or None
+        if version and expected_major is not None and _version_major(version) != int(expected_major):
+            version = None
+        if version:
+            detected_root = Path(root)
 
     if force_refresh and not version:
         for candidate in _candidate_roots(root):
