@@ -24,7 +24,9 @@ cache downward after a rollback. For cache-only or otherwise non-authoritative
 evidence, `current_version` is `null`, the text output is `current=unknown`,
 and MCD emits no branch or update target derived from the stale cache. A
 rollback is reported from the selected install root's static metadata when
-that metadata is available.
+that metadata is available. The command returns nonzero for every
+non-authoritative result, so legacy apply routing cannot treat `current=unknown`
+as an admissible source version.
 
 After a Mautic 7 Composer or ZIP upgrade, MCD emits
 `MCD_ASSETMAPPER_VERIFICATION=`. It discovers the configured served webroot,

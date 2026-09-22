@@ -52,7 +52,7 @@ class MauticVersionCacheTest(unittest.TestCase):
         ):
             output = StringIO()
             with redirect_stdout(output):
-                self.assertEqual(mautic_upgrade.run_upgrade_check(SimpleNamespace(), None), 0)
+                self.assertEqual(mautic_upgrade.run_upgrade_check(SimpleNamespace(), None), 1)
             marker = next(line for line in output.getvalue().splitlines() if line.startswith("MCD_UPGRADE_VERSION_EVIDENCE="))
             evidence = json.loads(marker.split("=", 1)[1])
             self.assertEqual(evidence["version_source"], "cache_fallback")

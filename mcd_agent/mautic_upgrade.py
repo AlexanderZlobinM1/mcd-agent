@@ -1771,7 +1771,7 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
         print("next=none")
     else:
         print(f"next={target}")
-    return 0
+    return 0 if authoritative else 1
 
 
 def _ensure_mautic7_locale_fix(config: AgentConfig, root: str) -> None:

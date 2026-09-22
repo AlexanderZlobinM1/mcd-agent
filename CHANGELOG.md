@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.44 - 2026-09-22
+
+- Return a nonzero result from `mautic-upgrade check` when version evidence is
+  non-authoritative, preventing legacy apply routing from treating
+  `current=unknown` as an admissible upgrade source.
+
 ## 1.2.43 - 2026-09-22
 
 - Make `mautic-upgrade check` fail closed for cache-only version evidence:
