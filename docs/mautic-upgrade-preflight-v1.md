@@ -6,6 +6,13 @@ emits one compact `MCD_UPGRADE_PREFLIGHT_EVIDENCE=` line with schema
 `source_version`, and `target_version` and is intended for MCC persistence and
 orchestration.
 
+The `composer.php` object also exposes the existing target-runtime policy as
+`required_version`, `compatible`, `status`, `remediation`, and `decision`.
+Mautic 7 uses the established PHP 8.4 policy and Mautic 6 uses PHP 8.3. An
+incompatible runtime is blocked before Composer/package work; with
+`--with-system-upgrade`, preflight returns `decision=allow_with_system_upgrade`
+and apply performs the guarded system runtime stage before package work.
+
 The `composer` object uses `mcd-mautic-composer-readiness-v1`. It contains the
 effective PHP path/version, Composer path/version, minimum compatible Composer
 version, and one of these statuses: `missing`, `incompatible`,

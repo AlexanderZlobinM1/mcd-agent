@@ -48,6 +48,8 @@ from mcd_agent.mautic_upgrade_contract import (
     composer_readiness,
     composer_readiness_from_observation,
     inspect_json_schema_repair,
+    php_target_readiness as _php_target_readiness,
+    rebind_php_after_system_upgrade,
 )
 
 
@@ -861,6 +863,10 @@ def _apply_php84_system_upgrade(config: AgentConfig, upgraded_root: str) -> None
     if changed:
         print("PHP 8.4 nginx references updated: " + ", ".join(changed))
     _enable_php84_and_restart_nginx()
+    php84 = str(shutil.which("php8.4") or "/usr/bin/php8.4")
+    probe = subprocess.run([php84, "-v"], capture_output=True, text=True, check=False)
+    if probe.returncode != 0:
+        raise RuntimeError("PHP 8.4 runtime is not runnable; refusing to purge PHP 8.3")
     _purge_php83_packages()
     print("PHP 8.4 system upgrade completed")
 
@@ -1352,6 +1358,7 @@ def run_upgrade_preflight(
     mode: str,
     target_override: str | None = None,
     repair_plan_json: str | None = None,
+    with_system_upgrade: bool = False,
 ) -> int:
     """Emit the read-only MCC-facing upgrade contract."""
     run_id = "preflight-" + uuid4().hex
@@ -1401,9 +1408,12 @@ def run_upgrade_preflight(
         plan = json_repair["repair_plan"].get("plan")
         if isinstance(plan, dict):
             json_repair["repair_plan"]["sha256"] = repair_plan_digest(plan)
+    php = _php_target_readiness(composer.get("php", {}), target, with_system_upgrade=with_system_upgrade)
+    composer["php"] = php
     composer_ok = composer.get("status") in {"not_required", "reused", "success"}
+    php_ok = php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"}
     json_ok = json_repair.get("status") in {"unsupported", "supported"}
-    status = "ready" if composer_ok and json_ok else "needs_attention"
+    status = "ready" if composer_ok and php_ok and json_ok else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1437,6 +1447,7 @@ def run_upgrade_composer_prepare(
     root: str | None,
     mode: str,
     target_override: str | None = None,
+    with_system_upgrade: bool = False,
 ) -> int:
     """Perform only the pinned Composer bootstrap/readiness stage."""
     inst = _pick_install_record(config, root)
@@ -1444,9 +1455,14 @@ def run_upgrade_composer_prepare(
     target = _clean_target_version(target_override)
     if mode != "composer":
         composer = {"status": "not_required", "compatible": True, "path": "", "version": ""}
+        php = {"available": True, "path": "", "version": ""}
     else:
+        composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=False)
+        php = _php_target_readiness(composer.get("php", {}), target, with_system_upgrade=with_system_upgrade)
+    if mode == "composer" and php.get("decision") in {"ready", "allow_with_system_upgrade"} and composer.get("status") not in {"reused", "success"}:
         composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=True)
-    status = "ready" if composer.get("status") in {"not_required", "reused", "success"} else "needs_attention"
+    composer["php"] = php
+    status = "ready" if composer.get("status") in {"not_required", "reused", "success"} and php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"} else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1818,6 +1834,7 @@ def run_upgrade_apply(
             mode=chosen_mode,
             target_override=target,
             repair_plan_json=repair_plan_json,
+            with_system_upgrade=with_system_upgrade,
         )
         if preflight_rc != 0:
             raise RuntimeError("Mautic upgrade preflight rejected")
@@ -1929,6 +1946,10 @@ def run_upgrade_apply(
             if repair_evidence.get("status") != "success":
                 raise RuntimeError("Mautic JSON schema repair rejected or failed")
 
+        if with_system_upgrade:
+            _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
+            config = replace(config, php_bin=rebind_php_after_system_upgrade(config.php_bin))
+
         if chosen_mode == "zip":
             if not mcc_preflighted_single_instance:
                 _require_release_approval(config, target)
@@ -1939,9 +1960,6 @@ def run_upgrade_apply(
             _apply_composer(install_root, console, config.php_bin, current, target, patch_hook)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")
-
-        if with_system_upgrade:
-            _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
 
         # Restore transport dependencies for API senders after upgrade
         # (especially relevant for zip installs where update flow may drop composer deps).

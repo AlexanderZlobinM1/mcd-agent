@@ -375,6 +375,9 @@ def execute_json_schema_repair(
         "checked_at_utc": checked_at,
         "plan": {"status": "not_validated"},
         "authorization": {"status": "not_validated"},
+        "backup_prerequisite": {"required": True, "satisfied": False, "source": "not_verified"},
+        "affected_columns": [],
+        "affected_count": 0,
         "before": [],
         "after": [],
         "applied_columns": [],
@@ -391,6 +394,8 @@ def execute_json_schema_repair(
         evidence["reason"] = "repair plan was rejected"
         return evidence
     evidence["plan"] = {"status": "accepted", "sha256": repair_plan_digest(plan), "action": plan["action"], "columns": plan["columns"]}
+    evidence["affected_columns"] = list(plan["columns"])
+    evidence["affected_count"] = len(plan["columns"])
     try:
         authorized = validate_authorization_context(
             authorization_context,
@@ -429,6 +434,7 @@ def execute_json_schema_repair(
         "completed_at": verified_backup["completed_at"],
         "rollback_supported": True,
     }
+    evidence["backup_prerequisite"] = {"required": True, "satisfied": True, "source": "mcd_backup_manifest"}
     evidence["rollback"] = {"available": True, "mechanism": "authorized_backup_restore", "outcome": "not_attempted"}
     config_path = _local_php_path(root, local_php_path)
     if config_path is None:

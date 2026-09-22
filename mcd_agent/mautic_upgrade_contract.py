@@ -68,6 +68,46 @@ def _version_text(value: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in value)
 
 
+def php_target_readiness(php: dict[str, Any], target: str, *, with_system_upgrade: bool) -> dict[str, Any]:
+    """Evaluate the existing Mautic major-to-PHP target policy without side effects."""
+    target_major = _version_tuple(target)[0]
+    policy = {6: "8.3", 7: "8.4"}
+    required = policy.get(target_major, "")
+    if not required:
+        return {**php, "required_version": "", "compatible": True, "status": "not_evaluated", "remediation": "none", "decision": "not_evaluated"}
+    current = _version_tuple(str(php.get("version") or ""))
+    required_tuple = tuple(int(part) for part in required.split("."))
+    available = bool(php.get("available"))
+    compatible = available and current >= required_tuple
+    if compatible:
+        status, remediation, decision = "compatible", "none", "ready"
+    elif not available:
+        status, remediation, decision = "missing", "install_target_php_runtime", "blocked"
+    elif with_system_upgrade:
+        status, remediation, decision = "requires_system_upgrade", "system_upgrade", "allow_with_system_upgrade"
+    else:
+        status, remediation, decision = "incompatible", "system_upgrade_required", "blocked"
+    return {
+        **php,
+        "required_version": required,
+        "compatible": bool(compatible),
+        "status": status,
+        "remediation": remediation,
+        "decision": decision,
+        "policy": "mcd-mautic-composer-skeleton-php-policy-v1",
+    }
+
+
+def rebind_php_after_system_upgrade(php_bin: str) -> str:
+    """Resolve the post-upgrade PHP binary without retaining a purged 8.3 path."""
+    configured = str(php_bin or "php").strip() or "php"
+    if re.search(r"php8\.3(?:$|/)", configured):
+        return str(shutil.which("php8.4") or "/usr/bin/php8.4")
+    if configured in {"php", "/usr/bin/php"}:
+        return str(shutil.which("php") or configured)
+    return configured
+
+
 def _probe_version(command: list[str], *, timeout_sec: int = 30) -> tuple[int, str]:
     try:
         proc = subprocess.run(command, cwd="/", capture_output=True, text=True, timeout=timeout_sec, check=False)

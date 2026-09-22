@@ -3172,6 +3172,7 @@ def main() -> int:
                 mode=args.mode,
                 target_override=str(args.target or "").strip() or None,
                 repair_plan_json=str(args.repair_plan_json or "").strip() or None,
+                with_system_upgrade=bool(args.with_system_upgrade),
             )
         if args.op == "composer-prepare":
             return run_upgrade_composer_prepare(
@@ -3179,6 +3180,7 @@ def main() -> int:
                 root=args.root,
                 mode=args.mode,
                 target_override=str(args.target or "").strip() or None,
+                with_system_upgrade=bool(args.with_system_upgrade),
             )
         if args.op == "authorize-repair":
             if not args.target or not args.repair_plan_json or not args.backup_manifest_path:

@@ -11,6 +11,9 @@
 - Add one-line `MCD_UPGRADE_PREFLIGHT_EVIDENCE` markers, the guarded
   `mautic-upgrade composer-prepare` operation, and automatic repair admission
   before Composer/Doctrine work in the major upgrade path.
+- Gate Composer/package work on the existing Mautic major-to-PHP policy and
+  expose explicit PHP compatibility, remediation and system-upgrade decision
+  fields in preflight evidence.
 
 ## 1.2.34 - 2026-09-22
 

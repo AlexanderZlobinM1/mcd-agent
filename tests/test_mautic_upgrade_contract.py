@@ -17,9 +17,40 @@ from mcd_agent.mautic_upgrade_contract import (
     inspect_json_schema_repair,
     validate_json_repair_plan,
 )
+from mcd_agent.mautic_upgrade_contract import (
+    php_target_readiness as _php_target_readiness,
+    rebind_php_after_system_upgrade,
+)
 
 
 class ComposerReadinessContractTests(unittest.TestCase):
+    def test_php_target_policy_is_explicit_and_blocks_incompatible_runtime(self) -> None:
+        php = {"available": True, "path": "/usr/bin/php", "version": "PHP 8.3.25"}
+        result = _php_target_readiness(php, "7.1.3", with_system_upgrade=False)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(result["required_version"], "8.4")
+        self.assertEqual(result["status"], "incompatible")
+        self.assertEqual(result["decision"], "blocked")
+
+    def test_php_target_policy_allows_declared_system_upgrade_without_bootstrap(self) -> None:
+        php = {"available": True, "path": "/usr/bin/php", "version": "PHP 8.3.25"}
+        result = _php_target_readiness(php, "7.1.3", with_system_upgrade=True)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(result["status"], "requires_system_upgrade")
+        self.assertEqual(result["decision"], "allow_with_system_upgrade")
+
+    def test_php_target_policy_accepts_existing_target_runtime(self) -> None:
+        result = _php_target_readiness({"available": True, "version": "PHP 8.4.25"}, "7.1.3", with_system_upgrade=False)
+        self.assertTrue(result["compatible"])
+        self.assertEqual(result["decision"], "ready")
+
+    def test_php_rebind_replaces_absolute_php83_path(self) -> None:
+        with patch("mcd_agent.mautic_upgrade_contract.shutil.which", return_value="/usr/bin/php8.4"):
+            self.assertEqual(rebind_php_after_system_upgrade("/usr/bin/php8.3"), "/usr/bin/php8.4")
+
+    def test_php_rebind_resolves_generic_php_after_upgrade(self) -> None:
+        with patch("mcd_agent.mautic_upgrade_contract.shutil.which", return_value="/usr/bin/php8.4"):
+            self.assertEqual(rebind_php_after_system_upgrade("php"), "/usr/bin/php8.4")
     def test_missing_is_distinct_and_fail_closed(self) -> None:
         result = composer_readiness_from_observation("", "")
         self.assertEqual(result["status"], "missing")
