@@ -144,7 +144,7 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
 
     monkeypatch.setattr(upgrade, "_apply_zip", install)
     monkeypatch.setattr(upgrade, "_apply_composer", install)
-    for name in ("ensure_mailer_packages_for_sender_config", "ensure_amazon_mailer_for_bundles", "_post_upgrade_verify"):
+    for name in ("ensure_mailer_packages_for_sender_config", "ensure_amazon_mailer_for_bundles", "_post_upgrade_verify", "_verify_assetmapper_upgrade"):
         monkeypatch.setattr(upgrade, name, lambda *a, **kw: None)
     monkeypatch.setattr(upgrade, "installed_required_bundles", lambda *a: [])
     monkeypatch.setattr(upgrade, "ensure_import_tag_patch", lambda *a: {"status": "already"})

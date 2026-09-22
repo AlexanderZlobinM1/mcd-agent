@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.42 - 2026-09-22
+
+- Add post-upgrade AssetMapper verification for Mautic 7 Composer and ZIP
+  layouts: discover the served webroot, generate assets and clear cache as the
+  runtime user, then require manifest-referenced CSS/JS HTTP 200 responses with
+  matching content types before reporting upgrade success.
+
 ## 1.2.41 - 2026-09-22
 
 - Require authoritative static Mautic version evidence before Composer

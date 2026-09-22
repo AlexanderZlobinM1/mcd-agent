@@ -22,6 +22,14 @@ authoritative result; `cache_fallback`, `unavailable_read_only`, and
 refresh uses the same authoritative metadata and may rewrite the MCD version
 cache downward after a rollback.
 
+After a Mautic 7 Composer or ZIP upgrade, MCD emits
+`MCD_ASSETMAPPER_VERIFICATION=`. It discovers the configured served webroot,
+runs `mautic:assets:generate` and `cache:clear` as the instance runtime user,
+and verifies `assets/build/manifest.json` plus every referenced CSS/JavaScript
+file on disk and through the instance HTTPS SNI/Host path. A missing asset,
+non-200 response, wrong content type, or failed command returns
+`status=failed`, `rollback_required=true`, and prevents the completion marker.
+
 Composer preparation and Mautic 6 to 7 repair authorization apply the same
 authoritative evidence gate and do not bootstrap or issue authorization from a
 cache-only result.

@@ -176,7 +176,7 @@ class Mautic713ImportTagPatchTests(unittest.TestCase):
 
             prefix = "mcd_agent.mautic_upgrade."
             stack.enter_context(patch(prefix + "_require_release_approval"))
-            for name in ("_enter_upgrade_maintenance", "_pre_upgrade_permissions_check", "ensure_mailer_packages_for_sender_config", "ensure_amazon_mailer_for_bundles", "installed_required_bundles", "_post_upgrade_verify", "_write_upgrade_version_cache"):
+            for name in ("_enter_upgrade_maintenance", "_pre_upgrade_permissions_check", "ensure_mailer_packages_for_sender_config", "ensure_amazon_mailer_for_bundles", "installed_required_bundles", "_post_upgrade_verify", "_verify_assetmapper_upgrade", "_write_upgrade_version_cache"):
                 stack.enter_context(patch(prefix + name))
             stack.enter_context(patch(prefix + "_pick_install_record", return_value=install))
             stack.enter_context(patch(prefix + "_read_current_version", side_effect=["7.1.3", "7.2.0"]))

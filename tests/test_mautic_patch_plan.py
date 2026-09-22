@@ -370,6 +370,7 @@ def test_monolithic_upgrade_emits_gate_before_failure(tmp_path, monkeypatch, cap
     for name in ("_require_release_approval", "_enter_upgrade_maintenance", "_exit_upgrade_maintenance",
                  "_pre_upgrade_permissions_check", "ensure_mailer_packages_for_sender_config",
                  "ensure_amazon_mailer_for_bundles", "installed_required_bundles", "_post_upgrade_verify",
+                 "_verify_assetmapper_upgrade",
                  "_write_upgrade_version_cache"):
         monkeypatch.setattr(upgrade, name, lambda *a, **kw: None)
     monkeypatch.setattr(upgrade, "revert_mautic713_import_tag_patch", lambda *a: {"status": "skip"})

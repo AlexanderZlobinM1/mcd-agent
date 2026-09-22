@@ -34,6 +34,7 @@ from mcd_agent.amazon_mailer_dep import (
     _ensure_node20,
     _resolve_composer_bin,
 )
+from mcd_agent.assetmapper_verification import verify_assetmapper_upgrade
 from mcd_agent.fs_permissions import ensure_instance_permissions
 from mcd_agent.localphp import parse_local_php
 from mcd_agent.mautic_version_cache import (
@@ -1713,6 +1714,29 @@ def _post_upgrade_verify(config: AgentConfig, inst: MauticInstall) -> None:
     print("Post-check: external HTTPS OK: " + external.summary)
 
 
+def _verify_assetmapper_upgrade(
+    config: AgentConfig,
+    inst: MauticInstall,
+    *,
+    project_root: str,
+    target: str,
+) -> None:
+    if _parse_semver(target)[0] != 7:
+        return
+    evidence = verify_assetmapper_upgrade(
+        project_root=project_root,
+        install_root=inst.root,
+        console_path=inst.console_path,
+        php_bin=config.php_bin,
+        runtime_user=config.mautic_run_as_user or "www-data",
+        domain=_best_probe_domain(inst),
+        target_version=target,
+    )
+    print("MCD_ASSETMAPPER_VERIFICATION=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    if evidence.get("status") != "success":
+        raise RuntimeError("AssetMapper upgrade verification failed; rollback is required")
+
+
 def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -1995,6 +2019,13 @@ def run_upgrade_apply(
             _apply_composer(install_root, console, config.php_bin, current, target, patch_hook)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")
+
+        _verify_assetmapper_upgrade(
+            config,
+            inst,
+            project_root=_resolve_composer_project_root(install_root),
+            target=target,
+        )
 
         # Restore transport dependencies for API senders after upgrade
         # (especially relevant for zip installs where update flow may drop composer deps).
