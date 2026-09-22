@@ -20,7 +20,11 @@ cache files. If static evidence is unavailable, the marker is
 authoritative result; `cache_fallback`, `unavailable_read_only`, and
 `conflicting_static_metadata` require MCC to reject a manual Refresh. Inventory
 refresh uses the same authoritative metadata and may rewrite the MCD version
-cache downward after a rollback.
+cache downward after a rollback. For cache-only or otherwise non-authoritative
+evidence, `current_version` is `null`, the text output is `current=unknown`,
+and MCD emits no branch or update target derived from the stale cache. A
+rollback is reported from the selected install root's static metadata when
+that metadata is available.
 
 After a Mautic 7 Composer or ZIP upgrade, MCD emits
 `MCD_ASSETMAPPER_VERIFICATION=`. It discovers the configured served webroot,

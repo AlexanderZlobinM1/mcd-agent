@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.43 - 2026-09-22
+
+- Make `mautic-upgrade check` fail closed for cache-only version evidence:
+  cache fallback is no longer printed as `current`, branch targets are not
+  selected from it, and rollback checks continue to report authoritative
+  on-disk metadata from the selected install root.
+
 ## 1.2.42 - 2026-09-22
 
 - Add post-upgrade AssetMapper verification for Mautic 7 Composer and ZIP

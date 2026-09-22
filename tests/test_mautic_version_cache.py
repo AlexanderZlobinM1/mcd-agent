@@ -23,7 +23,7 @@ class MauticVersionCacheTest(unittest.TestCase):
         install = SimpleNamespace(root="/var/www/site", console_path="/var/www/site/bin/console", runtime="host")
         with (
             patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
-            patch.object(mautic_upgrade, "_latest_same_branch", return_value=None),
+            patch.object(mautic_upgrade, "_latest_same_branch", return_value="7.2.0"),
             patch.object(
                 mautic_upgrade,
                 "read_mautic_version_evidence_read_only",
@@ -56,7 +56,45 @@ class MauticVersionCacheTest(unittest.TestCase):
             marker = next(line for line in output.getvalue().splitlines() if line.startswith("MCD_UPGRADE_VERSION_EVIDENCE="))
             evidence = json.loads(marker.split("=", 1)[1])
             self.assertEqual(evidence["version_source"], "cache_fallback")
+            self.assertIsNone(evidence["current_version"])
             self.assertFalse(evidence["authoritative"])
+            self.assertIn("current=unknown", output.getvalue())
+            self.assertNotIn("current=7.2.0", output.getvalue())
+            self.assertIn("next=none", output.getvalue())
+
+    @unittest.skipIf(mautic_upgrade is None, "upgrade check dependencies are not installed")
+    def test_upgrade_check_uses_rollback_static_metadata_and_install_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "site"
+            install_root = project / "public_html"
+            install_root.mkdir(parents=True)
+            (project / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}',
+                encoding="utf-8",
+            )
+            generated = Path(td) / "generated"
+            install = SimpleNamespace(
+                root=str(install_root),
+                console_path=str(install_root / "bin/console"),
+                runtime="host",
+            )
+            with (
+                patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", generated),
+                patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
+                patch.object(mautic_upgrade, "_latest_same_branch", return_value="7.2.0"),
+            ):
+                mautic_version_cache.write_mautic_version_cache(install_root, "7.2.0")
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(mautic_upgrade.run_upgrade_check(SimpleNamespace(), None), 0)
+            text = output.getvalue()
+            marker = next(line for line in text.splitlines() if line.startswith("MCD_UPGRADE_VERSION_EVIDENCE="))
+            evidence = json.loads(marker.split("=", 1)[1])
+            self.assertEqual(evidence["root"], str(install_root))
+            self.assertEqual(evidence["current_version"], "7.1.3")
+            self.assertEqual(evidence["version_source"], "static_metadata")
+            self.assertIn(f"root={install_root}", text)
+            self.assertIn("current=7.1.3", text)
 
     @unittest.skipIf(mautic_upgrade is None, "upgrade dependencies are not installed")
     def test_composer_prepare_does_not_bootstrap_for_cache_fallback(self) -> None:

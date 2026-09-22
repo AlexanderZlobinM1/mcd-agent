@@ -1746,17 +1746,18 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
         return 0
     install_root, console = inst.root, inst.console_path
     version_evidence = read_mautic_version_evidence_read_only(install_root)
-    current = str(version_evidence.get("version") or "0.0.0")
     version_source = str(version_evidence.get("source") or "unavailable_read_only")
-    target = _latest_same_branch(config, current)
-    branch = _release_family_label(current)
+    authoritative = version_source == "static_metadata"
+    current = str(version_evidence.get("version") or "") if authoritative else "unknown"
+    target = _latest_same_branch(config, current) if authoritative else None
+    branch = _release_family_label(current) if authoritative else ""
     evidence = {
         "schema": "mcd-mautic-upgrade-version-evidence-v1",
         "root": install_root,
-        "current_version": current,
+        "current_version": current if authoritative else None,
         "version_source": version_source,
-        "authoritative": version_source == "static_metadata",
-        "status": "ready" if version_source == "static_metadata" else "needs_attention",
+        "authoritative": authoritative,
+        "status": "ready" if authoritative else "needs_attention",
         "target_version": target or "",
     }
     if version_source != "static_metadata":
