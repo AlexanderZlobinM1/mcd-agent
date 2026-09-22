@@ -42,6 +42,11 @@ from mcd_agent.mautic713_import_tag_patch import (
 from mcd_agent.executor import execute_mautic_command_template
 from mcd_agent.plugins import run_plugins_interactive
 from mcd_agent.install_readiness import _database_state, mautic7_database_compatibility
+from mcd_agent.mautic_upgrade_contract import (
+    composer_readiness,
+    composer_readiness_from_observation,
+    inspect_json_schema_repair,
+)
 
 
 CORE_PLUGIN_BUNDLES = {
@@ -1288,7 +1293,7 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     cjson = Path(project_root) / "composer.json"
     if not cjson.exists():
         raise RuntimeError("composer.json not found")
-    composer_bin = _resolve_composer_bin()
+    composer_bin = _resolve_composer_bin(php_bin)
     _ensure_node20()
     _ensure_www_data_composer_cache()
     composer_version = _command_version_line(
@@ -1296,8 +1301,8 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
         cwd=project_root,
         as_www_data=True,
     )
-    version_match = re.search(r"\bComposer(?: version)? (\d+\.\d+\.\d+)\b", composer_version)
-    if not version_match or _parse_semver(version_match.group(1)) < (2, 8, 6):
+    readiness = composer_readiness_from_observation(composer_bin, composer_version)
+    if readiness.get("status") not in {"reused", "success"}:
         raise RuntimeError("Composer >= 2.8.6 is required to defer application scripts safely during upgrades")
     node_version = _command_version_line(["node", "-v"], cwd=project_root)
     npm_version = _command_version_line(["npm", "-v"], cwd=project_root)
@@ -1336,6 +1341,56 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
     _run_doctrine_migrate_with_reconcile(project_root, console_path, php_bin, migration_cmd)
     _verify_or_reconcile_doctrine_migrations(project_root, console_path, php_bin)
+
+
+def run_upgrade_preflight(
+    *,
+    config: AgentConfig,
+    root: str | None,
+    mode: str,
+    target_override: str | None = None,
+    repair_plan_json: str | None = None,
+) -> int:
+    """Emit the read-only MCC-facing upgrade contract."""
+    inst = _pick_install_record(config, root)
+    install_root, console = inst.root, inst.console_path
+    current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
+    target = _clean_target_version(target_override)
+    if not target and _parse_semver(current)[0] == 6:
+        target = str((_release_targets(config).get("7") or {}).get("version", ""))
+    target = target or ""
+    chosen_mode = detect_install_type(install_root) if mode == "auto" else mode
+    composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=False)
+    if chosen_mode != "composer":
+        composer = {"status": "not_required", "compatible": True, "path": "", "version": "", "php": composer.get("php", {})}
+    json_repair = inspect_json_schema_repair(
+        root=install_root,
+        current_version=current,
+        target_version=target,
+        local_php_path=inst.local_php_path,
+        repair_plan_json=repair_plan_json,
+    )
+    composer_ok = composer.get("status") in {"not_required", "reused", "success"}
+    json_ok = json_repair.get("status") in {"unsupported", "supported"}
+    status = "ready" if composer_ok and json_ok else "needs_attention"
+    payload = {
+        "schema": "mcd-mautic-upgrade-preflight-v1",
+        "contract_version": 1,
+        "status": status,
+        "instance": {
+            "instance_uid": inst.instance_uid,
+            "root": install_root,
+            "console": console,
+            "current_version": current,
+            "target_version": target,
+            "mode": chosen_mode,
+        },
+        "composer": {"schema": "mcd-mautic-composer-readiness-v1", **composer},
+        "json_schema_repair": json_repair,
+        "backup_prerequisite": json_repair.get("backup_prerequisite", {}),
+    }
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    return 0 if status == "ready" else 1
 
 
 def _permissions_check(config: AgentConfig, root: str, *, stage_label: str) -> None:

@@ -115,28 +115,10 @@ def _mautic_console_healthy(
     return proc.returncode == 0 and bool(re.search(r"\bMautic\s+\d+\.\d+\.\d+\b", out, re.IGNORECASE))
 
 
-def _resolve_composer_bin() -> str:
-    preferred = Path("/usr/local/bin/composer")
-    if preferred.exists():
-        return str(preferred)
-    found = shutil.which("composer")
-    if found:
-        return found
-    with tempfile.NamedTemporaryFile(prefix="composer-setup-", suffix=".php", delete=False) as tf:
-        setup_path = Path(tf.name)
-    try:
-        with urllib.request.urlopen("https://getcomposer.org/installer", timeout=90) as resp:
-            setup_path.write_bytes(resp.read())
-        subprocess.run(
-            ["php", str(setup_path), "--install-dir=/usr/local/bin", "--filename=composer"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-    finally:
-        setup_path.unlink(missing_ok=True)
-    return str(preferred)
+def _resolve_composer_bin(php_bin: str = "php") -> str:
+    from mcd_agent.mautic_upgrade_contract import ensure_composer_binary
+
+    return ensure_composer_binary(php_bin=php_bin)
 
 
 def _verify_composer_as_www_data(project_root: str, composer_bin: str) -> None:

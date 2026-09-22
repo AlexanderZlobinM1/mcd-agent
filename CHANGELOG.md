@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.2.34 - 2026-09-22
+
+- Add the read-only `mcd-mautic-upgrade-preflight-v1` contract with sanitized
+  PHP/Composer readiness and fail-closed Composer bootstrap states.
+- Add the read-only `mcd-mautic-json-schema-repair-v1` diagnosis and strict
+  `mcd-mautic-json-schema-repair-plan-v1` allowlist for the observed Mautic 6
+  to 7 SQLSTATE 1253 JSON/collation condition; no arbitrary SQL or migration
+  history mutation is accepted.
+
 ## 1.2.33 - 2026-09-21
 
 - Add the revision-pinned Mautic 7.2.0 GrapesJS asset-path remediation to the
