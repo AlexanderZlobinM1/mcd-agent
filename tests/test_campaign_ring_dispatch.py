@@ -97,6 +97,41 @@ from mcd_agent.ring_utils import advance_ring_after_launch
 
 
 class CampaignRingDispatchTests(unittest.TestCase):
+    def test_restart_reconciles_and_adopts_live_persisted_worker(self) -> None:
+        class Store:
+            def sync_sqlite_running_shadow(self) -> dict[str, int]:
+                return {"replaced": 0}
+
+            def running_rows(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "id": 7,
+                        "root": "/var/www/mautic",
+                        "task_key": "/var/www/mautic|segment|108",
+                        "task_type": "segment",
+                        "entity_id": 108,
+                        "command_str": "php /var/www/mautic/bin/console mautic:segments:update -i 108",
+                        "pid": 4321,
+                        "timeout_sec": 3600,
+                        "attempts": 1,
+                        "manual_request_id": None,
+                        "started_at": time.time() - 120,
+                    }
+                ]
+
+            def finish(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError(f"live worker was incorrectly finished: {args} {kwargs}")
+
+        with patch.object(daemon_mod, "_is_pid_alive", return_value=True), patch.object(
+            daemon_mod, "_pid_matches_task_command", return_value=True
+        ):
+            running: dict[str, RunningTask] = {}
+            stats = daemon_mod._reconcile_running_state(store=Store(), running=running, popens={})
+
+        self.assertEqual(stats["adopted"], 1)
+        self.assertIn("/var/www/mautic|segment|108", running)
+        self.assertEqual(running["/var/www/mautic|segment|108"].pid, 4321)
+
     def tearDown(self) -> None:
         _CAMPAIGN_TRIGGER_STUCK_UNTIL.clear()
         _CAMPAIGN_TRIGGER_FUTURE_WAKE.clear()

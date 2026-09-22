@@ -20,6 +20,86 @@ def _cfg(tmp: str) -> SimpleNamespace:
 
 
 class SelfUpdateVersionReportingTests(unittest.TestCase):
+    def test_active_mautic_detector_includes_segment_updates(self) -> None:
+        ps = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                " 321  42 /usr/bin/php /var/www/s/public_html/bin/console "
+                "mautic:segments:update -i 108 --no-interaction\n"
+            ),
+            stderr="",
+        )
+        with patch.object(self_update.subprocess, "run", return_value=ps):
+            rows = self_update._active_mautic_processes()
+
+        self.assertEqual(rows[0]["pid"], 321)
+        self.assertIn("mautic:segments:update", rows[0]["cmd"])
+
+    def test_apply_update_defers_for_any_active_mautic_console_process(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            releases: list[dict[str, str]] = []
+            old_active = self_update._active_mautic_processes
+            old_installed = self_update.installed_agent_version
+            old_release = self_update.release_session
+            try:
+                self_update._active_mautic_processes = lambda: [
+                    {"pid": 321, "elapsed_sec": 42, "cmd": "php bin/console mautic:segments:update -i 108"}
+                ]
+                self_update.installed_agent_version = lambda: "1.2.44"
+                self_update.release_session = lambda _cfg, session_id, **kw: releases.append(
+                    {"session_id": session_id, **{key: str(value) for key, value in kw.items()}}
+                )
+                ok, msg = self_update.apply_update(
+                    cfg,
+                    {
+                        "status": "update",
+                        "target": "1.2.45",
+                        "package_url": "https://mcc.invalid/mcd-agent-1.2.45.tar.gz",
+                        "session_id": "session-1",
+                    },
+                )
+            finally:
+                self_update._active_mautic_processes = old_active
+                self_update.installed_agent_version = old_installed
+                self_update.release_session = old_release
+
+            state = json.loads((Path(tmp) / "mcd-self-update.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(ok)
+        self.assertIn("active Mautic console process", msg)
+        self.assertEqual(state["last_status"], "deferred_active_mautic_task")
+        self.assertEqual(state["active_mautic_processes"][0]["pid"], 321)
+        self.assertEqual(releases[0]["result_status"], "deferred")
+
+    def test_restart_only_repair_is_deferred_for_active_mautic_process(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            old_active = self_update._active_mautic_processes
+            old_installed = self_update.installed_agent_version
+            old_sync = self_update._agent_package_sync_needed
+            try:
+                self_update._active_mautic_processes = lambda: [
+                    {"pid": 321, "elapsed_sec": 42, "cmd": "php bin/console mautic:segments:update -i 108"}
+                ]
+                self_update.installed_agent_version = lambda: "9.9.9"
+                self_update._agent_package_sync_needed = lambda *_args, **_kw: False
+                ok, msg = self_update.apply_update(
+                    cfg,
+                    {
+                        "status": "update",
+                        "target": "9.9.8",
+                        "package_url": "https://mcc.invalid/mcd-agent-9.9.8.tar.gz",
+                    },
+                )
+            finally:
+                self_update._active_mautic_processes = old_active
+                self_update.installed_agent_version = old_installed
+                self_update._agent_package_sync_needed = old_sync
+
+        self.assertFalse(ok)
+        self.assertIn("active Mautic console process", msg)
+
     def test_daemon_startup_runs_service_unit_migration(self) -> None:
         daemon_source = Path(self_update.__file__).with_name("daemon.py").read_text(encoding="utf-8")
 
@@ -29,7 +109,7 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             unit = Path(tmp) / "mcd.service"
             unit.write_text(
-                "[Service]\nExecStart=/opt/mcd/venv/bin/python -m mcd_agent\nKillMode=process\n",
+                "[Service]\nExecStart=/opt/mcd/venv/bin/python -m mcd_agent\nKillMode=control-group\n",
                 encoding="utf-8",
             )
             with patch.object(
@@ -41,13 +121,13 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
                 content = unit.read_text(encoding="utf-8")
 
         self.assertTrue(changed)
-        self.assertIn("KillMode=control-group", content)
+        self.assertIn("KillMode=process", content)
         run.assert_called_once_with(["systemctl", "daemon-reload"], capture_output=True, text=True)
 
     def test_current_service_unit_does_not_reload_systemd(self) -> None:
         with TemporaryDirectory() as tmp:
             unit = Path(tmp) / "mcd.service"
-            unit.write_text("[Service]\nKillMode=control-group\n", encoding="utf-8")
+            unit.write_text("[Service]\nKillMode=process\n", encoding="utf-8")
             with patch.object(self_update.subprocess, "run") as run:
                 changed = self_update._ensure_mcd_service_kill_mode(unit)
 
@@ -57,11 +137,11 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
     def test_service_dropin_cannot_override_control_group_with_process(self) -> None:
         with TemporaryDirectory() as tmp:
             unit = Path(tmp) / "mcd.service"
-            unit.write_text("[Service]\nKillMode=control-group\n", encoding="utf-8")
+            unit.write_text("[Service]\nKillMode=process\n", encoding="utf-8")
             dropin_dir = Path(tmp) / "mcd.service.d"
             dropin_dir.mkdir()
             override = dropin_dir / "override.conf"
-            override.write_text("[Service]\nKillMode=process\nTimeoutStopSec=15\n", encoding="utf-8")
+            override.write_text("[Service]\nKillMode=control-group\nTimeoutStopSec=15\n", encoding="utf-8")
             with patch.object(
                 self_update.subprocess,
                 "run",
@@ -71,7 +151,7 @@ class SelfUpdateVersionReportingTests(unittest.TestCase):
                 override_content = override.read_text(encoding="utf-8")
 
         self.assertTrue(changed)
-        self.assertIn("KillMode=control-group", override_content)
+        self.assertIn("KillMode=process", override_content)
         run.assert_called_once_with(["systemctl", "daemon-reload"], capture_output=True, text=True)
 
     def test_update_status_overwrites_stale_state_versions(self) -> None:

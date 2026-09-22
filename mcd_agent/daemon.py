@@ -8342,7 +8342,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
     try:
         if _ensure_mcd_service_kill_mode():
-            logging.info("MCD systemd unit migrated to KillMode=control-group")
+            logging.info("MCD systemd unit migrated to KillMode=process; running task workers survive supervisor restart")
     except Exception as exc:
         logging.warning("MCD systemd unit migration failed: %s", exc)
 

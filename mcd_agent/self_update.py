@@ -76,6 +76,7 @@ def _write_state(cfg: AgentConfig, payload: dict[str, Any]) -> None:
 
 def _clear_active_campaign_process_state(state: dict[str, Any]) -> None:
     state.pop("active_campaign_processes", None)
+    state.pop("active_mautic_processes", None)
 
 
 def _post_json(url: str, payload: dict[str, Any], token: str | None, timeout_sec: int = 10) -> dict[str, Any]:
@@ -113,7 +114,8 @@ def _update_policy(cfg: AgentConfig) -> str:
     return "approved"
 
 
-def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
+def _active_mautic_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
+    """Return running Mautic console processes that must survive an update."""
     stdout = ""
     has_elapsed = True
     for ps_args, elapsed_supported in (
@@ -140,11 +142,9 @@ def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for raw in stdout.splitlines():
         line = raw.strip()
-        if not line or "mautic:campaign" not in line:
+        if not line:
             continue
         if "/bin/console" not in line and "/app/console" not in line:
-            continue
-        if not any(cmd in line for cmd in _CAMPAIGN_CONSOLE_COMMANDS):
             continue
         parts = line.split(None, 2 if has_elapsed else 1)
         if len(parts) < (3 if has_elapsed else 2):
@@ -159,13 +159,21 @@ def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
         command = parts[2] if has_elapsed else parts[1]
         argv0 = command.split(None, 1)[0] if command else ""
         exe = Path(argv0).name.lower()
-        # Only a running PHP console process blocks self-update. Wrappers
-        # waiting on flock/timeout/sudo do not execute Mautic work and must not
-        # prevent agent replacement.
+        # Only a running PHP console process blocks self-update. A wrapper
+        # waiting on flock/timeout/sudo is not itself a Mautic process.
         if not (exe == "php" or exe.startswith("php")):
             continue
         rows.append({"pid": pid, "elapsed_sec": elapsed_sec, "cmd": command[:500]})
     return rows
+
+
+def _active_campaign_processes(timeout_sec: int = 4) -> list[dict[str, Any]]:
+    """Return the campaign subset for backwards-compatible status reporting."""
+    return [
+        process
+        for process in _active_mautic_processes(timeout_sec)
+        if any(command in str(process.get("cmd", "")) for command in _CAMPAIGN_CONSOLE_COMMANDS)
+    ]
 
 
 def _active_campaign_update_defer_message(rows: list[dict[str, Any]]) -> str:
@@ -175,6 +183,15 @@ def _active_campaign_update_defer_message(rows: list[dict[str, Any]]) -> str:
     )
     suffix = f" ({sample})" if sample else ""
     return f"MCD update deferred: active campaign trigger/rebuild process is running{suffix}"
+
+
+def _active_mautic_update_defer_message(rows: list[dict[str, Any]]) -> str:
+    sample = ", ".join(
+        f"pid={int(row.get('pid') or 0)} age={int(row.get('elapsed_sec') or 0)}s"
+        for row in rows[:3]
+    )
+    suffix = f" ({sample})" if sample else ""
+    return f"MCD update deferred: active Mautic console process is running{suffix}"
 
 
 def check_with_mcc(cfg: AgentConfig, *, auto_update_enabled: bool) -> dict[str, Any]:
@@ -466,7 +483,7 @@ def _restart_service_async() -> None:
 def _ensure_mcd_service_kill_mode(
     unit_path: Path = Path("/etc/systemd/system/mcd.service"),
 ) -> bool:
-    """Migrate an existing MCD unit and its drop-ins to group shutdown."""
+    """Keep Mautic workers alive while the MCD supervisor is restarted."""
     if not unit_path.exists():
         return False
     dropin_dir = unit_path.parent / f"{unit_path.name}.d"
@@ -477,12 +494,22 @@ def _ensure_mcd_service_kill_mode(
     changes: dict[Path, tuple[str, str, int]] = {}
     for path in paths:
         original = path.read_text(encoding="utf-8")
-        updated = original.replace("KillMode=process", "KillMode=control-group")
-        if path == unit_path and "KillMode=" not in updated:
+        lines = original.splitlines(keepends=True)
+        found_kill_mode = False
+        updated_lines: list[str] = []
+        for line in lines:
+            if line.lstrip().startswith("KillMode="):
+                newline = "\n" if line.endswith("\n") else ""
+                updated_lines.append("KillMode=process" + newline)
+                found_kill_mode = True
+            else:
+                updated_lines.append(line)
+        updated = "".join(updated_lines)
+        if path == unit_path and not found_kill_mode:
             marker = "[Service]\n"
             if marker not in updated:
                 raise RuntimeError(f"MCD systemd unit has no Service section: {unit_path}")
-            updated = updated.replace(marker, marker + "KillMode=control-group\n", 1)
+            updated = updated.replace(marker, marker + "KillMode=process\n", 1)
         if updated != original:
             changes[path] = (original, updated, path.stat().st_mode)
     if not changes:
@@ -767,16 +794,15 @@ def _cluster_local_update_blockers(cfg: AgentConfig) -> list[dict[str, Any]]:
                 blockers.append({"kind": "backup_lock", "message": "backup lock is active"})
         except Exception as e:
             blockers.append({"kind": "backup_lock_probe_failed", "message": str(e)[:300]})
-    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
-        campaigns = _active_campaign_processes()
-        if campaigns:
-            blockers.append(
-                {
-                    "kind": "active_campaigns",
-                    "message": _active_campaign_update_defer_message(campaigns),
-                    "processes": campaigns[:10],
-                }
-            )
+    active = _active_mautic_processes()
+    if active:
+        blockers.append(
+            {
+                "kind": "active_mautic_tasks",
+                "message": _active_mautic_update_defer_message(active),
+                "processes": active[:10],
+            }
+        )
     return blockers
 
 
@@ -814,6 +840,41 @@ def _defer_update_for_backup_lock(
             "last_target": target,
             "last_attempt_ts": now_s,
             "last_session_id": session_id,
+        }
+    )
+    _write_state(cfg, state)
+    if session_id:
+        release_session(
+            cfg,
+            session_id,
+            result_status="deferred",
+            result_message=msg,
+            new_version=installed_agent_version(),
+        )
+    return msg
+
+
+def _defer_update_for_active_mautic_processes(
+    cfg: AgentConfig,
+    state: dict[str, Any],
+    *,
+    target: str,
+    session_id: str,
+    now_s: int,
+) -> str | None:
+    """Fail closed while any Mautic console task is running."""
+    active = _active_mautic_processes()
+    if not active:
+        return None
+    msg = _active_mautic_update_defer_message(active)
+    state.update(
+        {
+            "last_status": "deferred_active_mautic_task",
+            "last_result": msg,
+            "last_target": target,
+            "last_attempt_ts": now_s,
+            "last_session_id": session_id,
+            "active_mautic_processes": active[:10],
         }
     )
     _write_state(cfg, state)
@@ -1278,6 +1339,15 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     )
     if backup_defer is not None:
         return False, backup_defer
+    active_defer = _defer_update_for_active_mautic_processes(
+        cfg,
+        state,
+        target=target,
+        session_id=session_id,
+        now_s=now_s,
+    )
+    if active_defer is not None:
+        return False, active_defer
     install_dir = Path(str(getattr(cfg, "mcd_install_dir", "/opt/mcd") or "/opt/mcd"))
     src_dir = install_dir / "src"
     current_installed = installed_agent_version()
@@ -1320,31 +1390,6 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
                 new_version=current_installed,
             )
         return False, f"already up-to-date ({current_installed})"
-
-    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
-        active_campaigns = _active_campaign_processes()
-        if active_campaigns:
-            msg = _active_campaign_update_defer_message(active_campaigns)
-            state.update(
-                {
-                    "last_status": "deferred_active_campaign",
-                    "last_result": msg,
-                    "last_target": target,
-                    "last_attempt_ts": now_s,
-                    "last_session_id": session_id,
-                    "active_campaign_processes": active_campaigns[:10],
-                }
-            )
-            _write_state(cfg, state)
-            if session_id:
-                release_session(
-                    cfg,
-                    session_id,
-                    result_status="deferred",
-                    result_message=msg,
-                    new_version=installed_agent_version(),
-                )
-            return False, msg
 
     backup_dir = install_dir / "var" / "backup"
     updates_dir = install_dir / "var" / "updates"
@@ -1544,20 +1589,19 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
         except Exception as e:
             logging.warning("MCD update backup lock check failed: %s", e)
 
-    if bool(getattr(cfg, "mcd_update_defer_during_campaigns", True)):
-        active_campaigns = _active_campaign_processes()
-        if active_campaigns:
-            state["active_campaign_processes"] = active_campaigns[:10]
-            if not cluster_update_mode:
-                retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
-                state["last_check_ts"] = now_s
-                state["last_check_status"] = "deferred_active_campaign"
-                state["last_result"] = _active_campaign_update_defer_message(active_campaigns)
-                state["next_check_ts"] = now_s + retry_sec
-                _write_state(cfg, state)
-                return str(state["last_result"]), retry_sec
-        else:
-            _clear_active_campaign_process_state(state)
+    active_mautic = _active_mautic_processes()
+    if active_mautic:
+        state["active_mautic_processes"] = active_mautic[:10]
+        if not cluster_update_mode:
+            retry_sec = max(60, int(cfg.mcd_update_wait_retry_sec or 60))
+            state["last_check_ts"] = now_s
+            state["last_check_status"] = "deferred_active_mautic_task"
+            state["last_result"] = _active_mautic_update_defer_message(active_mautic)
+            state["next_check_ts"] = now_s + retry_sec
+            _write_state(cfg, state)
+            return str(state["last_result"]), retry_sec
+    else:
+        _clear_active_campaign_process_state(state)
 
     # Cluster mode has its own Galera-backed rollout coordinator, so MCC is
     # queried as a release catalog and must not reserve a per-host update slot.
@@ -1665,6 +1709,12 @@ def maybe_auto_update(cfg: AgentConfig, *, force: bool = False) -> tuple[str | N
 
 def update_status(cfg: AgentConfig) -> dict[str, Any]:
     out = _read_state(cfg)
+    if "active_mautic_processes" in out:
+        active_mautic = _active_mautic_processes()
+        if active_mautic:
+            out["active_mautic_processes"] = active_mautic[:10]
+        else:
+            out.pop("active_mautic_processes", None)
     if "active_campaign_processes" in out:
         active_campaigns = _active_campaign_processes()
         if active_campaigns:

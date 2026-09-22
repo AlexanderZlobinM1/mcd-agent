@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.45 - 2026-09-22
+
+- Keep Mautic worker processes alive across MCD self-update and supervisor
+  restart, persist their task rows, and re-adopt live processes after startup.
+- Defer every self-update path while an active Mautic console process is
+  running, including `mautic:segments:update` and restart-only repairs.
+
 ## 1.2.44 - 2026-09-22
 
 - Return a nonzero result from `mautic-upgrade check` when version evidence is
