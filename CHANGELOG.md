@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.36 - 2026-09-22
+
+- Make Mautic upgrade preflight, Composer prepare and repair authorization
+  version probes bootstrap-free: they use only MCD cache and static release or
+  Composer metadata, and fail closed when no read-only version evidence exists.
+
 ## 1.2.35 - 2026-09-22
 
 - Add the signed, allowlisted `mcd-mautic-json-schema-repair-execution-v1`

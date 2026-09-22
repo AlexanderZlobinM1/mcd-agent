@@ -6,6 +6,12 @@ emits one compact `MCD_UPGRADE_PREFLIGHT_EVIDENCE=` line with schema
 `source_version`, and `target_version` and is intended for MCC persistence and
 orchestration.
 
+Version detection in this contract is strictly read-only: MCD reads its
+version cache, `release_metadata.json`, or `composer.lock`. It does not run
+`bin/console`, Symfony bootstrap, cache warmers, migrations, or write version
+cache files. If static evidence is unavailable, the marker is
+`status=needs_attention` with `version_source=unavailable_read_only`.
+
 The `composer.php` object also exposes the existing target-runtime policy as
 `required_version`, `compatible`, `status`, `remediation`, and `decision`.
 Mautic 7 uses the established PHP 8.4 policy and Mautic 6 uses PHP 8.3. An

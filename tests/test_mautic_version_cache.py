@@ -62,6 +62,20 @@ class MauticVersionCacheTest(unittest.TestCase):
                 self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "7.2.0")
                 runtime.assert_called_once()
 
+    def test_read_only_version_uses_static_metadata_without_console(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            root.mkdir(parents=True)
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.2.0"}]}',
+                encoding="utf-8",
+            )
+            with patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", root / "generated"), patch(
+                "mcd_agent.mautic_version_cache.subprocess.run",
+                side_effect=AssertionError("read-only version probe invoked subprocess"),
+            ):
+                self.assertEqual(mautic_version_cache.read_mautic_version_read_only(root), "7.2.0")
+
     def test_older_package_metadata_does_not_downgrade_cache(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "site"
