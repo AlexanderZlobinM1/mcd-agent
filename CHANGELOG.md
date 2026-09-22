@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.37 - 2026-09-22
+
+- Fix read-only Mautic version detection to prefer on-disk release metadata and
+  Composer lock evidence over a stale cache, and fail closed when those sources
+  disagree.
+
 ## 1.2.36 - 2026-09-22
 
 - Make Mautic upgrade preflight, Composer prepare and repair authorization

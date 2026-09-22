@@ -76,6 +76,18 @@ class MauticVersionCacheTest(unittest.TestCase):
             ):
                 self.assertEqual(mautic_version_cache.read_mautic_version_read_only(root), "7.2.0")
 
+    def test_read_only_version_rejects_stale_ahead_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            root.mkdir(parents=True)
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}',
+                encoding="utf-8",
+            )
+            with patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", root / "generated"):
+                mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
+                self.assertEqual(mautic_version_cache.read_mautic_version_read_only(root), "7.1.3")
+
     def test_older_package_metadata_does_not_downgrade_cache(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "site"

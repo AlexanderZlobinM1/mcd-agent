@@ -7,7 +7,9 @@ emits one compact `MCD_UPGRADE_PREFLIGHT_EVIDENCE=` line with schema
 orchestration.
 
 Version detection in this contract is strictly read-only: MCD reads its
-version cache, `release_metadata.json`, or `composer.lock`. It does not run
+version cache, `release_metadata.json`, or `composer.lock`. Static on-disk
+metadata takes precedence over the cache in both directions; conflicting
+static sources fail closed. It does not run
 `bin/console`, Symfony bootstrap, cache warmers, migrations, or write version
 cache files. If static evidence is unavailable, the marker is
 `status=needs_attention` with `version_source=unavailable_read_only`.

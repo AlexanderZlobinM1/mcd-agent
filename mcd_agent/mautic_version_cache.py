@@ -147,14 +147,18 @@ def _newer_local_version_metadata(root: Path, cached: str) -> str | None:
 def read_mautic_version_read_only(root: str | Path) -> str | None:
     """Read version evidence without invoking PHP, Symfony or Mautic code."""
     for candidate in _candidate_roots(str(root)):
+        static_versions = [
+            value
+            for value in (_read_version_from_release_metadata(candidate), _read_version_from_composer_lock(candidate))
+            if value
+        ]
+        if static_versions:
+            if len({_version_tuple(value) for value in static_versions}) != 1:
+                return None
+            return max(static_versions, key=lambda value: _version_tuple(value) or (0, 0, 0))
         cached = read_cached_mautic_version(candidate)
         if cached:
-            newer = _newer_local_version_metadata(candidate, cached)
-            return newer or cached
-        for reader in (_read_version_from_release_metadata, _read_version_from_composer_lock):
-            value = reader(candidate)
-            if value:
-                return value
+            return cached
     return None
 
 
