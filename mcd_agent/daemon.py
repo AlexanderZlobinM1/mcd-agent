@@ -139,6 +139,7 @@ from mcd_agent.segment_dependencies import (
     stale_dependent_segment_closure,
 )
 from mcd_agent.signals import collect_monitor_signals, collect_signals
+from mcd_agent.web_availability import collect_web_availability
 from mcd_agent.state_push import (
     MCCStatePusher,
     clear_pending_profile_event,
@@ -9752,6 +9753,9 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
         if pusher.enabled() and should_poll_alert(now, pusher.last_alert_poll_ts, config.mcc_push_alert_poll_interval_sec):
             try:
                 signals_payload = collect_signals(window_min=config.mcc_push_alert_window_min, cfg=config)
+                web_observation = collect_web_availability(config, installs)
+                if web_observation is not None:
+                    signals_payload["web_availability"] = web_observation
                 if mail_queue_metrics:
                     details_raw = signals_payload.get("details")
                     details = dict(details_raw) if isinstance(details_raw, dict) else {}

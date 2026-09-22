@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.2.46 - 2026-09-22
+
+- Add contract v1 HTTPS web-availability observations with DNS/TLS/HTTP
+  diagnosis, persistent failure threshold, cooldown and bounded service restart.
+- Emit AssetMapper verification v2 evidence with explicit webroot source,
+  manifest HTTP/content-type checks, referenced CSS/JS evidence and rollback.
+
 ## 1.2.45 - 2026-09-22
 
 - Keep Mautic worker processes alive across MCD self-update and supervisor

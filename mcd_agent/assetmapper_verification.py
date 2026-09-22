@@ -9,7 +9,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 
-SCHEMA = "mcd-mautic-assetmapper-verification-v1"
+SCHEMA = "mcd-mautic-assetmapper-verification-v2"
 _CONTENT_TYPES = {
     ".css": {"text/css"},
     ".js": {"application/javascript", "text/javascript", "application/x-javascript"},
@@ -43,9 +43,16 @@ def _configured_webroots(project_root: Path) -> list[Path]:
 
 def discover_asset_webroot(project_root: str | Path, install_root: str | Path) -> Path | None:
     """Resolve the actual served root from Mautic config and discovered install state."""
+    webroot, _source = _discover_asset_webroot_info(project_root, install_root)
+    return webroot
+
+
+def _discover_asset_webroot_info(project_root: str | Path, install_root: str | Path) -> tuple[Path | None, str]:
+    """Resolve the served root and whether it came from Composer or archive layout."""
     project = Path(project_root).resolve()
     install = Path(install_root).resolve()
-    candidates = _configured_webroots(project) + [install, project]
+    configured = _configured_webroots(project)
+    candidates = configured + [install, project]
     for child in sorted(project.iterdir(), key=lambda item: item.name) if project.is_dir() else []:
         if child.is_dir() and (child / "index.php").is_file():
             candidates.append(child)
@@ -56,8 +63,8 @@ def discover_asset_webroot(project_root: str | Path, install_root: str | Path) -
             continue
         seen.add(candidate)
         if (candidate / "index.php").is_file():
-            return candidate
-    return None
+            return candidate, ("composer" if candidate in configured else "archive")
+    return None, ""
 
 
 def _manifest_asset_paths(value: Any) -> list[str]:
@@ -98,6 +105,31 @@ def _status_code(headers: str) -> int | None:
     return int(matches[-1]) if matches else None
 
 
+def _curl_headers(
+    url: str,
+    *,
+    domain: str,
+    timeout_sec: int,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[int | None, str, int]:
+    try:
+        proc = runner(
+            [
+                "curl", "-ksS", "--max-time", str(max(5, int(timeout_sec))),
+                "--resolve", f"{domain.strip()}:443:127.0.0.1",
+                "-o", "/dev/null", "-D", "-", url,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "", 1
+    headers = proc.stdout or proc.stderr or ""
+    return _status_code(headers), _header_value(headers, "content-type"), int(proc.returncode)
+
+
 def _run_runtime_command(
     command: list[str],
     *,
@@ -122,6 +154,7 @@ def verify_assetmapper_upgrade(
     runtime_user: str,
     domain: str,
     target_version: str,
+    rollback_available: bool = True,
     timeout_sec: int = 120,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
@@ -136,13 +169,21 @@ def verify_assetmapper_upgrade(
         "runtime_user": str(runtime_user),
         "commands": [],
         "assets": [],
+        "rollback": {"available": bool(rollback_available), "required": True, "attempted": False},
     }
     project = Path(project_root).resolve()
-    webroot = discover_asset_webroot(project, install_root)
+    webroot, webroot_source = _discover_asset_webroot_info(project, install_root)
     if webroot is None:
         result["reason"] = "served webroot could not be discovered"
         return result
     result["webroot"] = str(webroot)
+    result["webroot_source"] = webroot_source
+    if webroot_source not in {"composer", "archive"}:
+        result["reason"] = "webroot source is not explicit"
+        return result
+    if not rollback_available:
+        result["reason"] = "rollback evidence is unavailable"
+        return result
     if not str(domain or "").strip():
         result["reason"] = "instance domain is unavailable for SNI/Host verification"
         return result
@@ -165,8 +206,19 @@ def verify_assetmapper_upgrade(
     manifest = webroot / "assets" / "build" / "manifest.json"
     result["manifest_path"] = str(manifest)
     result["manifest_url"] = "/assets/build/manifest.json"
+    result["manifest"] = {"exists": manifest.is_file()}
     if not manifest.is_file():
         result["reason"] = "AssetMapper manifest is missing from the served webroot"
+        return result
+    manifest_status, manifest_content_type, manifest_rc = _curl_headers(
+        f"https://{domain.strip()}{result['manifest_url']}",
+        domain=domain,
+        timeout_sec=timeout_sec,
+        runner=runner,
+    )
+    result["manifest"].update({"http_status": manifest_status, "content_type": manifest_content_type})
+    if manifest_rc != 0 or manifest_status != 200 or manifest_content_type != "application/json":
+        result["reason"] = "AssetMapper manifest did not return HTTP 200 application/json"
         return result
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -181,7 +233,7 @@ def verify_assetmapper_upgrade(
     for raw in raw_assets:
         url_path = _asset_url_path(raw)
         suffix = Path(url_path or raw).suffix.lower()
-        asset = {"manifest_value": raw, "url": url_path, "suffix": suffix}
+        asset = {"manifest_value": raw, "url": url_path, "suffix": suffix, "referenced_by_manifest": True}
         if url_path is None or suffix not in _CONTENT_TYPES:
             asset["status"] = "failed"
             asset["reason"] = "unsafe or unsupported manifest asset path"
@@ -206,29 +258,21 @@ def verify_assetmapper_upgrade(
             return result
         url = f"https://{domain.strip()}{url_path}"
         try:
-            proc = runner(
-                ["curl", "-ksS", "--max-time", str(max(5, int(timeout_sec))), "--resolve", f"{domain.strip()}:443:127.0.0.1", "-o", "/dev/null", "-D", "-", url],
-                text=True,
-                capture_output=True,
-                timeout=timeout_sec,
-                check=False,
-            )
+            status, content_type, returncode = _curl_headers(url, domain=domain, timeout_sec=timeout_sec, runner=runner)
         except (OSError, subprocess.TimeoutExpired) as exc:
             asset["status"] = "failed"
             asset["reason"] = f"HTTP probe failed: {type(exc).__name__}"
             result["assets"].append(asset)
             result["reason"] = "manifest asset HTTP verification failed"
             return result
-        headers = proc.stdout or proc.stderr or ""
-        status = _status_code(headers)
-        content_type = _header_value(headers, "content-type")
         asset.update({"http_status": status, "content_type": content_type, "status": "ok"})
         result["assets"].append(asset)
-        if proc.returncode != 0 or status != 200 or content_type not in _CONTENT_TYPES[suffix]:
+        if returncode != 0 or status != 200 or content_type not in _CONTENT_TYPES[suffix]:
             asset["status"] = "failed"
             result["reason"] = "manifest asset did not return HTTP 200 with the expected content type"
             return result
     result["status"] = "success"
     result["rollback_required"] = False
+    result["rollback"]["required"] = False
     result["asset_count"] = len(result["assets"])
     return result

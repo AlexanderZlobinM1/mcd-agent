@@ -51,7 +51,12 @@ class AssetMapperVerificationTests(unittest.TestCase):
 
             def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 if command[0] == "curl":
-                    content_type = "text/css" if command[-1].endswith(".css") else "application/javascript"
+                    if command[-1].endswith("manifest.json"):
+                        content_type = "application/json"
+                    elif command[-1].endswith(".css"):
+                        content_type = "text/css"
+                    else:
+                        content_type = "application/javascript"
                     return subprocess.CompletedProcess(command, 0, f"HTTP/2 200\r\ncontent-type: {content_type}\r\n\r\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -68,6 +73,10 @@ class AssetMapperVerificationTests(unittest.TestCase):
             self.assertEqual(result["status"], "success")
             self.assertFalse(result["rollback_required"])
             self.assertEqual(result["asset_count"], 2)
+            self.assertEqual(result["schema"], "mcd-mautic-assetmapper-verification-v2")
+            self.assertEqual(result["webroot_source"], "composer")
+            self.assertEqual(result["manifest"]["http_status"], 200)
+            self.assertTrue(result["rollback"]["available"])
             self.assertTrue(all(asset["status"] == "ok" for asset in result["assets"]))
 
     def test_rejects_html_response_for_css(self) -> None:
@@ -83,7 +92,8 @@ class AssetMapperVerificationTests(unittest.TestCase):
 
             def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 if command[0] == "curl":
-                    return subprocess.CompletedProcess(command, 0, "HTTP/2 200\r\ncontent-type: text/html\r\n\r\n", "")
+                    content_type = "application/json" if command[-1].endswith("manifest.json") else "text/html"
+                    return subprocess.CompletedProcess(command, 0, f"HTTP/2 200\r\ncontent-type: {content_type}\r\n\r\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             result = verify_assetmapper_upgrade(

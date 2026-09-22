@@ -1720,6 +1720,7 @@ def _verify_assetmapper_upgrade(
     *,
     project_root: str,
     target: str,
+    rollback_available: bool = True,
 ) -> None:
     if _parse_semver(target)[0] != 7:
         return
@@ -1731,6 +1732,7 @@ def _verify_assetmapper_upgrade(
         runtime_user=config.mautic_run_as_user or "www-data",
         domain=_best_probe_domain(inst),
         target_version=target,
+        rollback_available=rollback_available,
     )
     print("MCD_ASSETMAPPER_VERIFICATION=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
     if evidence.get("status") != "success":
@@ -2026,6 +2028,7 @@ def run_upgrade_apply(
             inst,
             project_root=_resolve_composer_project_root(install_root),
             target=target,
+            rollback_available=do_backup,
         )
 
         # Restore transport dependencies for API senders after upgrade
