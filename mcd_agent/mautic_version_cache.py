@@ -144,18 +144,25 @@ def _newer_local_version_metadata(root: Path, cached: str) -> str | None:
     return max(candidates, key=lambda value: _version_tuple(value) or (0, 0, 0)) if candidates else None
 
 
+def _read_static_mautic_version(root: Path) -> str | None:
+    static_versions = [
+        value
+        for value in (_read_version_from_release_metadata(root), _read_version_from_composer_lock(root))
+        if value
+    ]
+    if static_versions:
+        if len({_version_tuple(value) for value in static_versions}) != 1:
+            return None
+        return max(static_versions, key=lambda value: _version_tuple(value) or (0, 0, 0))
+    return None
+
+
 def read_mautic_version_read_only(root: str | Path) -> str | None:
     """Read version evidence without invoking PHP, Symfony or Mautic code."""
     for candidate in _candidate_roots(str(root)):
-        static_versions = [
-            value
-            for value in (_read_version_from_release_metadata(candidate), _read_version_from_composer_lock(candidate))
-            if value
-        ]
-        if static_versions:
-            if len({_version_tuple(value) for value in static_versions}) != 1:
-                return None
-            return max(static_versions, key=lambda value: _version_tuple(value) or (0, 0, 0))
+        static_version = _read_static_mautic_version(candidate)
+        if static_version:
+            return static_version
         cached = read_cached_mautic_version(candidate)
         if cached:
             return cached
@@ -381,13 +388,17 @@ def collect_mautic_version(
     # guard and runs the console as the Mautic runtime user, not root.
     if not force_refresh:
         for candidate in _candidate_roots(root):
-            version = read_cached_mautic_version(candidate)
+            version = _read_static_mautic_version(candidate) or read_cached_mautic_version(candidate)
             if version and expected_major is not None and _version_major(version) != int(expected_major):
                 version = None
             if version:
-                if _newer_local_version_metadata(candidate, version):
-                    version = None
-                    break
+                detected_root = candidate
+                break
+
+    if force_refresh and not version:
+        for candidate in _candidate_roots(root):
+            version = _read_static_mautic_version(candidate)
+            if version:
                 detected_root = candidate
                 break
 

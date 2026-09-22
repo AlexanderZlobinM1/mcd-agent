@@ -1712,9 +1712,18 @@ def run_upgrade_check(config: AgentConfig, root: str | None) -> int:
         print("next=image-managed")
         return 0
     install_root, console = inst.root, inst.console_path
-    current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
+    current = _read_current_version_read_only(install_root)
+    version_source = "read_only_metadata" if _parse_semver(current) != (0, 0, 0) else "unavailable_read_only"
     target = _latest_same_branch(config, current)
     branch = _release_family_label(current)
+    evidence = {
+        "schema": "mcd-mautic-upgrade-version-evidence-v1",
+        "root": install_root,
+        "current_version": current,
+        "version_source": version_source,
+        "target_version": target or "",
+    }
+    print("MCD_UPGRADE_VERSION_EVIDENCE=" + json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
     print(f"root={install_root}")
     print(f"current={current}")
     if branch:

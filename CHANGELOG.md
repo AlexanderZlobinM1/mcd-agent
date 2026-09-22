@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.38 - 2026-09-22
+
+- Make inventory and `mautic-upgrade check` prefer authoritative on-disk
+  Mautic metadata, refresh the MCD cache downward after rollback, and emit
+  structured read-only version evidence for MCC refresh/rescan.
+
 ## 1.2.37 - 2026-09-22
 
 - Fix read-only Mautic version detection to prefer on-disk release metadata and

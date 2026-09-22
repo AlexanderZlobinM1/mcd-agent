@@ -60,7 +60,7 @@ class MauticVersionCacheTest(unittest.TestCase):
 
                 self.assertEqual(actual, "7.2.0")
                 self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "7.2.0")
-                runtime.assert_called_once()
+                runtime.assert_not_called()
 
     def test_read_only_version_uses_static_metadata_without_console(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -88,6 +88,19 @@ class MauticVersionCacheTest(unittest.TestCase):
                 mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
                 self.assertEqual(mautic_version_cache.read_mautic_version_read_only(root), "7.1.3")
 
+    def test_inventory_refreshes_cache_downward_from_static_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "site"
+            root.mkdir(parents=True)
+            (root / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}',
+                encoding="utf-8",
+            )
+            with patch.object(mautic_version_cache, "_VERSION_CACHE_ROOT", root / "generated"):
+                mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
+                self.assertEqual(mautic_version_cache.collect_mautic_version(str(root), "/usr/bin/php"), "7.1.3")
+                self.assertEqual(mautic_version_cache.read_cached_mautic_version(root), "7.1.3")
+
     def test_older_package_metadata_does_not_downgrade_cache(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "site"
@@ -105,7 +118,7 @@ class MauticVersionCacheTest(unittest.TestCase):
                 mautic_version_cache.write_mautic_version_cache(root, "7.2.0")
                 self.assertEqual(
                     mautic_version_cache.collect_mautic_version(str(root), "/usr/bin/php"),
-                    "7.2.0",
+                    "7.1.3",
                 )
                 runtime.assert_not_called()
 
