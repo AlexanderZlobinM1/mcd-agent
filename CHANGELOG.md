@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.2.47 - 2026-09-23
+
+- Rotate web-availability probes across discovered instances so each instance
+  is sampled over successive MCC alert-poll cycles.
+
 ## 1.2.46 - 2026-09-22
 
 - Add contract v1 HTTPS web-availability observations with DNS/TLS/HTTP

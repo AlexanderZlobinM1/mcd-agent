@@ -61,3 +61,34 @@ def test_web_availability_success_resets_outage_state(tmp_path: Path) -> None:
     assert healthy["status"] == "available"
     state = json.loads((tmp_path / "web-availability.json").read_text(encoding="utf-8"))
     assert state["host::https://example.test/"]["consecutive_failures"] == 0
+
+
+def test_web_availability_rotates_one_instance_per_poll(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg.web_availability_endpoint = ""
+    installs = [
+        SimpleNamespace(instance_uid="agromanija", primary_domain="agromanija.test", domains=["agromanija.test"]),
+        SimpleNamespace(instance_uid="frusketerme", primary_domain="frusketerme.test", domains=["frusketerme.test"]),
+        SimpleNamespace(instance_uid="third", primary_domain="third.test", domains=["third.test"]),
+    ]
+    probed: list[str] = []
+
+    def probe(endpoint: str) -> dict[str, object]:
+        probed.append(endpoint)
+        return {"status": "available", "phase": "mautic", "diagnosis": "ok", "http_status": 302}
+
+    observations = [
+        collect_web_availability(cfg, installs, now=now, probe=probe)
+        for now in (100, 161, 222)
+    ]
+
+    assert probed == [
+        "https://agromanija.test/",
+        "https://frusketerme.test/",
+        "https://third.test/",
+    ]
+    assert [item["instance_uid"] for item in observations if item is not None] == [
+        "agromanija",
+        "frusketerme",
+        "third",
+    ]

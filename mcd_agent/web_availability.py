@@ -47,10 +47,16 @@ def _save_state(cfg: Any, state: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _endpoint(cfg: Any, installs: list[object]) -> tuple[str, str, str]:
+def _endpoint(
+    cfg: Any,
+    installs: list[object],
+    *,
+    previous_endpoint: str = "",
+) -> tuple[str, str, str]:
     configured = str(getattr(cfg, "web_availability_endpoint", "") or "").strip()
     if configured:
         return configured, "host", ""
+    candidates: list[tuple[str, str, str]] = []
     for inst in installs:
         uid = str(getattr(inst, "instance_uid", "") or "").strip()
         domain = str(getattr(inst, "primary_domain", "") or "").strip()
@@ -58,7 +64,16 @@ def _endpoint(cfg: Any, installs: list[object]) -> tuple[str, str, str]:
             domains = getattr(inst, "domains", []) or []
             domain = str(domains[0] if domains else "").strip()
         if domain:
-            return f"https://{domain}/", "instance", uid
+            endpoint = f"https://{domain}/"
+            candidate = (endpoint, "instance", uid)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if candidates:
+        previous_index = next(
+            (index for index, candidate in enumerate(candidates) if candidate[0] == previous_endpoint),
+            -1,
+        )
+        return candidates[(previous_index + 1) % len(candidates)]
     return "", "host", ""
 
 
@@ -146,14 +161,18 @@ def collect_web_availability(
     probe: Callable[..., dict[str, Any]] = _probe,
     restart: Callable[..., tuple[bool, str]] = _restart_service,
 ) -> dict[str, Any] | None:
-    endpoint, scope, instance_uid = _endpoint(cfg, installs)
+    state = _load_state(cfg)
+    endpoint, scope, instance_uid = _endpoint(
+        cfg,
+        installs,
+        previous_endpoint=str(state.get("_rotation_last_endpoint") or ""),
+    )
     if not endpoint:
         return None
     parsed = urlsplit(endpoint)
     if parsed.scheme != "https" or not parsed.netloc:
         return None
     now_ts = float(time.time() if now is None else now)
-    state = _load_state(cfg)
     key = f"{scope}:{instance_uid}:{endpoint}"
     previous = state.get(key) if isinstance(state.get(key), dict) else {}
     last_probe = float(previous.get("last_probe_ts", 0) or 0)
@@ -211,5 +230,7 @@ def collect_web_availability(
         "cooldown_until_ts": cooldown_until,
         "observation": observation,
     }
+    if scope == "instance":
+        state["_rotation_last_endpoint"] = endpoint
     _save_state(cfg, state)
     return observation
