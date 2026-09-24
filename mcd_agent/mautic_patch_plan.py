@@ -13,6 +13,7 @@ from typing import Any
 from mcd_agent.install_type import detect_install_type
 
 PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
+PLAN_V2_SCHEMA = "mcd-mautic-patch-plan-v2"
 REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
 MINIMUM_AGENT_VERSION = "1.2.21"
 PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
@@ -192,9 +193,18 @@ def _plan_sha(plan: dict[str, Any]) -> str:
     return _sha(canonical.encode("utf-8"))
 
 
+def _uses_v2(raw: str) -> bool:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get("schema") == PLAN_V2_SCHEMA
+
+
 def contract() -> dict[str, Any]:
+    from mcd_agent.mautic_patch_plan_v2 import capability as v2_capability
     return {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "minimum_agent_version": MINIMUM_AGENT_VERSION,
-            "capabilities": [PREFLIGHT_SCHEMA],
+            "capabilities": [PREFLIGHT_SCHEMA, PLAN_V2_SCHEMA], "patch_plan_v2": v2_capability(),
             "source_version": "7.1.3", "target_version": "7.2.0", "install_types": ["zip", "composer"],
             "plugin_enabled_required": True,
             "patches": [{"id": key, **value, "conflicts_with": []} for key, value in _PATCHES.items()]}
@@ -205,6 +215,12 @@ def parse_plan(raw: str) -> dict[str, Any]:
         plan = json.loads(raw)
     except (TypeError, ValueError) as exc:
         raise PatchPlanError("invalid_plan_json") from exc
+    if isinstance(plan, dict) and plan.get("schema") == PLAN_V2_SCHEMA:
+        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2
+        try:
+            return parse_v2(raw)
+        except RuntimeError as exc:
+            raise PatchPlanError(str(exc)) from exc
     expected = {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "source_version": "7.1.3", "target_version": "7.2.0", "plugin_enabled": True}
     if not isinstance(plan, dict) or any(plan.get(k) != v for k, v in expected.items()) or plan.get("install_type") not in {"zip", "composer"}:
         raise PatchPlanError("unknown_schema_or_registry_revision")
@@ -434,6 +450,11 @@ def _apply(source: Path, run: Path, ident: str, gate: dict[str, Any], context: d
 
 
 def rollback(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
+    if _uses_v2(raw_plan):
+        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, rollback as rollback_v2
+        if parse_v2(raw_plan)["run_id"] != run_id:
+            raise PatchPlanError("run_id_argument_mismatch")
+        return rollback_v2(root_value, raw_plan)
     plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
     root = Path(root_value).resolve(strict=True); source = _source_root(root)
@@ -513,6 +534,11 @@ def _preflight_restore(source: Path, run: Path, snapshot: dict[str, Any], allowe
 
 
 def atomic_preflight(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
+    if _uses_v2(raw_plan):
+        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, atomic_preflight as atomic_preflight_v2
+        if parse_v2(raw_plan)["run_id"] != run_id:
+            raise PatchPlanError("run_id_argument_mismatch")
+        return atomic_preflight_v2(root_value, raw_plan)
     """Apply and verify the complete mandatory patch sequence atomically."""
     plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id):
@@ -584,6 +610,12 @@ def _verify_preflight(source: Path) -> dict[str, Any]:
 
 
 def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply") -> dict[str, Any]:
+    if _uses_v2(raw_plan):
+        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, execute as execute_v2
+        plan_v2 = parse_v2(raw_plan)
+        if plan_v2["phase"] != phase or plan_v2["run_id"] != run_id or plan_v2["operation"] != operation:
+            raise PatchPlanError("v2_invocation_argument_mismatch")
+        return execute_v2(root_value, raw_plan)
     plan = parse_plan(raw_plan)
     if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
     root = Path(root_value).resolve(strict=True)

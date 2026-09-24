@@ -1,5 +1,10 @@
 # MCD Changelog
 
+## 1.2.51 - 2026-09-25
+- Add registry-bound Mautic patch-plan v2 with semantic version applicability,
+  literal fail-closed signature gates, immutable payload checksums, phase-scoped
+  execution, and rollback evidence while preserving v1 compatibility.
+
 ## 1.2.50 - 2026-09-24
 - Honor selected-profile per-instance segment fan-out when no explicit
   operator host safety cap is configured; retain configured caps when present.

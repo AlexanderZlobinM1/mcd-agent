@@ -1,0 +1,112 @@
+{
+  "schema": "mcd-mautic-patch-plan-v2",
+  "evidence_schema": "mcd-mautic-patch-preflight-v2",
+  "minimum_agent_version": "1.2.51",
+  "install_types": [
+    "composer",
+    "zip"
+  ],
+  "phases": [
+    "before_background_imports",
+    "before_cache_warmup",
+    "before_campaign_execution",
+    "before_doctrine_migrations",
+    "post_source_install"
+  ],
+  "gate_kinds": [
+    "exact_count"
+  ],
+  "gate_groups": [
+    "vulnerable",
+    "fixed"
+  ],
+  "gate_semantics": "literal_substring_count",
+  "expected_count": {
+    "minimum": 0,
+    "allow_missing_path": "only true when expected_count is 0"
+  },
+  "atomicity": "upgrade_preflight_atomic_across_post_source_install_and_before_doctrine_migrations; runtime invocation atomic per phase",
+  "operations": [
+    "apply",
+    "verify"
+  ],
+  "request_fields": [
+    "schema",
+    "registry_commit",
+    "registry_sha256",
+    "source_version",
+    "target_version",
+    "install_type",
+    "phase",
+    "run_id",
+    "operation",
+    "patches",
+    "payloads"
+  ],
+  "patch_record_gate_field": "gate",
+  "payload_fields": [
+    "path",
+    "sha256",
+    "content_base64"
+  ],
+  "evidence_fields": [
+    "schema",
+    "status",
+    "registry_commit",
+    "registry_sha256",
+    "source_version",
+    "target_version",
+    "install_type",
+    "phase",
+    "run_id",
+    "plan_sha256",
+    "selected",
+    "patches",
+    "phases",
+    "rollback_attempted",
+    "rollback_succeeded",
+    "upgrade_started"
+  ],
+  "aggregate_only_evidence_fields": [
+    "phases"
+  ],
+  "status_values": [
+    "success",
+    "error"
+  ],
+  "selected_shape": "ordered patch ID strings; phase-local on execute, all selected plan IDs on upgrade atomic_preflight",
+  "patch_row_fields": [
+    "id",
+    "decision",
+    "phase",
+    "gates",
+    "payload_sha256"
+  ],
+  "applied_patch_optional_fields": [
+    "before_sha256",
+    "after_sha256"
+  ],
+  "patch_decision_values": [
+    "applied",
+    "already",
+    "candidate",
+    "error"
+  ],
+  "gate_row_fields": [
+    "group",
+    "path",
+    "needle_sha256",
+    "expected",
+    "actual",
+    "allow_missing_path"
+  ],
+  "phase_execution": {
+    "upgrade_apply_initial_phase": "post_source_install",
+    "upgrade_apply_internal_phases": [
+      "post_source_install",
+      "before_doctrine_migrations"
+    ],
+    "later_runtime_phases_require_separate_invocation": true,
+    "empty_phase_selection": "success_noop"
+  }
+}
