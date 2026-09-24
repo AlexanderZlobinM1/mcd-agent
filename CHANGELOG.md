@@ -1,6 +1,16 @@
 # MCD Changelog
 
+## 1.2.50 - 2026-09-24
+- Honor selected-profile per-instance segment fan-out when no explicit
+  operator host safety cap is configured; retain configured caps when present.
+- Add bounded segment scheduler telemetry for import-follow-up queue wait,
+  dispatch blocking reasons, and segment process runtime/outcome.
+
 ## Unreleased
+
+## 1.2.49 - 2026-09-24
+- Add bounded segment scheduler telemetry for import-follow-up queue wait,
+  dispatch blocking reasons, and segment process runtime/outcome.
 
 ## 1.2.48 - 2026-09-24
 - Allow explicitly acknowledged manual forward upgrades within the installed Mautic major without requiring an unrelated patch plan; retain strict validation for selected patch adapters and release authorization for automatic upgrades.

@@ -120,8 +120,9 @@ host_pressure_php_stuck_pause_threshold = 8
 host_pressure_swap_level_pause_threshold = 2
 # Max concurrent generic jobs (from [[jobs]]).
 jobs_max_workers = 2
-# Host cap applied independently to segment/import and campaign command lanes.
-# 0 keeps both lanes unlimited; MCC hardware profiles set this value.
+# Optional explicit operator safety cap applied across scheduler command lanes.
+# 0 leaves per-instance worker counts to the selected profile. Hardware-derived
+# capacity is advisory and must not be delivered as this cap implicitly.
 scheduler_host_max_parallel = 0
 scheduler_elastic_slots_enabled = true
 scheduler_emergency_reserved_slots = 1

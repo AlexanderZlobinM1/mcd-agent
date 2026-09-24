@@ -2157,6 +2157,11 @@ def _scheduler_host_slots_available(
         # campaign lane. Shared host capacity applies only above that baseline.
         return 1
     host_limit = max(0, int(getattr(config, "scheduler_host_max_parallel", 0) or 0))
+    if lane == "segment" and host_limit <= 0:
+        # The selected profile's per-instance segment lanes are authoritative
+        # unless an operator explicitly configures a host-wide safety cap.
+        # Hardware-derived recommendations belong in metadata, not dispatch.
+        return None
     if (
         bool(getattr(config, "scheduler_elastic_slots_enabled", True))
         and host_limit > 0
@@ -4093,6 +4098,7 @@ def _fill_from_ring(
     remove_on_launch: bool = False,
     on_launch=None,
     bypass_repeat_guard_entities: set[int] | None = None,
+    queued_at_by_entity: dict[int, float] | None = None,
     max_launches: int = 1,
 ) -> int:
     if not ring or ring_limit <= 0 or total_limit <= 0:
@@ -4150,6 +4156,15 @@ def _fill_from_ring(
             bypass_repeat_guard=bypass_repeat_guard,
         )
         if launched:
+            if task_type == "segment":
+                queued_at = (queued_at_by_entity or {}).pop(eid, None)
+                if queued_at is not None:
+                    logging.info(
+                        "[%s] segment scheduler launch id=%s queue_wait_sec=%.3f source=import_followup",
+                        root,
+                        eid,
+                        max(0.0, time.time() - float(queued_at)),
+                    )
             if on_launch is not None:
                 try:
                     on_launch(eid)
@@ -7839,6 +7854,12 @@ def _monitor_running(
             popens.pop(key, None)
             if task.task_type == "segment":
                 _mark_segment_finished(task.root, task.entity_id, now_ts=now)
+                logging.info(
+                    "[%s] segment scheduler exit id=%s outcome=external_released runtime_sec=%.3f",
+                    task.root,
+                    task.entity_id,
+                    max(0.0, now - float(task.started_at)),
+                )
             logging.info(
                 "[%s] external %s entity=%s pid=%s released",
                 task.root,
@@ -7867,6 +7888,15 @@ def _monitor_running(
                 progress_watchdog.pop(key, None)
                 if rc == 0 and task.task_type == "segment":
                     _mark_segment_finished(task.root, task.entity_id, now_ts=now)
+                if task.task_type == "segment":
+                    logging.info(
+                        "[%s] segment scheduler exit id=%s outcome=%s rc=%s runtime_sec=%.3f",
+                        task.root,
+                        task.entity_id,
+                        "success" if rc == 0 else ("lock_busy" if lock_busy else "failed"),
+                        rc,
+                        max(0.0, now - float(task.started_at)),
+                    )
                 if rc == 0 and task.task_type == "campaign_rebuild":
                     _mark_campaign_rebuild_finished(task.root, task.entity_id, now_ts=now)
                 if rc == 0 and task.task_type == "campaign_trigger":
@@ -7962,6 +7992,14 @@ def _monitor_running(
             continue
 
         if alive and timeout_threshold is not None and elapsed > timeout_threshold:
+            if task.task_type == "segment":
+                logging.warning(
+                    "[%s] segment scheduler exit id=%s outcome=timeout runtime_sec=%.3f threshold_sec=%s",
+                    task.root,
+                    task.entity_id,
+                    max(0.0, elapsed),
+                    timeout_threshold,
+                )
             _kill_pid(task.pid, config.segment_kill_grace_sec)
             store.finish(task.row_id, state="timeout", rc=None, note="killed_by_timeout")
             progress_watchdog.pop(key, None)
@@ -7980,6 +8018,13 @@ def _monitor_running(
             continue
 
         if not alive:
+            if task.task_type == "segment":
+                logging.warning(
+                    "[%s] segment scheduler exit id=%s outcome=lost runtime_sec=%.3f",
+                    task.root,
+                    task.entity_id,
+                    max(0.0, elapsed),
+                )
             store.finish(task.row_id, state="lost", rc=None, note="pid_not_alive")
             _plugin_operation_runtime_finish(
                 store,
@@ -8453,6 +8498,8 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     import_pending_cache: dict[str, int] = {}
     import_monitor_cache: dict[str, dict[str, object]] = {}
     import_completed_segment_followups: dict[str, set[int]] = {}
+    import_completed_segment_followup_queued_at: dict[str, dict[int, float]] = {}
+    import_followup_wait_log_ts: dict[str, float] = {}
     import_completed_segment_imports: dict[str, dict[int, float]] = {}
     last_import_monitor_warn_ts: dict[str, float] = {}
     segment_last_full_scan_ts: dict[str, float] = {}
@@ -10027,12 +10074,16 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if import_id in completed_imports:
                         continue
                     import_completed_segment_followups.setdefault(root, set()).update(targets)
+                    queued_at_by_id = import_completed_segment_followup_queued_at.setdefault(root, {})
+                    for segment_id in targets:
+                        queued_at_by_id.setdefault(segment_id, now)
                     completed_imports[import_id] = now
                     logging.info(
-                        "[%s] import completion queued segment follow-up import=%s segments=%s",
+                        "[%s] import completion queued segment follow-up import=%s segments=%s queue_size=%s",
                         root,
                         import_id,
                         ",".join(str(segment_id) for segment_id in targets),
+                        len(import_completed_segment_followups.get(root, set())),
                     )
                 for import_id, observed_at in list(completed_imports.items()):
                     if now - float(observed_at) > 3600.0:
@@ -11767,9 +11818,34 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     dynamic_blocked=_segment_chain_running_conflict,
                     on_launch=_mark_import_followup_launch,
                     bypass_repeat_guard_entities=import_followup_ids,
+                    queued_at_by_entity=import_completed_segment_followup_queued_at.setdefault(root, {}),
                     remove_on_launch=True,
                     max_launches=import_followup_limit,
                 )
+            elif import_followup_ids:
+                if not cluster_cron_allowed:
+                    reason = "cron_disallowed"
+                elif segment_throttled_active:
+                    reason = "throttled"
+                elif import_followup_limit <= 0:
+                    reason = "shared_segment_slots_busy"
+                else:
+                    reason = "dispatch_guard"
+                wait_sec = max(
+                    0.0,
+                    now - min(import_completed_segment_followup_queued_at.get(root, {}).values(), default=now),
+                )
+                last_wait_log = float(import_followup_wait_log_ts.get(root, 0.0) or 0.0)
+                if now - last_wait_log >= 60.0:
+                    import_followup_wait_log_ts[root] = now
+                    logging.info(
+                        "[%s] segment scheduler follow-up waiting segments=%s queue_wait_sec=%.3f reason=%s slots=%s",
+                        root,
+                        len(import_followup_ids),
+                        wait_sec,
+                        reason,
+                        import_followup_limit,
+                    )
 
             if (
                 segment_launched_this_tick <= 0

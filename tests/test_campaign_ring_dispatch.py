@@ -180,6 +180,43 @@ class CampaignRingDispatchTests(unittest.TestCase):
 
         self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment"), 1)
 
+    def test_selected_profile_fanout_is_not_clamped_without_explicit_host_cap(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(
+            profile_name="midi",
+            scheduler_host_max_parallel=0,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=1,
+            segment_mode="id_weighted",
+            segment_priority_parallel_idle=3,
+            segment_regular_parallel_idle=1,
+            scheduler_instance_max_parallel=0,
+        )
+        running = {
+            f"segment-{idx}": SimpleNamespace(root=root, task_type="segment", entity_id=idx)
+            for idx in range(4)
+        }
+
+        self.assertIsNone(_scheduler_host_slots_available(cfg, running, "segment", root=root))
+        self.assertIsNone(_scheduler_instance_slots_available(cfg, running, root=root, task_type="segment"))
+
+    def test_explicit_host_safety_cap_still_clamps_profile_fanout(self) -> None:
+        root = "/var/www/site"
+        cfg = SimpleNamespace(
+            profile_name="hiload",
+            scheduler_host_max_parallel=2,
+            scheduler_elastic_slots_enabled=True,
+            scheduler_emergency_reserved_slots=1,
+            segment_mode="id_weighted",
+            segment_priority_parallel_idle=6,
+            segment_regular_parallel_idle=2,
+        )
+        running = {
+            "segment-baseline": SimpleNamespace(root=root, task_type="segment", entity_id=1)
+        }
+
+        self.assertEqual(_scheduler_host_slots_available(cfg, running, "segment", root=root), 1)
+
     def test_elastic_host_budget_keeps_one_emergency_slot_for_priority_work(self) -> None:
         cfg = SimpleNamespace(
             scheduler_host_max_parallel=6,
@@ -2303,6 +2340,81 @@ class CampaignRingDispatchTests(unittest.TestCase):
         submit.assert_called_once()
         self.assertEqual(submit.call_args.kwargs["entity_id"], 11)
         self.assertEqual(list(ring), [22, 33, 11])
+
+    def test_fill_from_ring_logs_import_followup_queue_wait(self) -> None:
+        root = "/var/www/site"
+        ring = deque([11])
+        queued_at = {11: time.time() - 12.0}
+        cfg = SimpleNamespace(command_timeout_sec=3600, segment_full_scan_interval_sec=0)
+
+        with patch.object(daemon_mod, "_submit_if_slot", return_value=True), patch.object(
+            daemon_mod.logging, "info"
+        ) as info:
+            launched = _fill_from_ring(
+                ring=ring,
+                ring_limit=1,
+                total_limit=1,
+                root=root,
+                task_type="segment",
+                running={},
+                ring_entities={11},
+                config=cfg,
+                store=SimpleNamespace(),
+                popens={},
+                build_args=lambda sid: ["php", "bin/console", "mautic:segments:update", "-i", str(sid)],
+                queued_at_by_entity=queued_at,
+                remove_on_launch=True,
+                max_launches=1,
+            )
+
+        self.assertEqual(launched, 1)
+        self.assertNotIn(11, queued_at)
+        self.assertTrue(
+            any(
+                call.args[0].endswith("segment scheduler launch id=%s queue_wait_sec=%.3f source=import_followup")
+                and call.args[1] == root
+                and call.args[2] == 11
+                for call in info.call_args_list
+            )
+        )
+
+    def test_monitor_logs_segment_runtime_on_exit(self) -> None:
+        root = "/var/www/site"
+        key = _task_key(root, "segment", 11)
+        task = RunningTask(
+            row_id=7,
+            root=root,
+            task_key=key,
+            task_type="segment",
+            entity_id=11,
+            command_str="php|bin/console|mautic:segments:update|-i|11",
+            timeout_sec=0,
+            attempts=1,
+            started_at=time.time() - 4.0,
+            pid=1234,
+        )
+        proc = Mock()
+        proc.poll.return_value = 0
+
+        with patch.object(daemon_mod, "_mark_segment_finished"), patch.object(
+            daemon_mod.logging, "info"
+        ) as info:
+            _monitor_running(
+                config=SimpleNamespace(task_retry_max=1),
+                store=Mock(),
+                running={key: task},
+                popens={key: proc},
+            )
+
+        self.assertTrue(
+            any(
+                call.args[0].endswith("segment scheduler exit id=%s outcome=%s rc=%s runtime_sec=%.3f")
+                and call.args[1] == root
+                and call.args[2] == 11
+                and call.args[3] == "success"
+                for call in info.call_args_list
+            )
+        )
 
     def test_fill_from_ring_blocks_active_import_target_and_bypasses_only_followup_repeat_guard(self) -> None:
         root = "/var/www/site"
