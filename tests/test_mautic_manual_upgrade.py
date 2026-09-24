@@ -31,6 +31,24 @@ def test_exact_manual_invocation_is_valid(invocation):
     manual.validate_preflighted_single_instance(**invocation)
 
 
+def test_manual_forward_same_major_latest_without_applicable_patch_is_valid(invocation):
+    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    manual.validate_preflighted_single_instance(**invocation)
+
+
+@pytest.mark.parametrize("target", ["7.0.9", "8.0.0"])
+def test_manual_downgrade_or_cross_major_is_rejected(invocation, target):
+    invocation.update(target=target, raw_plan=None, run_id=None)
+    with pytest.raises(manual.ManualUpgradePreflightError, match="newer|major-version"):
+        manual.validate_preflighted_single_instance(**invocation)
+
+
+def test_run_id_without_selected_patch_plan_is_rejected(invocation):
+    invocation.update(raw_plan=None)
+    with pytest.raises(manual.ManualUpgradePreflightError, match="patch-run-id"):
+        manual.validate_preflighted_single_instance(**invocation)
+
+
 @pytest.mark.parametrize("key,value", [
     ("root", None), ("root", "project"), ("root", "/"),
     ("current", "7.1.2"), ("current", "7.2.0"), ("target", None),
@@ -126,7 +144,7 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
     cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data",
                           mcc_url="https://mcc.example.test", mcc_token="test-shared-token")
     monkeypatch.setattr(upgrade, "_pick_install_record", lambda *a: Install(str(root)))
-    monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: "7.2.0" if installed[0] else "7.1.3")
+    monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: invocation["target"] if installed[0] else "7.1.3")
 
     def deny(request, **kwargs):
         events.append("global_authorization")
@@ -150,7 +168,7 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
     monkeypatch.setattr(upgrade, "ensure_import_tag_patch", lambda *a: {"status": "already"})
     monkeypatch.setattr(upgrade, "_write_upgrade_version_cache", lambda *a: 0)
     args = dict(config=cfg, root=str(root), mode=kind, yes=True, do_backup=False,
-                with_system_upgrade=False, target_override="7.2.0", allow_minor=True,
+                with_system_upgrade=False, target_override=invocation["target"], allow_minor=True,
                 patch_plan_json=invocation["raw_plan"], patch_run_id=invocation["run_id"])
     return args, events
 
@@ -162,9 +180,24 @@ def test_explicit_manual_flow_skips_both_callbacks(invocation, monkeypatch, kind
     assert events == ["maintenance", "permissions", "revert", "install", "cleanup"]
 
 
+def test_manual_latest_without_patch_plan_uses_regular_upgrade_path(invocation, monkeypatch):
+    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    args, events = wire_upgrade(invocation, monkeypatch)
+    assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
+    assert events == ["maintenance", "permissions", "revert", "install", "cleanup"]
+
+
 @pytest.mark.parametrize("kind", ["zip", "composer"])
 def test_ordinary_blocked_release_never_mutates_source(invocation, monkeypatch, kind):
     args, events = wire_upgrade(invocation, monkeypatch, kind)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        upgrade.run_upgrade_apply(**args)
+    assert events == ["global_authorization"]
+
+
+def test_ordinary_latest_above_pin_still_requires_release_authorization(invocation, monkeypatch):
+    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    args, events = wire_upgrade(invocation, monkeypatch)
     with pytest.raises(RuntimeError, match="not authorized"):
         upgrade.run_upgrade_apply(**args)
     assert events == ["global_authorization"]

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 1.2.48 - 2026-09-24
+- Allow explicitly acknowledged manual forward upgrades within the installed Mautic major without requiring an unrelated patch plan; retain strict validation for selected patch adapters and release authorization for automatic upgrades.
+
 ## 1.2.47 - 2026-09-23
 
 - Rotate web-availability probes across discovered instances so each instance

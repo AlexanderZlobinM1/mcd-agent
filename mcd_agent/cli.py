@@ -1896,7 +1896,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--backup-manifest-path", default="", help="MCD backup marker path for authorize-repair")
     up.add_argument("--repair-auth-output-file", default="", help="Optional root-owned output path for authorize-repair context")
     up.add_argument("--json", action="store_true", help="Emit the machine-readable preflight contract")
-    up.add_argument("--mcc-preflighted-single-instance", action="store_true", help="Root-only manual 7.1.3 to 7.2.0 apply: assert MCC single-instance preflight and explicit operator risk acknowledgement; bypass global release callbacks only for this exact invocation")
+    up.add_argument("--mcc-preflighted-single-instance", action="store_true", help="Root-only, explicitly acknowledged single-instance manual upgrade after MCC preflight; permits forward same-major targets while preserving selected patch-plan validation")
 
     img = sub.add_parser("mautic-image", help="Install a Mautic instance from an MCC image")
     img.add_argument("--config", default=default_cfg)
