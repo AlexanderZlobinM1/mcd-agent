@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcd_agent.runtime_overrides import fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, push_runtime_overrides
-from mcd_agent.config import remove_runtime_values
+from mcd_agent.config import load_config, remove_runtime_values
+from mcd_agent.runtime_overrides import apply_remote_overrides
 
 
 class RuntimeOverrideDirectionTests(unittest.TestCase):
@@ -127,6 +128,18 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             {"other.sales-snap.ru": {"segments": [{"id": 7, "max_interval_sec": 60}]}},
         )
 
+    def test_empty_qualified_instance_state_removes_stale_bare_uid_override(self) -> None:
+        merged = merge_instance_desired_states(
+            {
+                "segment_recurring_priority_v1": {
+                    "medtradcom.sales-snap.ru": {"segments": [{"id": 5, "max_interval_sec": 60}]},
+                }
+            },
+            {"medtradcom.sales-snap.ru@alex-personal": {"runtime_overrides": {}, "revision": 2}},
+        )
+
+        self.assertNotIn("segment_recurring_priority_v1", merged)
+
     def test_removed_stable_runtime_key_is_deleted_from_local_config(self) -> None:
         from pathlib import Path
         from tempfile import TemporaryDirectory
@@ -147,6 +160,10 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(changed_path, str(path))
             self.assertNotIn("segment_recurring_priority_v1", path.read_text(encoding="utf-8"))
+
+            rebased = load_config(str(path), allow_recover_from_mcc=False)
+            applied = apply_remote_overrides(rebased, {})
+            self.assertEqual(applied["config"].segment_recurring_priority_v1, {})
 
 
 if __name__ == "__main__":

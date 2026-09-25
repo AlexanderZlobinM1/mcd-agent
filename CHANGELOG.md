@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 1.2.54 - 2026-09-25
+
+- Rebuild effective runtime state after authoritative MCC clears and remove stale bare/qualified instance aliases during desired-state reconciliation.
+
 ## 1.2.53 - 2026-09-25
 - Reconcile authoritative MCC runtime removals from the local/profile baseline,
   deleting stale stable instance overrides instead of retaining them after an

@@ -119,9 +119,12 @@ def merge_instance_desired_states(runtime: dict[str, Any], states: object) -> di
         # previous values first so an unset MCC override cannot live forever.
         for key in _INSTANCE_RUNTIME_KEYS:
             current = merged.get(key)
-            if isinstance(current, dict) and uid in current:
+            if isinstance(current, dict):
                 next_map = dict(current)
-                next_map.pop(uid, None)
+                uid_base = uid.split("@", 1)[0]
+                for current_uid in current:
+                    if str(current_uid).split("@", 1)[0] == uid_base:
+                        next_map.pop(current_uid, None)
                 if next_map:
                     merged[key] = next_map
                 else:

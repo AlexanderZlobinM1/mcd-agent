@@ -9281,11 +9281,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     store.put_runtime_sync("mcc_runtime_desired_state", state_for_store)
                 fp = overrides_fingerprint(overrides)
                 if fp != last_runtime_overrides_fp:
-                    # Apply new MCC runtime over the currently effective
-                    # daemon config. Using the startup baseline here makes
-                    # operator saves look persisted on disk while scheduler
-                    # decisions can continue from stale in-memory values until
-                    # a restart.
+                    # A cleared MCC key must also leave the effective config.
+                    # Reload after deleting absent persisted keys, then apply
+                    # the current authoritative overrides to that baseline.
+                    _remove_absent_stable_runtime_from_config(config, overrides)
+                    base_config = load_config(config.config_file_path, allow_recover_from_mcc=False)
                     applied = apply_remote_overrides(base_config, overrides)
                     next_cfg = applied["config"]
                     applied_keys = list(applied.get("applied_keys", []))
@@ -9304,7 +9304,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     if next_cfg != config:
                         old_profile = (config.profile_name or "").strip().lower()
                         config = next_cfg
-                        base_config = config
                         pusher.cfg = config
                         next_plan_refresh_at = 0.0
                         next_update_check_at = 0.0
@@ -9347,7 +9346,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         applied_keys,
                         installs,
                     )
-                    _remove_absent_stable_runtime_from_config(config, overrides)
                     # Persisted MCC values are not a new local operator edit.
                     # Refresh the local fingerprint so the next tick does not
                     # echo the same revision back as another desired write.
