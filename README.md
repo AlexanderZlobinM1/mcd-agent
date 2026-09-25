@@ -174,17 +174,25 @@ Selection authority:
 
 Preset rules:
 - `tiny`: single ring, no throttle, no whitelists, segments `1`, periodic full segment scan every `60s`; campaigns use one worker with actual trigger-due campaigns first and rebuild-due campaigns second, newest-first published list.
-- `mini`: single ring, no throttle, no whitelists, segments `4`, campaign trigger `2`, campaign rebuild `1`, shared campaign cap `1`.
-- `midi`: dual ring, no throttle, whitelists enabled, priority size `10`, parallel `3+1` for segments, updates, triggers.
-- `maxi`: dual ring, throttle `200/5m`, whitelists enabled, segments `5+1`, triggers `3+1`, rebuilds `2+1`; during throttle only whitelist segments run in `1` stream.
+- `mini`: single ring, no throttle, no whitelists, segments `4`, periodic full segment scan every `120s`, campaign trigger `2`, campaign rebuild `1`, shared campaign cap `1`.
+- `midi`: dual ring, no throttle, whitelists enabled, priority size `10`, parallel `3+1` for segments, updates, triggers; periodic full segment scan every `300s`.
+- `maxi`: dual ring, throttle `200/5m`, whitelists enabled, segments `5+1`, triggers `3+1`, rebuilds `2+1`; periodic full segment scan every `300s`; during throttle only whitelist segments run in `1` stream.
 - `hiload`: dual ring, throttle `200/5m`, whitelists enabled, segments `6+2`, triggers `4+2`, rebuilds `3+1`; during throttle only whitelist segments run in `2` streams and non-whitelist running segments are killed and queued to resume first after throttle ends.
 - `ultra`: high-capacity dual ring for hosts with at least 24 CPUs and 96 GiB RAM; hardware-derived limits remain authoritative.
 - `farm-tiny` through `farm-ultra`: manually selected high-density hardware line
   for many small, separate Mautic databases. MCC selects the class from actual
-  CPU/RAM, permits up to one scheduler command per CPU within the RAM budget,
-  caps each instance separately, and keeps one host slot available for campaign
-  or import work.
+  CPU/RAM as a recommendation; an operator-selected profile and its slot counts
+  remain effective even when hardware differs. All farm profiles periodically
+  scan published segments every `300s`; hardware mismatch is a warning, not a
+  runtime slot clamp.
 - `custom`: uses explicit `[runtime]` values.
+
+Scheduler host/instance capacity presets are literal MCD values: `passive=0/0`,
+`tiny=1/1`, `mini=4/1`, `midi=4/2`, `maxi=8/4`, `hiload=12/6`,
+`ultra=24/12`; farm presets are `farm-tiny=1/1`, `farm-mini=2/1`,
+`farm-midi=4/2`, `farm-maxi=8/4`, `farm-hiload=12/6`, and `farm-ultra=24/12`.
+Custom profiles retain explicit operator values. Hardware affects only the
+recommendation and warning, never the selected profile's effective capacity.
 
 All active profiles use one elastic host budget. Segment rebuilds may borrow idle
 capacity but leave one emergency slot when the host has at least two slots;

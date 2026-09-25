@@ -889,6 +889,8 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=1,
+            scheduler_host_max_parallel=1,
+            scheduler_instance_max_parallel=1,
             segment_full_scan_interval_sec=60,
             segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=0,
@@ -914,7 +916,10 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_size=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=4,
+            scheduler_host_max_parallel=4,
+            scheduler_instance_max_parallel=1,
             segment_full_scan_interval_sec=120,
+            segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=4,
             campaign_priority_size=0,
@@ -941,6 +946,8 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_latest_priority_count=0,
             segment_priority_parallel_idle=0,
             segment_regular_parallel_idle=0,
+            scheduler_host_max_parallel=0,
+            scheduler_instance_max_parallel=0,
             segment_full_scan_interval_sec=300,
             segment_priority_parallel_throttled=0,
             segment_regular_parallel_throttled=0,
@@ -963,7 +970,10 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_priority_size=10,
             segment_priority_parallel_idle=3,
             segment_regular_parallel_idle=1,
+            scheduler_host_max_parallel=4,
+            scheduler_instance_max_parallel=2,
             segment_full_scan_interval_sec=300,
+            segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=3,
             segment_regular_parallel_throttled=1,
             campaign_total_parallel=0,
@@ -987,7 +997,10 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             campaign_priority_size=10,
             segment_priority_parallel_idle=5,
             segment_regular_parallel_idle=1,
+            scheduler_host_max_parallel=8,
+            scheduler_instance_max_parallel=4,
             segment_full_scan_interval_sec=300,
+            segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=1,
             segment_regular_parallel_throttled=0,
             segment_throttle_whitelist_only=True,
@@ -1026,8 +1039,10 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_regular = 4 if p == "ultra" else 2
             campaign_priority = 8 if p == "ultra" else 4
             campaign_regular = 4 if p == "ultra" else 2
-            scheduler_host_limit = base.scheduler_host_max_parallel
-            scheduler_instance_limit = base.scheduler_instance_max_parallel
+            scheduler_host_limit, scheduler_instance_limit = {
+                "hiload": (12, 6),
+                "ultra": (24, 12),
+            }[p]
         return replace(
             base,
             ring_mode="dual",
@@ -1041,6 +1056,7 @@ def _apply_profile(cfg: AgentConfig) -> AgentConfig:
             segment_priority_parallel_idle=segment_priority,
             segment_regular_parallel_idle=segment_regular,
             segment_full_scan_interval_sec=300,
+            segment_periodic_full_scan_enabled=True,
             segment_priority_parallel_throttled=2,
             segment_regular_parallel_throttled=0,
             segment_throttle_whitelist_only=True,

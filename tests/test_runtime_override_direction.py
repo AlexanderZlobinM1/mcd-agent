@@ -110,6 +110,22 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
         self.assertEqual(list(states), [canonical_uid])
         self.assertEqual(states[canonical_uid]["segment_recurring_priority_v1"]["segments"][0]["id"], 86)
 
+    def test_empty_authoritative_instance_state_removes_unset_override_only_for_that_uid(self) -> None:
+        merged = merge_instance_desired_states(
+            {
+                "segment_recurring_priority_v1": {
+                    "medtradcom.sales-snap.ru": {"segments": [{"id": 5, "max_interval_sec": 60}]},
+                    "other.sales-snap.ru": {"segments": [{"id": 7, "max_interval_sec": 60}]},
+                }
+            },
+            {"medtradcom.sales-snap.ru": {"runtime_overrides": {}, "revision": 2}},
+        )
+
+        self.assertEqual(
+            merged["segment_recurring_priority_v1"],
+            {"other.sales-snap.ru": {"segments": [{"id": 7, "max_interval_sec": 60}]}},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

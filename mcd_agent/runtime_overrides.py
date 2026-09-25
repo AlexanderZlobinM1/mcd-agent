@@ -114,6 +114,18 @@ def merge_instance_desired_states(runtime: dict[str, Any], states: object) -> di
         uid = str(raw_uid or "").strip()
         if not uid or not isinstance(raw_state, dict):
             continue
+        # MCC returns one authoritative desired-state row per known instance,
+        # including rows with no runtime overrides. Clear that instance's
+        # previous values first so an unset MCC override cannot live forever.
+        for key in _INSTANCE_RUNTIME_KEYS:
+            current = merged.get(key)
+            if isinstance(current, dict) and uid in current:
+                next_map = dict(current)
+                next_map.pop(uid, None)
+                if next_map:
+                    merged[key] = next_map
+                else:
+                    merged.pop(key, None)
         overrides = raw_state.get("runtime_overrides", raw_state)
         if not isinstance(overrides, dict):
             continue

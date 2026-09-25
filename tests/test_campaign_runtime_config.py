@@ -246,6 +246,70 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertTrue(cfg.segment_periodic_full_scan_enabled)
         self.assertEqual(cfg.segment_full_scan_interval_sec, 60)
 
+    def test_farm_maxi_runs_periodic_segment_full_scan_and_keeps_selected_capacity(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(["[profile]", 'name = "farm-maxi"', "",]),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertTrue(cfg.segment_periodic_full_scan_enabled)
+        self.assertEqual(cfg.segment_full_scan_interval_sec, 300)
+        self.assertEqual(cfg.segment_priority_parallel_idle, 5)
+        self.assertEqual(cfg.segment_regular_parallel_idle, 2)
+        self.assertEqual(cfg.scheduler_host_max_parallel, 8)
+        self.assertEqual(cfg.scheduler_instance_max_parallel, 4)
+
+    def test_every_named_profile_has_literal_scheduler_capacity(self) -> None:
+        expected = {
+            "passive": (0, 0),
+            "tiny": (1, 1),
+            "mini": (4, 1),
+            "midi": (4, 2),
+            "maxi": (8, 4),
+            "hiload": (12, 6),
+            "ultra": (24, 12),
+            "farm-tiny": (1, 1),
+            "farm-mini": (2, 1),
+            "farm-midi": (4, 2),
+            "farm-maxi": (8, 4),
+            "farm-hiload": (12, 6),
+            "farm-ultra": (24, 12),
+        }
+        for profile, (host_slots, instance_slots) in expected.items():
+            with self.subTest(profile=profile):
+                path = Path(tempfile.mkdtemp()) / "mcd.toml"
+                path.write_text(
+                    "\n".join(["[profile]", f'name = "{profile}"', "",]),
+                    encoding="utf-8",
+                )
+
+                cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+                self.assertEqual(cfg.scheduler_host_max_parallel, host_slots)
+                self.assertEqual(cfg.scheduler_instance_max_parallel, instance_slots)
+
+    def test_selected_high_capacity_profile_is_not_clamped_to_weak_hardware(self) -> None:
+        from mcd_agent.hardware_profile import recommended_farm_profile
+
+        self.assertEqual(
+            recommended_farm_profile(cpu_count=1, memory_kib=2 * 1024 * 1024),
+            "farm-tiny",
+        )
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(["[profile]", 'name = "farm-ultra"', "",]),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.profile_name, "farm-ultra")
+        self.assertEqual(cfg.scheduler_host_max_parallel, 24)
+        self.assertEqual(cfg.scheduler_instance_max_parallel, 12)
+
     def test_midi_profile_migrates_legacy_single_ring_snapshot(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(
