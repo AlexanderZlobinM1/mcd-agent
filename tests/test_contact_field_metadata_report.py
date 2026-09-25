@@ -70,7 +70,7 @@ class ContactFieldMetadataReportTests(unittest.TestCase):
         self.assertEqual(payload["schema"], SCHEMA)
         self.assertEqual(payload["schema_version"], "1")
         self.assertEqual(payload["capability"], SCHEMA)
-        self.assertEqual(payload["mcd_version"], "1.2.54")
+        self.assertEqual(payload["mcd_version"], "1.2.55")
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["field_count"], 2)
         self.assertEqual(payload["errors"], [])

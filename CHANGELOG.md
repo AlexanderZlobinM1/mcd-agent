@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 1.2.55 - 2026-09-25
+
+- Include agent test fixtures in published source archives so the final package passes the complete regression suite.
+
 ## 1.2.54 - 2026-09-25
 
 - Rebuild effective runtime state after authoritative MCC clears and remove stale bare/qualified instance aliases during desired-state reconciliation.
