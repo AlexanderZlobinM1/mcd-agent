@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 1.2.57 - 2026-09-25
+
+- Retry runtime desired-state ACK after transient failure or restart, tracking each scope by applied revision and content SHA256 independently from the desired snapshot.
+
 ## 1.2.56 - 2026-09-25
 
 - Cover authoritative instance override removal from a saved legacy config through agent reload and restart.

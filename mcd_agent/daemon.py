@@ -111,7 +111,7 @@ from mcd_agent.monitored_email import (
 )
 from mcd_agent.form_embed import sync_form_embed_settings
 from mcd_agent.runtime_overrides import (
-    acknowledge_runtime_state,
+    acknowledge_desired_runtime_states,
     apply_remote_overrides,
     consume_poll_trigger,
     fetch_runtime_overrides,
@@ -9269,7 +9269,6 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 overrides = merge_instance_desired_states(overrides, instance_states)
                 store.put_runtime_sync("mcc_runtime", overrides)
                 desired_state = ro.get("desired_state")
-                previous_state = store.get_runtime_sync("mcc_runtime_desired_state") or {}
                 if isinstance(desired_state, dict):
                     revisions: dict[str, int] = {}
                     if isinstance(instance_states, dict):
@@ -9360,40 +9359,15 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                             "unsupported_keys": unsupported_keys,
                         },
                     )
-                # Acknowledge only a newly observed revision. This remains
-                # compact while exposing actual convergence in MCC.
-                if isinstance(desired_state, dict) and isinstance(desired_state.get("revision"), int):
-                    revision = int(desired_state["revision"])
-                    if int(previous_state.get("revision", -1) or -1) != revision:
-                        ack = acknowledge_runtime_state(
-                            config,
-                            scope="host",
-                            scope_key=str(desired_state.get("scope_key", "") or ""),
-                            revision=revision,
-                            status="applied",
-                            observed={"runtime_fingerprint": fp},
-                        )
-                        if str(ack.get("status", "")).lower() != "ok":
-                            logging.warning("runtime desired-state acknowledgement failed: %s", ack.get("reason", "unknown"))
-                if isinstance(instance_states, dict):
-                    previous_instance_revisions = previous_state.get("instance_revisions")
-                    previous_instance_revisions = (
-                        previous_instance_revisions if isinstance(previous_instance_revisions, dict) else {}
-                    )
-                    for uid, item in instance_states.items():
-                        if not isinstance(item, dict) or not isinstance(item.get("revision"), int):
-                            continue
-                        revision = int(item["revision"])
-                        if int(previous_instance_revisions.get(str(uid), -1) or -1) == revision:
-                            continue
-                        acknowledge_runtime_state(
-                            config,
-                            scope="instance",
-                            scope_key=str(uid),
-                            revision=revision,
-                            status="applied",
-                            observed={"runtime_fingerprint": fp},
-                        )
+                for failure in acknowledge_desired_runtime_states(
+                    config,
+                    store,
+                    desired_state=desired_state,
+                    host_runtime=overrides_raw if isinstance(overrides_raw, dict) else {},
+                    instance_states=instance_states,
+                    runtime_fingerprint=fp,
+                ):
+                    logging.warning("runtime desired-state acknowledgement failed: %s", failure)
                 startup_runtime_sync_pending = False
                 last_runtime_overrides_error = ""
                 next_runtime_overrides_poll_at = now + poll_interval

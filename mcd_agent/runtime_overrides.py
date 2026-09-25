@@ -306,3 +306,82 @@ def acknowledge_runtime_state(
         return {"status": "error", "reason": f"urlerror:{e.reason}"}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
+
+
+def acknowledge_desired_runtime_states(
+    cfg: AgentConfig,
+    store: Any,
+    *,
+    desired_state: object,
+    host_runtime: dict[str, Any],
+    instance_states: object,
+    runtime_fingerprint: str,
+) -> list[str]:
+    """Retry each revision until MCC confirms the exact scoped value."""
+    saved = store.get_runtime_sync("mcc_runtime_acknowledged")
+    acknowledged = dict(saved) if isinstance(saved, dict) else {}
+    failures: list[str] = []
+
+    def send(scope: str, scope_key: str, revision: int, runtime: dict[str, Any]) -> None:
+        content_sha256 = overrides_fingerprint(runtime)
+        if scope == "host":
+            previous = acknowledged.get("host")
+        else:
+            instances = acknowledged.get("instances")
+            previous = instances.get(scope_key) if isinstance(instances, dict) else None
+        if (
+            isinstance(previous, dict)
+            and previous.get("scope_key") == scope_key
+            and previous.get("revision") == revision
+            and previous.get("content_sha256") == content_sha256
+        ):
+            return
+
+        result = acknowledge_runtime_state(
+            cfg,
+            scope=scope,
+            scope_key=scope_key,
+            revision=revision,
+            status="applied",
+            observed={
+                "runtime_fingerprint": runtime_fingerprint,
+                "content_sha256": content_sha256,
+            },
+        )
+        if str(result.get("status", "")).lower() != "ok":
+            failures.append(f"{scope}:{scope_key}:{revision}:{result.get('reason', 'unknown')}")
+            return
+
+        entry = {
+            "scope_key": scope_key,
+            "revision": revision,
+            "content_sha256": content_sha256,
+        }
+        if scope == "host":
+            acknowledged["host"] = entry
+        else:
+            instances = acknowledged.get("instances")
+            updated = dict(instances) if isinstance(instances, dict) else {}
+            updated[scope_key] = entry
+            acknowledged["instances"] = updated
+        store.put_runtime_sync("mcc_runtime_acknowledged", acknowledged)
+
+    if isinstance(desired_state, dict):
+        revision = desired_state.get("revision")
+        if isinstance(revision, int) and not isinstance(revision, bool):
+            send(
+                "host",
+                str(desired_state.get("scope_key", "") or ""),
+                revision,
+                host_runtime if isinstance(host_runtime, dict) else {},
+            )
+    if isinstance(instance_states, dict):
+        for uid, item in instance_states.items():
+            if not isinstance(item, dict):
+                continue
+            revision = item.get("revision")
+            runtime = item.get("runtime_overrides")
+            if not isinstance(revision, int) or isinstance(revision, bool) or not isinstance(runtime, dict):
+                continue
+            send("instance", str(uid), revision, runtime)
+    return failures

@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mcd_agent.runtime_overrides import fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, push_runtime_overrides
+from mcd_agent.runtime_overrides import acknowledge_desired_runtime_states, fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, overrides_fingerprint, push_runtime_overrides
 from mcd_agent.config import load_config, remove_runtime_values
 from mcd_agent.runtime_overrides import apply_remote_overrides, local_runtime_overrides
 from mcd_agent import daemon
@@ -195,6 +195,70 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
                 load_config(str(path), allow_recover_from_mcc=False).segment_recurring_priority_v1,
                 {},
             )
+
+    def test_failed_empty_instance_ack_retries_after_restart(self) -> None:
+        class MemoryStore:
+            def __init__(self, values=None):
+                self.values = dict(values or {})
+
+            def get_runtime_sync(self, key):
+                return self.values.get(key)
+
+            def put_runtime_sync(self, key, value):
+                self.values[key] = dict(value)
+
+        cfg = SimpleNamespace()
+        uid = "medtradcom.sales-snap.ru@alex-personal"
+        rows = {uid: {"revision": 2, "runtime_overrides": {}}}
+        store = MemoryStore()
+        with patch(
+            "mcd_agent.runtime_overrides.acknowledge_runtime_state",
+            side_effect=[{"status": "error", "reason": "temporary_network_error"}, {"status": "ok"}],
+        ) as acknowledge:
+            failed = acknowledge_desired_runtime_states(
+                cfg, store, desired_state=None, host_runtime={},
+                instance_states=rows, runtime_fingerprint="aggregate",
+            )
+            self.assertEqual(len(failed), 1)
+            self.assertNotIn("mcc_runtime_acknowledged", store.values)
+
+            restarted = MemoryStore(store.values)
+            self.assertEqual(
+                acknowledge_desired_runtime_states(
+                    cfg, restarted, desired_state=None, host_runtime={},
+                    instance_states=rows, runtime_fingerprint="aggregate",
+                ),
+                [],
+            )
+            self.assertEqual(
+                restarted.values["mcc_runtime_acknowledged"]["instances"][uid],
+                {"scope_key": uid, "revision": 2, "content_sha256": overrides_fingerprint({})},
+            )
+            acknowledge_desired_runtime_states(
+                cfg, restarted, desired_state=None, host_runtime={},
+                instance_states=rows, runtime_fingerprint="aggregate",
+            )
+            self.assertEqual(acknowledge.call_count, 2)
+            self.assertEqual(acknowledge.call_args.kwargs["revision"], 2)
+            self.assertEqual(
+                acknowledge.call_args.kwargs["observed"]["content_sha256"],
+                overrides_fingerprint({}),
+            )
+
+    def test_new_host_revision_is_acked_even_when_value_is_unchanged(self) -> None:
+        store = SimpleNamespace(values={})
+        store.get_runtime_sync = lambda key: store.values.get(key)
+        store.put_runtime_sync = lambda key, value: store.values.__setitem__(key, dict(value))
+        cfg = SimpleNamespace()
+        with patch("mcd_agent.runtime_overrides.acknowledge_runtime_state", return_value={"status": "ok"}) as acknowledge:
+            for revision in (3, 4, 4):
+                acknowledge_desired_runtime_states(
+                    cfg, store,
+                    desired_state={"scope_key": "test-host", "revision": revision},
+                    host_runtime={}, instance_states={}, runtime_fingerprint="aggregate",
+                )
+        self.assertEqual(acknowledge.call_count, 2)
+        self.assertEqual(store.values["mcc_runtime_acknowledged"]["host"]["revision"], 4)
 
 
 if __name__ == "__main__":
