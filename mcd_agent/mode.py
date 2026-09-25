@@ -1175,6 +1175,7 @@ PROFILE_MANAGED_RUNTIME_KEYS = (
     "campaign_trigger_regular_parallel",
     "campaign_rebuild_priority_parallel",
     "campaign_rebuild_regular_parallel",
+    "scheduler_host_max_parallel",
     "scheduler_elastic_slots_enabled",
     "scheduler_emergency_reserved_slots",
     "scheduler_instance_max_parallel",

@@ -99,10 +99,10 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.campaign_trigger_audit_interval_sec, 300)
 
-    def test_host_scheduler_parallel_limit_is_runtime_configurable(self) -> None:
+    def test_custom_host_scheduler_parallel_limit_is_runtime_configurable(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"
         path.write_text(
-            '[runtime]\nprofile_name = "midi"\nscheduler_host_max_parallel = 6\n',
+            '[profile]\nname = "custom"\n[runtime]\nscheduler_host_max_parallel = 6\n',
             encoding="utf-8",
         )
 
@@ -113,6 +113,36 @@ class CampaignRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.scheduler_emergency_reserved_slots, 1)
         self.assertEqual(cfg.scheduler_instance_max_parallel, 0)
         self.assertEqual(cfg.scheduler_fairness_watchdog_sec, 300)
+
+    def test_named_profile_capacity_cannot_be_overridden_by_persisted_runtime(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "mcd.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    "[profile]",
+                    'name = "farm-hiload"',
+                    "[runtime]",
+                    "scheduler_host_max_parallel = 0",
+                    "scheduler_instance_max_parallel = 0",
+                    "segment_priority_parallel_idle = 0",
+                    "segment_regular_parallel_idle = 2",
+                    "segment_priority_parallel_throttled = 0",
+                    "segment_regular_parallel_throttled = 2",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(path), allow_recover_from_mcc=False)
+
+        self.assertEqual(cfg.profile_name, "farm-hiload")
+        self.assertEqual(cfg.scheduler_host_max_parallel, 12)
+        self.assertEqual(cfg.scheduler_instance_max_parallel, 6)
+        self.assertEqual(cfg.segment_priority_parallel_idle, 8)
+        self.assertEqual(cfg.segment_regular_parallel_idle, 3)
+        self.assertEqual(cfg.segment_priority_parallel_throttled, 2)
+        self.assertEqual(cfg.segment_regular_parallel_throttled, 0)
 
     def test_page_hits_sql_segments_default_to_quiet_window_only(self) -> None:
         path = Path(tempfile.mkdtemp()) / "mcd.toml"

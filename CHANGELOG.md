@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 1.2.53 - 2026-09-25
+- Reconcile authoritative MCC runtime removals from the local/profile baseline,
+  deleting stale stable instance overrides instead of retaining them after an
+  unset or daemon restart.
+- Keep named profile capacity presets authoritative through runtime reload.
+
 ## 1.2.52 - 2026-09-25
 - Run periodic full segment discovery on active named profiles so newly
   created or changed segments enter the normal planner without instance
@@ -10,6 +16,9 @@
   of hardware recommendations.
 - Define literal host and per-instance scheduler capacities for every named
   profile; hardware recommendations no longer supply missing profile limits.
+- Remove absent authoritative MCC stable runtime keys from local config and
+  reapply remote state from the local/profile baseline, preventing stale
+  per-instance segment overrides after an unset or daemon restart.
 
 ## 1.2.51 - 2026-09-25
 - Add registry-bound Mautic patch-plan v2 with semantic version applicability,

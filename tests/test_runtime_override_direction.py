@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcd_agent.runtime_overrides import fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, push_runtime_overrides
+from mcd_agent.config import remove_runtime_values
 
 
 class RuntimeOverrideDirectionTests(unittest.TestCase):
@@ -125,6 +126,27 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             merged["segment_recurring_priority_v1"],
             {"other.sales-snap.ru": {"segments": [{"id": 7, "max_interval_sec": 60}]}},
         )
+
+    def test_removed_stable_runtime_key_is_deleted_from_local_config(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "mcd.toml"
+            path.write_text(
+                '[profile]\nname = "farm-maxi"\n\n[runtime]\n'
+                'segment_recurring_priority_v1 = { "medtradcom.sales-snap.ru" = { segments = [{ id = 5, max_interval_sec = 60 }] } }\n',
+                encoding="utf-8",
+            )
+
+            changed_path, changed = remove_runtime_values(
+                str(path),
+                {"segment_recurring_priority_v1"},
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(changed_path, str(path))
+            self.assertNotIn("segment_recurring_priority_v1", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

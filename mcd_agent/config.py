@@ -1677,6 +1677,18 @@ def upsert_runtime_values(config_path: str, updates: dict[str, object]) -> tuple
     return upsert_section_values(config_path, "runtime", updates)
 
 
+def remove_runtime_values(config_path: str, keys: set[str]) -> tuple[str, bool]:
+    path = Path(config_path)
+    if not path.exists() or not keys:
+        return str(path), False
+    text = path.read_text(encoding="utf-8")
+    updated, removed = _remove_section_keys_text(text, "runtime", set(keys))
+    if removed <= 0:
+        return str(path), False
+    path.write_text(updated, encoding="utf-8")
+    return str(path), True
+
+
 def _remove_section_keys_text(text: str, section: str, keys: set[str]) -> tuple[str, int]:
     if not keys:
         return text, 0
@@ -2390,9 +2402,50 @@ _RUNTIME_REMOTE_BLOCKED_KEYS: set[str] = {
 }
 
 
+_PROFILE_LOCKED_RUNTIME_KEYS = {
+    "command_timeout_sec",
+    "worker_watchdog_sec",
+    "ring_mode",
+    "disable_throttle",
+    "disable_whitelist",
+    "enable_import_polling",
+    "enable_campaign_rebuild",
+    "segment_priority_weight_threshold",
+    "segment_priority_size",
+    "campaign_priority_size",
+    "campaign_latest_priority_count",
+    "segment_priority_parallel_idle",
+    "segment_regular_parallel_idle",
+    "segment_priority_parallel_throttled",
+    "segment_regular_parallel_throttled",
+    "segment_throttle_whitelist_only",
+    "segment_throttle_whitelist_parallel",
+    "segment_throttle_kill_non_whitelist",
+    "queue_throttle_threshold",
+    "queue_throttle_window_min",
+    "campaign_total_parallel",
+    "campaign_update_priority_parallel",
+    "campaign_update_regular_parallel",
+    "campaign_trigger_priority_parallel",
+    "campaign_trigger_regular_parallel",
+    "campaign_rebuild_priority_parallel",
+    "campaign_rebuild_regular_parallel",
+    "scheduler_host_max_parallel",
+    "scheduler_elastic_slots_enabled",
+    "scheduler_emergency_reserved_slots",
+    "scheduler_instance_max_parallel",
+    "scheduler_fairness_watchdog_sec",
+}
+
+
 def _reapply_manual_runtime_overrides(cfg: AgentConfig, runtime: dict[str, Any]) -> AgentConfig:
     updates: dict[str, Any] = {}
     for raw_key, raw_value in runtime.items():
+        if (
+            raw_key in _PROFILE_LOCKED_RUNTIME_KEYS
+            and str(getattr(cfg, "profile_name", "") or "").strip().lower() not in {"", "custom"}
+        ):
+            continue
         attr = _RUNTIME_TO_ATTR.get(raw_key)
         if not attr:
             continue

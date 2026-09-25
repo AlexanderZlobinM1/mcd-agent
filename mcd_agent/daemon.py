@@ -25,6 +25,7 @@ from mcd_agent.config import (
     check_profile_drift_with_mcc,
     load_config,
     recover_config_from_mcc,
+    remove_runtime_values,
     runtime_effective_map,
     upsert_runtime_values,
 )
@@ -1794,6 +1795,18 @@ def _persist_stable_backup_runtime_to_config(
         _sync_segment_whitelist_file(config, installs)
     if "form_embed_instance_settings" in stable_keys:
         _sync_and_publish_form_embed_status(config, installs, reason="runtime_override")
+
+
+def _remove_absent_stable_runtime_from_config(config: AgentConfig, runtime: dict[str, object]) -> None:
+    absent = _STABLE_RUNTIME_KEYS - set(runtime)
+    if not absent:
+        return
+    try:
+        path, changed = remove_runtime_values(config.config_file_path, absent)
+        if changed:
+            logging.info("runtime-overrides removed absent stable keys from config (%s)", path)
+    except Exception as e:
+        logging.warning("runtime-overrides stable-key cleanup failed: %s", e)
 
 
 def _sync_and_publish_form_embed_status(
@@ -9273,7 +9286,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     # operator saves look persisted on disk while scheduler
                     # decisions can continue from stale in-memory values until
                     # a restart.
-                    applied = apply_remote_overrides(config, overrides)
+                    applied = apply_remote_overrides(base_config, overrides)
                     next_cfg = applied["config"]
                     applied_keys = list(applied.get("applied_keys", []))
                     unsupported_keys = list(applied.get("unsupported_keys", []))
@@ -9334,11 +9347,11 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         applied_keys,
                         installs,
                     )
+                    _remove_absent_stable_runtime_from_config(config, overrides)
                     # Persisted MCC values are not a new local operator edit.
                     # Refresh the local fingerprint so the next tick does not
                     # echo the same revision back as another desired write.
                     last_local_runtime_fp = overrides_fingerprint(local_runtime_overrides(config))
-                    base_config = config
                     last_runtime_overrides_fp = fp
                     store.put_runtime_sync(
                         "active_runtime",
