@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 from collections import deque
 from datetime import datetime
 from typing import Any
+
+import phpserialize
 
 _SERIALIZED_LEADLIST_FIELD_RE = re.compile(
     r's:\d+:"field";s:\d+:"leadlist"',
@@ -13,8 +16,6 @@ _SERIALIZED_FILTER_KEY_RE = re.compile(
     r's:\d+:"filter";',
     re.IGNORECASE,
 )
-_SERIALIZED_NUMERIC_STRING_RE = re.compile(r's:\d+:"(\d+)"')
-_SERIALIZED_INT_RE = re.compile(r"i:(\d+);")
 
 
 def extract_leadlist_filter_segment_ids(filters: object) -> set[int]:
@@ -30,22 +31,20 @@ def extract_leadlist_filter_segment_ids(filters: object) -> set[int]:
         filter_match = _SERIALIZED_FILTER_KEY_RE.search(chunk)
         if not filter_match:
             continue
-        value_chunk = chunk[filter_match.end() : filter_match.end() + 900]
-        string_ids: set[int] = set()
-        for found in _SERIALIZED_NUMERIC_STRING_RE.findall(value_chunk):
-            try:
-                sid = int(found)
-            except ValueError:
-                continue
-            if sid > 0:
-                string_ids.add(sid)
-        if string_ids:
-            out.update(string_ids)
+        # Decode exactly the filter value. Scanning integer tokens also reads
+        # array keys and the next clause's index as segment dependencies.
+        try:
+            value = phpserialize.load(
+                BytesIO(chunk[filter_match.end() :].encode("utf-8")),
+                decode_strings=True,
+            )
+        except (ValueError, TypeError):
             continue
-        for found in _SERIALIZED_INT_RE.findall(value_chunk):
+        values = value.values() if isinstance(value, dict) else [value]
+        for found in values:
             try:
                 sid = int(found)
-            except ValueError:
+            except (ValueError, TypeError):
                 continue
             if sid > 0:
                 out.add(sid)

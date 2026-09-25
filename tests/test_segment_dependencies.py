@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import phpserialize
+
 from types import SimpleNamespace
 
 from mcd_agent.segment_dependencies import (
@@ -19,6 +21,20 @@ from mcd_agent.segment_dependencies import (
 
 
 class SegmentDependencyTests(unittest.TestCase):
+    def test_integer_filter_values_do_not_include_array_keys_or_next_clause_index(self) -> None:
+        filters = phpserialize.dumps([
+            {"field": "leadlist", "properties": {"filter": [2]}, "filter": [2]},
+            {"field": "leadlist", "operator": "!in_all", "properties": {"filter": [5]}},
+        ]).decode()
+        self.assertEqual(extract_leadlist_filter_segment_ids(filters), {2, 5})
+
+    def test_integer_filter_values_ignore_numeric_tags_and_preserve_mixed_ids(self) -> None:
+        filters = phpserialize.dumps([
+            {"field": "leadlist", "properties": {"filter": [2, "5"]}},
+            {"field": "tags", "properties": {"filter": ["99"]}},
+        ]).decode()
+        self.assertEqual(extract_leadlist_filter_segment_ids(filters), {2, 5})
+
     def test_extracts_leadlist_filter_ids_from_php_serialized_filters(self) -> None:
         filters = (
             'a:2:{i:0;a:5:{s:5:"field";s:8:"leadlist";s:4:"type";s:8:"leadlist";'

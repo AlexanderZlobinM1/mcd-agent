@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 1.2.59 - 2026-09-25
+
+- Keep full-scan segment work pending across ordinary due-query refreshes until dispatch or unpublication, including children waiting for parent segment completion.
+- Decode serialized segment filter values without treating array indexes or adjacent clauses as dependency IDs.
+- Log full-scan pending IDs and native ring membership for scheduler diagnosis.
+
 ## 1.2.58 - 2026-09-25
 
 - Treat a config restored from MCC profile drift as the new local runtime baseline so recovery cannot push the stale pre-recovery runtime back as a local edit.

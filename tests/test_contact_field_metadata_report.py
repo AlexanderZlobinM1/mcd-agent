@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
+from mcd_agent import __version__
 from mcd_agent.contact_field_metadata_report import (
     SCHEMA,
     collect_contact_field_metadata_report,
@@ -70,7 +71,7 @@ class ContactFieldMetadataReportTests(unittest.TestCase):
         self.assertEqual(payload["schema"], SCHEMA)
         self.assertEqual(payload["schema_version"], "1")
         self.assertEqual(payload["capability"], SCHEMA)
-        self.assertEqual(payload["mcd_version"], "1.2.58")
+        self.assertEqual(payload["mcd_version"], __version__)
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["field_count"], 2)
         self.assertEqual(payload["errors"], [])

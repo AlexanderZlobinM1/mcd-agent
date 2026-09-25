@@ -124,6 +124,7 @@ from mcd_agent.runtime_overrides import (
 from mcd_agent.ring_utils import advance_ring_after_launch as _advance_ring_after_launch
 from mcd_agent.ring_utils import mark_ring_entity_executed as _mark_ring_entity_executed
 from mcd_agent.ring_utils import reconcile_ring as _reconcile_ring
+from mcd_agent.ring_utils import reconcile_full_scan_pending as _reconcile_full_scan_pending
 from mcd_agent.service_profiles import service_profiles_apply_once
 from mcd_agent.self_update import _ensure_mcd_service_kill_mode, maybe_auto_update
 from mcd_agent.segment_filter_safety import format_segment_filter_issues, segment_invalid_filter_issues
@@ -8524,6 +8525,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
     import_completed_segment_imports: dict[str, dict[int, float]] = {}
     last_import_monitor_warn_ts: dict[str, float] = {}
     segment_last_full_scan_ts: dict[str, float] = {}
+    segment_full_scan_pending: dict[str, set[int]] = {}
     segment_force_full_scan_until: dict[str, float] = {}
     last_cleanup_ts: dict[str, float] = {}
     last_mautic_lock_cleanup_ts: dict[str, float] = {}
@@ -10220,10 +10222,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
 
                 if segment_ids is not None:
                     standard_segment_ids = list(dict.fromkeys(segment_ids))
+                    published_segment_ids: set[int] | None = None
                     dependency_children: dict[int, set[int]] = {}
                     dependency_parents: dict[int, set[int]] = {}
                     try:
                         dep_rows = db.fetch_published_segment_filters()
+                        published_segment_ids = {int(row["id"]) for row in dep_rows}
                         dependency_children, dependency_parents = segment_dependency_maps(dep_rows)
                         segment_dependencies_by_root[root] = dependency_children
                         segment_parents_by_root[root] = dependency_parents
@@ -10274,6 +10278,12 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                         dependency_children = segment_dependencies_by_root.get(root, {})
                         dependency_parents = segment_parents_by_root.get(root, {})
                         logging.warning("[%s] segment dependency planning failed: %s", root, e)
+                    standard_segment_ids = _reconcile_full_scan_pending(
+                        segment_full_scan_pending.setdefault(root, set()),
+                        standard_segment_ids,
+                        full_scan=force_segment_full_scan and cluster_cron_allowed,
+                        published_ids=published_segment_ids,
+                    )
                     segment_definition_rows: list[dict[str, object]] = []
                     invalid_filter_ids: set[int] = set()
                     if standard_segment_ids:
@@ -10532,6 +10542,18 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                     )
                     segment_prio_sets[root] = set(seg_prio)
                     segment_reg_sets[root] = set(seg_reg)
+                    if force_segment_full_scan or segment_full_scan_pending.get(root):
+                        logging.info(
+                            "[%s] segment plan fetched=%s pending_full_scan=%s priority=%s regular=%s "
+                            "invalid=%s logical_blocked=%s",
+                            root,
+                            segment_ids[:100],
+                            sorted(segment_full_scan_pending.get(root, set()))[:100],
+                            list(segment_prio_rings[root])[:100],
+                            list(segment_reg_rings[root])[:100],
+                            sorted(invalid_filter_ids)[:100],
+                            sorted(segment_logical_issue_blocked_sets.get(root, set()))[:100],
+                        )
                 else:
                     logging.warning("[%s] segment planning skipped: preserving previous segment rings", root)
 
@@ -11510,6 +11532,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                 )
 
             def _mark_segment_cycle(sid: int) -> None:
+                segment_full_scan_pending.setdefault(root, set()).discard(sid)
                 _monitor_cycle_mark_launched(
                     monitor_cycle_done,
                     root=root,

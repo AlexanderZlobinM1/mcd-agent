@@ -3,6 +3,21 @@ from __future__ import annotations
 from collections import deque
 
 
+def reconcile_full_scan_pending(
+    pending: set[int],
+    due_ids: list[int],
+    *,
+    full_scan: bool,
+    published_ids: set[int] | None,
+) -> list[int]:
+    """Keep discovered work until launch or authoritative unpublication."""
+    if full_scan:
+        pending.update(due_ids)
+    if published_ids is not None:
+        pending.intersection_update(published_ids)
+    return list(dict.fromkeys([*due_ids, *sorted(pending)]))
+
+
 def reconcile_ring(old_ring: deque[int] | None, ordered_ids: list[int], *, new_to_front: bool = False) -> deque[int]:
     if old_ring is None or not old_ring:
         return deque(ordered_ids)
