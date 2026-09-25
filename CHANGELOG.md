@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 1.2.56 - 2026-09-25
+
+- Cover authoritative instance override removal from a saved legacy config through agent reload and restart.
+
 ## 1.2.55 - 2026-09-25
 
 - Include agent test fixtures in published source archives so the final package passes the complete regression suite.

@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from mcd_agent.runtime_overrides import fetch_runtime_overrides, instance_desired_states, merge_instance_desired_states, push_runtime_overrides
 from mcd_agent.config import load_config, remove_runtime_values
-from mcd_agent.runtime_overrides import apply_remote_overrides
+from mcd_agent.runtime_overrides import apply_remote_overrides, local_runtime_overrides
+from mcd_agent import daemon
 
 
 class RuntimeOverrideDirectionTests(unittest.TestCase):
@@ -164,6 +165,36 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
             rebased = load_config(str(path), allow_recover_from_mcc=False)
             applied = apply_remote_overrides(rebased, {})
             self.assertEqual(applied["config"].segment_recurring_priority_v1, {})
+
+    def test_authoritative_instance_clear_survives_legacy_file_and_restart(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "mcd.toml"
+            path.write_text(
+                '[profile]\nname = "farm-maxi"\n\n[runtime]\n'
+                'segment_recurring_priority_v1 = { "medtradcom.sales-snap.ru" = { segments = [{ id = 5, max_interval_sec = 60 }] } }\n',
+                encoding="utf-8",
+            )
+            legacy = load_config(str(path), allow_recover_from_mcc=False)
+            self.assertIn("segment_recurring_priority_v1", local_runtime_overrides(legacy))
+
+            desired = merge_instance_desired_states(
+                {},
+                {"medtradcom.sales-snap.ru@alex-personal": {"runtime_overrides": {}, "revision": 2}},
+            )
+            self.assertEqual(desired, {})
+            daemon._remove_absent_stable_runtime_from_config(legacy, desired)
+            reloaded = load_config(str(path), allow_recover_from_mcc=False)
+            effective = apply_remote_overrides(reloaded, desired)["config"]
+
+            self.assertNotIn("segment_recurring_priority_v1", local_runtime_overrides(reloaded))
+            self.assertEqual(effective.segment_recurring_priority_v1, {})
+            self.assertEqual(
+                load_config(str(path), allow_recover_from_mcc=False).segment_recurring_priority_v1,
+                {},
+            )
 
 
 if __name__ == "__main__":
