@@ -2233,6 +2233,11 @@ def _build_parser() -> argparse.ArgumentParser:
     bkp.add_argument("--config", default=default_cfg)
     bkp.add_argument("--root", help="Optional instance root selector (accepted for MCC compatibility; backup scope is host-level)")
     bkp.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="For a one-shot run, preserve all existing completed and incomplete backup generations",
+    )
+    bkp.add_argument(
         "op",
         choices=[
             "run",
@@ -4540,6 +4545,8 @@ def main() -> int:
 
     if args.cmd == "backup":
         cfg = load_config(args.config)
+        if args.no_prune and args.op != "run":
+            parser.error("--no-prune is supported only with `backup run`")
         note = maybe_notify_update(cfg)
         if note:
             print(f"NOTICE: {note}")
@@ -4628,7 +4635,7 @@ def main() -> int:
             _push_state_after_change(cfg, "backup-preflight")
             return 0 if res.ok else 1
         if args.op == "run":
-            res = backup_run(cfg, args.root)
+            res = backup_run(cfg, args.root, prune_retention=not args.no_prune)
             if args.json:
                 print(
                     json.dumps(

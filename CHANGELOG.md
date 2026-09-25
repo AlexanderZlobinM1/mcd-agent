@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 1.2.60 - 2026-09-25
+
+- Exclude mutable runtime logs, cache, spool, queue, temporary and session contents while retaining runtime directory metadata.
+- Record runtime exclusions and SHA-256 asset digests in backup manifests; verify recorded digests before restore.
+- Add `backup --no-prune run` to preserve pre-existing backup generations for a one-shot run.
+
 ## 1.2.59 - 2026-09-25
 
 - Keep full-scan segment work pending across ordinary due-query refreshes until dispatch or unpublication, including children waiting for parent segment completion.

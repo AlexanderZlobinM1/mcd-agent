@@ -83,6 +83,21 @@ _BACKUP_TAR_RUNTIME_EXCLUDES = (
     "--exclude=*/.mcd/*",
 )
 
+_BACKUP_RUNTIME_CONTENT_EXCLUDES = tuple(
+    f"--exclude=*/{runtime_path}/*"
+    for runtime_path in (
+        "var/logs",
+        "var/cache",
+        "var/spool",
+        "var/queue",
+        "var/tmp",
+        "var/sessions",
+        "app/logs",
+        "app/cache",
+    )
+)
+_BACKUP_RUNTIME_EXCLUDED_PATHS = [item.removeprefix("--exclude=") for item in _BACKUP_RUNTIME_CONTENT_EXCLUDES]
+
 
 @dataclass(frozen=True)
 class BackupResult:
@@ -272,6 +287,36 @@ def _asset_bytes(path: Path) -> int:
     return 0
 
 
+def _backup_asset_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.is_file() and not path.is_symlink():
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    if path.is_dir() and not path.is_symlink():
+        for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
+            if child.is_symlink():
+                continue
+            if child.is_file():
+                digest.update(child.relative_to(path).as_posix().encode("utf-8"))
+                digest.update(b"\0")
+                with child.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                digest.update(b"\0")
+    else:
+        raise RuntimeError(f"backup asset is missing or unsafe: {path}")
+    return digest.hexdigest()
+
+
+def _verify_backup_asset_sha256(path: Path, expected: str, *, label: str) -> None:
+    if not expected:
+        return
+    if not path.exists() or path.is_symlink() or _backup_asset_sha256(path) != expected:
+        raise RuntimeError(f"backup {label} SHA-256 verification failed")
+
+
 def _backup_manifest_from_marker(
     *,
     mount_path: Path,
@@ -308,6 +353,9 @@ def _backup_manifest_from_marker(
             "bytes": _asset_bytes(archive),
             "type": "tar.gz",
         }
+        archive_sha256 = str(marker.get("files_archive_sha256") or "").strip()
+        if archive_sha256:
+            files_asset["sha256"] = archive_sha256
     manifest = {
         "schema": "mcc.backup.manifest.v1",
         "kind": kind,
@@ -325,6 +373,9 @@ def _backup_manifest_from_marker(
         "files_asset": files_asset,
         "db_asset": db_asset,
         "restorable_as_image": bool(files_asset.get("path") and db_asset.get("path")),
+        "runtime_excluded_paths": list(marker.get("runtime_excluded_paths") or []),
+        "retention_pruned": bool(marker.get("retention_pruned", True)),
+        "database_sha256": str(marker.get("database_sha256") or ""),
     }
     if marker.get("cluster_backup"):
         manifest["cluster_backup"] = True
@@ -431,6 +482,7 @@ def _write_host_backup_instance_manifests(
                 "path": _path_rel_to(sidecar_dir, db_path),
                 "bytes": _asset_bytes(db_path),
                 "type": "directory",
+                "sha256": str(raw.get("sha256") or ""),
             }
         source_domain = inst.primary_domain or inst.name or name or uid
         manifest = {
@@ -505,8 +557,70 @@ def _archive_files(cfg: AgentConfig, out_dir: Path) -> None:
     if not src:
         return
     target = out_dir / cfg.backup_archive_name
-    cmd = ["tar", *_BACKUP_TAR_RUNTIME_EXCLUDES, "-czf", str(target)] + src
-    _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    _archive_path_list(cfg, src, target)
+
+
+def _is_backup_runtime_directory(path: Path) -> bool:
+    parts = path.parts
+    return len(parts) >= 2 and tuple(parts[-2:]) in {
+        ("var", "logs"),
+        ("var", "cache"),
+        ("var", "spool"),
+        ("var", "queue"),
+        ("var", "tmp"),
+        ("var", "sessions"),
+        ("app", "logs"),
+        ("app", "cache"),
+    }
+
+
+def _archive_path_list(
+    cfg: AgentConfig,
+    sources: list[str],
+    target: Path,
+    *,
+    relative_to: Path | None = None,
+) -> None:
+    """Archive a NUL-safe file list and never walk runtime directory contents."""
+    list_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="mcd-backup-files-", dir=target.parent, delete=False) as stream:
+            list_path = Path(stream.name)
+            for raw_source in sources:
+                source = Path(raw_source)
+                if not source.exists() and not source.is_symlink():
+                    continue
+                if source.is_symlink() or not source.is_dir():
+                    archive_name = Path(".") / source.relative_to(relative_to) if relative_to else source
+                    stream.write(os.fsencode(archive_name) + b"\0")
+                    continue
+                for current_raw, dirs, files in os.walk(source, topdown=True, followlinks=False):
+                    current = Path(current_raw)
+                    archive_current = Path(".") / current.relative_to(relative_to) if relative_to else current
+                    stream.write(os.fsencode(archive_current) + b"\0")
+                    if _is_backup_runtime_directory(current):
+                        dirs[:] = []
+                        continue
+                    # Never include or descend into MCD-generated runtime state.
+                    dirs[:] = [name for name in dirs if name != ".mcd"]
+                    for name in files:
+                        archive_file = archive_current / name
+                        stream.write(os.fsencode(archive_file) + b"\0")
+        cmd = [
+            "tar",
+            *_BACKUP_TAR_RUNTIME_EXCLUDES,
+            "--no-recursion",
+            "--null",
+            *( ["-C", str(relative_to)] if relative_to else [] ),
+            "--files-from",
+            str(list_path),
+            "-czf",
+            str(target),
+        ]
+        _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    finally:
+        if list_path is not None:
+            list_path.unlink(missing_ok=True)
 
 
 def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path) -> Path:
@@ -516,20 +630,7 @@ def _archive_instance_files(cfg: AgentConfig, inst: MauticInstall, out_dir: Path
     if root.is_symlink():
         raise RuntimeError(f"instance root must not resolve through symlinks: {inst.root}")
     target = out_dir / "files.tar.gz"
-    cmd = [
-        "tar",
-        *_BACKUP_TAR_RUNTIME_EXCLUDES,
-        "--exclude=var/cache",
-        "--exclude=var/logs",
-        "--exclude=app/cache",
-        "--exclude=app/logs",
-        "-czf",
-        str(target),
-        "-C",
-        str(root),
-        ".",
-    ]
-    _run(cmd, timeout_sec=cfg.backup_dump_timeout_sec, check=True)
+    _archive_path_list(cfg, [str(root)], target, relative_to=root)
     return target
 
 
@@ -612,6 +713,27 @@ def _prune_by_copies(
                     removed_paths.append(sidecar)
     _prune_storage_index_entries(mount_path, removed_paths)
     return removed
+
+
+def _prune_backup_retention(
+    cfg: AgentConfig,
+    parent: Path,
+    mount_path: Path,
+    *,
+    method: str,
+    enabled: bool,
+    protected: set[Path] | None = None,
+) -> list[str]:
+    if not enabled:
+        return []
+    if method == "xtrabackup":
+        return _prune_xtrabackup_retention(parent, cfg)
+    return _prune_by_copies(
+        parent,
+        cfg.backup_retention_copies,
+        protected=protected,
+        mount_path=mount_path,
+    )
 
 
 def _cleanup_incomplete_dirs(
@@ -916,7 +1038,13 @@ def _oldest_xtrabackup_chain_ids(parent: Path, *, exclude_chain_id: str = "") ->
     return out
 
 
-def _ensure_xtrabackup_space(parent: Path, mount_path: Path, plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _ensure_xtrabackup_space(
+    parent: Path,
+    mount_path: Path,
+    plan: dict[str, Any],
+    *,
+    allow_prune: bool = True,
+) -> tuple[dict[str, Any], list[str]]:
     required = _estimate_xtrabackup_required_bytes(parent, plan)
     if required <= 0:
         return plan, []
@@ -924,6 +1052,11 @@ def _ensure_xtrabackup_space(parent: Path, mount_path: Path, plan: dict[str, Any
     free = int(usage.get("free_bytes") or 0) if isinstance(usage, dict) else 0
     if free >= required:
         return plan, []
+    if not allow_prune:
+        raise RuntimeError(
+            f"insufficient backup storage for no-prune run: required={required} free={free}; "
+            "existing backup chains were preserved"
+        )
     removed: list[str] = []
     protected_chain = str(plan.get("chain_id") or "").strip() if str(plan.get("kind") or "") == "incremental" else ""
     for chain_id in _oldest_xtrabackup_chain_ids(parent, exclude_chain_id=protected_chain):
@@ -5063,6 +5196,9 @@ def backup_instance_run(
             "mydumper_threads": cfg.backup_mydumper_threads,
             "mydumper_compress": cfg.backup_mydumper_compress,
             "files_archive_path": str(final_dir / files_archive.name),
+            "files_archive_sha256": _backup_asset_sha256(final_dir / files_archive.name),
+            "database_sha256": _backup_asset_sha256(final_dir / "databases"),
+            "runtime_excluded_paths": list(_BACKUP_RUNTIME_EXCLUDED_PATHS),
             "restorable_as_image": True,
         }
         if retention_removed:
@@ -5177,7 +5313,12 @@ def backup_instance_run(
             pass
 
 
-def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
+def backup_run(
+    config: AgentConfig,
+    root: str | None = None,
+    *,
+    prune_retention: bool = True,
+) -> BackupResult:
     cfg = _effective_cfg(config)
     method = _backup_method(cfg)
     state_path = _state_path(cfg)
@@ -5274,14 +5415,18 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
     try:
         _mount(cfg, mount_path)
         remote_parent.mkdir(parents=True, exist_ok=True)
-        _removed_incomplete, failed_incomplete = _cleanup_incomplete_dirs(remote_parent)
+        _removed_incomplete, failed_incomplete = (
+            _cleanup_incomplete_dirs(remote_parent) if prune_retention else ([], [])
+        )
         if failed_incomplete:
             raise RuntimeError(
                 "failed to cleanup stale incomplete backup dirs: "
                 + ", ".join(sorted(failed_incomplete))
             )
         if method != "xtrabackup":
-            _prune_by_copies(remote_parent, cfg.backup_retention_copies, mount_path=mount_path)
+            _prune_backup_retention(
+                cfg, remote_parent, mount_path, method=method, enabled=prune_retention,
+            )
         if final_dir.exists():
             marker = _read_backup_marker(final_dir)
             if str(marker.get("status") or "").strip().lower() == "ok":
@@ -5346,6 +5491,12 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
         tmp_dir.mkdir(parents=True, exist_ok=False)
 
         _archive_files(cfg, tmp_dir)
+        files_archive_path = tmp_dir / cfg.backup_archive_name if cfg.backup_archive_enabled else None
+        files_archive_sha256 = (
+            _backup_asset_sha256(files_archive_path)
+            if files_archive_path is not None and files_archive_path.is_file()
+            else ""
+        )
 
         db_root = tmp_dir / "databases"
         db_root.mkdir(parents=True, exist_ok=True)
@@ -5363,6 +5514,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                 remote_parent,
                 mount_path,
                 xtrabackup_plan,
+                allow_prune=prune_retention,
             )
             backup_kind = str(xtrabackup_plan.get("kind") or "full").strip().lower()
             incremental_base_dir = xtrabackup_plan.get("base_dir") if backup_kind == "incremental" else None
@@ -5401,6 +5553,7 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                     "method": "xtrabackup",
                     "backup_kind": verified_kind,
                     "bytes": one_bytes,
+                    "sha256": _backup_asset_sha256(db_dir),
                 }
             )
         else:
@@ -5428,9 +5581,11 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
                         "method": "mydumper",
                         "bytes": one_bytes,
                         "path": _path_rel_to(tmp_dir, db_dir),
+                        "sha256": _backup_asset_sha256(db_dir),
                     }
                 )
         bytes_written = total_bytes
+        database_root_sha256 = _backup_asset_sha256(db_root)
 
         os.replace(tmp_dir, final_dir)
         storage_usage = _storage_usage(mount_path)
@@ -5456,6 +5611,10 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             "xtrabackup_parallel": cfg.backup_xtrabackup_parallel if method == "xtrabackup" else None,
             "server_snapshot": server_snapshot,
             "tool_state": tool_state,
+            "files_archive_sha256": files_archive_sha256,
+            "database_sha256": database_root_sha256,
+            "runtime_excluded_paths": list(_BACKUP_RUNTIME_EXCLUDED_PATHS),
+            "retention_pruned": bool(prune_retention),
         }
         if method == "xtrabackup":
             marker.update(
@@ -5490,16 +5649,20 @@ def backup_run(config: AgentConfig, root: str | None = None) -> BackupResult:
             }
         _write_marker(final_dir, marker)
         if method == "xtrabackup":
-            retention_removed = _prune_xtrabackup_retention(remote_parent, cfg)
+            retention_removed = _prune_backup_retention(
+                cfg, remote_parent, mount_path, method=method, enabled=prune_retention,
+            )
             if retention_removed:
                 marker["retention_removed"] = retention_removed
                 _write_marker(final_dir, marker)
         else:
-            retention_removed = _prune_by_copies(
+            retention_removed = _prune_backup_retention(
+                cfg,
                 remote_parent,
-                cfg.backup_retention_copies,
+                mount_path,
+                method=method,
+                enabled=prune_retention,
                 protected={final_dir},
-                mount_path=mount_path,
             )
             if retention_removed:
                 marker["retention_removed"] = retention_removed
@@ -5727,6 +5890,12 @@ def backup_restore(
             restrict_to_parent=_backup_storage_kind(cfg) == "local",
         )
         marker = _read_backup_marker(source_dir)
+        expected_files_hash = str(marker.get("files_archive_sha256") or "").strip()
+        files_asset = source_dir / str(marker.get("files_archive_path") or cfg.backup_archive_name).split("/")[-1]
+        _verify_backup_asset_sha256(files_asset, expected_files_hash, label="files archive")
+        expected_db_hash = str(marker.get("database_sha256") or "").strip()
+        db_asset = source_dir / "databases"
+        _verify_backup_asset_sha256(db_asset, expected_db_hash, label="database assets")
         restored_dbs = 0
         restored_files = False
         instances = _list_instances(cfg, force_rescan=True)
