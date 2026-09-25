@@ -178,6 +178,14 @@ _CAMPAIGN_TRIGGER_STUCK_COOLDOWN_SEC = 900
 _CAMPAIGN_TRIGGER_FUTURE_WAKE_EARLY_SEC = 1.0
 _CAMPAIGN_NATIVE_FALLBACK_TIMEOUT_SEC = 30 * 60
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_MIN_INTERVAL_SEC = 6 * 3600
+
+
+def _sync_local_runtime_baseline_after_config_recovery(config: AgentConfig, store: object) -> str:
+    """Treat MCC recovery as the new local baseline, never as a local edit."""
+    runtime = local_runtime_overrides(config)
+    fingerprint = overrides_fingerprint(runtime)
+    store.put_runtime_sync("local_runtime", runtime)
+    return fingerprint
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_RECENT_SEC = 14 * 86400
 _CAMPAIGN_EMAIL_COUNTER_RECONCILE_DEFER_LOG_SEC = 15 * 60
 # Avoid spending an entire scheduler pass probing stale audit candidates.
@@ -10929,6 +10937,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 profile=(config.profile_name or desired_profile),
                             )
                         base_config = config
+                        last_local_runtime_fp = _sync_local_runtime_baseline_after_config_recovery(config, store)
                         pusher.cfg = config
                         next_plan_refresh_at = 0.0
                         next_update_check_at = 0.0

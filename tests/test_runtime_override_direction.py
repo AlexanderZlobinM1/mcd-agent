@@ -11,6 +11,29 @@ from mcd_agent import daemon
 
 
 class RuntimeOverrideDirectionTests(unittest.TestCase):
+    def test_profile_recovery_updates_local_baseline_without_pushing(self) -> None:
+        class MemoryStore:
+            def __init__(self):
+                self.values = {}
+
+            def put_runtime_sync(self, key, value):
+                self.values[key] = value
+
+        cfg = SimpleNamespace()
+        store = MemoryStore()
+        with patch(
+            "mcd_agent.daemon.local_runtime_overrides",
+            return_value={"segment_recurring_priority_v1": {}},
+        ), patch("mcd_agent.daemon.push_runtime_overrides") as push:
+            fingerprint = daemon._sync_local_runtime_baseline_after_config_recovery(cfg, store)
+
+        self.assertEqual(
+            fingerprint,
+            overrides_fingerprint({"segment_recurring_priority_v1": {}}),
+        )
+        self.assertEqual(store.values["local_runtime"], {"segment_recurring_priority_v1": {}})
+        push.assert_not_called()
+
     def test_poll_includes_canonical_host_qualified_instance_uid(self) -> None:
         cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="token")
         identity = {

@@ -1,5 +1,9 @@
 # MCD Changelog
 
+## 1.2.58 - 2026-09-25
+
+- Treat a config restored from MCC profile drift as the new local runtime baseline so recovery cannot push the stale pre-recovery runtime back as a local edit.
+
 ## 1.2.57 - 2026-09-25
 
 - Retry runtime desired-state ACK after transient failure or restart, tracking each scope by applied revision and content SHA256 independently from the desired snapshot.
