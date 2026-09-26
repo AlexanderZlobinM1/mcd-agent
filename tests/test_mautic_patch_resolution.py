@@ -74,6 +74,20 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "plan_sha256_mismatch"):
             self._resolve(response)
 
+    def test_rejects_unknown_record_fields(self):
+        response = json.loads(json.dumps(self.fixture["resolve_response"]))
+        response["plan"]["patches"][0]["untrusted_extra"] = True
+        response["plan_sha256"] = resolution.canonical_json_sha256(response["plan"])
+        with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "patch_record_fields_invalid"):
+            self._resolve(response)
+
+    def test_rejects_payload_bytes_that_do_not_match_digest(self):
+        response = json.loads(json.dumps(self.fixture["resolve_response"]))
+        response["plan"]["payloads"][0]["content_base64"] = "Y2hhbmdlZAo="
+        response["plan_sha256"] = resolution.canonical_json_sha256(response["plan"])
+        with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "payload_sha256_mismatch"):
+            self._resolve(response)
+
     def test_requires_rollback_run_id(self):
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "rollback_run_id_required"):
             resolution.resolve_plan(

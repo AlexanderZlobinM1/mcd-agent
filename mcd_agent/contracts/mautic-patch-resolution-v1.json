@@ -37,8 +37,8 @@
   ],
   "version_policy": {
     "upgrade_lifecycle": "source_version must be lower than target_version",
-    "other_triggers": "source_version may equal target_version only for a selected remediation record; source_version greater than target_version is rejected",
-    "unknown_version": "an absent observed version is accepted only when the agent independently confirms the Mautic major, the active catalog explicitly allows unknown versions for the selected record, and all vulnerable source-signature gates match; otherwise return blocked/noop without mutation",
+    "other_triggers": "when version is known, source_version and target_version must both equal the observed version; source_version greater than target_version is rejected",
+    "unknown_version": "when observed version is absent, plan source_version and target_version are null; selection is accepted only when the agent independently confirms the Mautic major, active catalog explicitly allows unknown versions for every selected record, and all vulnerable source-signature gates match; otherwise return blocked/noop without mutation",
     "authority": "MCC selects applicability from the active effective catalog; MCD independently validates the returned version relation and never supplies version-specific fallback"
   },
   "resolve_request_fields": [
@@ -110,8 +110,7 @@
     "execution_kind",
     "triggers",
     "phase_order",
-    "phases",
-    "gate"
+    "phases"
   ],
   "patch_record_optional_fields": [
     "source_paths",
@@ -146,7 +145,6 @@
         "triggers",
         "phase_order",
         "phases",
-        "gate",
         "parameters"
       ],
       "optional": [

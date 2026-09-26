@@ -154,6 +154,188 @@ def _agent_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _safe_relative_path(value: Any, *, suffix: str | None = None) -> bool:
+    raw = str(value or "")
+    if not raw or "\\" in raw or raw.startswith("/") or ":" in raw.split("/", 1)[0]:
+        return False
+    parts = raw.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if suffix and not raw.endswith(suffix):
+        return False
+    return True
+
+
+def _validate_gates(record: dict[str, Any], source_paths: set[str]) -> None:
+    gates = record.get("gate")
+    if not isinstance(gates, list) or not gates:
+        raise MauticPatchResolutionError("patch_record_gate_invalid")
+    groups: set[str] = set()
+    for gate in gates:
+        if not isinstance(gate, dict):
+            raise MauticPatchResolutionError("patch_gate_not_object")
+        kind = gate.get("kind")
+        group = gate.get("group")
+        path = gate.get("path")
+        if group not in {"vulnerable", "fixed"} or not _safe_relative_path(path) or path not in source_paths:
+            raise MauticPatchResolutionError("patch_gate_context_invalid")
+        if kind == "exact_count":
+            allowed = {"group", "kind", "path", "needle", "expected_count", "allow_missing_path"}
+            count = gate.get("expected_count")
+            if (
+                set(gate) - allowed
+                or not isinstance(gate.get("needle"), str)
+                or not gate["needle"]
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                or (gate.get("allow_missing_path") is True and count != 0)
+                or (group == "fixed" and count == 0)
+            ):
+                raise MauticPatchResolutionError("patch_exact_count_gate_invalid")
+        elif kind == "path_state":
+            if set(gate) != {"group", "kind", "path", "expected_state"} or gate.get("expected_state") not in {"absent", "present"}:
+                raise MauticPatchResolutionError("patch_path_state_gate_invalid")
+        elif kind == "sha256":
+            if set(gate) != {"group", "kind", "path", "expected_sha256"} or not _SHA64_RE.fullmatch(str(gate.get("expected_sha256", ""))):
+                raise MauticPatchResolutionError("patch_sha256_gate_invalid")
+        else:
+            raise MauticPatchResolutionError("patch_gate_kind_unsupported")
+        groups.add(group)
+    if groups != {"vulnerable", "fixed"}:
+        raise MauticPatchResolutionError("patch_gate_groups_incomplete")
+
+
+def _validate_legacy_state(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {
+        "kind", "backup_suffix", "metadata_suffix", "metadata_fields", "expected_marker"
+    }:
+        raise MauticPatchResolutionError("legacy_state_descriptor_invalid")
+    kind = value.get("kind")
+    backup_suffix = value.get("backup_suffix")
+    metadata_suffix = value.get("metadata_suffix")
+    fields = value.get("metadata_fields")
+    marker = value.get("expected_marker")
+    if kind == "backup_file":
+        if not isinstance(backup_suffix, str) or not re.fullmatch(r"\.[A-Za-z0-9._-]{1,80}", backup_suffix):
+            raise MauticPatchResolutionError("legacy_state_backup_suffix_invalid")
+        if metadata_suffix is not None or fields != {} or marker is not None:
+            raise MauticPatchResolutionError("legacy_state_backup_file_shape_invalid")
+    elif kind == "backup_file_with_metadata":
+        if not isinstance(backup_suffix, str) or not re.fullmatch(r"\.[A-Za-z0-9._-]{1,80}", backup_suffix):
+            raise MauticPatchResolutionError("legacy_state_backup_suffix_invalid")
+        if not isinstance(metadata_suffix, str) or not re.fullmatch(r"\.[A-Za-z0-9._-]{1,80}", metadata_suffix):
+            raise MauticPatchResolutionError("legacy_state_metadata_suffix_invalid")
+        required = {"marker", "path", "original_sha256", "applied_sha256"}
+        if not isinstance(fields, dict) or set(fields) != required or any(not isinstance(v, str) or not v for v in fields.values()):
+            raise MauticPatchResolutionError("legacy_state_metadata_fields_invalid")
+        if not isinstance(marker, str) or not marker:
+            raise MauticPatchResolutionError("legacy_state_marker_invalid")
+    else:
+        raise MauticPatchResolutionError("legacy_state_kind_unsupported")
+
+
+def _validate_plan_records(plan: dict[str, Any], contract: dict[str, Any], trigger: str, phase: str) -> None:
+    plan_fields = set(contract["plan_fields"])
+    if set(plan) != plan_fields:
+        raise MauticPatchResolutionError("patch_plan_fields_invalid")
+    if plan.get("install_type") not in set(contract["install_types"]):
+        raise MauticPatchResolutionError("patch_plan_install_type_invalid")
+    if plan.get("trigger") != trigger or plan.get("phase") != phase:
+        raise MauticPatchResolutionError("patch_plan_trigger_phase_mismatch")
+    if plan.get("operation") not in _OPERATIONS:
+        raise MauticPatchResolutionError("patch_plan_operation_invalid")
+    patches = plan.get("patches")
+    if not isinstance(patches, list) or not patches or len(patches) > 32:
+        raise MauticPatchResolutionError("patch_plan_records_invalid")
+    payloads = plan.get("payloads")
+    if not isinstance(payloads, list):
+        raise MauticPatchResolutionError("patch_plan_payloads_invalid")
+    payload_by_path: dict[str, dict[str, Any]] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict) or set(payload) != {"path", "sha256", "content_base64"}:
+            raise MauticPatchResolutionError("patch_payload_fields_invalid")
+        path = payload.get("path")
+        if not _safe_relative_path(path, suffix=".patch") or path in payload_by_path:
+            raise MauticPatchResolutionError("patch_payload_path_invalid")
+        payload_by_path[path] = payload
+
+    record_ids: set[str] = set()
+    used_payload_paths: set[str] = set()
+    previous_order = -1
+    for record in patches:
+        if not isinstance(record, dict):
+            raise MauticPatchResolutionError("patch_record_not_object")
+        kind = record.get("execution_kind")
+        allowlists = contract["patch_record_field_allowlists"].get(kind)
+        if not isinstance(allowlists, dict):
+            raise MauticPatchResolutionError("patch_execution_kind_unsupported")
+        required = set(allowlists["required"])
+        optional = set(allowlists["optional"])
+        if not required.issubset(record) or set(record) - required - optional:
+            raise MauticPatchResolutionError("patch_record_fields_invalid")
+        patch_id = record.get("id")
+        if not isinstance(patch_id, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9-]{2,95}", patch_id) or patch_id in record_ids:
+            raise MauticPatchResolutionError("patch_record_id_invalid")
+        record_ids.add(patch_id)
+        triggers = record.get("triggers")
+        phases = record.get("phases")
+        order = record.get("phase_order")
+        if (
+            not isinstance(triggers, list)
+            or not triggers
+            or any(value not in _TRIGGERS for value in triggers)
+            or trigger not in triggers
+            or not isinstance(phases, list)
+            or not phases
+            or any(value not in _PHASES for value in phases)
+            or phase not in phases
+            or isinstance(order, bool)
+            or not isinstance(order, int)
+            or not 0 <= order <= 10000
+            or order < previous_order
+        ):
+            raise MauticPatchResolutionError("patch_record_trigger_phase_order_invalid")
+        previous_order = order
+        if "allow_unknown_version" in record and not isinstance(record["allow_unknown_version"], bool):
+            raise MauticPatchResolutionError("patch_unknown_version_flag_invalid")
+        _validate_legacy_state(record.get("legacy_state"))
+        source_paths = record.get("source_paths", [])
+        if kind == "git_patch_v1":
+            if not isinstance(source_paths, list) or not source_paths or any(not isinstance(p, str) or not _safe_relative_path(p) for p in source_paths) or len(set(source_paths)) != len(source_paths):
+                raise MauticPatchResolutionError("patch_source_paths_invalid")
+            if record.get("gate_logic") not in {
+                "vulnerable_all; fixed_all; mixed_or_unknown=error",
+                "vulnerable_exactly_one; fixed_exactly_one; mixed_or_unknown=error",
+            }:
+                raise MauticPatchResolutionError("patch_gate_logic_invalid")
+            _validate_gates(record, set(source_paths))
+            payload_path = record.get("payload_path")
+            if not _safe_relative_path(payload_path, suffix=".patch") or payload_path not in payload_by_path or payload_path in used_payload_paths:
+                raise MauticPatchResolutionError("patch_payload_reference_invalid")
+            used_payload_paths.add(payload_path)
+        else:
+            if source_paths or "payload_path" in record:
+                raise MauticPatchResolutionError("db_operation_has_file_payload")
+            parameters = record.get("parameters")
+            if not isinstance(parameters, dict) or set(parameters) != {"table", "column", "predicate", "replacement_json"}:
+                raise MauticPatchResolutionError("db_operation_parameters_invalid")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", str(parameters.get("table", ""))) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", str(parameters.get("column", ""))):
+                raise MauticPatchResolutionError("db_operation_identifier_invalid")
+            if parameters.get("predicate") != "null_or_empty_or_invalid_json" or not isinstance(parameters.get("replacement_json"), str):
+                raise MauticPatchResolutionError("db_operation_value_invalid")
+            try:
+                json.loads(parameters["replacement_json"])
+            except ValueError as exc:
+                raise MauticPatchResolutionError("db_operation_replacement_json_invalid") from exc
+            if record.get("gate") not in (None, []):
+                raise MauticPatchResolutionError("db_operation_gate_unsupported")
+    if used_payload_paths != set(payload_by_path):
+        raise MauticPatchResolutionError("unreferenced_patch_payload")
+
+
 def resolve_plan(
     config: AgentConfig,
     install: Any,
@@ -215,6 +397,14 @@ def resolve_plan(
     if result.get("instance_uid") != instance_uid:
         raise MauticPatchResolutionError("mcc_patch_instance_mismatch")
     _resolved_host_id(result.get("host_id"))
+    if result.get("trigger") != trigger or result.get("phase") != phase:
+        raise MauticPatchResolutionError("mcc_patch_response_context_mismatch")
+    if not str(result.get("catalog_revision", "") or "").strip() or not _SHA64_RE.fullmatch(str(result.get("catalog_sha256", ""))):
+        raise MauticPatchResolutionError("mcc_catalog_identity_invalid")
+    if not _SHA40_RE.fullmatch(str(result.get("registry_commit", ""))):
+        raise MauticPatchResolutionError("mcc_registry_commit_invalid")
+    if not _SHA64_RE.fullmatch(str(result.get("registry_sha256", ""))):
+        raise MauticPatchResolutionError("mcc_registry_sha256_invalid")
     if result.get("status") not in {"selected", "noop", "blocked"}:
         raise MauticPatchResolutionError("mcc_patch_response_status_invalid")
     if result["status"] != "selected":
@@ -227,28 +417,37 @@ def resolve_plan(
         raise MauticPatchResolutionError("mcc_patch_plan_schema_mismatch")
     if result.get("plan_sha256") != canonical_json_sha256(plan):
         raise MauticPatchResolutionError("mcc_patch_plan_sha256_mismatch")
-    if not _SHA40_RE.fullmatch(str(result.get("registry_commit", ""))):
-        raise MauticPatchResolutionError("mcc_registry_commit_invalid")
-    if not _SHA64_RE.fullmatch(str(result.get("registry_sha256", ""))):
-        raise MauticPatchResolutionError("mcc_registry_sha256_invalid")
+    _validate_plan_records(plan, contract, trigger, phase)
     if plan.get("registry_commit") != result.get("registry_commit") or plan.get("registry_sha256") != result.get("registry_sha256"):
         raise MauticPatchResolutionError("mcc_plan_registry_mismatch")
     if plan.get("instance_uid") not in (None, instance_uid):
         raise MauticPatchResolutionError("mcc_plan_instance_mismatch")
     if plan.get("trigger") != trigger or plan.get("phase") != phase or plan.get("operation") != operation:
         raise MauticPatchResolutionError("mcc_plan_context_mismatch")
+    if (
+        plan.get("source_version") != result.get("source_version")
+        or plan.get("target_version") != result.get("target_version")
+        or plan.get("install_type") != result.get("install_type")
+    ):
+        raise MauticPatchResolutionError("mcc_plan_response_metadata_mismatch")
     if plan.get("run_id") != run_id:
         raise MauticPatchResolutionError("mcc_plan_run_id_mismatch")
-    source = str(plan.get("source_version", "") or "")
-    target = str(plan.get("target_version", "") or "")
-    source_tuple = _version_tuple(source)
-    target_tuple = _version_tuple(target)
+    source_value = plan.get("source_version")
+    target_value = plan.get("target_version")
+    source_tuple = _version_tuple(str(source_value)) if source_value is not None else None
+    target_tuple = _version_tuple(str(target_value)) if target_value is not None else None
     if trigger == "upgrade_lifecycle":
         if source_tuple is None or target_tuple is None or source_tuple >= target_tuple:
             raise MauticPatchResolutionError("upgrade_plan_version_relation_invalid")
-    elif source or target:
+    elif source_value is None and target_value is None:
+        if observed_version is not None or observed_major is None or not all(record.get("allow_unknown_version") is True for record in plan["patches"]):
+            raise MauticPatchResolutionError("unknown_version_plan_not_authorized")
+    elif source_tuple is None or target_tuple is None or source_tuple != target_tuple:
         if source_tuple is None or target_tuple is None or source_tuple > target_tuple:
             raise MauticPatchResolutionError("remediation_plan_version_relation_invalid")
+        raise MauticPatchResolutionError("remediation_plan_version_mismatch")
+    elif observed_version is not None and source_tuple != _version_tuple(observed_version):
+        raise MauticPatchResolutionError("remediation_plan_observed_version_mismatch")
     if len(json.dumps(plan, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > int(contract["max_plan_bytes"]):
         raise MauticPatchResolutionError("mcc_patch_plan_too_large")
     payloads = plan.get("payloads", [])

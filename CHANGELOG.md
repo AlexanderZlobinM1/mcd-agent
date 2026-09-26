@@ -2,7 +2,8 @@
 
 - Add the versioned MCC-resolved Mautic patch contract for generic runtime remediation.
 - Add authenticated resolved-plan/evidence transport with host, version, plan, and payload hash checks.
-- Add resolver transport regression coverage for auth, canonical hashes, and fail-closed request guards.
+- Enforce plan/record field allowlists, trigger/phase selection, and safe payload references before execution.
+- Add resolver regression coverage for auth, canonical hashes, payload integrity, and fail-closed schema guards.
 
 # MCD Changelog
 
