@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import pytest
 from mcd_agent import mautic_patch_plan as patch
+from mcd_agent import __version__
 
 
 def plan():
@@ -15,7 +16,7 @@ def test_contract_has_no_embedded_patch_catalog_and_advertises_both_generic_vers
     assert 'patches' not in advertised
     assert 'mautic-patch-plan-v3' in advertised['capabilities']
     assert 'mautic-patch-plan-v2' in advertised['capabilities']
-    assert advertised['minimum_agent_version'] == '1.2.63'
+    assert advertised['minimum_agent_version'] == __version__
 
 
 def test_static_catalog_is_rejected_without_source_access(tmp_path):

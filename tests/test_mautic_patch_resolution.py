@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from mcd_agent import mautic_patch_resolution as resolution
+from mcd_agent import __version__
 
 
 FIXTURE = Path(__file__).parents[1] / "mcd_agent" / "contracts" / "fixtures" / "mautic-patch-resolution-v1.json"
@@ -65,7 +66,7 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         payload = json.loads(request.data)
         self.assertEqual(payload["schema"], "mcc-mautic-patch-resolve-v1")
         self.assertEqual(payload["mcc_host_name"], "fixture-mcc-host")
-        self.assertEqual(payload["agent_version"], "1.2.63")
+        self.assertEqual(payload["agent_version"], __version__)
         self.assertIsNone(payload["target_version"])
 
     def test_rejects_plan_hash_mismatch(self):

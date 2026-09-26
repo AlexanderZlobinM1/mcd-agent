@@ -994,7 +994,7 @@ def _patch_lifecycle_phase(hook, root: str, phase: str) -> None:
         callback(root, phase)
 
 
-def _prepare_patch_target_stage(config, root: str, current: str, target: str, mode: str, plan):
+def _prepare_patch_target_stage(config, root: str, current: str, target: str, mode: str, plan, facts_provider=None):
     from mcd_agent.mautic_patch_stage import TargetStage, application_root
     from mcd_agent.mautic_patch_plan import _target_version
     package_identity = {}
@@ -1023,7 +1023,7 @@ def _prepare_patch_target_stage(config, root: str, current: str, target: str, mo
                 archive.extractall(stage_root)
         else:
             raise RuntimeError("Unsupported target stage install type")
-    staged = TargetStage(root, plan, prepare, _target_version, application_root)
+    staged = TargetStage(root, plan, prepare, _target_version, application_root, facts_provider=facts_provider)
     staged.target_package_sha256 = package_identity["sha256"]
     return staged
 
@@ -1968,6 +1968,7 @@ def run_upgrade_apply(
             patch_run_id = selected["plan"]["run_id"]
     patch_hook = None
     target_stage = None
+    patch_facts_provider = None
     has_patch_plan_input = bool(patch_plan_json or patch_run_id)
     if has_patch_plan_input:
         if not patch_plan_json or not patch_run_id:
@@ -1984,6 +1985,9 @@ def run_upgrade_apply(
             if validated_patch_plan.get("schema") == "mcd-mautic-patch-plan-v3":
                 if validated_patch_plan["trigger"] != "upgrade_lifecycle" or validated_patch_plan["operation"] != "apply" or validated_patch_plan["run_id"] != patch_run_id:
                     raise PatchPlanError("upgrade_patch_context_mismatch")
+                from mcd_agent.mautic_patch_fact_binding import needs_facts, bound_provider
+                if needs_facts(validated_patch_plan):
+                    patch_facts_provider = bound_provider(config, install_root)
                 from mcd_agent.mautic_patch_backup import required, load_and_validate
                 if required(validated_patch_plan):
                     if not patch_backup_context_file:
@@ -2006,7 +2010,7 @@ def run_upgrade_apply(
                     staged_evidence = target_stage.verify_live(source_root, validated_patch_plan, _target_version)
                     print("MCD_PATCH_TARGET_EVIDENCE=" + json.dumps(staged_evidence, sort_keys=True))
                     source_root = str(application_root(source_root))
-                evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id)
+                evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id, facts_provider=patch_facts_provider)
             except PatchPlanError as exc:
                 evidence = rejected_preflight(patch_run_id, str(exc))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
@@ -2019,7 +2023,8 @@ def run_upgrade_apply(
             from mcd_agent.mautic_patch_plan import execute
             from mcd_agent.mautic_patch_stage import application_root
             source_root = str(application_root(source_root))
-            result = execute(source_root, patch_plan_json, phase, patch_run_id)
+            result = execute(source_root, patch_plan_json, phase, patch_run_id, facts_provider=patch_facts_provider,
+                             accepted_facts=getattr(target_stage, "facts_receipt", None))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(result, sort_keys=True))
             if result.get("status") != "success":
                 raise RuntimeError("Mautic patch phase rejected: " + phase)
@@ -2029,7 +2034,7 @@ def run_upgrade_apply(
             if any(set(record["phases"]) - supported_phases for record in validated_patch_plan["patches"]):
                 raise RuntimeError("Selected upgrade plan contains a phase unavailable in this upgrade workflow")
             target_stage = _prepare_patch_target_stage(config, _resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root,
-                                                       current, target, chosen_mode, validated_patch_plan)
+                                                       current, target, chosen_mode, validated_patch_plan, facts_provider=patch_facts_provider)
             patch_hook.target_stage = target_stage
             patch_hook.apply_phase = apply_patch_phase
     if not yes:
@@ -2171,7 +2176,8 @@ def run_upgrade_apply(
         if target_stage is not None:
             from mcd_agent.mautic_patch_stage import application_root
             from mcd_agent.mautic_patch_plan_v3 import verify_applied
-            verification = verify_applied(str(application_root(install_root)), validated_patch_plan)
+            verification = verify_applied(str(application_root(install_root)), validated_patch_plan,
+                                          accepted_facts=getattr(target_stage, "facts_receipt", None))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(verification, sort_keys=True))
         import_patch = {"status": "already", "reason": "runtime_reconciliation_uses_catalog_plan"}
         if import_patch.get("status") == "error":
@@ -2185,7 +2191,7 @@ def run_upgrade_apply(
             try:
                 from mcd_agent.mautic_patch_stage import application_root
                 rollback_evidence = rollback_v3(str(application_root(_resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root)),
-                                                dict(validated_patch_plan, operation="rollback"))
+                                                dict(validated_patch_plan, operation="rollback"), facts_provider=patch_facts_provider)
                 print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(rollback_evidence, sort_keys=True))
             except RuntimeError as rollback_error:
                 print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps({"status": "error", "rollback_succeeded": False, "reason": str(rollback_error)}, sort_keys=True))

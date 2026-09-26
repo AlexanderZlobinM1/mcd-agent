@@ -4369,7 +4369,17 @@ def main() -> int:
             print(json.dumps(contract(), ensure_ascii=True, indent=2))
             return 0
         try:
-            result = rollback(args.root or "", args.plan_json, args.run_id) if args.op == "rollback" else execute(args.root or "", args.plan_json, args.phase, args.run_id, args.op)
+            from mcd_agent.mautic_patch_plan import parse_plan
+            from mcd_agent.mautic_patch_fact_binding import needs_facts, bound_provider
+            plan = parse_plan(args.plan_json)
+            options = {}
+            if needs_facts(plan):
+                provider = bound_provider(load_config(args.config), args.root or "")
+                options["facts_provider"] = provider
+                if args.op == "apply":
+                    admission = execute(args.root or "", json.dumps(dict(plan, operation="verify")), args.phase, args.run_id, "verify", **options)
+                    options["accepted_facts"] = admission["facts_receipt"]
+            result = rollback(args.root or "", args.plan_json, args.run_id, **options) if args.op == "rollback" else execute(args.root or "", args.plan_json, args.phase, args.run_id, args.op, **options)
         except PatchPlanError as exc:
             result = {"status": "error", "reason": str(exc)}
         print(json.dumps(result, ensure_ascii=True, indent=2))

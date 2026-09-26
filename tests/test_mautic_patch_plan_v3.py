@@ -24,6 +24,27 @@ def _payload(plan, content: bytes) -> None:
 
 
 class MauticPatchPlanV3Tests(unittest.TestCase):
+    def test_unexecuted_phase_source_gates_do_not_prevent_applied_phase_restore(self):
+        plan = _plan()
+        plan.update(trigger="upgrade_lifecycle", phase="dependency_update_preflight", source_version="7.1.3", target_version="7.2.1")
+        first = plan["patches"][0]
+        first.update(triggers=["upgrade_lifecycle"], phases=["before_cache_warmup"])
+        import copy
+        second = copy.deepcopy(first)
+        second.update(id="UNEXECUTED-PHASE", phase_order=first["phase_order"] + 1,
+                      phases=["before_doctrine_migrations"], source_paths=["docroot/app/second.txt"], payload_path="fixtures/second.patch")
+        path = self.root / "docroot/app/second.txt"
+        path.write_bytes(b"before\n")
+        for gate in second["gate"]:
+            gate["path"] = "docroot/app/second.txt"
+        data = base64.b64decode(plan["payloads"][0]["content_base64"]).replace(b"docroot/app/fixture.txt", b"docroot/app/second.txt")
+        plan["patches"].append(second)
+        plan["payloads"].append({"path": second["payload_path"], "sha256": hashlib.sha256(data).hexdigest(), "content_base64": base64.b64encode(data).decode()})
+        executor.execute(str(self.root), plan, phase="before_cache_warmup")
+        executor.execute(str(self.root), dict(plan, operation="rollback"))
+        self.assertEqual(self.source.read_bytes(), b"before\n")
+        self.assertEqual(path.read_bytes(), b"before\n")
+
     def test_gate_only_common_identity_files_are_never_rewritten_and_guard_rollback(self):
         plan = _plan()
         identity = self.root / "docroot/app/identity.json"

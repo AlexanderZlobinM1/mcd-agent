@@ -222,16 +222,16 @@ def _validate_plan(plan: dict[str, Any]) -> str:
     return canonical_json_sha256(plan)
 
 
-def _simulate(root: Path, plan: dict[str, Any], phase: str | None = None) -> tuple[Path, list[dict[str, Any]], dict[str, tuple[bytes | None, int]]]:
+def _simulate(root: Path, plan: dict[str, Any], phase: str | None = None, facts: dict[str, Any] | None = None) -> tuple[Path, list[dict[str, Any]], dict[str, tuple[bytes | None, int]]]:
     temp = Path(tempfile.mkdtemp(prefix="mcd-patch-v3-"))
     try:
-        return _simulate_inner(root, plan, phase, temp)
+        return _simulate_inner(root, plan, phase, temp, facts)
     except Exception:
         shutil.rmtree(temp, ignore_errors=True)
         raise
 
 
-def _simulate_inner(root: Path, plan: dict[str, Any], phase: str | None, temp: Path) -> tuple[Path, list[dict[str, Any]], dict[str, tuple[bytes | None, int]]]:
+def _simulate_inner(root: Path, plan: dict[str, Any], phase: str | None, temp: Path, facts: dict[str, Any] | None = None) -> tuple[Path, list[dict[str, Any]], dict[str, tuple[bytes | None, int]]]:
     payloads = _payloads(plan)
     records = [record for record in plan["patches"] if phase is None or phase in record["phases"]]
     declared = list(dict.fromkeys(path for record in records for path in record["source_paths"]))
@@ -247,6 +247,13 @@ def _simulate_inner(root: Path, plan: dict[str, Any], phase: str | None, temp: P
     outcomes: list[dict[str, Any]] = []
     final: dict[str, tuple[bytes | None, int]] = {}
     for record in records:
+        if record.get("preconditions"):
+            if facts is None:
+                raise PatchPlanV3Error("typed_facts_provider_required")
+            if not facts["records"][record["id"]]["preconditions"]:
+                outcomes.append({"id": record["id"], "decision": "skip_condition_not_required", "gates": [],
+                                 "observations_sha256": facts["observations_sha256"]})
+                continue
         state, gates = _record_state(temp, record)
         if state == "ambiguous":
             shutil.rmtree(temp, ignore_errors=True)
@@ -500,25 +507,29 @@ def _legacy_snapshot(root: Path, record: dict[str, Any]) -> dict[str, Any] | Non
     }
 
 
-def atomic_preflight(root_value: str, plan_value: dict[str, Any] | str) -> dict[str, Any]:
+def atomic_preflight(root_value: str, plan_value: dict[str, Any] | str, *, facts_provider=None) -> dict[str, Any]:
     """Validate the entire immutable plan in a disposable source tree."""
     plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     digest = _validate_plan(plan)
     root = _root(root_value)
-    temp, outcomes, _final = _simulate(root, plan)
+    facts = _observe_facts(plan, facts_provider, "verify", plan["phase"])
+    temp, outcomes, _final = _simulate(root, plan, facts=facts)
     shutil.rmtree(temp, ignore_errors=True)
     return {"schema": "mcd-mautic-patch-preflight-v3", "status": "success",
             "operation": "patch_preflight", "run_id": plan["run_id"],
             "plan_sha256": digest, "selected": [row["id"] for row in outcomes],
-            "patches": outcomes, "upgrade_started": False, "rollback_attempted": False}
+            "patches": outcomes, "facts_receipt": facts, "upgrade_started": False, "rollback_attempted": False}
 
 
-def verify_applied(root_value: str, plan_value: dict[str, Any] | str) -> dict[str, Any]:
+def verify_applied(root_value: str, plan_value: dict[str, Any] | str, *, accepted_facts=None) -> dict[str, Any]:
     plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     digest = _validate_plan(plan)
     root = _root(root_value)
     outcomes = []
     for record in plan["patches"]:
+        if record.get("preconditions") and accepted_facts is not None and not accepted_facts["records"][record["id"]]["preconditions"]:
+            outcomes.append({"id": record["id"], "decision": "skip_condition_not_required", "gates": []})
+            continue
         state, gates = _record_state(root, record)
         if state != "already":
             raise PatchPlanV3Error("patch_final_fixed_gate_failed")
@@ -527,7 +538,7 @@ def verify_applied(root_value: str, plan_value: dict[str, Any] | str) -> dict[st
             "plan_sha256": digest, "patches": outcomes}
 
 
-def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, observed_major: int | None = None) -> dict[str, Any]:
+def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, observed_major: int | None = None, facts_provider=None, accepted_facts=None) -> dict[str, Any]:
     try:
         plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     except ValueError as exc:
@@ -537,6 +548,16 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
     if plan["source_version"] is None and (type(observed_major) is not int or observed_major not in range(1, 100)):
         raise PatchPlanV3Error("unknown_version_requires_independently_confirmed_major")
     selected_phase = phase or plan["phase"]
+    facts = _observe_facts(plan, facts_provider, plan["operation"], selected_phase)
+    if facts is not None:
+        from mcd_agent.mautic_patch_fact_binding import require_receipt
+        if plan["operation"] == "apply":
+            if accepted_facts is None:
+                raise PatchPlanV3Error("typed_facts_admission_required")
+            try:
+                require_receipt(accepted_facts, facts)
+            except ValueError as exc:
+                raise PatchPlanV3Error(str(exc)) from exc
     if selected_phase not in _contract()["phases"] or (plan["trigger"] != "upgrade_lifecycle" and selected_phase != plan["phase"]):
         raise PatchPlanV3Error("patch_execution_phase_invalid")
     if plan["trigger"] == "upgrade_lifecycle" and phase is None and plan["operation"] == "apply":
@@ -548,9 +569,9 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
     ledger_run_id = plan["run_id"] + ("." + selected_phase if plan["trigger"] == "upgrade_lifecycle" else "")
     operation = plan["operation"]
     if operation == "rollback":
-        return _rollback(root_value, plan, phase=phase)
+        return _rollback(root_value, plan, phase=phase, facts=facts)
     if operation in {"status", "verify"}:
-        temp, outcomes, _final = _simulate(root, plan, selected_phase)
+        temp, outcomes, _final = _simulate(root, plan, selected_phase, facts)
         shutil.rmtree(temp, ignore_errors=True)
         for outcome in outcomes:
             record = next(row for row in plan["patches"] if row["id"] == outcome["id"])
@@ -564,11 +585,12 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
             "plan_sha256": plan_sha,
             "selected": [row["id"] for row in outcomes],
             "patches": outcomes,
+            "facts_receipt": facts,
             "rollback_available": False,
         }
     if operation != "apply":
         raise PatchPlanV3Error("patch_operation_unsupported")
-    temp, outcomes, final = _simulate(root, plan, selected_phase)
+    temp, outcomes, final = _simulate(root, plan, selected_phase, facts)
     try:
         records_by_path: dict[str, dict[str, Any]] = {}
         for record in records:
@@ -591,6 +613,7 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
             "operation": "apply",
             "status": "prepared",
             "snapshots": snapshots,
+            "facts_receipt": facts,
         }
         if not snapshots:
             # No source changes. Preserve rollback for a catalog-declared legacy state only.
@@ -609,6 +632,12 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
                 raise PatchPlanV3Error("patch_existing_ledger_state_mismatch")
             return {"status": "success", "operation": "apply", "run_id": plan["run_id"], "plan_sha256": plan_sha, "patches": outcomes, "rollback_available": bool(existing.get("snapshots"))}
         _save_ledger(ledger_path, ledger)
+        if facts is not None:
+            from mcd_agent.mautic_patch_fact_binding import require_receipt
+            try:
+                require_receipt(facts, _observe_facts(plan, facts_provider, "apply", selected_phase))
+            except ValueError as exc:
+                raise PatchPlanV3Error(str(exc)) from exc
         for item in snapshots:
             path = _file(root, item["path"], create_parents=True)
             expected_before = item.get("before_sha256")
@@ -642,6 +671,7 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
             "plan_sha256": plan_sha,
             "selected": [row["id"] for row in outcomes],
             "patches": outcomes,
+            "facts_receipt": facts,
             "rollback_available": bool(snapshots),
             "rollback_attempted": False,
             "rollback_succeeded": True,
@@ -662,7 +692,7 @@ def _execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | 
         shutil.rmtree(temp, ignore_errors=True)
 
 
-def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None) -> dict[str, Any]:
+def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, facts=None) -> dict[str, Any]:
     try:
         plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     except ValueError as exc:
@@ -672,13 +702,20 @@ def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str |
         raise PatchPlanV3Error("patch_rollback_operation_required")
     root = _root(root_value)
     selected_phase = phase or plan["phase"]
+    if facts is not None and any(not row["rollback_preconditions"] for row in facts["records"].values()):
+        raise PatchPlanV3Error("patch_rollback_dependent_database_barrier")
     if plan["trigger"] == "upgrade_lifecycle" and phase is None:
         phases = list(dict.fromkeys(item for record in plan["patches"] for item in record["phases"]))
-        restored = []
+        ledgers = []
         for item in reversed(phases):
             ledger_file = root / ".mcd" / "patch-plan-v3" / (plan["run_id"] + "." + item + ".json")
             if ledger_file.exists():
-                restored.extend(_rollback(root_value, plan, phase=item)["restored"])
+                ledgers.append((ledger_file, _load_ledger(ledger_file)))
+        _preflight_restore(root, plan, ledgers, facts)
+        restored = []
+        for ledger_file, ledger in ledgers:
+            restored.extend(_restore_ledger(root, ledger, allow_pre_state=ledger.get("status") == "rolled_back")["restored"])
+            _save_ledger(ledger_file, ledger)
         return {"status": "success", "operation": "rollback", "run_id": plan["run_id"], "restored": restored, "rollback_attempted": bool(restored), "rollback_succeeded": True}
     path = _ledger_path(root, plan["run_id"] + ("." + selected_phase if plan["trigger"] == "upgrade_lifecycle" else ""))
     if not path.exists():
@@ -706,6 +743,7 @@ def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str |
         _save_ledger(path, ledger)
     else:
         ledger = _load_ledger(path)
+    _preflight_restore(root, plan, [(path, ledger)], facts)
     if ledger.get("registry_commit") != plan["registry_commit"] or ledger.get("registry_sha256") != plan["registry_sha256"]:
         raise PatchPlanV3Error("patch_rollback_registry_mismatch")
     if ledger.get("plan_binding_sha256") != canonical_json_sha256(dict(plan, operation="apply")):
@@ -731,23 +769,72 @@ def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str |
     }
 
 
-def execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, observed_major: int | None = None) -> dict[str, Any]:
+def _observe_facts(plan, provider, operation, phase):
+    from mcd_agent.mautic_patch_fact_binding import needs_facts
+    if not needs_facts(plan):
+        return None
+    if provider is None:
+        raise PatchPlanV3Error("typed_facts_provider_required")
+    try:
+        return provider(plan, operation, phase)
+    except (ValueError, OSError) as exc:
+        raise PatchPlanV3Error(str(exc)) from exc
+
+
+def _preflight_restore(root, plan, ledgers, facts):
+    """Verify the complete reverse hash chain and all receipts before writing."""
+    from mcd_agent.mautic_patch_fact_binding import require_receipt
+    virtual = {}
+    mutated = {item["path"] for _path, ledger in ledgers for item in ledger.get("snapshots", [])}
+    applied_phases = {ledger.get("phase") for _path, ledger in ledgers}
+    for _path, ledger in ledgers:
+        if (ledger.get("plan_binding_sha256") != canonical_json_sha256(dict(plan, operation="apply"))
+                or ledger.get("run_id") != plan["run_id"] or ledger.get("trigger") != plan["trigger"]):
+            raise PatchPlanV3Error("patch_rollback_plan_mismatch")
+        if facts is not None:
+            try:
+                require_receipt(ledger.get("facts_receipt"), facts)
+            except ValueError as exc:
+                raise PatchPlanV3Error(str(exc)) from exc
+        for item in reversed(ledger.get("snapshots", [])):
+            path = _file(root, item["path"])
+            actual = virtual.get(item["path"], _current_sha(path))
+            if ledger.get("status") == "rolled_back" and actual == item["before_sha256"]:
+                continue
+            if actual != item["after_sha256"]:
+                raise PatchPlanV3Error("patch_rollback_after_hash_mismatch")
+            if item.get("existed"):
+                try:
+                    before = base64.b64decode(item["before_base64"], validate=True)
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise PatchPlanV3Error("patch_rollback_snapshot_invalid") from exc
+                if _sha(before) != item["before_sha256"]:
+                    raise PatchPlanV3Error("patch_rollback_snapshot_hash_mismatch")
+            virtual[item["path"]] = item["before_sha256"]
+    for record in plan["patches"]:
+        if not applied_phases.intersection(record["phases"]) or not mutated.intersection(record["source_paths"]):
+            continue
+        if any(not _gate(root, gate)[0] for gate in record["gate"] if gate["group"] == "fixed" and gate["path"] not in mutated):
+            raise PatchPlanV3Error("patch_rollback_identity_gate_mismatch")
+
+
+def execute(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, observed_major: int | None = None, facts_provider=None, accepted_facts=None) -> dict[str, Any]:
     plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     _validate_plan(plan)
     if plan["operation"] in {"status", "verify"}:
-        return _execute(root_value, plan, phase=phase, observed_major=observed_major)
+        return _execute(root_value, plan, phase=phase, observed_major=observed_major, facts_provider=facts_provider, accepted_facts=accepted_facts)
     root = _root(root_value)
     path = _ledger_dir(root) / ".execution.lock"
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        return _execute(root_value, plan, phase=phase, observed_major=observed_major)
+        return _execute(root_value, plan, phase=phase, observed_major=observed_major, facts_provider=facts_provider, accepted_facts=accepted_facts)
     finally:
         os.close(fd)
 
 
-def rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None) -> dict[str, Any]:
+def rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str | None = None, facts_provider=None) -> dict[str, Any]:
     plan = json.loads(plan_value) if isinstance(plan_value, str) else plan_value
     if plan.get("operation") != "rollback":
         raise PatchPlanV3Error("patch_rollback_operation_required")
-    return execute(root_value, plan, phase=phase)
+    return execute(root_value, plan, phase=phase, facts_provider=facts_provider)

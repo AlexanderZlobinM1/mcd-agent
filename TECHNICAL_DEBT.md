@@ -15,10 +15,15 @@ payloads and unverified DB metadata rewrites are retired. The owner-published
 4,126,599-byte Composer payload passed isolated consumer acceptance; that record
 remains disabled until its owner accepts the published consumer evidence.
 
-The Operations input `generic-readiness-dependencies.json` is published in
-canonical ref `8bbbd54980b0f571788690c6bd3140c4056fda02` and retained in the
-later canonical ref `3681e699ba6bdd387f6e9d6741c2fc6f1b3bc3ec`.
-These requirements are accepted and remain unimplemented typed capabilities:
+The corrected Operations input `generic-readiness-dependencies.json` is
+published in canonical main `11ad9404e3290507e5c857802c4d1ef3b6e9db18`,
+SHA-256 `01f4bbff011423dc52851c34549cd23990eee0f6eaacfa4ad86655cf85cb34bf`.
+It supersedes the earlier total-role proposal. The 1.2.64 source candidate adds
+typed integer-domain/count/migration facts, independent instance binding,
+read-only admission, apply drift guards and complete-plan rollback barriers.
+Disposable MySQL 8.0.46 and MariaDB 10.11.19 source checks passed; published
+consumer acceptance and owner activation remain separate gates.
+These accepted requirements remain tracked until their final acceptance:
 
 - Read selected-instance non-admin roles count with the typed filter `is_admin=0`; pending migration and count `>0` require the source patch. One non-admin role triggers; one admin role alone skips. The earlier total-role `>1` proposal is superseded and cannot establish readiness.
 - Read configured-prefix Doctrine migration storage with exact namespace/encoding; missing or unknown schema blocks.
@@ -32,9 +37,9 @@ stay disabled and remain explicit MCC upgrade-readiness blockers. The database
 `plugins.metadata` normalization scenario remains disabled: upstream source
 does not establish that column as PluginUpdateEvent metadata.
 
-Next action: publish typed field schemas with the evidence owner, implement
-read-only facts and rollback barriers, test missing/ambiguous/executed states,
-release the supported capability, then obtain owner/MCC readiness acceptance.
+Next action: release and replay the typed DB capability on the same disposable
+databases, then obtain owner/MCC acceptance; complete remaining method/policy
+and staged dependency predicates for their applicable version branches.
 Source-only acceptance and an MCD package release do not close this debt or
 prove full customer-upgrade readiness. Parent aggregate and this record retain
 the same debt identity; MCC implementation details remain with MCC.

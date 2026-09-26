@@ -1,6 +1,19 @@
 {
   "schema": "mcd-mautic-patch-resolution-v1",
-  "minimum_agent_version": "1.2.63",
+  "minimum_agent_version": "1.2.64",
+  "plan_optional_fields": ["execution_context"],
+  "execution_context_fields": ["instance_uid", "application_root", "table_prefix"],
+  "predicate_kinds": ["column_integer_domain", "table_row_count", "migration_execution_state"],
+  "typed_predicate_contract": {
+    "column_integer_domain": {"fields": ["kind", "table_suffix", "column", "allowed_values"], "semantics": "verified integer schema and complete domain; sorted unique integer values, never booleans; any NULL, invalid value, missing or nontransactional schema blocks"},
+    "table_row_count": {"fields": ["kind", "table_suffix", "filters", "comparison", "value"], "filter_fields": ["column", "comparison", "value"], "filter_comparison": "equal", "comparisons": ["equal", "greater_than"], "semantics": "each filtered column requires a matching column_integer_domain predicate in the same condition group; exact typed integers, validated identifiers and bound values; unknown never becomes zero"},
+    "migration_execution_state": {"fields": ["kind", "table_suffix", "version_column", "migration", "encoding", "expected"], "encoding": "fqcn_utf8", "expected": ["pending", "executed"], "semantics": "textual UTF-8 storage, byte-exact returned FQCN; zero exact matches pending, one executed, duplicate exact match/NULL/numeric alias/case-folded target near-match/unknown schema or encoding blocks; no storage initialization"},
+    "selection": "all facts are read in a read-only repeatable-read transaction before any skip; verified precondition conjunction false is skip_condition_not_required, true retains source gates; unknown blocks",
+    "binding": "execution_context required for typed records, independently rediscovered selected instance must match UID/application-root/explicit local prefix and DB name; actual server/database identity and configured connection fingerprint are bound to receipts, never credentials",
+    "hashing": "sorted compact ensure_ascii UTF-8 JSON plus LF; observations_sha256 binds original apply plan/hash/run/source/target/trigger/plan phase/context/database identity and ordered typed observations; invocation_sha256 additionally binds actual operation and phase; timestamps excluded",
+    "admission": "read before target preparation, re-read before live source mutation, before phase apply and immediately before file writes; any observation or context drift blocks",
+    "rollback": "all rollback_preconditions for the complete plan must be verified true; original receipts and complete reverse snapshot hash chain checked before any phase restores. Executed or unknown dependent migration blocks; no SQL/down migration"
+  },
   "request_schema": "mcc-mautic-patch-resolve-v1",
   "response_schema": "mcc-mautic-patch-resolved-v1",
   "evidence_request_schema": "mcd-mautic-patch-evidence-v1",
@@ -117,7 +130,9 @@
     "payload_path",
     "parameters",
     "allow_unknown_version",
-    "legacy_state"
+    "legacy_state",
+    "preconditions",
+    "rollback_preconditions"
   ],
   "patch_record_field_allowlists": {
     "git_patch_v1": {
@@ -135,7 +150,9 @@
       "optional": [
         "parameters",
         "allow_unknown_version",
-        "legacy_state"
+        "legacy_state",
+        "preconditions",
+        "rollback_preconditions"
       ]
     },
     "db_json_normalize_v1": {
@@ -261,7 +278,7 @@
     "issue_cli": "mautic-patch-backup-authorize --root ROOT --instance-uid UID --plan-json PLAN --backup-evidence-json EVIDENCE --output-file FILE --signing-key-file KEY",
     "consume_cli": "mautic-upgrade apply --patch-backup-context-file FILE; key comes from --repair-auth-key-file",
     "sequence": "resolve immutable plan at enqueue; complete backup; host-authorize separate attestation; validate before any source mutation. Attestation is outside the plan and never changes its hash.",
-    "unsupported_predicates": "DB migration-pending, role_count, dependency-package/version and method-scope predicates are not supported by git_patch_v1 gates; records requiring them must stay disabled until a versioned capability is published"
+    "unsupported_predicates": "method-scope and dependency-package/version predicates remain unsupported; typed DB facts are separate preconditions/rollback_preconditions, never hidden in source gates or parameters; owner records remain disabled until published consumer acceptance"
   },
   "gate_kinds": [
     "exact_count",
@@ -278,6 +295,8 @@
   "rollback_semantics": "bound to run_id and the persisted immutable plan/hash; restore original bytes, mode, uid, and gid or remove a created file only if its current SHA-256 equals the recorded after SHA-256; database rows restore only when their current value equals the recorded replacement; drift is never overwritten",
   "phase_atomicity": "runtime invocation is atomic per phase; upgrade preflight remains atomic across its declared internal phases; lifecycle phases are invoked separately by their owning workflow",
   "evidence_schema": "mcd-mautic-patch-evidence-v1",
+  "evidence_optional_fields": ["facts_receipt"],
+  "facts_receipt_evidence": "required whenever the selected plan declares typed preconditions or rollback_preconditions; includes independent instance/database binding, ordered observations and canonical digests. Conditional skips retain their recorded decisions and facts; a successful phase does not imply its skipped patches were applied.",
   "evidence_fields": [
     "schema",
     "host_id",

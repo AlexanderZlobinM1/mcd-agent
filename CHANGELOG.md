@@ -1,3 +1,10 @@
+## 1.2.64 - 2026-09-26
+
+- Add typed read-only integer-domain, filtered row-count and byte-exact migration-state observations.
+- Bind DB facts to independently discovered instance/root/prefix and local connection identity; reject unknown schema, encoding and domain states.
+- Recheck admission observations before file apply and preflight all rollback phase receipts/hash chains before restoration.
+- Preserve verified conditional skips as explicit outcomes, without advertising method or dependency predicates.
+
 ## 1.2.63 - 2026-09-26
 
 - Add the versioned MCC-resolved Mautic patch contract for generic runtime remediation.

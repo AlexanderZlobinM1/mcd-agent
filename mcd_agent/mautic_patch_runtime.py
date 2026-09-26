@@ -47,7 +47,12 @@ def run(config: Any, install: Any, *, phase: str, operation: str = "apply",
                     "root": root, "reason": resolved.get("reason", "catalog_not_selected")}
         plan = resolved["plan"]
         from mcd_agent.mautic_patch_stage import application_root
-        result = execute(str(application_root(root)), plan, observed_major=major)
+        from mcd_agent.mautic_patch_fact_binding import needs_facts, bound_provider
+        provider = bound_provider(config, root) if needs_facts(plan) else None
+        admission = execute(str(application_root(root)), dict(plan, operation="verify"), observed_major=major,
+                            facts_provider=provider) if provider is not None and operation == "apply" else {}
+        result = execute(str(application_root(root)), plan, observed_major=major, facts_provider=provider,
+                         accepted_facts=admission.get("facts_receipt"))
         host_name, hostname = _host_identity(config)
         evidence = {"schema": "mcd-mautic-patch-evidence-v1", "host_id": resolved["host_id"],
                     "instance_uid": install.instance_uid, "catalog_revision": resolved["catalog_revision"],
@@ -65,6 +70,8 @@ def run(config: Any, install: Any, *, phase: str, operation: str = "apply",
                                  "succeeded": bool(result.get("rollback_succeeded"))}}
         from mcd_agent import __version__
         evidence["agent_version"] = __version__
+        if result.get("facts_receipt") is not None:
+            evidence["facts_receipt"] = result["facts_receipt"]
         report_evidence(config, instance_uid=install.instance_uid, mcc_host_name=host_name,
                         hostname=hostname, host_id=resolved["host_id"],
                         catalog_revision=resolved["catalog_revision"], catalog_sha256=resolved["catalog_sha256"],

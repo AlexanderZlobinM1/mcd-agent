@@ -189,6 +189,7 @@ def _agent_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
         )
     }
     result["execution_kinds"] = [kind for kind in contract["execution_kinds"] if kind in _IMPLEMENTED_EXECUTION_KINDS]
+    result["predicate_kinds"] = contract.get("predicate_kinds", [])
     return result
 
 
@@ -280,8 +281,13 @@ def _validate_legacy_state(value: Any) -> None:
 
 def _validate_plan_records(plan: dict[str, Any], contract: dict[str, Any], trigger: str, phase: str) -> None:
     plan_fields = set(contract["plan_fields"])
-    if set(plan) != plan_fields:
+    if not plan_fields.issubset(plan) or set(plan) - plan_fields - set(contract.get("plan_optional_fields", [])):
         raise MauticPatchResolutionError("patch_plan_fields_invalid")
+    from mcd_agent.mautic_patch_fact_binding import validate_context
+    try:
+        validate_context(plan)
+    except ValueError as exc:
+        raise MauticPatchResolutionError(str(exc)) from exc
     if plan.get("install_type") not in set(contract["install_types"]):
         raise MauticPatchResolutionError("patch_plan_install_type_invalid")
     if plan.get("trigger") != trigger or plan.get("phase") != phase:

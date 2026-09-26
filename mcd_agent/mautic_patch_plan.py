@@ -71,7 +71,7 @@ def _target_version(root: Path) -> str | None:
     return versions.pop() if len(versions) == 1 else None
 
 
-def _dispatch(root_value: str, raw_plan: str, run_id: str, operation: str, phase: str | None = None):
+def _dispatch(root_value: str, raw_plan: str, run_id: str, operation: str, phase: str | None = None, **facts_options):
     plan = parse_plan(raw_plan)
     if plan["run_id"] != run_id:
         raise PatchPlanError("run_id_argument_mismatch")
@@ -87,21 +87,21 @@ def _dispatch(root_value: str, raw_plan: str, run_id: str, operation: str, phase
             return engine.execute(root_value, raw_plan)
         from mcd_agent import mautic_patch_plan_v3 as engine
         if operation == "patch_preflight":
-            return engine.atomic_preflight(root_value, plan)
+            return engine.atomic_preflight(root_value, plan, **facts_options)
         if plan["operation"] != operation:
             raise PatchPlanError("v3_invocation_argument_mismatch")
-        return engine.execute(root_value, plan, phase=phase)
+        return engine.execute(root_value, plan, phase=phase, **facts_options)
     except RuntimeError as exc:
         raise PatchPlanError(str(exc)) from exc
 
 
-def atomic_preflight(root_value: str, raw_plan: str, run_id: str):
-    return _dispatch(root_value, raw_plan, run_id, "patch_preflight")
+def atomic_preflight(root_value: str, raw_plan: str, run_id: str, **facts_options):
+    return _dispatch(root_value, raw_plan, run_id, "patch_preflight", **facts_options)
 
 
-def rollback(root_value: str, raw_plan: str, run_id: str):
-    return _dispatch(root_value, raw_plan, run_id, "rollback")
+def rollback(root_value: str, raw_plan: str, run_id: str, **facts_options):
+    return _dispatch(root_value, raw_plan, run_id, "rollback", **facts_options)
 
 
-def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply"):
-    return _dispatch(root_value, raw_plan, run_id, operation, phase or None)
+def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply", **facts_options):
+    return _dispatch(root_value, raw_plan, run_id, operation, phase or None, **facts_options)

@@ -33,7 +33,7 @@ def application_root(value: str | Path) -> Path:
 
 class TargetStage:
     def __init__(self, source: str, plan: dict[str, Any], prepare: Callable[[Path], None],
-                 read_version: Callable[[Path], str | None], root_binding: Callable[[Path], Path] | None = None):
+                 read_version: Callable[[Path], str | None], root_binding: Callable[[Path], Path] | None = None, facts_provider=None):
         self.plan_sha256 = _validate_plan(plan)
         self.target_version = plan["target_version"]
         self.directory = Path(tempfile.mkdtemp(prefix="mcd-target-stage-"))
@@ -43,7 +43,11 @@ class TargetStage:
         self.original_composer_hashes: dict[str, str | None] = {}
         self.root_binding = root_binding or (lambda root: root)
         self.composer_files: dict[str, bytes] = {}
+        self.facts_provider = facts_provider
+        self.facts_receipt = None
         try:
+            from mcd_agent.mautic_patch_plan_v3 import _observe_facts
+            self.facts_receipt = _observe_facts(plan, facts_provider, "verify", plan["phase"])
             original = _root(source)
             if read_version(original) != plan["source_version"]:
                 raise PatchPlanV3Error("target_stage_source_version_mismatch")
@@ -71,7 +75,7 @@ class TargetStage:
             for path in paths:
                 content, _st = _read(_file(staged_application, path))
                 self.hashes[path] = hashlib.sha256(content).hexdigest() if content is not None else None
-            preview, self.outcomes, _final = _simulate(staged_application, plan)
+            preview, self.outcomes, _final = _simulate(staged_application, plan, facts=self.facts_receipt)
             shutil.rmtree(preview, ignore_errors=True)
             for name in ("composer.json", "composer.lock"):
                 path = self.root / name
@@ -83,6 +87,7 @@ class TargetStage:
             raise
 
     def verify_original(self, root: str, plan: dict[str, Any], read_version: Callable[[Path], str | None]) -> None:
+        self.verify_facts(plan)
         live = _root(root)
         if canonical_json_sha256(plan) != self.plan_sha256 or read_version(live) != plan["source_version"]:
             raise PatchPlanV3Error("target_stage_source_binding_changed")
@@ -98,6 +103,7 @@ class TargetStage:
                 raise PatchPlanV3Error("target_stage_composer_changed_before_mutation")
 
     def verify_live(self, root: str, plan: dict[str, Any], read_version: Callable[[Path], str | None]) -> dict[str, Any]:
+        self.verify_facts(plan)
         if canonical_json_sha256(plan) != self.plan_sha256:
             raise PatchPlanV3Error("target_stage_plan_changed")
         live = _root(root)
@@ -116,6 +122,12 @@ class TargetStage:
                 "target_package_sha256": getattr(self, "target_package_sha256", None),
                 "application_root_relative": self.application_root_relative,
                 "target_source_sha256": self.target_source_sha256, "source_hashes": self.hashes}
+
+    def verify_facts(self, plan) -> None:
+        if self.facts_receipt is not None:
+            from mcd_agent.mautic_patch_fact_binding import require_receipt
+            from mcd_agent.mautic_patch_plan_v3 import _observe_facts
+            require_receipt(self.facts_receipt, _observe_facts(plan, self.facts_provider, "apply", plan["phase"]))
 
     def close(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
