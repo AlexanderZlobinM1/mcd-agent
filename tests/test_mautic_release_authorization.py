@@ -12,6 +12,7 @@ def context():
     now = datetime.now(timezone.utc)
     value = {key: "fixture" for key in auth.BINDINGS}
     value.update(schema=auth.CONTEXT_SCHEMA, host_id="00000000-0000-0000-0000-000000000001",
+                 policy_revision=1,
                  application_root="/fixture/app", policy_sha256="a" * 64, plan_sha256="b" * 64,
                  signature="c" * 64, nonce="n" * 24, issued_at=now.isoformat(),
                  expires_at=(now + timedelta(minutes=10)).isoformat())
@@ -64,6 +65,14 @@ def test_binding_and_expiry_are_independent_gates():
         auth.validate_context(value, {"instance_uid": "other"})
     value["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     with pytest.raises(ValueError, match="expired"):
+        auth.validate_context(value, {})
+
+
+@pytest.mark.parametrize("revision", [True, False, "1", 1.0, None, -1])
+def test_policy_revision_requires_exact_json_integer(revision):
+    value = context()
+    value["policy_revision"] = revision
+    with pytest.raises(ValueError, match="types_invalid"):
         auth.validate_context(value, {})
 
 

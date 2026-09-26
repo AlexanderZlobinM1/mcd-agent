@@ -1,6 +1,6 @@
 {
   "schema": "mcc-mautic-release-authorization-v3",
-  "minimum_agent_version": "1.2.67",
+  "minimum_agent_version": "1.2.68",
   "required_runtime_capability": "mcc-mautic-release-authorization-v3",
   "policy_contract": "mcc-mautic-release-transition-v2",
   "same_line_compatibility": "mcc-mautic-release-authorization-v1",
@@ -36,7 +36,33 @@
     "source_line", "target_line", "install_type", "phase", "operation", "transition_id", "policy_revision",
     "policy_sha256", "plan_sha256", "transition_requirements"
   ],
+  "authorization_context_binding_field_types": {
+    "job_id": {"type": "string", "non_empty": true},
+    "patch_run_id": {"type": "string", "non_empty": true},
+    "host_id": {"type": "string", "format": "UUID"},
+    "instance_uid": {"type": "string", "non_empty": true},
+    "application_root": {"type": "string", "format": "absolute normalized path"},
+    "source_version": {"type": "string", "format": "exact stable MAJOR.MINOR.PATCH"},
+    "target_version": {"type": "string", "format": "exact stable MAJOR.MINOR.PATCH"},
+    "source_line": {"type": "string", "format": "MAJOR.MINOR"},
+    "target_line": {"type": "string", "format": "MAJOR.MINOR"},
+    "install_type": {"type": "string", "enum": ["composer", "zip"]},
+    "phase": {"type": "string", "enum": ["upgrade"]},
+    "operation": {"type": "string", "enum": ["apply"]},
+    "transition_id": {"type": "string", "format": "<source_line>-to-<target_line>"},
+    "policy_revision": {"type": "integer", "minimum": 0, "strict": true},
+    "policy_sha256": {"type": "string", "format": "lowercase SHA-256 hex"},
+    "plan_sha256": {"type": "string", "format": "lowercase SHA-256 hex"},
+    "transition_requirements": {"type": "object", "schema": "transition_requirements"}
+  },
   "authorization_context_envelope_fields": ["schema", "issued_at", "expires_at", "nonce", "signature"],
+  "authorization_context_envelope_field_types": {
+    "schema": {"type": "string", "enum": ["mcc-mautic-release-authorization-context-v2"]},
+    "issued_at": {"type": "string", "format": "timezone-aware ISO 8601 UTC"},
+    "expires_at": {"type": "string", "format": "timezone-aware ISO 8601 UTC"},
+    "nonce": {"type": "string", "format": "base64url token_urlsafe(18)"},
+    "signature": {"type": "string", "format": "lowercase HMAC-SHA256 hex"}
+  },
   "cross_line_response_echo_fields": [
     "schema", "job_id", "patch_run_id", "host_id", "instance_uid", "application_root", "source_version",
     "target_version", "source_line", "target_line", "install_type", "phase", "operation", "transition_id",
@@ -63,7 +89,7 @@
       "database_compatibility": "mautic7", "minimum_agent_version": "1.2.42",
       "requires_latest_source": true, "install_types": ["composer"], "phases": ["upgrade"]
     },
-    "validation": "MCC checks the context policy hash against current policy before returning; MCD rejects unknown fields, wrong JSON types, malformed versions and enum values, then enforces each requirement independently. The package-level 1.2.67 floor and runtime capability are separate from this per-edge minimum."
+    "validation": "MCC checks the context policy hash against current policy before returning; MCD rejects unknown fields, wrong JSON types, malformed versions and enum values, then enforces each requirement independently. The package-level 1.2.68 floor and runtime capability are separate from this per-edge minimum."
   },
   "same_line_target_only_legacy_allowed": true,
   "cross_line_legacy_fallback_allowed": false,

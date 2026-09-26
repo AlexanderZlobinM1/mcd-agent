@@ -84,7 +84,9 @@ def read_context(path: str, expected_sha256: str) -> dict[str, Any]:
 def validate_context(context: dict[str, Any], expected: dict[str, str], now: datetime | None = None) -> None:
     if set(context) != set(BINDINGS + ENVELOPE) or context["schema"] != CONTEXT_SCHEMA:
         raise ValueError("release_context_schema_mismatch")
-    if any(not isinstance(context[key], str) or not context[key] for key in BINDINGS + ENVELOPE if key != "transition_requirements"):
+    if (type(context["policy_revision"]) is not int or context["policy_revision"] < 0
+            or any(not isinstance(context[key], str) or not context[key]
+                   for key in BINDINGS + ENVELOPE if key not in {"transition_requirements", "policy_revision"})):
         raise ValueError("release_context_types_invalid")
     requirements = context["transition_requirements"]
     flags = {"requires_json_repair", "requires_backup", "system_upgrade_supported", "requires_latest_source"}

@@ -1,3 +1,8 @@
+## 1.2.68 - 2026-09-26
+
+- Accept the MCC authorization context's strict JSON integer policy revision without coercion.
+- Reject boolean, string, floating-point and null policy revisions before sending authorization requests.
+
 ## 1.2.67 - 2026-09-26
 
 - Consume private MCC release-authorization context-v2 and live authorization-v3 with exact immutable-plan and instance bindings.
