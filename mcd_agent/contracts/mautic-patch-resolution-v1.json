@@ -1,0 +1,206 @@
+{
+  "schema": "mcd-mautic-patch-resolution-v1",
+  "minimum_agent_version": "1.2.62",
+  "request_schema": "mcc-mautic-patch-resolve-v1",
+  "response_schema": "mcc-mautic-patch-resolved-v1",
+  "evidence_request_schema": "mcd-mautic-patch-evidence-v1",
+  "evidence_response_schema": "mcc-mautic-patch-evidence-accepted-v1",
+  "plan_schema": "mcd-mautic-patch-plan-v3",
+  "triggers": [
+    "daemon_reconcile",
+    "plugin_reload_failure",
+    "upgrade_lifecycle",
+    "operator_action"
+  ],
+  "operations": [
+    "status",
+    "verify",
+    "apply",
+    "rollback"
+  ],
+  "execution_kinds": [
+    "git_patch_v1",
+    "db_json_normalize_v1"
+  ],
+  "phases": [
+    "before_background_imports",
+    "before_cache_warmup",
+    "before_campaign_execution",
+    "before_doctrine_migrations",
+    "post_source_install",
+    "before_plugin_reload",
+    "dependency_update_preflight",
+    "before_asset_generation",
+    "preflight_frontend_assets",
+    "legacy_runtime_plugin_repair",
+    "image_build_before_packaging"
+  ],
+  "version_policy": {
+    "upgrade_lifecycle": "source_version must be lower than target_version",
+    "other_triggers": "source_version may equal target_version only for a selected remediation record; source_version greater than target_version is rejected",
+    "unknown_version": "an absent observed version is accepted only when the agent independently confirms the Mautic major, the active catalog explicitly allows unknown versions for the selected record, and all vulnerable source-signature gates match; otherwise return blocked/noop without mutation",
+    "authority": "MCC selects applicability from the active effective catalog; MCD independently validates the returned version relation and never supplies version-specific fallback"
+  },
+  "resolve_request_fields": [
+    "schema",
+    "mcc_host_name",
+    "hostname",
+    "instance_uid",
+    "observed_version",
+    "observed_major",
+    "target_version",
+    "install_type",
+    "trigger",
+    "phase",
+    "cached_catalog_revision",
+    "cached_catalog_sha256",
+    "agent_patch_contract"
+  ],
+  "resolve_response_fields": [
+    "schema",
+    "status",
+    "host_id",
+    "instance_uid",
+    "catalog_revision",
+    "catalog_sha256",
+    "registry_commit",
+    "registry_sha256",
+    "trigger",
+    "phase",
+    "source_version",
+    "target_version",
+    "install_type",
+    "plan_sha256",
+    "plan",
+    "reason"
+  ],
+  "resolve_status_values": [
+    "selected",
+    "noop",
+    "blocked"
+  ],
+  "plan_fields": [
+    "schema",
+    "registry_commit",
+    "registry_sha256",
+    "source_version",
+    "target_version",
+    "install_type",
+    "trigger",
+    "phase",
+    "operation",
+    "run_id",
+    "patches",
+    "payloads"
+  ],
+  "patch_record_required_fields": [
+    "id",
+    "execution_kind",
+    "phase_order",
+    "phases",
+    "gate"
+  ],
+  "patch_record_optional_fields": [
+    "source_paths",
+    "payload_path",
+    "parameters"
+  ],
+  "dependency_resolution": "MCC returns the effective selected records in validated dependency and phase_order order; MCD does not independently select IDs or infer dependencies",
+  "payload_contract": {
+    "git_patch_v1": "bounded UTF-8 or Git-binary patch bytes in payloads with exact SHA-256; paths must be declared, relative, root-contained, and symlink-safe; deletion and rename are rejected",
+    "db_json_normalize_v1": "typed declarative parameters only; no SQL, shell, PHP, or executable text; the agent validates identifiers and schema and executes only its fixed implementation"
+  },
+  "db_json_normalize_v1_parameters": {
+    "required": [
+      "table",
+      "column",
+      "predicate",
+      "replacement_json"
+    ],
+    "allowed_predicates": [
+      "null_or_empty_or_invalid_json"
+    ],
+    "replacement_json_must_parse": true,
+    "identifier_validation": "table and column must match the agent's strict identifier grammar and exist in the selected instance schema; values are parameter-bound",
+    "rollback": "persist row keys and original values; restore a row only if its current column value still equals the recorded replacement; otherwise fail closed"
+  },
+  "plugin_reload_retry_semantics": "before each plugin reload, run the catalog-selected db_json_normalize_v1 capability at most once when the instance database and declared column exist; if and only if reload fails with the exact plugin_update_metadata_array_null signature, run the same normalization once more and retry reload once; missing database/column means skip, and other errors are never retried",
+  "m6_runtime_remediation_semantics": "the daemon retains its current planning-cycle cadence; when observed_version is unknown, it may request a catalog-selected remediation only after independently confirming observed_major=6, and only the selected record may permit unknown version; the vulnerable source-signature gates still decide whether apply is safe",
+  "gate_kinds": [
+    "exact_count",
+    "path_state",
+    "sha256"
+  ],
+  "gate_groups": [
+    "vulnerable",
+    "fixed"
+  ],
+  "status_semantics": "read-only; evaluate selected-record gates and report already-correct, candidate, ambiguous, or blocked without writing files or database rows",
+  "verify_semantics": "read-only; validate the immutable selected plan, payload hashes, paths, source gates, and applicable patch preconditions without mutation",
+  "apply_semantics": "idempotent; atomically apply the selected phase; already-correct state is a no-op; partial, mixed, unknown, stale, unsafe-path, or payload-integrity state fails closed",
+  "rollback_semantics": "bound to run_id and the persisted immutable plan/hash; restore original bytes, mode, uid, and gid or remove a created file only if its current SHA-256 equals the recorded after SHA-256; database rows restore only when their current value equals the recorded replacement; drift is never overwritten",
+  "phase_atomicity": "runtime invocation is atomic per phase; upgrade preflight remains atomic across its declared internal phases; lifecycle phases are invoked separately by their owning workflow",
+  "evidence_schema": "mcd-mautic-patch-evidence-v1",
+  "evidence_fields": [
+    "schema",
+    "host_id",
+    "instance_uid",
+    "catalog_revision",
+    "catalog_sha256",
+    "registry_commit",
+    "registry_sha256",
+    "plan_sha256",
+    "trigger",
+    "phase",
+    "run_id",
+    "operation",
+    "started_at",
+    "completed_at",
+    "status",
+    "selected",
+    "records",
+    "rollback",
+    "agent_version"
+  ],
+  "evidence_record_fields": [
+    "id",
+    "execution_kind",
+    "decision",
+    "gates",
+    "before_sha256",
+    "after_sha256"
+  ],
+  "evidence_status_values": [
+    "success",
+    "noop",
+    "error"
+  ],
+  "evidence_report_request_fields": [
+    "schema",
+    "mcc_host_name",
+    "hostname",
+    "host_id",
+    "instance_uid",
+    "catalog_revision",
+    "catalog_sha256",
+    "plan_sha256",
+    "trigger",
+    "phase",
+    "run_id",
+    "evidence"
+  ],
+  "evidence_report_response_fields": [
+    "schema",
+    "evidence_id",
+    "status"
+  ],
+  "evidence_integrity": "MCC verifies the authenticated host owns instance_uid and verifies registry, catalog, and plan hashes before recording evidence",
+  "host_identity": "MCD sends its configured mcc_host_name and hostname; it never supplies MCC Host.id. MCC resolves host identity server-side, returns the derived host_id in the resolve response, and requires that UUID together with the host names on evidence submission.",
+  "cache_semantics": "catalog bytes are not an MCD source of truth; a cache hint is only catalog_revision plus catalog_sha256; a stale or unknown hint returns a complete immutable selected plan",
+  "max_plan_bytes": 33554432,
+  "max_payload_bytes": 16777216,
+  "install_types": [
+    "composer",
+    "zip"
+  ]
+}

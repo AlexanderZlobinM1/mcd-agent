@@ -1,0 +1,191 @@
+{
+  "resolve_request": {
+    "schema": "mcc-mautic-patch-resolve-v1",
+    "mcc_host_name": "fixture-mcc-host",
+    "hostname": "fixture.example",
+    "instance_uid": "fixture-instance-001",
+    "observed_version": "7.2.0",
+    "observed_major": 7,
+    "target_version": "7.2.0",
+    "install_type": "composer",
+    "trigger": "daemon_reconcile",
+    "phase": "before_plugin_reload",
+    "cached_catalog_revision": null,
+    "cached_catalog_sha256": null,
+    "agent_patch_contract": {
+      "schema": "mcd-mautic-patch-resolution-v1",
+      "plan_schema": "mcd-mautic-patch-plan-v3",
+      "evidence_schema": "mcd-mautic-patch-evidence-v1",
+      "triggers": [
+        "daemon_reconcile",
+        "plugin_reload_failure",
+        "upgrade_lifecycle",
+        "operator_action"
+      ],
+      "operations": [
+        "status",
+        "verify",
+        "apply",
+        "rollback"
+      ],
+      "execution_kinds": [
+        "git_patch_v1",
+        "db_json_normalize_v1"
+      ],
+      "phases": [
+        "before_background_imports",
+        "before_cache_warmup",
+        "before_campaign_execution",
+        "before_doctrine_migrations",
+        "post_source_install",
+        "before_plugin_reload",
+        "dependency_update_preflight",
+        "before_asset_generation",
+        "preflight_frontend_assets",
+        "legacy_runtime_plugin_repair",
+        "image_build_before_packaging"
+      ],
+      "gate_kinds": [
+        "exact_count",
+        "path_state",
+        "sha256"
+      ],
+      "max_plan_bytes": 33554432,
+      "max_payload_bytes": 16777216
+    }
+  },
+  "resolve_response": {
+    "schema": "mcc-mautic-patch-resolved-v1",
+    "status": "selected",
+    "host_id": "550e8400-e29b-41d4-a716-446655440000",
+    "instance_uid": "fixture-instance-001",
+    "catalog_revision": "fixture-catalog-rev-1",
+    "catalog_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "trigger": "daemon_reconcile",
+    "phase": "before_plugin_reload",
+    "source_version": "7.2.0",
+    "target_version": "7.2.0",
+    "install_type": "composer",
+    "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+    "plan": {
+      "schema": "mcd-mautic-patch-plan-v3",
+      "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "source_version": "7.2.0",
+      "target_version": "7.2.0",
+      "install_type": "composer",
+      "trigger": "daemon_reconcile",
+      "phase": "before_plugin_reload",
+      "operation": "apply",
+      "run_id": "fixture-m6-runtime-001",
+      "patches": [
+        {
+          "id": "FIXTURE-GENERIC-PATCH",
+          "execution_kind": "git_patch_v1",
+          "phase_order": 10,
+          "phases": [
+            "before_plugin_reload"
+          ],
+          "source_paths": [
+            "docroot/app/fixture.txt"
+          ],
+          "payload_path": "fixtures/generic.patch",
+          "gate_logic": "vulnerable_exactly_one; fixed_exactly_one; mixed_or_unknown=error",
+          "gate": [
+            {
+              "group": "vulnerable",
+              "kind": "exact_count",
+              "path": "docroot/app/fixture.txt",
+              "needle": "before",
+              "expected_count": 1
+            },
+            {
+              "group": "fixed",
+              "kind": "exact_count",
+              "path": "docroot/app/fixture.txt",
+              "needle": "after",
+              "expected_count": 1
+            }
+          ]
+        }
+      ],
+      "payloads": [
+        {
+          "path": "fixtures/generic.patch",
+          "sha256": "c3dc0996c8d48cc7a0655d96af80a418edfe387ef8aa71ca3425216b15bc5984",
+          "content_base64": "ZGlmZiAtLWdpdCBhL2RvY3Jvb3QvYXBwL2ZpeHR1cmUudHh0IGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKLS0tIGEvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKKysrIGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKQEAgLTEgKzEgQEAKLWJlZm9yZQorYWZ0ZXIK"
+        }
+      ]
+    }
+  },
+  "evidence_report_request": {
+    "schema": "mcd-mautic-patch-evidence-v1",
+    "mcc_host_name": "fixture-mcc-host",
+    "hostname": "fixture.example",
+    "host_id": "550e8400-e29b-41d4-a716-446655440000",
+    "instance_uid": "fixture-instance-001",
+    "catalog_revision": "fixture-catalog-rev-1",
+    "catalog_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+    "trigger": "daemon_reconcile",
+    "phase": "before_plugin_reload",
+    "run_id": "fixture-m6-runtime-001",
+    "evidence": {
+      "schema": "mcd-mautic-patch-evidence-v1",
+      "instance_uid": "fixture-instance-001",
+      "catalog_revision": "fixture-catalog-rev-1",
+      "catalog_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+      "trigger": "daemon_reconcile",
+      "phase": "before_plugin_reload",
+      "run_id": "fixture-m6-runtime-001",
+      "operation": "apply",
+      "started_at": "2026-09-26T10:00:00Z",
+      "completed_at": "2026-09-26T10:00:01Z",
+      "status": "success",
+      "selected": [
+        "FIXTURE-GENERIC-PATCH"
+      ],
+      "records": [
+        {
+          "id": "FIXTURE-GENERIC-PATCH",
+          "execution_kind": "git_patch_v1",
+          "decision": "applied",
+          "gates": [
+            {
+              "group": "vulnerable",
+              "kind": "exact_count",
+              "path": "docroot/app/fixture.txt",
+              "expected": 1,
+              "actual": 1
+            },
+            {
+              "group": "fixed",
+              "kind": "exact_count",
+              "path": "docroot/app/fixture.txt",
+              "expected": 1,
+              "actual": 0
+            }
+          ],
+          "before_sha256": "9160d4be34c8695bd172a76c7c7966587ea5a4d991ad22c87b2b91af54aa9ebb",
+          "after_sha256": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919"
+        }
+      ],
+      "rollback": {
+        "attempted": false,
+        "succeeded": true,
+        "reason": null
+      },
+      "agent_version": "1.2.62"
+    }
+  },
+  "evidence_report_response": {
+    "schema": "mcc-mautic-patch-evidence-accepted-v1",
+    "evidence_id": "fixture-evidence-001",
+    "status": "accepted"
+  }
+}
