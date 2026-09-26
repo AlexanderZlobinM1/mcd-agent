@@ -1,7 +1,31 @@
 {
   "schema": "mcd-mautic-patch-resolution-v1",
-  "minimum_agent_version": "1.2.65",
-  "features": {"typed_execution_context_v1": true, "facts_receipt_binding_v1": true},
+  "minimum_agent_version": "1.2.66",
+  "features": {"typed_execution_context_v1": true, "facts_receipt_binding_v1": true, "typed_context_preflight_v1": true},
+  "context_preflight_contract": {
+    "schema": "mcd-mautic-patch-context-v1",
+    "minimum_agent_version": "1.2.66",
+    "invocation": "mcd-cli mautic-patch-context --root CANONICAL_APPLICATION_ROOT --instance-uid SELECTED_UID --json [--config CONFIG]",
+    "transport": "existing authenticated per-host MCC SSH transport; exactly one selected instance per invocation",
+    "success_required_keys": ["schema", "agent_version", "features", "execution_context"],
+    "success_exit_code": 0,
+    "features": {"typed_context_preflight_v1": true},
+    "execution_context_required_keys": ["instance_uid", "application_root", "table_prefix"],
+    "failure_required_keys": ["schema", "agent_version", "features", "status", "code"],
+    "failure_status": "error",
+    "failure_codes": ["patch_context_selection_invalid", "patch_context_discovery_unavailable", "patch_context_unknown_or_mismatch"],
+    "failure_exit_code": 2,
+    "output": "stdout JSON only; exact fields, no database name, connection identity or credentials. Failure has no execution_context; unknown never supplies null/default context.",
+    "read_only": "read configuration/includes, discovered layout and explicit local PHP values only; do not use migrating/recovering config loader, record history, connect to DB, bootstrap app or run Mautic commands",
+    "selection": "requested root must already be the canonical absolute application root; reject aliases, symlinks/ambiguous layouts, parent traversal, mismatched UID, absent explicit prefix or local db_name inconsistency. Distinct roots sharing a database are distinct selections.",
+    "workflow": {
+      "enqueue": "fresh context preflight -> MCC authenticated selected Host/InstanceCache UID/root verification -> resolve and persist one immutable plan with exact context -> dispatch inline or private file+canonical SHA",
+      "retry_recovery": "fresh preflight -> compare selected instance and stored immutable context/hash -> dispatch same plan; do not resolve a new catalog or replace context after mutation",
+      "bulk": "separate preflight and immutable plan per selected instance/root; missing per-instance context is fail-closed, never reuse one prefix or plan for instance=all",
+      "rollback": "use same persisted immutable plan; explicit retry/rollback preflight must match its context; MCD independently rediscovers and observes fresh rollback barriers before any source restore",
+      "evidence": "require and independently validate typed facts_receipt at final upgrade evidence gate as well as authenticated evidence endpoint"
+    }
+  },
   "resolve_execution_context": {
     "required_keys": ["instance_uid", "application_root", "table_prefix"],
     "additional_properties": false,

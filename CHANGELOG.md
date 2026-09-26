@@ -1,3 +1,9 @@
+## 1.2.66 - 2026-09-26
+
+- Add read-only selected-instance context preflight for MCC immutable upgrade-plan issuance and redispatch validation.
+- Read discovery configuration without migration, recovery, history writes, database queries or Mautic bootstrap.
+- Publish per-instance context selection and enqueue/retry/bulk/rollback binding sequence.
+
 ## 1.2.65 - 2026-09-26
 
 - Supply independently discovered explicit instance context through authenticated patch resolution.

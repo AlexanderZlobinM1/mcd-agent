@@ -2201,6 +2201,12 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("--json", action="store_true")
     m6p.add_argument("--run-id", default="", help="Original catalog execution run for revert")
 
+    patch_context = sub.add_parser("mautic-patch-context", help="Read selected-instance context without mutation")
+    patch_context.add_argument("--config", default=default_cfg)
+    patch_context.add_argument("--root", required=True)
+    patch_context.add_argument("--instance-uid", required=True)
+    patch_context.add_argument("--json", action="store_true")
+
     patch_plan = sub.add_parser("mautic-patch-plan", help="Verify/apply a revision-pinned MCC Mautic patch plan")
     patch_plan.add_argument("op", choices=["contract", "status", "verify", "apply", "rollback"], nargs="?", default="contract")
     patch_plan.add_argument("--root")
@@ -4344,6 +4350,16 @@ def main() -> int:
         if (not ok) and "deferred" in str(msg).strip().lower():
             return 2
         return 0 if ok else 1
+
+    if args.cmd == "mautic-patch-context":
+        from mcd_agent.mautic_patch_context import preflight, error
+        try:
+            result = preflight(args.config, args.root, args.instance_uid)
+        except ValueError as exc:
+            print(json.dumps(error(str(exc)), ensure_ascii=True))
+            return 2
+        print(json.dumps(result, ensure_ascii=True))
+        return 0
 
     if args.cmd == "mautic-patch-backup-authorize":
         if args.plan_file:
