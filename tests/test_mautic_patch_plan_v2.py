@@ -56,7 +56,8 @@ def _plan(payload, record=None, **overrides):
 def test_v2_contract_is_additive_and_advertises_literal_gate_capability():
     contract = v1.contract()
     assert contract["schema"] == v1.PLAN_SCHEMA
-    assert v2.SCHEMA in contract["capabilities"]
+    assert "mautic-patch-plan-v2" in contract["capabilities"]
+    assert v2.EVIDENCE_SCHEMA in contract["capabilities"]
     capability = contract["patch_plan_v2"]
     assert capability["gate_kinds"] == ["exact_count"]
     assert capability["gate_groups"] == ["vulnerable", "fixed"]
@@ -97,6 +98,59 @@ def test_v2_explicit_missing_zero_count_gate_is_a_candidate(tmp_path):
     record = _record(_payload(), absent_gate=True)
     record["gate"][0]["path"] = "app/migrations/not-created-yet.php"
     assert v2._gate_results(root, record)[0] == "vulnerable"
+
+
+def test_v2_atomic_preflight_returns_first_phase_error_without_rollback_ledger(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    target = root / "app/example.php"
+    target.parent.mkdir(parents=True)
+    target.write_text("legacy\nfixed\n")
+    payload = _payload()
+    raw = _plan(payload)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    result = v2.atomic_preflight(str(root), raw)
+    assert result["status"] == "error"
+    assert result["rollback_attempted"] is False
+    assert result["rollback_succeeded"] is True
+    assert target.read_text() == "legacy\nfixed\n"
+
+
+def test_v2_rolls_back_every_file_in_a_multi_file_patch(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    first = root / "app/example.php"
+    second = root / "app/second.php"
+    first.parent.mkdir(parents=True)
+    first.write_text("legacy\n")
+    second.write_text("before\n")
+    payload = (
+        "diff --git a/app/example.php b/app/example.php\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/app/example.php\n+++ b/app/example.php\n@@ -1 +1 @@\n-legacy\n+fixed\n"
+        "diff --git a/app/second.php b/app/second.php\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/app/second.php\n+++ b/app/second.php\n@@ -1 +1 @@\n-before\n+after\n"
+    ).encode()
+    record = _record(payload)
+    record["source_paths"] = ["app/example.php", "app/second.php"]
+    raw = _plan(payload, record)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    original_gate = v2._gate_results
+    calls = 0
+
+    def fail_post_apply(source, patch_record):
+        nonlocal calls
+        calls += 1
+        return original_gate(source, patch_record) if calls == 1 else ("ambiguous_or_unknown", [])
+
+    monkeypatch.setattr(v2, "_gate_results", fail_post_apply)
+    result = v2.execute(str(root), raw)
+    assert result["status"] == "error"
+    assert result["rollback_attempted"] is True
+    assert result["rollback_succeeded"] is True
+    assert first.read_text() == "legacy\n"
+    assert second.read_text() == "before\n"
 
 
 def test_v2_fixed_signatures_win_when_vulnerable_absence_gate_still_matches(tmp_path):

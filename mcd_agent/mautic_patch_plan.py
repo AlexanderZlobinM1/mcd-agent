@@ -204,7 +204,7 @@ def _uses_v2(raw: str) -> bool:
 def contract() -> dict[str, Any]:
     from mcd_agent.mautic_patch_plan_v2 import capability as v2_capability
     return {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "minimum_agent_version": MINIMUM_AGENT_VERSION,
-            "capabilities": [PREFLIGHT_SCHEMA, PLAN_V2_SCHEMA], "patch_plan_v2": v2_capability(),
+            "capabilities": [PREFLIGHT_SCHEMA, "mautic-patch-plan-v2", v2_capability()["evidence_schema"]], "patch_plan_v2": v2_capability(),
             "source_version": "7.1.3", "target_version": "7.2.0", "install_types": ["zip", "composer"],
             "plugin_enabled_required": True,
             "patches": [{"id": key, **value, "conflicts_with": []} for key, value in _PATCHES.items()]}

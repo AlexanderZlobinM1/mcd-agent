@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 1.2.61 - 2026-09-26
+
+- Advertise the Mautic patch-plan v2 and preflight evidence capabilities only when the complete executor is available on supported host runtimes.
+- Include v2 evidence schema in the CLI contract and raise its minimum supported agent version to 1.2.61.
+- Preserve and restore every file in multi-file patches and return safe rollback evidence when atomic preflight fails before any phase is applied.
+
 ## 1.2.60 - 2026-09-25
 
 - Exclude mutable runtime logs, cache, spool, queue, temporary and session contents while retaining runtime directory metadata.

@@ -146,7 +146,11 @@ def test_atomic_preflight_success_is_complete_mcc_handoff(tmp_path, kind):
 def test_contract_advertises_atomic_preflight_capability():
     advertised = patch.contract()
     assert advertised["minimum_agent_version"] == "1.2.21"
-    assert advertised["capabilities"] == [patch.PREFLIGHT_SCHEMA, patch.PLAN_V2_SCHEMA]
+    assert advertised["capabilities"] == [
+        patch.PREFLIGHT_SCHEMA,
+        "mautic-patch-plan-v2",
+        "mcd-mautic-patch-preflight-v2",
+    ]
 
 
 def test_plan_checksum_uses_compact_sorted_canonical_json():

@@ -1,7 +1,7 @@
 {
   "schema": "mcd-mautic-patch-plan-v2",
   "evidence_schema": "mcd-mautic-patch-preflight-v2",
-  "minimum_agent_version": "1.2.51",
+  "minimum_agent_version": "1.2.61",
   "install_types": [
     "composer",
     "zip"

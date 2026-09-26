@@ -401,11 +401,13 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
         before = {}
         for relative in sorted(paths):
             path = _safe_file(source, relative)
-        if not path.is_file():
-            raise PatchPlanV2Error("patch_target_missing")
-        before[relative] = {"bytes": path.read_bytes(), "mode": stat.S_IMODE(path.stat().st_mode),
-                            "uid": path.stat().st_uid, "gid": path.stat().st_gid,
-                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            if not path.is_file():
+                raise PatchPlanV2Error("patch_target_missing")
+            data = path.read_bytes()
+            metadata = path.stat()
+            before[relative] = {"bytes": data, "mode": stat.S_IMODE(metadata.st_mode),
+                                "uid": metadata.st_uid, "gid": metadata.st_gid,
+                                "sha256": hashlib.sha256(data).hexdigest()}
         to_apply.append((record, gates, patch_bytes, paths, before))
     if any(item["decision"] == "error" for item in decisions):
         status = "error"
@@ -495,6 +497,7 @@ def atomic_preflight(root_value: str, raw_plan: str) -> dict[str, Any]:
         if result["status"] != "success":
             rollback_attempted = bool(result.get("rollback_attempted", False))
             rollback_succeeded = bool(result.get("rollback_succeeded", True))
+            rollback_result = {"status": "success"}
             for prior in reversed(phase_results[:-1]):
                 if any(item.get("decision") == "applied" for item in prior.get("patches", [])):
                     prior_object = dict(raw_object)

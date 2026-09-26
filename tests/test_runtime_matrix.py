@@ -3,6 +3,8 @@ from __future__ import annotations
 from mcd_agent.runtime_matrix import (
     CONTACT_FIELD_METADATA_OPERATION,
     MAUTIC_PATCH_PREFLIGHT_OPERATION,
+    MAUTIC_PATCH_PLAN_V2_CAPABILITY,
+    MAUTIC_PATCH_PREFLIGHT_V2_OPERATION,
     build_runtime_profile,
 )
 
@@ -30,6 +32,10 @@ def test_host_zip_supports_composer_move_but_host_composer_does_not() -> None:
     assert composer.allows("core-upgrade")
     assert zipped.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
     assert composer.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
+    assert zipped.allows(MAUTIC_PATCH_PLAN_V2_CAPABILITY)
+    assert zipped.allows(MAUTIC_PATCH_PREFLIGHT_V2_OPERATION)
+    assert composer.allows(MAUTIC_PATCH_PLAN_V2_CAPABILITY)
+    assert composer.allows(MAUTIC_PATCH_PREFLIGHT_V2_OPERATION)
     assert zipped.allows("backup")
     assert composer.allows("backup")
     assert zipped.allows(CONTACT_FIELD_METADATA_OPERATION)
@@ -61,6 +67,8 @@ def test_host_explicit_runtime_advertises_atomic_patch_preflight() -> None:
         )
         assert profile.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
         assert MAUTIC_PATCH_PREFLIGHT_OPERATION in profile.capabilities
+        assert MAUTIC_PATCH_PLAN_V2_CAPABILITY in profile.capabilities
+        assert MAUTIC_PATCH_PREFLIGHT_V2_OPERATION in profile.capabilities
         assert not profile.allows("core-upgrade")
 
     missing_filesystem = build_runtime_profile(
@@ -68,6 +76,18 @@ def test_host_explicit_runtime_advertises_atomic_patch_preflight() -> None:
     )
     assert not missing_filesystem.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
     assert MAUTIC_PATCH_PREFLIGHT_OPERATION not in missing_filesystem.capabilities
+    assert MAUTIC_PATCH_PLAN_V2_CAPABILITY not in missing_filesystem.capabilities
+    assert MAUTIC_PATCH_PREFLIGHT_V2_OPERATION not in missing_filesystem.capabilities
+
+
+def test_v2_capabilities_are_not_advertised_without_the_executor(monkeypatch) -> None:
+    monkeypatch.setattr("mcd_agent.runtime_matrix._patch_v2_executor_available", lambda: False)
+    profile = build_runtime_profile(runtime="host", install_type="zip")
+    assert profile.allows(MAUTIC_PATCH_PREFLIGHT_OPERATION)
+    assert not profile.allows(MAUTIC_PATCH_PLAN_V2_CAPABILITY)
+    assert not profile.allows(MAUTIC_PATCH_PREFLIGHT_V2_OPERATION)
+    assert MAUTIC_PATCH_PLAN_V2_CAPABILITY not in profile.capabilities
+    assert MAUTIC_PATCH_PREFLIGHT_V2_OPERATION not in profile.capabilities
 
 
 def test_docker_composer_uses_image_upgrade_and_explicit_plugin_capability() -> None:
