@@ -1,0 +1,71 @@
+{
+  "schema": "mcc-mautic-release-authorization-v3",
+  "minimum_agent_version": "1.2.67",
+  "required_runtime_capability": "mcc-mautic-release-authorization-v3",
+  "policy_contract": "mcc-mautic-release-transition-v2",
+  "same_line_compatibility": "mcc-mautic-release-authorization-v1",
+  "request_shape": {
+    "method": "POST",
+    "path": "/api/v1/agent/mautic/releases/authorize-transition",
+    "authenticated_with": "existing MCD agent Authorization header",
+    "exact_top_level_fields": ["authorization_context", "authorization_context_sha256"],
+    "context_transport": "root-owned regular temporary file, mode 0600, delivered over authenticated SSH stdin; removed by MCC EXIT trap",
+    "context_file_max_bytes": 16384,
+    "canonical_json": "UTF-8 json.dumps(sort_keys=True,separators=(',', ':'),ensure_ascii=True,allow_nan=False), no trailing LF",
+    "context_sha256": "SHA-256 over canonical complete context bytes including signature",
+    "signature": "HMAC-SHA256 hex over canonical context body excluding signature, key is MCC settings.jwt_secret and is never disclosed to MCD",
+    "timestamps": "timezone-aware ISO 8601 UTC; maximum lifetime 1800 seconds; issued_at may not exceed now by more than 30 seconds",
+    "nonce": "token_urlsafe(18); retries are idempotent only while the exact bound MCC job remains queued or running"
+  },
+  "response_shape": {
+    "exact_fields": ["status", "schema", "job_id", "patch_run_id", "host_id", "instance_uid", "application_root",
+      "source_version", "target_version", "source_line", "target_line", "install_type", "phase", "operation",
+      "transition_id", "policy_revision", "policy_sha256", "plan_sha256", "transition_requirements"],
+    "status": "authorized",
+    "schema": "mcc-mautic-release-authorization-v3",
+    "binding_rule": "every echoed binding field must equal the locally verified request context; response fields are not a source of authorization"
+  },
+  "phase_semantics": {
+    "transition_phase": "upgrade",
+    "patch_plan_phase": "dependency_update_preflight",
+    "meaning": "MCC authorizes the configured release transition at the upgrade phase; the immutable patch plan remains separately bound to its dependency_update_preflight audit phase"
+  },
+  "authorization_context_schema": "mcc-mautic-release-authorization-context-v2",
+  "authorization_context_binding_fields": [
+    "job_id", "patch_run_id", "host_id", "instance_uid", "application_root", "source_version", "target_version",
+    "source_line", "target_line", "install_type", "phase", "operation", "transition_id", "policy_revision",
+    "policy_sha256", "plan_sha256", "transition_requirements"
+  ],
+  "authorization_context_envelope_fields": ["schema", "issued_at", "expires_at", "nonce", "signature"],
+  "cross_line_response_echo_fields": [
+    "schema", "job_id", "patch_run_id", "host_id", "instance_uid", "application_root", "source_version",
+    "target_version", "source_line", "target_line", "install_type", "phase", "operation", "transition_id",
+    "policy_revision", "policy_sha256", "plan_sha256", "transition_requirements"
+  ],
+  "transition_requirements": {
+    "fields": [
+      "requires_json_repair", "requires_backup", "system_upgrade_supported", "database_compatibility",
+      "minimum_agent_version", "requires_latest_source", "install_types", "phases"
+    ],
+    "source": "exact MCC policy edge selected by the signed transition_id, policy_revision and policy_sha256",
+    "field_types_and_values": {
+      "requires_json_repair": {"type": "boolean", "strict": true},
+      "requires_backup": {"type": "boolean", "strict": true},
+      "system_upgrade_supported": {"type": "boolean", "strict": true},
+      "database_compatibility": {"type": "string", "enum": ["", "mautic7"], "empty_means": "no transition-specific database profile; retain ordinary MCD checks"},
+      "minimum_agent_version": {"type": "string", "format": "exact stable MAJOR.MINOR.PATCH or empty"},
+      "requires_latest_source": {"type": "boolean", "strict": true},
+      "install_types": {"type": "array<string>", "items_enum": ["composer", "zip"]},
+      "phases": {"type": "array<string>", "items_enum": ["upgrade"]}
+    },
+    "example": {
+      "requires_json_repair": true, "requires_backup": true, "system_upgrade_supported": true,
+      "database_compatibility": "mautic7", "minimum_agent_version": "1.2.42",
+      "requires_latest_source": true, "install_types": ["composer"], "phases": ["upgrade"]
+    },
+    "validation": "MCC checks the context policy hash against current policy before returning; MCD rejects unknown fields, wrong JSON types, malformed versions and enum values, then enforces each requirement independently. The package-level 1.2.67 floor and runtime capability are separate from this per-edge minimum."
+  },
+  "same_line_target_only_legacy_allowed": true,
+  "cross_line_legacy_fallback_allowed": false,
+  "context_max_age_seconds": 1800
+}

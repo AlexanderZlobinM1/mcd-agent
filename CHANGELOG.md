@@ -1,3 +1,10 @@
+## 1.2.67 - 2026-09-26
+
+- Consume private MCC release-authorization context-v2 and live authorization-v3 with exact immutable-plan and instance bindings.
+- Require explicit release-transition permission for every cross-line apply path; never fall back to target-only approval.
+- Select automatic patch targets only within the installed release line, and enforce signed repair, backup, database and installation prerequisites independently.
+- Advertise the versioned host execution capability and packaged wire contract without exposing authorization material.
+
 ## 1.2.66 - 2026-09-26
 
 - Add read-only selected-instance context preflight for MCC immutable upgrade-plan issuance and redispatch validation.

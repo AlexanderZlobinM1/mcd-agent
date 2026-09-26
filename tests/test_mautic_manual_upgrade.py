@@ -22,11 +22,11 @@ def invocation(tmp_path, monkeypatch):
     (root / "composer.lock").write_text('{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}')
     fixture = Path(__file__).parents[1] / "mcd_agent/contracts/fixtures/mautic-patch-resolution-v1.json"
     plan = json.loads(fixture.read_text())["resolve_response"]["plan"]
-    plan.update(source_version="7.1.3", target_version="7.2.0", trigger="upgrade_lifecycle", phase="dependency_update_preflight", run_id="manual-job-72")
+    plan.update(source_version="7.1.3", target_version="7.1.4", trigger="upgrade_lifecycle", phase="dependency_update_preflight", run_id="manual-job-72")
     plan["patches"][0]["triggers"] = ["upgrade_lifecycle"]
     plan["patches"][0]["phases"] = ["post_source_install"]
     monkeypatch.setattr(manual.os, "geteuid", lambda: 0)
-    return dict(root=str(root), install_root=str(root), current="7.1.3", target="7.2.0",
+    return dict(root=str(root), install_root=str(root), current="7.1.3", target="7.1.4",
                 mode="composer", raw_plan=json.dumps(plan), run_id="manual-job-72",
                 yes=True, allow_minor=True, allow_major=False, with_system_upgrade=False)
 
@@ -36,7 +36,7 @@ def test_exact_manual_invocation_is_valid(invocation):
 
 
 def test_manual_forward_same_major_latest_without_applicable_patch_is_valid(invocation):
-    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    invocation.update(target="7.1.5", raw_plan=None, run_id=None)
     manual.validate_preflighted_single_instance(**invocation)
 
 
@@ -55,8 +55,8 @@ def test_run_id_without_selected_patch_plan_is_rejected(invocation):
 
 @pytest.mark.parametrize("key,value", [
     ("root", None), ("root", "project"), ("root", "/"),
-    ("current", "7.1.2"), ("current", "7.2.0"), ("target", None),
-    ("target", "7.2.1"), ("target", "8.0.0"), ("mode", "auto"),
+    ("current", "7.1.2"), ("current", "7.1.4"), ("target", None),
+    ("target", "7.1.5"), ("target", "8.0.0"), ("mode", "auto"),
     ("mode", "zip"), ("raw_plan", None), ("raw_plan", "{}"),
     ("raw_plan", " " * 16385), ("run_id", None), ("run_id", ""),
     ("run_id", "../other"), ("run_id", "x" * 97), ("yes", False),
@@ -75,7 +75,7 @@ def test_non_root_rejected(invocation, monkeypatch):
 
 
 def test_same_version_has_stable_no_mutation_reason(invocation):
-    invocation.update(current="7.2.0", target="7.2.0")
+    invocation.update(current="7.1.4", target="7.1.4")
     with pytest.raises(manual.ManualUpgradePreflightError) as caught:
         manual.validate_preflighted_single_instance(**invocation)
     assert caught.value.reason == "target_already_installed"
@@ -129,6 +129,7 @@ def test_source_metadata_ambiguity_or_absence_rejected(invocation, missing):
 @dataclass
 class Install:
     root: str
+    instance_uid: str = "fixture-instance"
     console_path: str = "bin/console"
     runtime: str = "host"
     mautic_major: int = 7
@@ -188,14 +189,14 @@ def test_explicit_manual_flow_skips_both_callbacks(invocation, monkeypatch, kind
 
 
 def test_manual_latest_without_patch_plan_uses_regular_upgrade_path(invocation, monkeypatch):
-    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    invocation.update(target="7.1.5", raw_plan=None, run_id=None)
     args, events = wire_upgrade(invocation, monkeypatch)
     assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
     assert events == ["maintenance", "permissions", "install", "cleanup"]
 
 
 def test_same_major_upgrade_keeps_requested_baseline_backup(invocation, monkeypatch):
-    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    invocation.update(target="7.1.5", raw_plan=None, run_id=None)
     args, events = wire_upgrade(invocation, monkeypatch)
     args["do_backup"] = True
     monkeypatch.setattr(upgrade, "_backup_install", lambda *a: events.append("baseline_backup") or "verified-backup")
@@ -212,7 +213,7 @@ def test_ordinary_blocked_release_never_mutates_source(invocation, monkeypatch, 
 
 
 def test_ordinary_latest_above_pin_still_requires_release_authorization(invocation, monkeypatch):
-    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    invocation.update(target="7.1.5", raw_plan=None, run_id=None)
     args, events = wire_upgrade(invocation, monkeypatch)
     with pytest.raises(RuntimeError, match="not authorized"):
         upgrade.run_upgrade_apply(**args)
@@ -245,7 +246,7 @@ def test_same_version_manual_job_emits_terminal_rejection_before_maintenance(
     invocation, monkeypatch, capsys
 ):
     args, events = wire_upgrade(invocation, monkeypatch)
-    monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: "7.2.0")
+    monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: "7.1.4")
 
     with pytest.raises(manual.ManualUpgradePreflightError) as caught:
         upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True)
@@ -294,7 +295,7 @@ def test_cli_forwards_manual_flag_and_exact_job_fields(invocation, monkeypatch):
     monkeypatch.setattr(cli, "maybe_notify_update", lambda *a: None)
     monkeypatch.setattr(cli, "run_upgrade_apply", lambda **kw: captured.update(kw) or 2)
     monkeypatch.setattr("sys.argv", ["mcd-cli", "mautic-upgrade", "apply", "--root", invocation["root"],
-        "--mode", "composer", "--target", "7.2.0", "--allow-minor", "--yes",
+        "--mode", "composer", "--target", "7.1.4", "--allow-minor", "--yes",
         "--patch-plan-json", invocation["raw_plan"], "--patch-run-id", invocation["run_id"],
         "--mcc-preflighted-single-instance"])
     assert cli.main() == 2
@@ -302,3 +303,39 @@ def test_cli_forwards_manual_flag_and_exact_job_fields(invocation, monkeypatch):
     assert captured["root"] == invocation["root"]
     assert captured["patch_plan_json"] == invocation["raw_plan"]
     assert captured["patch_run_id"] == invocation["run_id"]
+
+
+@pytest.mark.parametrize("preflighted", [False, True])
+def test_cross_line_never_uses_minor_flag_or_preflight_as_authorization(invocation, monkeypatch, preflighted):
+    args, events = wire_upgrade(invocation, monkeypatch)
+    args["target_override"] = "7.2.0"
+    with pytest.raises(RuntimeError):
+        upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=preflighted)
+    assert events == []
+
+
+def test_cross_line_live_authorization_repeated_before_mutation(invocation, monkeypatch):
+    from mcd_agent import mautic_release_authorization as auth
+    args, events = wire_upgrade(invocation, monkeypatch)
+    plan = json.loads(args["patch_plan_json"])
+    plan["target_version"] = "7.2.0"
+    args.update(target_override="7.2.0", patch_plan_json=json.dumps(plan),
+                allow_release_transition=True, mcc_release_authorization_context_file="private-file",
+                mcc_release_authorization_context_sha256="a" * 64)
+    invocation["target"] = "7.2.0"
+    requirements = {"minimum_agent_version": "1.2.67", "install_types": ["composer"], "phases": ["upgrade"],
+                    "requires_backup": False, "requires_json_repair": False, "system_upgrade_supported": False,
+                    "requires_latest_source": True, "database_compatibility": ""}
+    monkeypatch.setattr(auth, "read_context", lambda *a: {"transition_requirements": requirements})
+    expected = []
+    def authorize(config, context, sha, binding):
+        expected.append(binding)
+        events.append("transition_authorization")
+    monkeypatch.setattr(auth, "authorize", authorize)
+    assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
+    assert events.count("transition_authorization") >= 4
+    assert events.index("transition_authorization") < events.index("maintenance")
+    assert events[events.index("permissions") - 1] == "transition_authorization"
+    assert events[events.index("install") - 1] == "transition_authorization"
+    assert all(row["phase"] == "upgrade" and row["patch_run_id"] == args["patch_run_id"] for row in expected)
+    assert "global_authorization" not in events

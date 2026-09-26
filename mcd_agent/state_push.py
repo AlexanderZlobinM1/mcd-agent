@@ -2172,6 +2172,7 @@ class MCCStatePusher:
         instances_snapshot_complete: bool = True,
     ) -> dict[str, Any]:
         identity = resolve_agent_identity(self.cfg)
+        from mcd_agent.mautic_release_authorization import runtime_capabilities as release_capabilities
         instances = []
         for i in installs:
             plugins = _collect_installed_plugins(i.root)
@@ -2199,7 +2200,7 @@ class MCCStatePusher:
                     ),
                     "runtime": str(i.runtime or "host").strip().lower() or "host",
                     "install_type": install_type,
-                    "runtime_capabilities": sorted(runtime_profile.capabilities),
+                    "runtime_capabilities": release_capabilities(i.runtime, install_type, runtime_profile.capabilities),
                     "runtime_adapter": str(i.runtime_adapter or ""),
                     "runtime_image_ref": str(i.runtime_image_ref or ""),
                     "runtime_profile": runtime_profile.safe_dict(),

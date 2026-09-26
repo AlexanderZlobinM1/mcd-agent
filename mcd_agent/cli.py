@@ -1888,6 +1888,9 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--target", help="Explicit target Mautic version")
     up.add_argument("--allow-minor", action="store_true", help="Allow a forward minor upgrade within the current major")
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
+    up.add_argument("--allow-release-transition", action="store_true", help="Request an explicitly MCC-authorized release-line transition")
+    up.add_argument("--mcc-release-authorization-context-file", default="")
+    up.add_argument("--mcc-release-authorization-context-sha256", default="")
     up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for an atomic patch stage")
     up.add_argument("--patch-plan-file", default="", help="Private host file containing a large immutable patch plan")
     up.add_argument("--patch-plan-sha256", default="", help="Expected canonical immutable plan SHA-256")
@@ -2202,6 +2205,7 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("--run-id", default="", help="Original catalog execution run for revert")
 
     patch_context = sub.add_parser("mautic-patch-context", help="Read selected-instance context without mutation")
+    sub.add_parser("mautic-release-contract", help="Print the packaged release authorization wire contract")
     patch_context.add_argument("--config", default=default_cfg)
     patch_context.add_argument("--root", required=True)
     patch_context.add_argument("--instance-uid", required=True)
@@ -3242,6 +3246,9 @@ def main() -> int:
             target_override=str(args.target or "").strip() or None,
             allow_minor=bool(args.allow_minor),
             allow_major=bool(args.allow_major),
+            allow_release_transition=bool(args.allow_release_transition),
+            mcc_release_authorization_context_file=str(args.mcc_release_authorization_context_file or ""),
+            mcc_release_authorization_context_sha256=str(args.mcc_release_authorization_context_sha256 or ""),
             patch_plan_json=str(args.patch_plan_json or "") or None,
             patch_run_id=str(args.patch_run_id or "") or None,
             repair_plan_json=str(args.repair_plan_json or "") or None,
@@ -4359,6 +4366,11 @@ def main() -> int:
             print(json.dumps(error(str(exc)), ensure_ascii=True))
             return 2
         print(json.dumps(result, ensure_ascii=True))
+        return 0
+
+    if args.cmd == "mautic-release-contract":
+        from mcd_agent.mautic_release_authorization import contract
+        print(json.dumps(contract(), ensure_ascii=True))
         return 0
 
     if args.cmd == "mautic-patch-backup-authorize":

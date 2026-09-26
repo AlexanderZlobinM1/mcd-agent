@@ -79,7 +79,7 @@ FALLBACK_BRANCH_TARGETS: dict[str, str] = {
     "5.1": "5.1.1",
     "5.2": "5.2.9",
     "6.0": "6.0.7",
-    "7": "7.1.3",
+    "7.1": "7.1.3",
 }
 
 PHP84_PACKAGE_SUFFIXES = [
@@ -332,10 +332,12 @@ def _release_targets(config: AgentConfig) -> dict[str, dict[str, str]]:
     return _release_targets_fallback()
 
 
-def _require_release_approval(config: AgentConfig, target: str) -> None:
+def _require_release_approval(config: AgentConfig, target: str, source_version: str = "") -> None:
     if not config.mcc_url:
         raise RuntimeError("Mautic upgrade requires a live MCC release approval")
-    url = config.mcc_url.rstrip("/") + "/api/v1/agent/mautic/releases/authorize?" + urlencode({"version": target})
+    if not source_version or _branch_key(source_version) != _branch_key(target):
+        raise RuntimeError("Cross-line apply requires bound release transition authorization")
+    url = config.mcc_url.rstrip("/") + "/api/v1/agent/mautic/releases/authorize?" + urlencode({"version": target, "source_version": source_version})
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {config.mcc_token}"})
     try:
         with urllib.request.urlopen(req, timeout=20) as response:
@@ -439,7 +441,7 @@ def _latest_same_branch(config: AgentConfig, version: str) -> str | None:
     candidates = [
         x
         for x in targets.keys()
-        if (_parse_semver(x)[0] == 7 and v[0] == 7) or _parse_semver(x)[:2] == v[:2]
+        if _branch_key(x) == _branch_key(version)
     ]
     if not candidates:
         return None
@@ -1886,6 +1888,9 @@ def run_upgrade_apply(
     patch_backup_context_file: str | None = None,
     repair_auth_key_file: str = "/etc/mcd/mcc-operation-signing.key",
     mcc_preflighted_single_instance: bool = False,
+    allow_release_transition: bool = False,
+    mcc_release_authorization_context_file: str = "",
+    mcc_release_authorization_context_sha256: str = "",
 ) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -1895,7 +1900,7 @@ def run_upgrade_apply(
     install_root, console = inst.root, inst.console_path
     current = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
     target = _clean_target_version(target_override)
-    if mcc_preflighted_single_instance:
+    if mcc_preflighted_single_instance and not allow_release_transition:
         from mcd_agent.mautic_manual_upgrade import ManualUpgradePreflightError, validate_preflighted_single_instance
         from mcd_agent.mautic_patch_plan import rejected_preflight
 
@@ -1917,33 +1922,66 @@ def run_upgrade_apply(
 
         validate_manual_invocation(current)
     if not target:
-        if allow_major and _parse_semver(current)[0] == 6:
-            target = str((_release_targets(config).get("7") or {}).get("version", ""))
-        else:
-            target = _latest_same_branch(config, current)
+        target = _latest_same_branch(config, current)
     if not target:
         print(f"No upgrade target for current version {current}")
         return 0
-    if not _ensure_upgrade_target_allowed(current, target, allow_minor=allow_minor, allow_major=allow_major):
+    cross_line = _branch_key(current) != _branch_key(target)
+    release_context = None
+    requirements = {}
+    if cross_line:
+        if not allow_release_transition or not yes or not root or root == "all":
+            raise RuntimeError("Cross-line upgrade requires explicit single-instance release transition authorization")
+        if _parse_semver(current) == (0, 0, 0) or _parse_semver(target) <= _parse_semver(current):
+            raise RuntimeError("Invalid release transition versions")
+        from mcd_agent.mautic_release_authorization import read_context, authorize
+        from mcd_agent.mautic_patch_plan import parse_plan
+        from mcd_agent.mautic_patch_resolution import canonical_json_sha256
+        from mcd_agent.mautic_patch_stage import application_root
+        authorization_plan = parse_plan(patch_plan_json or "")
+        if (authorization_plan.get("run_id") != patch_run_id or authorization_plan.get("source_version") != current
+                or authorization_plan.get("target_version") != target or authorization_plan.get("operation") != "apply"
+                or authorization_plan.get("trigger") != "upgrade_lifecycle"
+                or authorization_plan.get("phase") != "dependency_update_preflight"):
+            raise RuntimeError("Release transition immutable plan binding mismatch")
+        release_context = read_context(mcc_release_authorization_context_file, mcc_release_authorization_context_sha256)
+        actual_mode = detect_install_type(install_root) if mode == "auto" else mode
+        expected_release_binding = {
+            "instance_uid": inst.instance_uid, "application_root": str(application_root(install_root)),
+            "source_version": current, "target_version": target, "source_line": _branch_key(current),
+            "target_line": _branch_key(target), "install_type": actual_mode, "phase": "upgrade", "operation": "apply",
+            "patch_run_id": patch_run_id, "plan_sha256": canonical_json_sha256(authorization_plan),
+        }
+        if authorization_plan.get("install_type") != actual_mode:
+            raise RuntimeError("Release transition install binding mismatch")
+        def require_live_release_authorization():
+            authorize(config, release_context, mcc_release_authorization_context_sha256, expected_release_binding)
+        require_live_release_authorization()
+        requirements = release_context["transition_requirements"]
+        from mcd_agent import __version__
+        minimum = requirements["minimum_agent_version"]
+        if ((minimum and _parse_semver(__version__) < _parse_semver(minimum))
+                or actual_mode not in requirements["install_types"] or "upgrade" not in requirements["phases"]
+                or (requirements["requires_backup"] and not do_backup)
+                or (with_system_upgrade and not requirements["system_upgrade_supported"])
+                or (requirements["requires_json_repair"] and (not repair_plan_json or not repair_auth_context_file))):
+            raise RuntimeError("Release transition prerequisites are not satisfied")
+    elif not _ensure_upgrade_target_allowed(current, target):
         print(f"No upgrade target for current version {current}")
         return 0
 
-    if not mcc_preflighted_single_instance:
-        _require_release_approval(config, target)
+    if not cross_line and not mcc_preflighted_single_instance:
+        _require_release_approval(config, target, current)
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = detect_install_type(install_root)
-    if _parse_semver(current)[0] != _parse_semver(target)[0]:
-        if not (allow_major and _is_supported_major_upgrade(current, target) and chosen_mode == "composer"):
-            raise RuntimeError(
-                "Major upgrade is supported only for Composer Mautic 6 -> 7 with --allow-major"
-            )
+    if requirements.get("database_compatibility") == "mautic7":
         database_ok, database_reason = mautic7_database_compatibility(_database_state())
         if not database_ok:
             raise RuntimeError("Mautic 6 to 7 upgrade is blocked: " + database_reason)
         print("Mautic 7 database preflight: " + database_reason)
 
-    if _parse_semver(current)[0] == 6 and _parse_semver(target)[0] == 7:
+    if requirements.get("requires_json_repair"):
         preflight_rc = run_upgrade_preflight(
             config=config,
             root=install_root,
@@ -2046,6 +2084,8 @@ def run_upgrade_apply(
             return 0
 
     try:
+        if cross_line:
+            require_live_release_authorization()
         guard = _enter_upgrade_maintenance(config)
     except Exception:
         if target_stage is not None:
@@ -2056,7 +2096,9 @@ def run_upgrade_apply(
             from mcd_agent.mautic_patch_plan import _target_version
             target_stage.verify_original(_resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root,
                                          validated_patch_plan, _target_version)
-        if mcc_preflighted_single_instance:
+        if cross_line:
+            require_live_release_authorization()
+        if mcc_preflighted_single_instance and not cross_line:
             # Maintenance admission may take time. Recheck before permissions
             # alignment or reverting a core patch, which also mutate source.
             validate_manual_invocation(
@@ -2081,7 +2123,7 @@ def run_upgrade_apply(
             b = _backup_install(install_root)
             print(f"Backup created: {b}")
 
-        if _parse_semver(current)[0] == 6 and _parse_semver(target)[0] == 7:
+        if requirements.get("requires_json_repair"):
             repair_run_id = "json-repair-" + uuid4().hex
             if not repair_plan_json or not repair_auth_context_file:
                 repair_evidence = {
@@ -2131,12 +2173,16 @@ def run_upgrade_apply(
             config = replace(config, php_bin=rebind_php_after_system_upgrade(config.php_bin))
 
         if chosen_mode == "zip":
-            if not mcc_preflighted_single_instance:
-                _require_release_approval(config, target)
+            if cross_line:
+                require_live_release_authorization()
+            elif not mcc_preflighted_single_instance:
+                _require_release_approval(config, target, current)
             _apply_zip(config, install_root, console, config.php_bin, target, patch_hook)
         elif chosen_mode == "composer":
-            if not mcc_preflighted_single_instance:
-                _require_release_approval(config, target)
+            if cross_line:
+                require_live_release_authorization()
+            elif not mcc_preflighted_single_instance:
+                _require_release_approval(config, target, current)
             _apply_composer(install_root, console, config.php_bin, current, target, patch_hook)
         else:
             raise RuntimeError(f"Unsupported mode: {mode}")

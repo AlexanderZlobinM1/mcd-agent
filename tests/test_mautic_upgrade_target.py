@@ -74,15 +74,16 @@ class MauticUpgradeTargetTests(unittest.TestCase):
         self.assertEqual(_upgrade_target_relation("7.0.2", "8.0.0", allow_minor=True), "blocked_major")
         self.assertEqual(_upgrade_target_relation("7.0.2", "7.2.0", allow_minor=True), "allowed")
 
-    def test_mautic_seven_checker_uses_latest_release_across_minor_versions(self) -> None:
+    def test_checker_does_not_cross_release_lines_automatically(self) -> None:
         cfg = SimpleNamespace()
         targets = {
             "7.0.2": "https://example.test/7.0.2-update.zip",
+            "7.1.4": "https://example.test/7.1.4-update.zip",
             "7.2.0": "https://example.test/7.2.0-update.zip",
         }
         with patch("mcd_agent.mautic_upgrade._available_targets", return_value=targets):
-            self.assertEqual(_latest_same_branch(cfg, "7.0.2"), "7.2.0")
-            self.assertEqual(_latest_same_branch(cfg, "7.1.3"), "7.2.0")
+            self.assertIsNone(_latest_same_branch(cfg, "7.0.2"))
+            self.assertEqual(_latest_same_branch(cfg, "7.1.3"), "7.1.4")
 
     def test_non_seven_checker_remains_on_minor_branch(self) -> None:
         cfg = SimpleNamespace()
