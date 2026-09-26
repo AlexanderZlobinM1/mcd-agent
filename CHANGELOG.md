@@ -1,6 +1,8 @@
 ## 1.2.63 - 2026-09-26
 
 - Add the versioned MCC-resolved Mautic patch contract for generic runtime remediation.
+- Add authenticated resolved-plan/evidence transport with host, version, plan, and payload hash checks.
+- Add resolver transport regression coverage for auth, canonical hashes, and fail-closed request guards.
 
 # MCD Changelog
 
