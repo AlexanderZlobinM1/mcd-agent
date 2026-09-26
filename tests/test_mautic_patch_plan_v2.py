@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -53,15 +55,257 @@ def _plan(payload, record=None, **overrides):
     return json.dumps(plan, separators=(",", ":"))
 
 
+def _binary_create_patch(tmp_path, relative_path, content):
+    repo = tmp_path / "binary-patch-source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "MCD tests"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "mcd-tests@example.invalid"], cwd=repo, check=True)
+    target = repo / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    subprocess.run(["git", "add", "--", relative_path], cwd=repo, check=True)
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--binary", "--", relative_path],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return result.stdout
+
+
+def _binary_replace_patch(tmp_path, relative_path, old_content, new_content):
+    repo = tmp_path / "binary-patch-source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "MCD tests"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "mcd-tests@example.invalid"], cwd=repo, check=True)
+    target = repo / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(old_content)
+    subprocess.run(["git", "add", "--", relative_path], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+    target.write_bytes(new_content)
+    result = subprocess.run(
+        ["git", "diff", "--binary", "--", relative_path],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return result.stdout
+
+
+def _binary_record(payload, relative_path, *, old_sha256=None, new_sha256):
+    record = _record(payload)
+    record.update({
+        "id": "GENERIC-BINARY-ASSET",
+        "patch_path": "patches/generated-assets.patch",
+        "patch_sha256": hashlib.sha256(payload).hexdigest(),
+        "source_paths": [relative_path],
+        "gate": [],
+    })
+    if old_sha256 is None:
+        record["gate"].append({
+            "group": "vulnerable", "kind": "path_state", "path": relative_path,
+            "expected_state": "absent",
+        })
+    else:
+        record["gate"].extend([
+            {"group": "vulnerable", "kind": "path_state", "path": relative_path,
+             "expected_state": "present"},
+            {"group": "vulnerable", "kind": "sha256", "path": relative_path,
+             "expected_sha256": old_sha256},
+        ])
+    record["gate"].append({
+        "group": "fixed", "kind": "sha256", "path": relative_path,
+        "expected_sha256": new_sha256,
+    })
+    return record
+
+
 def test_v2_contract_is_additive_and_advertises_literal_gate_capability():
     contract = v1.contract()
     assert contract["schema"] == v1.PLAN_SCHEMA
     assert "mautic-patch-plan-v2" in contract["capabilities"]
     assert v2.EVIDENCE_SCHEMA in contract["capabilities"]
     capability = contract["patch_plan_v2"]
-    assert capability["gate_kinds"] == ["exact_count"]
+    assert capability["minimum_agent_version"] == "1.2.62"
+    assert capability["gate_kinds"] == ["exact_count", "path_state", "sha256"]
     assert capability["gate_groups"] == ["vulnerable", "fixed"]
-    assert capability["gate_semantics"] == "literal_substring_count"
+    assert capability["gate_semantics"]["exact_count"] == "literal_substring_count"
+    assert capability["gate_semantics"]["path_state"] == "root_relative_regular_file_absent_or_present"
+
+
+@pytest.mark.parametrize("state", ["absent", "already"])
+def test_v2_binary_create_verify_apply_hash_and_rollback(tmp_path, monkeypatch, state):
+    root = tmp_path / "mautic"
+    assets = root / "plugins" / "Bundle" / "Assets"
+    assets.mkdir(parents=True)
+    relative = "plugins/Bundle/Assets/engine.bin"
+    content = b"\x00binary-generated-asset\xff"
+    payload = _binary_create_patch(tmp_path, relative, content)
+    record = _binary_record(payload, relative, new_sha256=hashlib.sha256(content).hexdigest())
+    raw = _plan(payload, record)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    target = root / relative
+    if state == "already":
+        target.write_bytes(content)
+        result = v2.execute(str(root), raw)
+        assert result["status"] == "success"
+        assert result["patches"][0]["decision"] == "already"
+        assert target.read_bytes() == content
+        return
+    verify_plan = json.loads(raw)
+    verify_plan["operation"] = "verify"
+    verified = v2.execute(str(root), json.dumps(verify_plan))
+    assert verified["status"] == "success"
+    assert verified["patches"][0]["decision"] == "candidate"
+    assert not target.exists()
+    applied = v2.execute(str(root), raw)
+    assert applied["status"] == "success"
+    assert applied["patches"][0]["decision"] == "applied"
+    assert applied["patches"][0]["before_sha256"][relative] is None
+    assert applied["patches"][0]["after_sha256"][relative] == hashlib.sha256(content).hexdigest()
+    assert target.read_bytes() == content
+    rolled_back = v2.rollback(str(root), raw)
+    assert rolled_back["status"] == "success"
+    assert rolled_back["restored"] == [record["id"]]
+    assert not target.exists()
+
+
+def test_v2_binary_replacement_restores_existing_bytes_and_mode(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    relative = "plugins/Bundle/Assets/engine.bin"
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    old_content = b"\x00old-binary\xfe"
+    new_content = b"\x00new-binary\xff"
+    target.write_bytes(old_content)
+    target.chmod(0o640)
+    old_mode = target.stat().st_mode & 0o777
+    payload = _binary_replace_patch(tmp_path, relative, old_content, new_content)
+    record = _binary_record(
+        payload, relative, old_sha256=hashlib.sha256(old_content).hexdigest(),
+        new_sha256=hashlib.sha256(new_content).hexdigest(),
+    )
+    raw = _plan(payload, record)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    applied = v2.execute(str(root), raw)
+    assert applied["status"] == "success"
+    assert target.read_bytes() == new_content
+    rolled_back = v2.rollback(str(root), raw)
+    assert rolled_back["status"] == "success"
+    assert target.read_bytes() == old_content
+    assert target.stat().st_mode & 0o777 == old_mode
+
+
+def test_v2_atomic_preflight_rolls_back_created_file_after_later_phase_failure(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    assets = root / "plugins" / "Bundle" / "Assets"
+    assets.mkdir(parents=True)
+    first_path = "plugins/Bundle/Assets/first.bin"
+    second_path = "plugins/Bundle/Assets/second.bin"
+    first_content = b"\x00first"
+    second_content = b"\x00second"
+    first_payload = _binary_create_patch(tmp_path, first_path, first_content)
+    second_tmp = tmp_path / "other-patch"
+    second_tmp.mkdir()
+    second_payload = _binary_create_patch(second_tmp, second_path, second_content)
+    first_record = _binary_record(
+        first_payload, first_path, new_sha256=hashlib.sha256(first_content).hexdigest()
+    )
+    first_record["id"] = "GENERIC-BINARY-FIRST"
+    first_record["phase_order"] = 10
+    first_record["phases"] = ["post_source_install", "before_doctrine_migrations"]
+    second_record = _binary_record(
+        second_payload, second_path, old_sha256=hashlib.sha256(b"old").hexdigest(),
+        new_sha256=hashlib.sha256(second_content).hexdigest(),
+    )
+    second_record["id"] = "GENERIC-BINARY-SECOND"
+    second_record["patch_path"] = "patches/second-assets.patch"
+    second_record["phase_order"] = 20
+    second_record["phases"] = ["before_doctrine_migrations"]
+    plan = json.loads(_plan(first_payload, first_record))
+    plan["patches"].append(second_record)
+    plan["payloads"].append({
+        "path": second_record["patch_path"],
+        "sha256": second_record["patch_sha256"],
+        "content_base64": base64.b64encode(second_payload).decode(),
+    })
+    raw = json.dumps(plan, separators=(",", ":"))
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+
+    result = v2.atomic_preflight(str(root), raw)
+    assert result["status"] == "error"
+    assert result["rollback_attempted"] is True
+    assert result["rollback_succeeded"] is True
+    assert not (root / first_path).exists()
+    assert not (root / second_path).exists()
+
+
+def test_v2_rollback_does_not_overwrite_post_apply_changes(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    assets = root / "plugins" / "Bundle" / "Assets"
+    assets.mkdir(parents=True)
+    relative = "plugins/Bundle/Assets/engine.bin"
+    content = b"\x00expected"
+    payload = _binary_create_patch(tmp_path, relative, content)
+    record = _binary_record(payload, relative, new_sha256=hashlib.sha256(content).hexdigest())
+    raw = _plan(payload, record)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    assert v2.execute(str(root), raw)["status"] == "success"
+    target = root / relative
+    target.write_bytes(b"operator-change")
+    result = v2.rollback(str(root), raw)
+    assert result["status"] == "error"
+    assert result["rollback_succeeded"] is False
+    assert target.read_bytes() == b"operator-change"
+
+
+def test_v2_binary_partial_or_wrong_hash_fails_closed_without_mutation(tmp_path, monkeypatch):
+    root = tmp_path / "mautic"
+    relative = "plugins/Bundle/Assets/engine.bin"
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    partial = b"\x00partial-unknown"
+    target.write_bytes(partial)
+    expected = b"\x00expected"
+    payload = _binary_create_patch(tmp_path, relative, expected)
+    record = _binary_record(payload, relative, new_sha256=hashlib.sha256(expected).hexdigest())
+    raw = _plan(payload, record)
+    monkeypatch.setattr(v1, "_target_version", lambda _root: "7.2.1")
+    monkeypatch.setattr("mcd_agent.install_type.detect_install_type", lambda _root: "zip")
+    result = v2.execute(str(root), raw)
+    assert result["status"] == "error"
+    assert result["patches"][0]["reason"] == "ambiguous_or_unknown_gate"
+    assert target.read_bytes() == partial
+
+
+def test_v2_rejects_symlinked_gate_path(tmp_path):
+    root = tmp_path / "mautic"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "engine.bin").write_bytes(b"outside")
+    (root / "assets").symlink_to(outside, target_is_directory=True)
+    record = {
+        "gate": [
+            {"group": "vulnerable", "kind": "path_state", "path": "assets/engine.bin", "expected_state": "absent"},
+            {"group": "fixed", "kind": "sha256", "path": "assets/engine.bin", "expected_sha256": "a" * 64},
+        ]
+    }
+    with pytest.raises(v2.PatchPlanV2Error, match="source_path_symlink"):
+        v2._gate_results(root, record)
+
+
+def test_v2_accepts_large_binary_git_patch_payloads(tmp_path):
+    relative = "plugins/Bundle/Assets/generated.bin"
+    content = os.urandom(3_500_000)
+    payload = _binary_create_patch(tmp_path, relative, content)
+    assert len(payload) > 4_126_671
+    record = _binary_record(payload, relative, new_sha256=hashlib.sha256(content).hexdigest())
+    parsed = v2.parse_plan(_plan(payload, record))
+    assert len(parsed["_payload_map"][record["patch_path"]]) == len(payload)
 
 
 def test_plan_accepts_future_same_major_target_without_registry_target_pin():

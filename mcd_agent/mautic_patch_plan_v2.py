@@ -20,8 +20,8 @@ from typing import Any
 
 SCHEMA = "mcd-mautic-patch-plan-v2"
 EVIDENCE_SCHEMA = "mcd-mautic-patch-preflight-v2"
-MAX_PLAN_BYTES = 1_048_576
-MAX_PAYLOAD_BYTES = 131_072
+MAX_PLAN_BYTES = 32 * 1_048_576
+MAX_PAYLOAD_BYTES = 16 * 1_048_576
 PHASES = frozenset({
     "post_source_install",
     "before_doctrine_migrations",
@@ -88,6 +88,8 @@ def _range_matches(expression: str, target: tuple[int, int, int]) -> bool:
 def _safe_relative(value: Any) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise PatchPlanV2Error("unsafe_relative_path")
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise PatchPlanV2Error("unsafe_relative_path")
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise PatchPlanV2Error("unsafe_relative_path")
@@ -144,27 +146,49 @@ def _validate_record(record: Any, target: tuple[int, int, int], install_type: st
         raise PatchPlanV2Error("missing_signature_gates")
     groups: set[str] = set()
     for gate in gates:
-        if not isinstance(gate, dict) or not {"group", "kind", "path", "needle", "expected_count"}.issubset(gate) or set(gate) - {
-            "group", "kind", "path", "needle", "expected_count", "allow_missing_path"
-        }:
+        if not isinstance(gate, dict) or not {"group", "kind", "path"}.issubset(gate):
             raise PatchPlanV2Error("unsupported_gate_shape")
-        if gate["kind"] != "exact_count" or gate["group"] not in {"vulnerable", "fixed"}:
+        if gate["kind"] not in {"exact_count", "path_state", "sha256"} or gate["group"] not in {"vulnerable", "fixed"}:
             raise PatchPlanV2Error("unsupported_gate_kind_or_group")
-        if gate["group"] == "vulnerable":
-            groups.add("vulnerable")
-        if not isinstance(gate["needle"], str) or not gate["needle"]:
-            raise PatchPlanV2Error("invalid_literal_gate_needle")
-        if isinstance(gate["expected_count"], bool) or not isinstance(gate["expected_count"], int) or gate["expected_count"] < 0:
-            raise PatchPlanV2Error("invalid_gate_expected_count")
-        if "allow_missing_path" in gate and not isinstance(gate["allow_missing_path"], bool):
-            raise PatchPlanV2Error("invalid_allow_missing_path")
-        if gate.get("allow_missing_path") is True and gate["expected_count"] != 0:
-            raise PatchPlanV2Error("allow_missing_requires_zero_count")
-        if gate["group"] == "fixed" and gate["expected_count"] == 0:
-            raise PatchPlanV2Error("fixed_gate_must_be_positive")
+        groups.add(gate["group"])
+        if gate["kind"] == "exact_count":
+            allowed = {"group", "kind", "path", "needle", "expected_count", "allow_missing_path"}
+            if set(gate) - allowed or not {"needle", "expected_count"}.issubset(gate):
+                raise PatchPlanV2Error("unsupported_gate_shape")
+            if not isinstance(gate["needle"], str) or not gate["needle"]:
+                raise PatchPlanV2Error("invalid_literal_gate_needle")
+            if isinstance(gate["expected_count"], bool) or not isinstance(gate["expected_count"], int) or gate["expected_count"] < 0:
+                raise PatchPlanV2Error("invalid_gate_expected_count")
+            if "allow_missing_path" in gate and not isinstance(gate["allow_missing_path"], bool):
+                raise PatchPlanV2Error("invalid_allow_missing_path")
+            if gate.get("allow_missing_path") is True and gate["expected_count"] != 0:
+                raise PatchPlanV2Error("allow_missing_requires_zero_count")
+            if gate["group"] == "fixed" and gate["expected_count"] == 0:
+                raise PatchPlanV2Error("fixed_gate_must_be_positive")
+        elif gate["kind"] == "path_state":
+            if set(gate) != {"group", "kind", "path", "expected_state"} or gate["expected_state"] not in {"absent", "present"}:
+                raise PatchPlanV2Error("invalid_path_state_gate")
+        else:
+            if set(gate) != {"group", "kind", "path", "expected_sha256"} or not isinstance(gate["expected_sha256"], str) or not _HEX64.fullmatch(gate["expected_sha256"]):
+                raise PatchPlanV2Error("invalid_sha256_gate")
         gate["path"] = _safe_relative(gate["path"])
-    if "vulnerable" not in groups:
-        raise PatchPlanV2Error("missing_vulnerable_gate_group")
+    for gate in gates:
+        if gate["kind"] != "path_state":
+            continue
+        same_path_sha = [
+            item for item in gates
+            if item["kind"] == "sha256" and item["path"] == gate["path"]
+        ]
+        if not any(item["group"] == "fixed" for item in same_path_sha):
+            raise PatchPlanV2Error("path_state_requires_fixed_sha256_gate")
+        if (
+            gate["group"] == "vulnerable"
+            and gate["expected_state"] == "present"
+            and not any(item["group"] == "vulnerable" for item in same_path_sha)
+        ):
+            raise PatchPlanV2Error("present_vulnerable_path_requires_sha256_gate")
+    if groups != {"vulnerable", "fixed"}:
+        raise PatchPlanV2Error("missing_vulnerable_or_fixed_gate_group")
     return record
 
 
@@ -238,20 +262,25 @@ def parse_plan(raw: str) -> dict[str, Any]:
 
 
 def _safe_file(root: Path, relative: str) -> Path:
-    path = root.joinpath(*PurePosixPath(relative).parts)
+    path = root
+    for part in PurePosixPath(relative).parts:
+        path = path / part
+        if path.is_symlink():
+            raise PatchPlanV2Error("source_path_symlink")
     resolved = path.resolve(strict=False)
-    if root not in resolved.parents or path.is_symlink():
+    if resolved == root or root not in resolved.parents:
         raise PatchPlanV2Error("source_path_escape")
     return path
 
 
 def _patch_paths(data: bytes) -> set[str]:
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise PatchPlanV2Error("non_text_patch_unsupported") from exc
-    if "GIT binary patch" in text or "\nrename from " in text or "\nnew file mode " in text or "\ndeleted file mode " in text:
+    text = data.decode("utf-8", errors="surrogateescape")
+    if "\nrename from " in text or "\nrename to " in text or "\ndeleted file mode " in text or "\n+++ /dev/null" in text:
         raise PatchPlanV2Error("unsupported_patch_operation")
+    for line in text.splitlines():
+        if line.startswith(("new file mode ", "old mode ", "new mode ")):
+            if line.rsplit(" ", 1)[-1] not in {"100644", "100755"}:
+                raise PatchPlanV2Error("unsupported_patch_file_mode")
     pairs = _DIFF_PATH.findall(text)
     if not pairs:
         raise PatchPlanV2Error("invalid_unified_patch")
@@ -268,39 +297,65 @@ def _patch_paths(data: bytes) -> set[str]:
 def _gate_results(root: Path, record: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     counts: dict[str, list[bool]] = {"vulnerable": [], "fixed": []}
     evidence = []
+    vulnerable_positive_present = False
+    vulnerable_positive_paths: set[str] = set()
     for gate in record["gate"]:
         path = _safe_file(root, gate["path"])
-        if not path.is_file():
-            if gate.get("allow_missing_path") is not True or gate["expected_count"] != 0:
-                raise PatchPlanV2Error("source_gate_path_missing")
-            actual = 0
+        exists = path.exists()
+        if exists and not path.is_file():
+            raise PatchPlanV2Error("source_gate_not_regular_file")
+        row = {"group": gate["group"], "kind": gate["kind"], "path": gate["path"]}
+        if gate["kind"] == "exact_count":
+            if not exists:
+                if gate.get("allow_missing_path") is not True or gate["expected_count"] != 0:
+                    raise PatchPlanV2Error("source_gate_path_missing")
+                actual = 0
+            else:
+                try:
+                    contents = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as exc:
+                    raise PatchPlanV2Error("source_gate_read_failed") from exc
+                actual = contents.count(gate["needle"])
+            expected = gate["expected_count"]
+            matched = actual == expected
+            row.update({"needle_sha256": hashlib.sha256(gate["needle"].encode()).hexdigest(),
+                        "expected": expected, "actual": actual,
+                        "allow_missing_path": gate.get("allow_missing_path", False)})
+            if gate["group"] == "vulnerable" and expected > 0 and actual > 0:
+                vulnerable_positive_present = True
+                vulnerable_positive_paths.add(gate["path"])
+        elif gate["kind"] == "path_state":
+            actual_state = "present" if exists else "absent"
+            expected_state = gate["expected_state"]
+            matched = actual_state == expected_state
+            row.update({"expected_state": expected_state, "actual_state": actual_state})
         else:
-            try:
-                contents = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as exc:
-                raise PatchPlanV2Error("source_gate_read_failed") from exc
-            actual = contents.count(gate["needle"])
-        expected = gate["expected_count"]
-        counts[gate["group"]].append(actual == expected)
-        evidence.append({"group": gate["group"], "path": gate["path"],
-                         "needle_sha256": hashlib.sha256(gate["needle"].encode()).hexdigest(),
-                         "expected": expected, "actual": actual,
-                         "allow_missing_path": gate.get("allow_missing_path", False)})
+            actual_sha256 = _sha_file(path) if exists else None
+            expected_sha256 = gate["expected_sha256"]
+            matched = actual_sha256 == expected_sha256
+            row.update({"expected_sha256": expected_sha256, "actual_sha256": actual_sha256})
+            if gate["group"] == "vulnerable" and matched:
+                vulnerable_positive_present = True
+                vulnerable_positive_paths.add(gate["path"])
+        counts[gate["group"]].append(matched)
+        evidence.append(row)
     vuln_ok = bool(counts["vulnerable"]) and all(counts["vulnerable"])
-    fixed_evidence = [item for item in evidence if item["group"] == "fixed"]
-    fixed_ok = bool(fixed_evidence) and all(counts["fixed"])
-    fixed_zero = all(item["actual"] == 0 for item in fixed_evidence)
-    vulnerable_positive_present = any(
-        item["expected"] > 0 and item["actual"] > 0
-        for item in evidence if item["group"] == "vulnerable"
-    )
-    # Fixed signatures take precedence over vulnerable absence-gates, but
-    # simultaneous positive vulnerable/fixed signatures are a mixed tree.
+    fixed_ok = bool(counts["fixed"]) and all(counts["fixed"])
+    for gate, row in zip(record["gate"], evidence):
+        if gate["kind"] != "path_state" or gate["group"] != "vulnerable" or gate["expected_state"] != "present":
+            continue
+        fixed_hash_matches = any(
+            other["kind"] == "sha256" and other["group"] == "fixed" and other["path"] == gate["path"]
+            and other_row.get("actual_sha256") == other["expected_sha256"]
+            for other, other_row in zip(record["gate"], evidence)
+        )
+        if not fixed_hash_matches and gate["path"] not in vulnerable_positive_paths:
+            return "ambiguous_or_unknown", evidence
     if fixed_ok:
         if not vulnerable_positive_present:
             return "fixed", evidence
         return "ambiguous_or_unknown", evidence
-    if vuln_ok and (not fixed_evidence or fixed_zero):
+    if vuln_ok:
         return "vulnerable", evidence
     return "ambiguous_or_unknown", evidence
 
@@ -344,6 +399,9 @@ def _restore_snapshots(source: Path, snapshots: list[dict[str, Any]], expected_a
         if not path.is_file() or _sha_file(path) != expected_after.get(relative):
             ok = False
             continue
+        if snapshot.get("existed", True) is False:
+            path.unlink()
+            continue
         path.write_bytes(base64.b64decode(snapshot["content_base64"], validate=True))
         path.chmod(snapshot["mode"])
         if os.geteuid() == 0:
@@ -353,6 +411,16 @@ def _restore_snapshots(source: Path, snapshots: list[dict[str, Any]], expected_a
 
 def _sha_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _serialize_snapshot(relative: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    item: dict[str, Any] = {"path": relative, "existed": bool(snapshot.get("existed", True))}
+    if item["existed"]:
+        item.update({
+            "content_base64": base64.b64encode(snapshot["bytes"]).decode(),
+            "mode": snapshot["mode"], "uid": snapshot["uid"], "gid": snapshot["gid"],
+        })
+    return item
 
 
 def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
@@ -382,10 +450,6 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
             decisions.append({"id": record["id"], "decision": "error", "gates": gates,
                               "reason": "fixed_range_without_fixed_signature"})
             continue
-        if plan["operation"] == "verify":
-            decisions.append({"id": record["id"], "decision": "candidate", "gates": gates,
-                              "payload_sha256": record["patch_sha256"]})
-            continue
         paths = _patch_paths(payloads[record["patch_path"]])
         if not paths.issubset(set(record["source_paths"])):
             decisions.append({"id": record["id"], "decision": "error", "gates": gates,
@@ -398,16 +462,26 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
             decisions.append({"id": record["id"], "decision": "error", "gates": gates,
                               "reason": "patch_apply_check_failed"})
             continue
+        if plan["operation"] == "verify":
+            decisions.append({"id": record["id"], "decision": "candidate", "gates": gates,
+                              "payload_sha256": record["patch_sha256"]})
+            continue
         before = {}
         for relative in sorted(paths):
             path = _safe_file(source, relative)
-            if not path.is_file():
-                raise PatchPlanV2Error("patch_target_missing")
-            data = path.read_bytes()
-            metadata = path.stat()
-            before[relative] = {"bytes": data, "mode": stat.S_IMODE(metadata.st_mode),
-                                "uid": metadata.st_uid, "gid": metadata.st_gid,
-                                "sha256": hashlib.sha256(data).hexdigest()}
+            if path.exists():
+                if not path.is_file():
+                    raise PatchPlanV2Error("patch_target_not_regular_file")
+                data = path.read_bytes()
+                metadata = path.stat()
+                before[relative] = {"existed": True, "bytes": data,
+                                    "mode": stat.S_IMODE(metadata.st_mode),
+                                    "uid": metadata.st_uid, "gid": metadata.st_gid,
+                                    "sha256": hashlib.sha256(data).hexdigest()}
+            else:
+                if not path.parent.is_dir():
+                    raise PatchPlanV2Error("patch_parent_missing")
+                before[relative] = {"existed": False, "sha256": None}
         to_apply.append((record, gates, patch_bytes, paths, before))
     if any(item["decision"] == "error" for item in decisions):
         status = "error"
@@ -428,15 +502,18 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
                 decisions.append({"id": record["id"], "decision": "error", "gates": gates,
                                   "reason": "patch_apply_failed"})
                 break
-            after = {rel: _sha_file(_safe_file(source, rel)) for rel in paths}
+            after = {}
+            for rel in paths:
+                after_path = _safe_file(source, rel)
+                if not after_path.is_file():
+                    raise PatchPlanV2Error("patch_result_not_regular_file")
+                after[rel] = _sha_file(after_path)
             current, after_gates = _gate_results(source, record)
             if current != "fixed":
                 status = "error"
                 decisions.append({"id": record["id"], "decision": "error", "gates": after_gates,
                                   "reason": "post_apply_fixed_gate_failed"})
-                serialized = [{"path": rel, "content_base64": base64.b64encode(snap["bytes"]).decode(),
-                               "mode": snap["mode"], "uid": snap["uid"], "gid": snap["gid"]}
-                              for rel, snap in before.items()]
+                serialized = [_serialize_snapshot(rel, snap) for rel, snap in before.items()]
                 rollback_attempted = True
                 rollback_succeeded = _restore_snapshots(source, serialized, after)
                 break
@@ -446,8 +523,7 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
                               "after_sha256": after})
         if status == "error":
             for applied_item in reversed(applied):
-                serialized = [{"path": rel, "content_base64": base64.b64encode(snap["bytes"]).decode(),
-                               "mode": snap["mode"], "uid": snap["uid"], "gid": snap["gid"]}
+                serialized = [_serialize_snapshot(rel, snap)
                               for rel, snap in applied_item["before"].items()]
                 rollback_attempted = True
                 rollback_succeeded = _restore_snapshots(source, serialized, applied_item["after"]) and rollback_succeeded
@@ -458,8 +534,7 @@ def execute(root_value: str, raw_plan: str) -> dict[str, Any]:
                        "registry_commit": plan["registry_commit"], "registry_sha256": plan["registry_sha256"],
                        "target_version": plan["target_version"], "phase": plan["phase"], "run_id": plan["run_id"],
                        "applied": [{"id": item["record"]["id"],
-                                    "before": [{"path": rel, "content_base64": base64.b64encode(snap["bytes"]).decode(),
-                                                "mode": snap["mode"], "uid": snap["uid"], "gid": snap["gid"]}
+                                    "before": [_serialize_snapshot(rel, snap)
                                                for rel, snap in item["before"].items()],
                                     "after_sha256": item["after"]} for item in applied]}
         temporary = ledger.with_suffix(".tmp")

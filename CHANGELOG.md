@@ -1,5 +1,11 @@
 # MCD Changelog
 
+## 1.2.62 - 2026-09-26
+
+- Support bounded binary Git patch payloads and safe declared-file creation/replacement with exact before/after SHA-256 evidence.
+- Add generic absent/present path-state and exact SHA-256 gates; reject symlinked paths and ambiguous or partial source states before mutation.
+- Make verify run the same non-mutating patch/path checks as apply, and make rollback restore replaced files or remove created files only when recorded after hashes match.
+
 ## 1.2.61 - 2026-09-26
 
 - Advertise the Mautic patch-plan v2 and preflight evidence capabilities only when the complete executor is available on supported host runtimes.

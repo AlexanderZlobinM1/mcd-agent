@@ -1,7 +1,9 @@
 {
   "schema": "mcd-mautic-patch-plan-v2",
   "evidence_schema": "mcd-mautic-patch-preflight-v2",
-  "minimum_agent_version": "1.2.61",
+  "minimum_agent_version": "1.2.62",
+  "max_plan_bytes": 33554432,
+  "max_payload_bytes": 16777216,
   "install_types": [
     "composer",
     "zip"
@@ -13,19 +15,22 @@
     "before_doctrine_migrations",
     "post_source_install"
   ],
-  "gate_kinds": [
-    "exact_count"
-  ],
+  "gate_kinds": ["exact_count", "path_state", "sha256"],
   "gate_groups": [
     "vulnerable",
     "fixed"
   ],
-  "gate_semantics": "literal_substring_count",
+  "gate_semantics": {
+    "exact_count": "literal_substring_count",
+    "path_state": "root_relative_regular_file_absent_or_present",
+    "sha256": "exact_sha256_of_regular_file_bytes"
+  },
   "expected_count": {
     "minimum": 0,
     "allow_missing_path": "only true when expected_count is 0"
   },
-  "atomicity": "upgrade_preflight_atomic_across_post_source_install_and_before_doctrine_migrations; runtime invocation atomic per phase",
+  "atomicity": "upgrade_preflight_atomic_across_post_source_install_and_before_doctrine_migrations; runtime invocation atomic per phase; rollback restores original bytes and metadata or removes a created file only when current SHA-256 equals the recorded after hash",
+  "binary_payloads": "git binary patches are supported; created/replaced files must be declared in source_paths and pass root-relative symlink-safe path gates; delete and rename are rejected",
   "operations": [
     "apply",
     "verify"
@@ -92,14 +97,7 @@
     "candidate",
     "error"
   ],
-  "gate_row_fields": [
-    "group",
-    "path",
-    "needle_sha256",
-    "expected",
-    "actual",
-    "allow_missing_path"
-  ],
+  "gate_row_fields": ["group", "kind", "path", "needle_sha256", "expected", "actual", "allow_missing_path", "expected_state", "actual_state", "expected_sha256", "actual_sha256"],
   "phase_execution": {
     "upgrade_apply_initial_phase": "post_source_install",
     "upgrade_apply_internal_phases": [
