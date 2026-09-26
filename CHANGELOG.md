@@ -1,3 +1,9 @@
+## 1.2.65 - 2026-09-26
+
+- Supply independently discovered explicit instance context through authenticated patch resolution.
+- Reject typed plans whose context differs from the fresh request; preserve file-only compatibility when context is unknown.
+- Publish versioned context capability and precise typed receipt digest/binding verification contract.
+
 ## 1.2.64 - 2026-09-26
 
 - Add typed read-only integer-domain, filtered row-count and byte-exact migration-state observations.

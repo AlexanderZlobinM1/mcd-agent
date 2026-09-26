@@ -68,12 +68,30 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         self.assertEqual(payload["mcc_host_name"], "fixture-mcc-host")
         self.assertEqual(payload["agent_version"], __version__)
         self.assertIsNone(payload["target_version"])
+        self.assertNotIn("execution_context", payload)
+        self.assertTrue(payload["agent_patch_contract"]["features"]["typed_execution_context_v1"])
 
     def test_rejects_plan_hash_mismatch(self):
         response = json.loads(json.dumps(self.fixture["resolve_response"]))
         response["plan_sha256"] = "0" * 64
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "plan_sha256_mismatch"):
             self._resolve(response)
+
+    def test_typed_resolve_echoes_independent_context_and_rejects_drift(self):
+        context = {"instance_uid": "fixture-instance-001", "application_root": "/fixture/app", "table_prefix": "ss_"}
+        response = json.loads(json.dumps(self.fixture["resolve_response"]))
+        response["plan"]["execution_context"] = context
+        response["plan"]["patches"][0]["preconditions"] = [{
+            "kind": "column_integer_domain", "table_suffix": "roles", "column": "is_admin", "allowed_values": [0, 1]}]
+        response["plan_sha256"] = resolution.canonical_json_sha256(response["plan"])
+        with patch("mcd_agent.mautic_patch_fact_binding.discover_execution_context", return_value=context):
+            result, call = self._resolve(response)
+        self.assertEqual(result["plan"]["execution_context"], context)
+        self.assertEqual(json.loads(call.call_args.args[0].data)["execution_context"], context)
+        for fresh in (None, dict(context, table_prefix="other_"), dict(context, application_root="/other/app")):
+            with patch("mcd_agent.mautic_patch_fact_binding.discover_execution_context", return_value=fresh):
+                with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "execution_context_mismatch"):
+                    self._resolve(response)
 
     def test_rejects_unknown_record_fields(self):
         response = json.loads(json.dumps(self.fixture["resolve_response"]))

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import pytest
-from mcd_agent.mautic_patch_fact_binding import _select_instance, validate_context
+from mcd_agent.mautic_patch_fact_binding import _select_instance, validate_context, discover_execution_context
 from mcd_agent.mautic_patch_facts import PatchFactsError
 
 
@@ -44,3 +44,21 @@ def test_two_owner_roots_for_one_application_are_ambiguous(tmp_path):
 def test_malformed_records_fail_closed_with_stable_error():
     with pytest.raises(PatchFactsError, match="records_invalid"):
         validate_context({"patches": ["not-a-record"]})
+
+
+@pytest.mark.parametrize("prefix", ["", "ss_"])
+def test_resolve_context_requires_explicit_discovered_prefix(tmp_path, monkeypatch, prefix):
+    root = layout(tmp_path / "selected")
+    db = SimpleNamespace(table_prefix=prefix, name="fixture_db")
+    install = SimpleNamespace(root=str(root), instance_uid="uid", db=db, local_php_path="fixture.php")
+    config = SimpleNamespace(discovery_roots=[], exclude_path_contains=[], supported_mautic_majors=[], custom_instances=[])
+    monkeypatch.setattr("mcd_agent.discovery.discover_mautic", lambda *args: [install])
+    monkeypatch.setattr("mcd_agent.localphp.parse_local_php", lambda path: {"db_table_prefix": prefix, "db_name": "fixture_db"})
+    assert discover_execution_context(config, install) == {
+        "instance_uid": "uid", "application_root": str(root), "table_prefix": prefix}
+    monkeypatch.setattr("mcd_agent.localphp.parse_local_php", lambda path: {"db_name": "fixture_db"})
+    assert discover_execution_context(config, install) is None
+
+
+def test_resolve_context_never_invents_legacy_identity():
+    assert discover_execution_context(SimpleNamespace(), SimpleNamespace(instance_uid="uid")) is None

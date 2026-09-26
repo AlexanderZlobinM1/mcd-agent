@@ -190,6 +190,7 @@ def _agent_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
     }
     result["execution_kinds"] = [kind for kind in contract["execution_kinds"] if kind in _IMPLEMENTED_EXECUTION_KINDS]
     result["predicate_kinds"] = contract.get("predicate_kinds", [])
+    result["features"] = contract.get("features", {})
     return result
 
 
@@ -441,6 +442,10 @@ def resolve_plan(
         "cached_catalog_sha256": cached_catalog_sha256,
         "agent_patch_contract": _agent_capabilities(contract),
     }
+    from mcd_agent.mautic_patch_fact_binding import discover_execution_context, needs_facts
+    execution_context = discover_execution_context(config, install)
+    if execution_context is not None:
+        request_payload["execution_context"] = execution_context
     result = _post_json(config, "/agent/mautic-patches/resolve", request_payload)
     if result.get("schema") != RESPONSE_SCHEMA:
         raise MauticPatchResolutionError("mcc_patch_response_schema_mismatch")
@@ -468,6 +473,8 @@ def resolve_plan(
     if result.get("plan_sha256") != canonical_json_sha256(plan):
         raise MauticPatchResolutionError("mcc_patch_plan_sha256_mismatch")
     _validate_plan_records(plan, contract, trigger, phase)
+    if needs_facts(plan) and (execution_context is None or plan.get("execution_context") != execution_context):
+        raise MauticPatchResolutionError("mcc_plan_execution_context_mismatch")
     if plan.get("registry_commit") != result.get("registry_commit") or plan.get("registry_sha256") != result.get("registry_sha256"):
         raise MauticPatchResolutionError("mcc_plan_registry_mismatch")
     if plan.get("instance_uid") not in (None, instance_uid):

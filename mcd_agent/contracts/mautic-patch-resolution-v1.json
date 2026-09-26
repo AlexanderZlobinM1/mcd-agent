@@ -1,6 +1,51 @@
 {
   "schema": "mcd-mautic-patch-resolution-v1",
-  "minimum_agent_version": "1.2.64",
+  "minimum_agent_version": "1.2.65",
+  "features": {"typed_execution_context_v1": true, "facts_receipt_binding_v1": true},
+  "resolve_execution_context": {
+    "required_keys": ["instance_uid", "application_root", "table_prefix"],
+    "additional_properties": false,
+    "types": {"instance_uid": "nonempty string", "application_root": "canonical absolute application-root string", "table_prefix": "string: empty or [A-Za-z_][A-Za-z0-9_]{0,63}"},
+    "authority": "MCD independently discovers the selected instance and requires explicit local db_table_prefix and db_name matching discovery; missing/unknown context is omitted, never null or guessed. Empty prefix is allowed only when explicitly proved locally.",
+    "producer": "authenticated MCC verifies selected instance UID and canonical application root; typed plans require both advertised features and agent >=1.2.65, persist and echo exact request context. Missing or changed context blocks typed apply/rollback. Legacy file-only plans remain compatible.",
+    "consumer": "MCD rejects typed response context unequal to fresh request context and independently rediscovers it again during read-only observation; database identity is not an MCC-supplied input."
+  },
+  "predicate_array_schema": {"type": "array", "minItems": 1, "maxItems": 32, "logic": "AND", "absent": "no predicates", "null": "reject", "empty": "reject", "nested_groups": "reject"},
+  "facts_receipt_contract": {
+    "schema": "mcd-mautic-patch-facts-admission-v1",
+    "required_keys": ["schema", "observation_binding", "observations_sha256", "records", "invocation", "invocation_sha256"],
+    "additional_properties": false,
+    "canonicalization": {"encoding": "UTF-8", "sort_keys": true, "ensure_ascii": true, "separators": [",", ":"], "trailing_bytes_hex": "0a", "digest": "SHA-256 lowercase hex", "duplicate_keys": "reject", "nonfinite_numbers": "reject"},
+    "binding_required_keys": ["schema", "execution_context", "database_binding_sha256", "plan_sha256", "run_id", "source_version", "target_version", "trigger", "plan_phase", "observation"],
+    "observation_required_keys": ["schema", "database_identity", "database_identity_sha256", "table_prefix", "facts", "all_matched"],
+    "observation_schema": "mcd-mautic-patch-facts-v1",
+    "database_identity_required_keys": ["database_name", "server_version", "server_name", "server_port", "driver"],
+    "database_identity_types": {"database_name": "string", "server_version": "string", "server_name": "string", "server_port": "integer, not boolean", "driver": "mysql_protocol"},
+    "database_binding_sha256_input": {"driver": "mysql_protocol", "host": "independently discovered configured host string", "port": "configured integer port", "database": "independently discovered configured database name"},
+    "plan_sha256_input": "original immutable selected plan with operation replaced by apply; all other fields unchanged",
+    "observations_sha256_input": "complete observation_binding object",
+    "database_identity_sha256_input": "complete database_identity object",
+    "invocation_required_keys": ["operation", "phase"],
+    "invocation_sha256_input": "object with receipt equal to receipt minus invocation and invocation_sha256, operation equal to invocation.operation, phase equal to invocation.phase",
+    "ordered_facts": "visit patches in plan order, then preconditions before rollback_preconditions, preserving predicate order; deduplicate by canonical predicate SHA-256 at first occurrence. facts array must match this sequence exactly, including predicate objects.",
+    "fact_common_required_keys": ["predicate", "observed", "matched"],
+    "fact_kind_fields": {
+      "column_integer_domain": {"required_keys": ["predicate", "observed", "matched", "metadata"], "observed_required_keys": ["total", "null_count", "invalid_count"], "observed_types": "nonnegative integers, never boolean", "matched": "true only with null_count=invalid_count=0 and integer schema"},
+      "table_row_count": {"required_keys": ["predicate", "observed", "matched"], "observed_type": "nonnegative integer, never boolean", "matched": "recompute predicate comparison against observed"},
+      "migration_execution_state": {"required_keys": ["predicate", "observed", "matched", "exact_match_count", "storage_sha256", "metadata"], "observed_values": ["pending", "executed"], "exact_match_count": "0 for pending, 1 for executed; other values reject", "storage_sha256_input": "sorted complete verified UTF-8 FQCN storage value array", "matched": "observed equals predicate.expected"}
+    },
+    "metadata_required_keys": ["data_type", "column_type", "nullable", "charset", "collation", "engine"],
+    "records": "object keyed by exact selected patch IDs; each value has exactly preconditions and rollback_preconditions booleans, recomputed as conjunction over its mapped facts; absent list is empty conjunction true",
+    "independent_verification": [
+      "Require receipt for every typed selected plan; reject extra/missing keys, unknown schemas, wrong JSON types and noncanonical digests.",
+      "Bind execution_context to persisted immutable plan context and authenticated selected instance; observation.table_prefix equals context.table_prefix.",
+      "Recompute original apply plan digest; compare run_id/source_version/target_version/trigger/plan_phase to immutable plan, not mutable evidence fields.",
+      "Reconstruct ordered predicates from immutable plan; require exact fact predicate sequence and recompute matched booleans, records and all_matched.",
+      "Verify database_identity digest, observation_binding digest and invocation digest independently; invocation operation/phase must equal submitted evidence operation/phase and be permitted by the immutable plan workflow.",
+      "Configured endpoint digest and migration storage digest are host attestations: without independently known endpoint/storage bytes MCC cannot recompute them; do not claim otherwise. Pin database identity and endpoint digest to first accepted admission for this run and reject later drift.",
+      "Fresh admission/apply/rollback observation invariants are identical excluding invocation; conditional skips stay explicit. Successful phase is not proof that skipped patches were applied."
+    ]
+  },
   "plan_optional_fields": ["execution_context"],
   "execution_context_fields": ["instance_uid", "application_root", "table_prefix"],
   "predicate_kinds": ["column_integer_domain", "table_row_count", "migration_execution_state"],
@@ -70,7 +115,8 @@
     "run_id",
     "cached_catalog_revision",
     "cached_catalog_sha256",
-    "agent_patch_contract"
+    "agent_patch_contract",
+    "execution_context"
   ],
   "request_optional_fields": [
     "observed_version",
@@ -78,7 +124,8 @@
     "target_version",
     "run_id",
     "cached_catalog_revision",
-    "cached_catalog_sha256"
+    "cached_catalog_sha256",
+    "execution_context"
   ],
   "request_operation_semantics": "operation is required and must be one of status, verify, apply, rollback; run_id is required for rollback and optional for other operations; target_version is optional for non-upgrade triggers and MCC resolves it to the observed version",
   "resolve_response_fields": [

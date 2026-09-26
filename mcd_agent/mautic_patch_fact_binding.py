@@ -64,6 +64,31 @@ def require_receipt(accepted: dict[str, Any], current: dict[str, Any]) -> None:
         raise PatchFactsError("fact_admission_or_binding_drift")
 
 
+def discover_execution_context(config: Any, selected: Any) -> dict[str, str] | None:
+    """Supply a proven resolve context, never a discovery default or secret."""
+    from mcd_agent.discovery import discover_mautic
+    from mcd_agent.localphp import parse_local_php
+    from mcd_agent.mautic_patch_facts import _IDENT
+    root = getattr(selected, "root", None)
+    if not root or not hasattr(config, "discovery_roots"):
+        return None
+    try:
+        installs = discover_mautic(config.discovery_roots, config.exclude_path_contains,
+                                   config.supported_mautic_majors, config.custom_instances)
+        install, app = _select_instance(installs, root)
+        db = install.db
+        if install.instance_uid != selected.instance_uid or db is None or not install.local_php_path:
+            return None
+        local = parse_local_php(install.local_php_path)
+        prefix = local.get("db_table_prefix")
+        if (not isinstance(prefix, str) or (prefix and not _IDENT.fullmatch(prefix))
+                or prefix != db.table_prefix or local.get("db_name") != db.name):
+            return None
+        return {"instance_uid": install.instance_uid, "application_root": str(app), "table_prefix": prefix}
+    except (PatchFactsError, OSError, ValueError):
+        return None
+
+
 def bound_provider(config: Any, selected_root: str):
     """Rediscover the selected root on each observation; never trust plan DB data."""
     admitted_connection = None
