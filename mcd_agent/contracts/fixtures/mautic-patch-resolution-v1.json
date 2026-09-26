@@ -3,13 +3,16 @@
     "schema": "mcc-mautic-patch-resolve-v1",
     "mcc_host_name": "fixture-mcc-host",
     "hostname": "fixture.example",
+    "agent_version": "1.2.63",
     "instance_uid": "fixture-instance-001",
     "observed_version": "7.2.0",
     "observed_major": 7,
-    "target_version": "7.2.0",
+    "target_version": null,
     "install_type": "composer",
     "trigger": "daemon_reconcile",
     "phase": "before_plugin_reload",
+    "operation": "apply",
+    "run_id": "fixture-runtime-001",
     "cached_catalog_revision": null,
     "cached_catalog_sha256": null,
     "agent_patch_contract": {
@@ -68,7 +71,7 @@
     "source_version": "7.2.0",
     "target_version": "7.2.0",
     "install_type": "composer",
-    "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+    "plan_sha256": "4b4340be8c3bd6242ffca8eaf6ecaac4cefcdcc55a77f9cc31c2d0bb3399a2b2",
     "plan": {
       "schema": "mcd-mautic-patch-plan-v3",
       "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -79,11 +82,14 @@
       "trigger": "daemon_reconcile",
       "phase": "before_plugin_reload",
       "operation": "apply",
-      "run_id": "fixture-m6-runtime-001",
+      "run_id": "fixture-runtime-001",
       "patches": [
         {
           "id": "FIXTURE-GENERIC-PATCH",
           "execution_kind": "git_patch_v1",
+          "triggers": [
+            "daemon_reconcile"
+          ],
           "phase_order": 10,
           "phases": [
             "before_plugin_reload"
@@ -128,10 +134,10 @@
     "instance_uid": "fixture-instance-001",
     "catalog_revision": "fixture-catalog-rev-1",
     "catalog_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+    "plan_sha256": "4b4340be8c3bd6242ffca8eaf6ecaac4cefcdcc55a77f9cc31c2d0bb3399a2b2",
     "trigger": "daemon_reconcile",
     "phase": "before_plugin_reload",
-    "run_id": "fixture-m6-runtime-001",
+    "run_id": "fixture-runtime-001",
     "evidence": {
       "schema": "mcd-mautic-patch-evidence-v1",
       "instance_uid": "fixture-instance-001",
@@ -139,10 +145,10 @@
       "catalog_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "plan_sha256": "0d71b0858461f8697cebd80deedbf7b42630d25300b2e84a55541b803a5382a3",
+      "plan_sha256": "4b4340be8c3bd6242ffca8eaf6ecaac4cefcdcc55a77f9cc31c2d0bb3399a2b2",
       "trigger": "daemon_reconcile",
       "phase": "before_plugin_reload",
-      "run_id": "fixture-m6-runtime-001",
+      "run_id": "fixture-runtime-001",
       "operation": "apply",
       "started_at": "2026-09-26T10:00:00Z",
       "completed_at": "2026-09-26T10:00:01Z",

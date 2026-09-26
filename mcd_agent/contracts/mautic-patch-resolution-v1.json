@@ -1,6 +1,6 @@
 {
   "schema": "mcd-mautic-patch-resolution-v1",
-  "minimum_agent_version": "1.2.62",
+  "minimum_agent_version": "1.2.63",
   "request_schema": "mcc-mautic-patch-resolve-v1",
   "response_schema": "mcc-mautic-patch-resolved-v1",
   "evidence_request_schema": "mcd-mautic-patch-evidence-v1",
@@ -45,6 +45,7 @@
     "schema",
     "mcc_host_name",
     "hostname",
+    "agent_version",
     "instance_uid",
     "observed_version",
     "observed_major",
@@ -52,10 +53,21 @@
     "install_type",
     "trigger",
     "phase",
+    "operation",
+    "run_id",
     "cached_catalog_revision",
     "cached_catalog_sha256",
     "agent_patch_contract"
   ],
+  "request_optional_fields": [
+    "observed_version",
+    "observed_major",
+    "target_version",
+    "run_id",
+    "cached_catalog_revision",
+    "cached_catalog_sha256"
+  ],
+  "request_operation_semantics": "operation is required and must be one of status, verify, apply, rollback; run_id is required for rollback and optional for other operations; target_version is optional for non-upgrade triggers and MCC resolves it to the observed version",
   "resolve_response_fields": [
     "schema",
     "status",
@@ -96,6 +108,7 @@
   "patch_record_required_fields": [
     "id",
     "execution_kind",
+    "triggers",
     "phase_order",
     "phases",
     "gate"
@@ -103,8 +116,18 @@
   "patch_record_optional_fields": [
     "source_paths",
     "payload_path",
-    "parameters"
+    "parameters",
+    "allow_unknown_version",
+    "legacy_state"
   ],
+  "trigger_record_field": "triggers",
+  "scenario_migration_mapping": {
+    "existing_generic_upgrade_records": ["upgrade_lifecycle"],
+    "m6_metadata_null_file_patch": ["daemon_reconcile"],
+    "m7_import_tag_remediation": ["daemon_reconcile", "upgrade_lifecycle", "operator_action"],
+    "plugin_metadata_db_normalization": ["plugin_reload_failure"],
+    "m4_hostnet_transaction_action": "disabled_historical_only"
+  },
   "dependency_resolution": "MCC returns the effective selected records in validated dependency and phase_order order; MCD does not independently select IDs or infer dependencies",
   "payload_contract": {
     "git_patch_v1": "bounded UTF-8 or Git-binary patch bytes in payloads with exact SHA-256; paths must be declared, relative, root-contained, and symlink-safe; deletion and rename are rejected",
@@ -126,6 +149,45 @@
   },
   "plugin_reload_retry_semantics": "before each plugin reload, run the catalog-selected db_json_normalize_v1 capability at most once when the instance database and declared column exist; if and only if reload fails with the exact plugin_update_metadata_array_null signature, run the same normalization once more and retry reload once; missing database/column means skip, and other errors are never retried",
   "m6_runtime_remediation_semantics": "the daemon retains its current planning-cycle cadence; when observed_version is unknown, it may request a catalog-selected remediation only after independently confirming observed_major=6, and only the selected record may permit unknown version; the vulnerable source-signature gates still decide whether apply is safe",
+  "legacy_state_import_semantics": "when current source matches fixed gates, the agent may recognize a pre-v3 backup only through the selected record's declared legacy_state descriptor; it verifies declared relative paths, metadata marker/path fields when present, backup original SHA, current patched SHA, and vulnerable/fixed gates. Read-only status reports validated legacy rollback availability without writing. Apply or rollback may atomically import the snapshot into the generic ledger. Any mismatch fails closed; no legacy filename, marker, or patch ID is hardcoded in the executor.",
+  "legacy_state_descriptor_fields": [
+    "kind",
+    "backup_suffix",
+    "metadata_suffix",
+    "metadata_fields",
+    "expected_marker"
+  ],
+  "legacy_state_descriptor_kinds": [
+    "backup_file",
+    "backup_file_with_metadata"
+  ],
+  "legacy_state_descriptor_semantics": {
+    "suffixes": "suffixes are appended to the declared source path basename; they must be simple dot-prefixed filename suffixes with no slash, backslash, or parent traversal",
+    "backup_file": "metadata_suffix and expected_marker are null and metadata_fields is empty; both backup bytes and current bytes must independently satisfy the selected record vulnerable/fixed gates",
+    "backup_file_with_metadata": "metadata_suffix is required; metadata_fields maps semantic names marker, path, original_sha256, applied_sha256 to JSON object keys; expected_marker is a catalog value; source path, marker, original hash, applied hash, and both vulnerable/fixed gates must match",
+    "plan_presence": "legacy_state is returned on every selected record that declares it, including status and rollback plans; MCD never infers a descriptor from a patch ID or local filename"
+  },
+  "legacy_state_descriptor_examples": {
+    "m6_file_patch": {
+      "kind": "backup_file",
+      "backup_suffix": ".mcd-bak",
+      "metadata_suffix": null,
+      "metadata_fields": {},
+      "expected_marker": null
+    },
+    "m7_import_tag": {
+      "kind": "backup_file_with_metadata",
+      "backup_suffix": ".mcd-import-tag-713.bak",
+      "metadata_suffix": ".mcd-import-tag-713.json",
+      "metadata_fields": {
+        "marker": "patch",
+        "path": "path",
+        "original_sha256": "original_sha256",
+        "applied_sha256": "patched_sha256"
+      },
+      "expected_marker": "mautic-7.1.3-import-tag-detach-v1"
+    }
+  },
   "gate_kinds": [
     "exact_count",
     "path_state",

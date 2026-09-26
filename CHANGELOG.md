@@ -1,3 +1,7 @@
+## 1.2.63 - 2026-09-26
+
+- Add the versioned MCC-resolved Mautic patch contract for generic runtime remediation.
+
 # MCD Changelog
 
 ## 1.2.62 - 2026-09-26
