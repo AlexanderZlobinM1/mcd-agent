@@ -120,6 +120,50 @@
     "allow_unknown_version",
     "legacy_state"
   ],
+  "patch_record_field_allowlists": {
+    "git_patch_v1": {
+      "required": [
+        "id",
+        "execution_kind",
+        "triggers",
+        "phase_order",
+        "phases",
+        "gate",
+        "gate_logic",
+        "source_paths",
+        "payload_path"
+      ],
+      "optional": [
+        "parameters",
+        "allow_unknown_version",
+        "legacy_state"
+      ]
+    },
+    "db_json_normalize_v1": {
+      "required": [
+        "id",
+        "execution_kind",
+        "triggers",
+        "phase_order",
+        "phases",
+        "gate",
+        "parameters"
+      ],
+      "optional": [
+        "allow_unknown_version",
+        "legacy_state"
+      ]
+    },
+    "unknown_fields": "reject"
+  },
+  "payload_path_semantics": "git_patch_v1 payload_path is a safe root-independent relative key ending in .patch, with no empty, dot, dotdot, backslash, absolute, or drive-qualified component; it exactly matches one unique payloads[].path. db_json_normalize_v1 has no payload_path or payload object.",
+  "payload_fields": [
+    "path",
+    "sha256",
+    "content_base64"
+  ],
+  "payload_integrity": "base64 must decode strictly; decoded bytes must match lowercase SHA-256 and configured size limits before plan execution; payload paths are unique",
+  "selected_record_order": "patches are the exact MCC-selected list in dependency and phase_order order; MCD preserves the list and rejects duplicate IDs/paths or invalid order rather than sorting or selecting records locally",
   "trigger_record_field": "triggers",
   "scenario_migration_mapping": {
     "existing_generic_upgrade_records": ["upgrade_lifecycle"],
@@ -129,6 +173,7 @@
     "m4_hostnet_transaction_action": "disabled_historical_only"
   },
   "dependency_resolution": "MCC returns the effective selected records in validated dependency and phase_order order; MCD does not independently select IDs or infer dependencies",
+  "registry_identity": "registry_commit is the opaque 40-hex ID of the exact effective merged snapshot used for selection; registry_sha256 hashes the exact immutable bytes for that same effective snapshot. catalog_revision/catalog_sha256 separately identify MCC operator Assets provenance. Upstream-only registry provenance must use separately named fields and must not replace effective registry identity.",
   "payload_contract": {
     "git_patch_v1": "bounded UTF-8 or Git-binary patch bytes in payloads with exact SHA-256; paths must be declared, relative, root-contained, and symlink-safe; deletion and rename are rejected",
     "db_json_normalize_v1": "typed declarative parameters only; no SQL, shell, PHP, or executable text; the agent validates identifiers and schema and executes only its fixed implementation"
