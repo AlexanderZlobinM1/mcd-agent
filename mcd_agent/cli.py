@@ -1227,11 +1227,11 @@ def _run_mautic6_patch_menu(cfg, root: str | None) -> int:
                 continue
             for inst in installs:
                 if choice == "1":
-                    res = mautic6_patch_status(inst)
+                    res = mautic6_patch_status(inst, cfg)
                 elif choice == "2":
-                    res = ensure_m6_plugin_update_metadata_patch(inst)
+                    res = ensure_m6_plugin_update_metadata_patch(inst, cfg, trigger="operator_action")
                 else:
-                    res = revert_m6_plugin_update_metadata_patch(inst)
+                    res = revert_m6_plugin_update_metadata_patch(inst, cfg)
                 print(json.dumps(res, ensure_ascii=True, indent=2))
             if choice == "2":
                 _push_state_after_change(cfg, "mautic6-core-patch-apply")
@@ -1889,9 +1889,12 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--allow-minor", action="store_true", help="Allow a forward minor upgrade within the current major")
     up.add_argument("--allow-major", action="store_true", help="Allow the guarded Composer Mautic 6 to 7 upgrade flow")
     up.add_argument("--patch-plan-json", default="", help="Revision-pinned MCC Mautic patch plan for an atomic patch stage")
+    up.add_argument("--patch-plan-file", default="", help="Private host file containing a large immutable patch plan")
+    up.add_argument("--patch-plan-sha256", default="", help="Expected canonical immutable plan SHA-256")
     up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the atomic MCC patch-plan run")
     up.add_argument("--repair-plan-json", default="", help="Strict versioned JSON-schema repair plan")
     up.add_argument("--repair-auth-context-file", default="", help="Root-owned signed MCC authorization context file for JSON repair")
+    up.add_argument("--patch-backup-context-file", default="", help="Signed host-local backup attestation bound to the immutable v3 patch plan")
     up.add_argument("--repair-auth-key-file", default="/etc/mcd/mcc-operation-signing.key", help="Root-owned MCC operation signing key file")
     up.add_argument("--backup-manifest-path", default="", help="MCD backup marker path for authorize-repair")
     up.add_argument("--repair-auth-output-file", default="", help="Optional root-owned output path for authorize-repair context")
@@ -2196,20 +2199,33 @@ def _build_parser() -> argparse.ArgumentParser:
     m6p.add_argument("op", choices=["status", "apply", "revert", "policy"], nargs="?", default="status")
     m6p.add_argument("--policy", choices=["required", "off"], help="Policy value for op=policy")
     m6p.add_argument("--json", action="store_true")
+    m6p.add_argument("--run-id", default="", help="Original catalog execution run for revert")
 
     patch_plan = sub.add_parser("mautic-patch-plan", help="Verify/apply a revision-pinned MCC Mautic patch plan")
-    patch_plan.add_argument("op", choices=["contract", "verify", "apply", "rollback"], nargs="?", default="contract")
+    patch_plan.add_argument("op", choices=["contract", "status", "verify", "apply", "rollback"], nargs="?", default="contract")
     patch_plan.add_argument("--root")
     patch_plan.add_argument("--plan-json", default="")
+    patch_plan.add_argument("--plan-file", default="")
+    patch_plan.add_argument("--plan-sha256", default="")
     patch_plan.add_argument("--phase", default="")
     patch_plan.add_argument("--run-id", default="")
     patch_plan.add_argument("--json", action="store_true")
+    patch_backup = sub.add_parser("mautic-patch-backup-authorize", help="Bind a verified backup to an immutable upgrade patch plan")
+    patch_backup.add_argument("--root", required=True)
+    patch_backup.add_argument("--instance-uid", required=True)
+    patch_backup.add_argument("--plan-json", default="")
+    patch_backup.add_argument("--plan-file", default="")
+    patch_backup.add_argument("--plan-sha256", default="")
+    patch_backup.add_argument("--backup-evidence-json", required=True)
+    patch_backup.add_argument("--output-file", required=True)
+    patch_backup.add_argument("--signing-key-file", default="/etc/mcd/mcc-operation-signing.key")
 
     m713p = sub.add_parser("mautic713-import-tag-patch", help="Manage the reversible Mautic 7.0-7.2 import tag remediation")
     m713p.add_argument("--config", default=default_cfg)
     m713p.add_argument("--root", help="Instance root or instance uid (default: all)")
     m713p.add_argument("op", choices=["status", "apply", "revert"], nargs="?", default="status")
     m713p.add_argument("--json", action="store_true")
+    m713p.add_argument("--run-id", default="", help="Original catalog execution run for revert")
 
     assets = sub.add_parser("cluster-assets", help="Verify/sanitize cluster-shared Mautic plugins and app/bundles")
     assets.add_argument("--config", default=default_cfg)
@@ -3161,6 +3177,11 @@ def main() -> int:
             return 0 if str(payload.get("status")) == "ok" else 1
 
     if args.cmd == "mautic-upgrade":
+        if args.patch_plan_file:
+            if args.patch_plan_json:
+                raise RuntimeError("Choose exactly one patch plan transport")
+            from mcd_agent.mautic_patch_resolution import read_plan_file
+            args.patch_plan_json = read_plan_file(args.patch_plan_file, args.patch_plan_sha256)
         if args.mcc_preflighted_single_instance and args.op != "apply":
             print("--mcc-preflighted-single-instance is valid only with mautic-upgrade apply")
             return 2
@@ -3219,6 +3240,7 @@ def main() -> int:
             patch_run_id=str(args.patch_run_id or "") or None,
             repair_plan_json=str(args.repair_plan_json or "") or None,
             repair_auth_context_file=str(args.repair_auth_context_file or "") or None,
+            patch_backup_context_file=str(args.patch_backup_context_file or "") or None,
             repair_auth_key_file=str(args.repair_auth_key_file or "/etc/mcd/mcc-operation-signing.key"),
             mcc_preflighted_single_instance=bool(args.mcc_preflighted_single_instance),
         )
@@ -4323,7 +4345,25 @@ def main() -> int:
             return 2
         return 0 if ok else 1
 
+    if args.cmd == "mautic-patch-backup-authorize":
+        if args.plan_file:
+            if args.plan_json:
+                raise RuntimeError("Choose exactly one patch plan transport")
+            from mcd_agent.mautic_patch_resolution import read_plan_file
+            args.plan_json = read_plan_file(args.plan_file, args.plan_sha256)
+        from mcd_agent.mautic_patch_backup import issue
+        result = issue(plan=json.loads(args.plan_json), instance_uid=args.instance_uid,
+                       root=args.root, backup_evidence=json.loads(args.backup_evidence_json),
+                       key_path=args.signing_key_file, output_path=args.output_file)
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0
+
     if args.cmd == "mautic-patch-plan":
+        if args.plan_file:
+            if args.plan_json:
+                raise RuntimeError("Choose exactly one patch plan transport")
+            from mcd_agent.mautic_patch_resolution import read_plan_file
+            args.plan_json = read_plan_file(args.plan_file, args.plan_sha256)
         from mcd_agent.mautic_patch_plan import PatchPlanError, contract, execute, rollback
         if args.op == "contract":
             print(json.dumps(contract(), ensure_ascii=True, indent=2))
@@ -4367,11 +4407,11 @@ def main() -> int:
         rc = 0
         for inst in installs:
             if args.op == "status":
-                res = mautic6_patch_status(inst)
+                res = mautic6_patch_status(inst, cfg)
             elif args.op == "apply":
-                res = ensure_m6_plugin_update_metadata_patch(inst)
+                res = ensure_m6_plugin_update_metadata_patch(inst, cfg, trigger="operator_action")
             elif args.op == "revert":
-                res = revert_m6_plugin_update_metadata_patch(inst)
+                res = revert_m6_plugin_update_metadata_patch(inst, cfg, run_id=args.run_id or None)
             else:
                 raise RuntimeError(f"unsupported op: {args.op}")
             payload.append({"root": inst.root, "instance_uid": inst.instance_uid, "result": res})
@@ -4402,11 +4442,11 @@ def main() -> int:
         rc = 0
         for inst in installs:
             if args.op == "status":
-                res = mautic713_import_tag_patch_status(inst)
+                res = mautic713_import_tag_patch_status(inst, cfg)
             elif args.op == "apply":
-                res = ensure_mautic713_import_tag_patch(inst)
+                res = ensure_mautic713_import_tag_patch(inst, cfg, trigger="operator_action")
             elif args.op == "revert":
-                res = revert_mautic713_import_tag_patch(inst)
+                res = revert_mautic713_import_tag_patch(inst, cfg, run_id=args.run_id or None)
             else:
                 raise RuntimeError(f"unsupported op: {args.op}")
             payload.append({"root": inst.root, "instance_uid": inst.instance_uid, "result": res})

@@ -20,10 +20,14 @@ def invocation(tmp_path, monkeypatch):
     metadata.write_text('{"version":"7.1.3"}')
     (root / "composer.json").write_text('{"name":"mautic/recommended-project","require":{"mautic/core-lib":"7.1.3"}}')
     (root / "composer.lock").write_text('{"packages":[{"name":"mautic/core-lib","version":"7.1.3"}]}')
-    fixture = Path(__file__).parent / "fixtures/mautic_patch_plan/mcc-e74cdc2b-plan.json"
+    fixture = Path(__file__).parents[1] / "mcd_agent/contracts/fixtures/mautic-patch-resolution-v1.json"
+    plan = json.loads(fixture.read_text())["resolve_response"]["plan"]
+    plan.update(source_version="7.1.3", target_version="7.2.0", trigger="upgrade_lifecycle", phase="dependency_update_preflight", run_id="manual-job-72")
+    plan["patches"][0]["triggers"] = ["upgrade_lifecycle"]
+    plan["patches"][0]["phases"] = ["post_source_install"]
     monkeypatch.setattr(manual.os, "geteuid", lambda: 0)
     return dict(root=str(root), install_root=str(root), current="7.1.3", target="7.2.0",
-                mode="composer", raw_plan=fixture.read_text(), run_id="manual-job-72",
+                mode="composer", raw_plan=json.dumps(plan), run_id="manual-job-72",
                 yes=True, allow_minor=True, allow_major=False, with_system_upgrade=False)
 
 
@@ -103,7 +107,7 @@ def test_strict_patch_plan_rejected(invocation, mutation):
         elif mutation == "mode":
             plan["install_type"] = "zip"
         else:
-            plan["patches"].reverse()
+            plan["patches"].append(dict(plan["patches"][0]))
         invocation["raw_plan"] = json.dumps(plan)
     with pytest.raises(RuntimeError):
         manual.validate_preflighted_single_instance(**invocation)
@@ -140,6 +144,9 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
         plan["install_type"] = "zip"
         invocation.update(mode="zip", raw_plan=json.dumps(plan))
     events = []
+    monkeypatch.setattr("mcd_agent.mautic_patch_stage.application_root", lambda root: Path(root))
+    monkeypatch.setattr("mcd_agent.mautic_patch_plan_v3.verify_applied", lambda *a: {"status": "success"})
+    monkeypatch.setattr(upgrade, "_prepare_patch_target_stage", lambda *a: events.append("stage") or SimpleNamespace(close=lambda: None, verify_original=lambda *a: None))
     installed = [False]
     cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data",
                           mcc_url="https://mcc.example.test", mcc_token="test-shared-token")
@@ -177,14 +184,23 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
 def test_explicit_manual_flow_skips_both_callbacks(invocation, monkeypatch, kind):
     args, events = wire_upgrade(invocation, monkeypatch, kind)
     assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
-    assert events == ["maintenance", "permissions", "revert", "install", "cleanup"]
+    assert events == ["stage", "maintenance", "permissions", "install", "cleanup"]
 
 
 def test_manual_latest_without_patch_plan_uses_regular_upgrade_path(invocation, monkeypatch):
     invocation.update(target="7.2.1", raw_plan=None, run_id=None)
     args, events = wire_upgrade(invocation, monkeypatch)
     assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
-    assert events == ["maintenance", "permissions", "revert", "install", "cleanup"]
+    assert events == ["maintenance", "permissions", "install", "cleanup"]
+
+
+def test_same_major_upgrade_keeps_requested_baseline_backup(invocation, monkeypatch):
+    invocation.update(target="7.2.1", raw_plan=None, run_id=None)
+    args, events = wire_upgrade(invocation, monkeypatch)
+    args["do_backup"] = True
+    monkeypatch.setattr(upgrade, "_backup_install", lambda *a: events.append("baseline_backup") or "verified-backup")
+    assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
+    assert events.index("baseline_backup") < events.index("install")
 
 
 @pytest.mark.parametrize("kind", ["zip", "composer"])
@@ -261,7 +277,7 @@ def test_source_change_during_maintenance_aborts_before_first_mutation(invocatio
     monkeypatch.setattr(upgrade, "_enter_upgrade_maintenance", changed)
     with pytest.raises(RuntimeError):
         upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True)
-    assert events == ["maintenance", "cleanup"]
+    assert events == ["stage", "maintenance", "cleanup"]
 
 
 @pytest.mark.parametrize("operation", ["check", "interactive"])

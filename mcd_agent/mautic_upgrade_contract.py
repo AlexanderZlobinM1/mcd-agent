@@ -382,7 +382,7 @@ def inspect_json_schema_repair(
         "affected_columns": [],
         "json_validity": {"status": "not_checked", "columns": []},
         "backup_prerequisite": {
-            "required": True,
+            "required": _version_tuple(current_version)[0] == 6 and _version_tuple(target_version)[0] == 7,
             "satisfied": bool(backup_confirmed),
             "source": "mcc_backup_evidence" if backup_confirmed else "not_confirmed",
         },

@@ -1,0 +1,64 @@
+{
+  "schema": "mcd-mautic-patch-record-example-v3",
+  "record": {
+    "id": "FIXTURE-GENERIC-PATCH",
+    "execution_kind": "git_patch_v1",
+    "triggers": [
+      "daemon_reconcile"
+    ],
+    "phase_order": 10,
+    "phases": [
+      "before_plugin_reload"
+    ],
+    "source_paths": [
+      "docroot/app/fixture.txt"
+    ],
+    "payload_path": "fixtures/generic.patch",
+    "gate_logic": "vulnerable_all; fixed_all; mixed_or_unknown=error",
+    "gate": [
+      {
+        "group": "vulnerable",
+        "kind": "exact_count",
+        "path": "docroot/app/fixture.txt",
+        "needle": "before",
+        "expected_count": 1
+      },
+      {
+        "group": "vulnerable",
+        "kind": "path_state",
+        "path": "docroot/app/fixture.txt",
+        "expected_state": "present"
+      },
+      {
+        "group": "vulnerable",
+        "kind": "sha256",
+        "path": "docroot/app/fixture.txt",
+        "expected_sha256": "9160d4be34c8695bd172a76c7c7966587ea5a4d991ad22c87b2b91af54aa9ebb"
+      },
+      {
+        "group": "fixed",
+        "kind": "exact_count",
+        "path": "docroot/app/fixture.txt",
+        "needle": "after",
+        "expected_count": 1
+      },
+      {
+        "group": "fixed",
+        "kind": "path_state",
+        "path": "docroot/app/fixture.txt",
+        "expected_state": "present"
+      },
+      {
+        "group": "fixed",
+        "kind": "sha256",
+        "path": "docroot/app/fixture.txt",
+        "expected_sha256": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919"
+      }
+    ]
+  },
+  "payload": {
+    "path": "fixtures/generic.patch",
+    "sha256": "c3dc0996c8d48cc7a0655d96af80a418edfe387ef8aa71ca3425216b15bc5984",
+    "content_base64": "ZGlmZiAtLWdpdCBhL2RvY3Jvb3QvYXBwL2ZpeHR1cmUudHh0IGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKLS0tIGEvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKKysrIGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKQEAgLTEgKzEgQEAKLWJlZm9yZQorYWZ0ZXIK"
+  }
+}

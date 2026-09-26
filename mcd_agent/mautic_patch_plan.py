@@ -1,657 +1,107 @@
-"""Revision-pinned, fail-closed Mautic 7.2 host patch-plan adapter."""
+"""Generic catalog-plan dispatch; the embedded static v1 catalog is retired."""
 from __future__ import annotations
-
-import hashlib
 import json
-import os
 from pathlib import Path
 import re
-import subprocess
-import tempfile
 from typing import Any
 
-from mcd_agent.install_type import detect_install_type
-
-PLAN_SCHEMA = "mcd-mautic-patch-plan-v1"
+PLAN_SCHEMA = "mcd-mautic-patch-plan-v3"
 PLAN_V2_SCHEMA = "mcd-mautic-patch-plan-v2"
-REGISTRY_REVISION = "8829d322409c66f8ec9e9abf57c9ac42a19022cc"
-MINIMUM_AGENT_VERSION = "1.2.21"
 PREFLIGHT_SCHEMA = "mcd-mautic-patch-preflight-v1"
-ROLE = "M7-ROLE-PERMISSIONS-HYDRATED-ROW"
-ASSET = "M7-ASSET-MAPPER-WEBROOT"
-GRAPESJS = "M7-GRAPESJS-ASSET-PATH"
 _RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_ROLE_PATH = "app/migrations/Version20211209022550.php"
-_ROLE_720_VULNERABLE_SHA256 = "f970321517fa32eed01a031f5110f397e441bb049965efdbbeece7750df4d33c"
-_ROLE_720_FIXED_SHA256 = "b690b3cdd927a9b8257572cbb7bc42aba79f6c8b90d1ce39bac3154a928f2328"
-_BUNDLE_PATH = "app/bundles/CoreBundle/MauticCoreBundle.php"
-_ASSET_PATH = "app/bundles/CoreBundle/DependencyInjection/Compiler/AssetMapperWebRootPass.php"
-_ROLE_OLD = """        foreach ($roles as $role) {
-            $rawPermissions = $role->getRawPermissions();"""
-_ROLE_NEW = """        foreach ($roles as $roleResult) {
-            // RoleRepository adds a scalar user count to this query, so Doctrine
-            // hydrates each row as [Role, user_count] instead of Role.
-            $role = is_array($roleResult) ? ($roleResult[0] ?? null) : $roleResult;
-            if (!$role instanceof Role) {
-                continue;
-            }
-
-            $rawPermissions = $role->getRawPermissions();"""
-_BUNDLE_OLD = "        $container->addCompilerPass(new Compiler\\SystemThemeTemplatePathPass(), PassConfig::TYPE_BEFORE_REMOVING, 0);"
-_BUNDLE_NEW = _BUNDLE_OLD + "\n        $container->addCompilerPass(new Compiler\\AssetMapperWebRootPass(), PassConfig::TYPE_BEFORE_REMOVING, 0);"
-_ASSET_SOURCE = """<?php
-
-declare(strict_types=1);
-
-namespace Mautic\\CoreBundle\\DependencyInjection\\Compiler;
-
-use Mautic\\CoreBundle\\Loader\\ParameterLoader;
-use Symfony\\Component\\Config\\Resource\\FileResource;
-use Symfony\\Component\\DependencyInjection\\Compiler\\CompilerPassInterface;
-use Symfony\\Component\\DependencyInjection\\ContainerBuilder;
-
-final class AssetMapperWebRootPass implements CompilerPassInterface
-{
-    private const PUBLIC_ASSETS_PATH_RESOLVER_ID         = 'asset_mapper.public_assets_path_resolver';
-    private const LOCAL_PUBLIC_ASSETS_FILESYSTEM_ID      = 'asset_mapper.local_public_assets_filesystem';
-    private const COMPILED_ASSET_MAPPER_CONFIG_READER_ID = 'asset_mapper.compiled_asset_mapper_config_reader';
-    private const DEFAULT_PUBLIC_PREFIX                  = '/assets/build/';
-
-    public function process(ContainerBuilder $container): void
-    {
-        $webRoot = $this->resolveWebRoot($container);
-        if (!$webRoot) {
-            return;
-        }
-
-        if ($container->hasDefinition(self::LOCAL_PUBLIC_ASSETS_FILESYSTEM_ID)) {
-            $container->findDefinition(self::LOCAL_PUBLIC_ASSETS_FILESYSTEM_ID)->replaceArgument(0, $webRoot);
-        }
-
-        if (!$container->hasDefinition(self::COMPILED_ASSET_MAPPER_CONFIG_READER_ID)) {
-            return;
-        }
-
-        $publicPrefix = $this->resolvePublicPrefix($container);
-        $container->findDefinition(self::COMPILED_ASSET_MAPPER_CONFIG_READER_ID)
-            ->replaceArgument(0, $webRoot.'/'.ltrim($publicPrefix, '/'));
-    }
-
-    private function resolveWebRoot(ContainerBuilder $container): ?string
-    {
-        if ($container->hasParameter('mautic.local_root')) {
-            $localRoot = $container->getParameter('mautic.local_root');
-            if (is_string($localRoot) && '' !== trim($localRoot) && !str_contains($localRoot, '%env(')) {
-                return rtrim($localRoot, '/');
-            }
-        }
-
-        if (!$container->hasParameter('kernel.project_dir')) {
-            return null;
-        }
-
-        $projectDir = $container->getParameter('kernel.project_dir');
-        if (!is_string($projectDir) || '' === trim($projectDir)) {
-            return null;
-        }
-
-        $projectDir   = rtrim($projectDir, '/');
-        $composerFile = $projectDir.'/composer.json';
-        if (is_file($composerFile)) {
-            $container->addResource(new FileResource($composerFile));
-        }
-
-        return rtrim(ParameterLoader::getWebrootDir($projectDir), '/');
-    }
-
-    private function resolvePublicPrefix(ContainerBuilder $container): string
-    {
-        if (!$container->hasDefinition(self::PUBLIC_ASSETS_PATH_RESOLVER_ID)) {
-            return self::DEFAULT_PUBLIC_PREFIX;
-        }
-
-        $publicPrefix = $container->findDefinition(self::PUBLIC_ASSETS_PATH_RESOLVER_ID)->getArgument(0);
-        if (!is_string($publicPrefix) || '' === trim($publicPrefix)) {
-            return self::DEFAULT_PUBLIC_PREFIX;
-        }
-
-        return $publicPrefix;
-    }
-}
-"""
-_GRAPESJS_SERVICES_PATH = "plugins/GrapesJsBuilderBundle/Config/services.php"
-_GRAPESJS_SUBSCRIBER_PATH = "plugins/GrapesJsBuilderBundle/EventSubscriber/AssetsSubscriber.php"
-_GRAPESJS_MANIFEST_PATH = "plugins/GrapesJsBuilderBundle/Assets/library/js/dist/manifest.json"
-_GRAPESJS_BUILDER_PATH = "plugins/GrapesJsBuilderBundle/Assets/library/js/dist/builder.js"
-_GRAPESJS_DIST_DIR = "plugins/GrapesJsBuilderBundle/Assets/library/js/dist"
-_GRAPESJS_UPSTREAM_COMMIT = "c2d330569710d8175216c9dce325d5e525342484"
-_GRAPESJS_UPSTREAM_BASE = "4caf97414452cb02c08097c2fe3839670510d074"
-_GRAPESJS_SERVICES_OLD = "        ->bind('string $projectDir', '%kernel.project_dir%')\n"
-_GRAPESJS_SUBSCRIBER_OLD = """use Mautic\\CoreBundle\\Event\\CustomAssetsEvent;
-use Mautic\\InstallBundle\\Install\\InstallService;"""
-_GRAPESJS_SUBSCRIBER_NEW = """use Mautic\\CoreBundle\\Event\\CustomAssetsEvent;
-use Mautic\\CoreBundle\\Helper\\PathsHelper;
-use Mautic\\InstallBundle\\Install\\InstallService;"""
-_GRAPESJS_CLASS_OLD = """    private const ASSET_DIR = 'plugins/GrapesJsBuilderBundle/Assets/library/js/dist';
-
-    public function __construct(
-        private Config $config,
-        private InstallService $installer,
-        private RequestStack $requestStack,
-        private string $projectDir,
-        private LoggerInterface $logger,
-    ) {"""
-_GRAPESJS_CLASS_NEW = """    private const ASSET_DIR = 'GrapesJsBuilderBundle/Assets/library/js/dist';
-
-    public function __construct(
-        private Config $config,
-        private InstallService $installer,
-        private RequestStack $requestStack,
-        private PathsHelper $pathsHelper,
-        private LoggerInterface $logger,
-    ) {"""
-_GRAPESJS_PATH_OLD = "        $assetDir = $this->projectDir.'/'.self::ASSET_DIR;"
-_GRAPESJS_PATH_NEW = "        $assetDir = $this->pathsHelper->getPluginsPath().'/'.self::ASSET_DIR;"
-_GRAPESJS_RESOLVE_PATH_OLD = "        $assetDir     = $this->projectDir.'/'.self::ASSET_DIR;"
-_GRAPESJS_RESOLVE_PATH_NEW = "        $assetDir     = $this->pathsHelper->getPluginsPath().'/'.self::ASSET_DIR;"
-_GRAPESJS_SCRIPT_OLD = "self::ASSET_DIR.'/'.$js"
-_GRAPESJS_SCRIPT_NEW = "'plugins/'.self::ASSET_DIR.'/'.$js"
-_GRAPESJS_STYLE_OLD = "self::ASSET_DIR.'/'.$css"
-_GRAPESJS_STYLE_NEW = "'plugins/'.self::ASSET_DIR.'/'.$css"
-_GRAPESJS_SERVICES_VULNERABLE_SHA256 = "a9e6de6bc58134c42ef406d0b6839020a8f288600a0422f05f99ef8cd31c5429"
-_GRAPESJS_SERVICES_FIXED_SHA256 = "a6dee7979c9f971af9af1339e3a1330e5edd268ddd4533814e17d6bf3cd43f8d"
-_GRAPESJS_SUBSCRIBER_VULNERABLE_SHA256 = "79df8ca8595e4fd4ffa94d2b6ee83009146b128f2d6df5a73ae2801b85bc0ea4"
-_GRAPESJS_SUBSCRIBER_FIXED_SHA256 = "5618b2c53ef314d80079e66cb3bd0c68b064aa09753422b4be4164b7b813cf9d"
-_PATCHES = {
-    ROLE: {"phase_order": 10, "phases": ["post_source_install", "before_doctrine_migrations"], "depends_on": []},
-    ASSET: {"phase_order": 20, "phases": ["post_source_install_before_asset_generation"], "depends_on": [ROLE]},
-    GRAPESJS: {
-        "phase_order": 30,
-        "phases": ["post_source_install_before_asset_generation"],
-        "depends_on": [ASSET],
-        "affected_ranges": ["=7.2.0"],
-        "fixed_ranges": [">=7.2.1"],
-        "upstream_commit": _GRAPESJS_UPSTREAM_COMMIT,
-        "upstream_base": _GRAPESJS_UPSTREAM_BASE,
-        "plugin": "GrapesJsBuilderBundle",
-        "plugin_enabled_required": True,
-        "asset_paths": [_GRAPESJS_MANIFEST_PATH, _GRAPESJS_BUILDER_PATH, _GRAPESJS_DIST_DIR + "/builder.*.css"],
-    },
-}
 
 
 class PatchPlanError(RuntimeError):
     pass
 
 
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _plan_sha(plan: dict[str, Any]) -> str:
-    canonical = json.dumps(plan, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return _sha(canonical.encode("utf-8"))
-
-
-def _uses_v2(raw: str) -> bool:
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return False
-    return isinstance(value, dict) and value.get("schema") == PLAN_V2_SCHEMA
-
-
 def contract() -> dict[str, Any]:
-    from mcd_agent.mautic_patch_plan_v2 import capability as v2_capability
-    return {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "minimum_agent_version": MINIMUM_AGENT_VERSION,
-            "capabilities": [PREFLIGHT_SCHEMA, "mautic-patch-plan-v2", v2_capability()["evidence_schema"]], "patch_plan_v2": v2_capability(),
-            "source_version": "7.1.3", "target_version": "7.2.0", "install_types": ["zip", "composer"],
-            "plugin_enabled_required": True,
-            "patches": [{"id": key, **value, "conflicts_with": []} for key, value in _PATCHES.items()]}
+    from mcd_agent.mautic_patch_resolution import _contract
+    from mcd_agent.mautic_patch_plan_v2 import capability
+    result = dict(_contract())
+    result.update(capabilities=[PREFLIGHT_SCHEMA, "mautic-patch-plan-v2", capability()["evidence_schema"], "mautic-patch-plan-v3"], patch_plan_v2=capability())
+    return result
 
 
 def parse_plan(raw: str) -> dict[str, Any]:
     try:
         plan = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise PatchPlanError("invalid_plan_json") from exc
-    if isinstance(plan, dict) and plan.get("schema") == PLAN_V2_SCHEMA:
-        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2
-        try:
+        if isinstance(plan, dict) and plan.get("schema") == PLAN_V2_SCHEMA:
+            from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2
             return parse_v2(raw)
-        except RuntimeError as exc:
-            raise PatchPlanError(str(exc)) from exc
-    expected = {"schema": PLAN_SCHEMA, "registry_revision": REGISTRY_REVISION, "source_version": "7.1.3", "target_version": "7.2.0", "plugin_enabled": True}
-    if not isinstance(plan, dict) or any(plan.get(k) != v for k, v in expected.items()) or plan.get("install_type") not in {"zip", "composer"}:
-        raise PatchPlanError("unknown_schema_or_registry_revision")
-    patches = [{"id": key, **value, "conflicts_with": []} for key, value in _PATCHES.items()]
-    if set(plan) != {"schema", "registry_revision", "source_version", "target_version", "install_type", "plugin_enabled", "patches"} or plan["patches"] != patches:
-        raise PatchPlanError("unknown_patch_id_or_plan_order")
-    return plan
+        if isinstance(plan, dict) and plan.get("schema") == PLAN_SCHEMA:
+            from mcd_agent.mautic_patch_plan_v3 import _validate_plan
+            _validate_plan(plan)
+            return plan
+        raise PatchPlanError("static_or_unknown_patch_catalog_rejected")
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise PatchPlanError(str(exc) or "invalid_plan_json") from exc
 
 
 def validate_upgrade_plan(raw: str, source_version: str, target_version: str, install_type: str) -> dict[str, Any]:
-    """Validate catalog selection before the upgrade mutates the installation."""
     plan = parse_plan(raw)
-    if plan["source_version"] != source_version:
-        raise PatchPlanError("source_version_mismatch")
-    if plan["target_version"] != target_version:
-        raise PatchPlanError("target_version_mismatch")
-    if plan["install_type"] != install_type:
-        raise PatchPlanError("install_type_mismatch")
+    for field, expected in (("source_version", source_version), ("target_version", target_version), ("install_type", install_type)):
+        if plan[field] != expected:
+            raise PatchPlanError(field + "_mismatch")
     return plan
 
 
 def rejected_preflight(run_id: str | None, reason: str) -> dict[str, Any]:
-    """Return the stable terminal evidence shape for rejection before snapshot."""
-    return {
-        "schema": PREFLIGHT_SCHEMA,
-        "operation": "patch_preflight",
-        "run_id": run_id or "",
-        "plan_sha256": None,
-        "snapshot_id": None,
-        "resolved_source_root": None,
-        "upgrade_started": False,
-        "selected": [],
-        "applied": [],
-        "status": "error",
-        "reason": reason,
-        "phases": [],
-        "verification": {},
-        "rollback_attempted": False,
-        "rollback_succeeded": False,
-        "hard_incident": False,
-        "rollback_reason": None,
-        "pre_patch_hashes": {},
-        "post_patch_hashes": {},
-        "restore_hashes": {},
-        "restored": [],
-    }
-
-
-def _inside(root: Path, relative: str) -> Path:
-    path = (root / relative).resolve()
-    if os.path.commonpath((str(root), str(path))) != str(root):
-        raise PatchPlanError("root_containment_failed")
-    return path
-
-
-def _source_root(root: Path) -> Path:
-    sources = []
-    for relative in (".", "docroot", "public"):
-        candidate = _inside(root, relative)
-        if _inside(candidate, _ROLE_PATH).is_file():
-            sources.append(candidate)
-    if len(sources) != 1:
-        raise PatchPlanError("ambiguous_or_missing_mautic_source_root")
-    return sources[0]
+    return {"schema": PREFLIGHT_SCHEMA, "operation": "patch_preflight", "run_id": run_id or "", "plan_sha256": None,
+            "snapshot_id": None, "resolved_source_root": None, "upgrade_started": False,
+            "selected": [], "applied": [], "status": "error", "reason": reason, "phases": [], "verification": {},
+            "rollback_attempted": False, "rollback_succeeded": False, "hard_incident": False,
+            "rollback_reason": None, "pre_patch_hashes": {}, "post_patch_hashes": {}, "restore_hashes": {}, "restored": []}
 
 
 def _target_version(root: Path) -> str | None:
     versions = set()
-    for relative in ("composer.lock", "docroot/composer.lock", "public/composer.lock"):
-        path = _inside(root, relative)
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                for package in data["packages"]:
+    for prefix in ("", "docroot/", "public/"):
+        lock = root / (prefix + "composer.lock")
+        metadata = root / (prefix + "app/bundles/CoreBundle/release_metadata.json")
+        try:
+            if lock.is_file():
+                for package in json.loads(lock.read_text(encoding="utf-8"))["packages"]:
                     if package.get("name") in {"mautic/core-lib", "mautic/core-bundle", "mautic/core"}:
                         versions.add(str(package.get("version", "")).removeprefix("v"))
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                raise PatchPlanError("invalid_version_metadata") from exc
-    for prefix in ("", "docroot/", "public/"):
-        path = _inside(root, prefix + "app/bundles/CoreBundle/release_metadata.json")
-        if path.is_file():
-            try:
-                versions.add(json.loads(path.read_text(encoding="utf-8"))["version"])
-            except (ValueError, KeyError, TypeError) as exc:
-                raise PatchPlanError("invalid_version_metadata") from exc
+            if metadata.is_file():
+                versions.add(json.loads(metadata.read_text(encoding="utf-8"))["version"])
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PatchPlanError("invalid_version_metadata") from exc
     return versions.pop() if len(versions) == 1 else None
 
 
-def _gate(source: Path, ident: str) -> dict[str, Any]:
-    if ident == ROLE:
-        path = _inside(source, _ROLE_PATH)
-        content = path.read_bytes()
-        text = content.decode("utf-8")
-        old, fixed, sha = text.count(_ROLE_OLD), text.count(_ROLE_NEW), _sha(content)
-        state = "error"
-        if (old, fixed) == (1, 0) and sha == _ROLE_720_VULNERABLE_SHA256:
-            state = "vulnerable"
-        elif (old, fixed) == (0, 1) and sha == _ROLE_720_FIXED_SHA256:
-            state = "already"
-        return {"id": ident, "state": state, "gate_logic": "exact_count_and_file_sha256", "files": [{
-            "path": _ROLE_PATH, "sha256": sha, "vulnerable_count": old, "fixed_count": fixed,
-            "expected_count": 1, "vulnerable_sha256": _ROLE_720_VULNERABLE_SHA256,
-            "fixed_sha256": _ROLE_720_FIXED_SHA256,
-        }]}
-    if ident == GRAPESJS:
-        services = _inside(source, _GRAPESJS_SERVICES_PATH)
-        subscriber = _inside(source, _GRAPESJS_SUBSCRIBER_PATH)
-        manifest = _inside(source, _GRAPESJS_MANIFEST_PATH)
-        builder = _inside(source, _GRAPESJS_BUILDER_PATH)
-        services_text = services.read_text(encoding="utf-8")
-        subscriber_text = subscriber.read_text(encoding="utf-8")
-        css_files = sorted(_inside(source, _GRAPESJS_DIST_DIR).glob("builder.*.css"))
-        manifest_data: dict[str, Any] | None = None
-        try:
-            loaded = json.loads(manifest.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                manifest_data = loaded
-        except (OSError, ValueError):
-            manifest_data = None
-        manifest_values = {str(value) for value in (manifest_data or {}).values()}
-        css_name = next((path.name for path in css_files if path.name in manifest_values), None)
-        old_count = services_text.count(_GRAPESJS_SERVICES_OLD) + subscriber_text.count(_GRAPESJS_SUBSCRIBER_OLD) + subscriber_text.count(_GRAPESJS_CLASS_OLD) + subscriber_text.count(_GRAPESJS_PATH_OLD)
-        old_paths = subscriber_text.count(_GRAPESJS_PATH_OLD) + subscriber_text.count(_GRAPESJS_RESOLVE_PATH_OLD)
-        fixed_count = subscriber_text.count("private PathsHelper $pathsHelper") + subscriber_text.count("$this->pathsHelper->getPluginsPath()") + subscriber_text.count(_GRAPESJS_SCRIPT_NEW) + subscriber_text.count(_GRAPESJS_STYLE_NEW)
-        services_sha = _sha(services.read_bytes())
-        subscriber_sha = _sha(subscriber.read_bytes())
-        runtime_fixed = services_sha == _GRAPESJS_SERVICES_FIXED_SHA256 and subscriber_sha == _GRAPESJS_SUBSCRIBER_FIXED_SHA256
-        assets_ok = manifest_data is not None and builder.is_file() and css_name is not None
-        state = "already" if runtime_fixed and assets_ok and fixed_count == 5 else "vulnerable" if services_sha == _GRAPESJS_SERVICES_VULNERABLE_SHA256 and subscriber_sha == _GRAPESJS_SUBSCRIBER_VULNERABLE_SHA256 and services_text.count(_GRAPESJS_SERVICES_OLD) == 1 and old_paths == 2 and assets_ok else "error"
-        return {"id": ident, "state": state, "gate_logic": "exact_7.2.0_legacy_runtime_and_manifest_assets", "upstream_commit": _GRAPESJS_UPSTREAM_COMMIT, "files": [
-            {"path": _GRAPESJS_SERVICES_PATH, "sha256": services_sha, "legacy_count": services_text.count(_GRAPESJS_SERVICES_OLD), "vulnerable_sha256": _GRAPESJS_SERVICES_VULNERABLE_SHA256, "fixed_sha256": _GRAPESJS_SERVICES_FIXED_SHA256},
-            {"path": _GRAPESJS_SUBSCRIBER_PATH, "sha256": subscriber_sha, "legacy_count": old_paths, "fixed_count": fixed_count, "vulnerable_sha256": _GRAPESJS_SUBSCRIBER_VULNERABLE_SHA256, "fixed_sha256": _GRAPESJS_SUBSCRIBER_FIXED_SHA256},
-            {"path": _GRAPESJS_MANIFEST_PATH, "sha256": _sha(manifest.read_bytes()), "present": manifest.is_file(), "builder": builder.is_file(), "css": css_name},
-        ]}
-    asset, bundle = _inside(source, _ASSET_PATH), _inside(source, _BUNDLE_PATH)
-    bundle_text = bundle.read_text(encoding="utf-8"); asset_sha = _sha(asset.read_bytes()) if asset.exists() else None
-    registered = bundle_text.count("new Compiler\\AssetMapperWebRootPass()")
-    state = "vulnerable" if not asset.exists() and bundle_text.count(_BUNDLE_OLD) == 1 and registered == 0 else "already" if asset_sha == _sha(_ASSET_SOURCE.encode()) and registered == 1 else "error"
-    return {"id": ident, "state": state, "gate_logic": "asset_source_and_registration_exact", "files": [{"path": _ASSET_PATH, "sha256": asset_sha, "expected_sha256": _sha(_ASSET_SOURCE.encode())}, {"path": _BUNDLE_PATH, "sha256": _sha(bundle_text.encode()), "vulnerable_count": bundle_text.count(_BUNDLE_OLD), "fixed_count": registered}]}
-
-
-def _save(run: Path, payload: dict[str, Any]) -> None:
-    previous_path = _inside(run, "result.json")
-    previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else {}
-    history = previous.get("history", [])
-    backups = {item["path"]: item for item in previous.get("backup_records", [])}
-    for patch in payload.get("patches", []):
-        for item in patch.get("backups", []):
-            if item["path"] in backups and backups[item["path"]] != item:
-                raise PatchPlanError("backup_evidence_changed")
-            backups[item["path"]] = item
-    stored = {**payload, "history": history + [payload], "backup_records": list(backups.values())}
-    run.mkdir(parents=True, exist_ok=True); temp = run / "result.json.tmp"
-    temp.write_text(json.dumps(stored, sort_keys=True, indent=2) + "\n", encoding="utf-8"); temp.replace(run / "result.json")
-
-
-def _backup(run: Path, source: Path, relative: str) -> dict[str, Any]:
-    path = _inside(source, relative); backup = _inside(run, "backups/" + relative); backup.parent.mkdir(parents=True, exist_ok=True)
-    existed = path.exists(); before = path.read_bytes() if existed else b""
-    if existed:
-        with backup.open("xb") as stream:
-            stream.write(before)
-    return {"path": relative, "backup": str(backup), "existed": existed, "before_sha256": _sha(before) if existed else None}
-
-
-def _lint(path: Path) -> None:
-    result = subprocess.run(["php", "-l", str(path)], capture_output=True, text=True, timeout=30, check=False)
-    if result.returncode: raise PatchPlanError("php_syntax_check_failed")
-
-
-def _apply(source: Path, run: Path, ident: str, gate: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    for item in gate["files"]:
-        candidate = _inside(source, item["path"])
-        if (_sha(candidate.read_bytes()) if candidate.exists() else None) != item["sha256"]:
-            raise PatchPlanError("source_changed_after_gate")
-    paths = [_ROLE_PATH] if ident == ROLE else [_ASSET_PATH, _BUNDLE_PATH] if ident == ASSET else [_GRAPESJS_SERVICES_PATH, _GRAPESJS_SUBSCRIBER_PATH]
-    changes = {}
-    for relative in paths:
-        path = _inside(source, relative)
-        if relative == _ROLE_PATH:
-            changes[relative] = path.read_bytes().replace(_ROLE_OLD.encode(), _ROLE_NEW.encode(), 1)
-        elif relative == _ASSET_PATH:
-            changes[relative] = _ASSET_SOURCE.encode()
-        elif relative == _BUNDLE_PATH:
-            changes[relative] = path.read_bytes().replace(_BUNDLE_OLD.encode(), _BUNDLE_NEW.encode(), 1)
-        elif relative == _GRAPESJS_SERVICES_PATH:
-            changes[relative] = path.read_bytes().replace(_GRAPESJS_SERVICES_OLD.encode(), b"", 1)
-        else:
-            content = path.read_bytes().replace(_GRAPESJS_SUBSCRIBER_OLD.encode(), _GRAPESJS_SUBSCRIBER_NEW.encode(), 1)
-            content = content.replace(_GRAPESJS_CLASS_OLD.encode(), _GRAPESJS_CLASS_NEW.encode(), 1)
-            content = content.replace(_GRAPESJS_PATH_OLD.encode(), _GRAPESJS_PATH_NEW.encode(), 2)
-            content = content.replace(_GRAPESJS_RESOLVE_PATH_OLD.encode(), _GRAPESJS_RESOLVE_PATH_NEW.encode(), 1)
-            content = content.replace(_GRAPESJS_SCRIPT_OLD.encode(), _GRAPESJS_SCRIPT_NEW.encode(), 1)
-            content = content.replace(_GRAPESJS_STYLE_OLD.encode(), _GRAPESJS_STYLE_NEW.encode(), 1)
-            changes[relative] = content
-    if ident == ROLE and _sha(changes[_ROLE_PATH]) != _ROLE_720_FIXED_SHA256:
-        raise PatchPlanError("unexpected_patch_result")
-    if ident == GRAPESJS and (_sha(changes[_GRAPESJS_SERVICES_PATH]) != _GRAPESJS_SERVICES_FIXED_SHA256 or _sha(changes[_GRAPESJS_SUBSCRIBER_PATH]) != _GRAPESJS_SUBSCRIBER_FIXED_SHA256):
-        raise PatchPlanError("unexpected_patch_result")
-    backups = [_backup(run, source, item) for item in paths]
-    for item in backups:
-        item["after_sha256"] = _sha(changes[item["path"]])
-    _save(run, {**context, "status": "pending", "patches": [{"id": ident, "state": "pending", "backups": backups}]})
-    staged = []
-    try:
-        for relative, content in changes.items():
-            path = _inside(source, relative)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix=".mcd-patch-", suffix=".php", dir=path.parent)
-            staged.append((path, Path(temporary)))
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(content)
-            stat = path.stat() if path.exists() else path.parent.stat()
-            os.chmod(temporary, (stat.st_mode & 0o777) if path.exists() else 0o644)
-            if os.geteuid() == 0:
-                os.chown(temporary, stat.st_uid, stat.st_gid)
-            _lint(Path(temporary))
-        for path, temporary in staged:
-            original = next(item for item in backups if _inside(source, item["path"]) == path)
-            if (_sha(path.read_bytes()) if path.exists() else None) != original["before_sha256"]:
-                raise PatchPlanError("source_changed_after_gate")
-            temporary.replace(path)
-    finally:
-        for _, temporary in staged:
-            temporary.unlink(missing_ok=True)
-    return {"id": ident, "state": "applied", "backups": backups}
-
-
-def rollback(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
-    if _uses_v2(raw_plan):
-        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, rollback as rollback_v2
-        if parse_v2(raw_plan)["run_id"] != run_id:
-            raise PatchPlanError("run_id_argument_mismatch")
-        return rollback_v2(root_value, raw_plan)
+def _dispatch(root_value: str, raw_plan: str, run_id: str, operation: str, phase: str | None = None):
     plan = parse_plan(raw_plan)
-    if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
-    root = Path(root_value).resolve(strict=True); source = _source_root(root)
-    result_path = _inside(root, ".mcd/patch-runs/" + run_id + "/result.json")
-    if not result_path.is_file(): raise PatchPlanError("rollback_evidence_not_found")
-    evidence = json.loads(result_path.read_text(encoding="utf-8"))
-    if evidence.get("plan_sha256") != _plan_sha(plan):
-        raise PatchPlanError("stale_run_plan")
-    restored: list[dict[str, Any]] = []
-    records = list(reversed(evidence.get("backup_records", [])))
-    for item in records:
-        if item["path"] not in {_ROLE_PATH, _ASSET_PATH, _BUNDLE_PATH, _GRAPESJS_SERVICES_PATH, _GRAPESJS_SUBSCRIBER_PATH}:
-            raise PatchPlanError("unknown_backup_path")
-        path = _inside(source, item["path"])
-        current = _sha(path.read_bytes()) if path.exists() else None
-        if current not in {item.get("before_sha256"), item.get("after_sha256")}:
-            return {"status": "error", "reason": "partial_application", "run_id": run_id, "rollback": [], "path": item["path"]}
-        backup = _inside(result_path.parent, "backups/" + item["path"])
-        if item.get("existed") and _sha(backup.read_bytes()) != item["before_sha256"]:
-            raise PatchPlanError("backup_checksum_mismatch")
-    for item in records:
-        path = _inside(source, item["path"])
-        backup = _inside(result_path.parent, "backups/" + item["path"])
-        if item.get("existed"):
-            path.write_bytes(backup.read_bytes())
-        elif path.exists():
-            path.unlink()
-        restored.append({"path": item["path"], "state": "reverted", "backup": str(backup)})
-    payload = {"status": "success", "operation": "rollback", "run_id": run_id, "plan_sha256": evidence["plan_sha256"], "rollback": restored}
-    _save(result_path.parent, payload)
-    return payload
-
-
-def _preflight_snapshot(source: Path, run: Path, plan: dict[str, Any]) -> dict[str, Any]:
-    records: list[dict[str, Any]] = []
-    snapshot_dir = _inside(run, "preflight-snapshot")
-    for relative in (_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH, _GRAPESJS_SERVICES_PATH, _GRAPESJS_SUBSCRIBER_PATH):
-        path = _inside(source, relative)
-        existed = path.is_file()
-        data = path.read_bytes() if existed else b""
-        backup = _inside(snapshot_dir, relative)
-        if existed:
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            with backup.open("xb") as stream:
-                stream.write(data)
-        records.append({"path": relative, "existed": existed, "sha256": _sha(data) if existed else None})
-    snapshot_id = _sha(json.dumps({"plan": plan, "files": records}, sort_keys=True).encode())
-    return {"snapshot_id": snapshot_id, "files": records}
-
-
-def _preflight_restore(source: Path, run: Path, snapshot: dict[str, Any], allowed_after: dict[str, set[str]]) -> tuple[bool, list[dict[str, Any]], str | None]:
-    records = snapshot.get("files") if isinstance(snapshot.get("files"), list) else []
-    for item in records:
-        relative = str(item.get("path", ""))
-        if relative not in {_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH, _GRAPESJS_SERVICES_PATH, _GRAPESJS_SUBSCRIBER_PATH}:
-            return False, [], "unknown_snapshot_path"
-        path = _inside(source, relative)
-        current = _sha(path.read_bytes()) if path.is_file() else None
-        if current not in ({item.get("sha256")} | allowed_after.get(relative, set())):
-            return False, [], "source_changed_during_patch_preflight"
-    restored: list[dict[str, Any]] = []
-    for item in records:
-        relative = str(item["path"])
-        path = _inside(source, relative)
-        if item.get("existed"):
-            backup = _inside(run, "preflight-snapshot/" + relative)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(backup.read_bytes())
-        elif path.exists():
-            path.unlink()
-        restored.append({"path": relative, "sha256": item.get("sha256"), "state": "restored"})
-    for item in records:
-        path = _inside(source, str(item["path"]))
-        if (_sha(path.read_bytes()) if path.is_file() else None) != item.get("sha256"):
-            return False, restored, "restore_verification_failed"
-    return True, restored, None
-
-
-def atomic_preflight(root_value: str, raw_plan: str, run_id: str) -> dict[str, Any]:
-    if _uses_v2(raw_plan):
-        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, atomic_preflight as atomic_preflight_v2
-        if parse_v2(raw_plan)["run_id"] != run_id:
-            raise PatchPlanError("run_id_argument_mismatch")
-        return atomic_preflight_v2(root_value, raw_plan)
-    """Apply and verify the complete mandatory patch sequence atomically."""
-    plan = parse_plan(raw_plan)
-    if not _RUN.fullmatch(run_id):
-        raise PatchPlanError("invalid_run_id")
-    root = Path(root_value).resolve(strict=True)
-    if detect_install_type(str(root)) != plan["install_type"]:
-        raise PatchPlanError("install_type_mismatch")
-    if _target_version(root) != plan["target_version"]:
-        raise PatchPlanError("target_version_mismatch")
-    source = _source_root(root)
-    run = _inside(root, ".mcd/patch-runs/" + run_id)
-    snapshot = _preflight_snapshot(source, run, plan)
-    context: dict[str, Any] = {
-        "schema": PREFLIGHT_SCHEMA, "operation": "patch_preflight", "run_id": run_id,
-        "plan_sha256": _plan_sha(plan),
-        "snapshot_id": snapshot["snapshot_id"], "resolved_source_root": str(source),
-        "upgrade_started": False, "selected": [ROLE, ASSET, GRAPESJS], "applied": [],
-        "rollback_attempted": False, "rollback_succeeded": False,
-        "hard_incident": False, "rollback_reason": None,
-        "pre_patch_hashes": {item["path"]: item["sha256"] for item in snapshot["files"]},
-        "post_patch_hashes": {}, "restore_hashes": {}, "restored": [],
-    }
-    _save(run, {**context, "status": "pending", "snapshot": snapshot})
-    evidence: list[dict[str, Any]] = []
-    allowed_after = {
-        _ROLE_PATH: {_ROLE_720_FIXED_SHA256},
-        _BUNDLE_PATH: set(),
-        _ASSET_PATH: set(),
-        _GRAPESJS_SERVICES_PATH: set(),
-        _GRAPESJS_SUBSCRIBER_PATH: set(),
-    }
+    if plan["run_id"] != run_id:
+        raise PatchPlanError("run_id_argument_mismatch")
     try:
-        for phase in ("post_source_install", "before_doctrine_migrations", "post_source_install_before_asset_generation"):
-            result = execute(str(root), raw_plan, phase, run_id, "apply")
-            evidence.append(result)
-            if result.get("status") != "success":
-                raise PatchPlanError(f"phase_failed:{phase}:{result.get('reason', 'unknown')}")
-            for relative in allowed_after:
-                path = _inside(source, relative)
-                if path.is_file():
-                    allowed_after[relative].add(_sha(path.read_bytes()))
-            for item in result.get("patches", []):
-                if item.get("id") not in context["applied"] and item.get("state") in {"applied", "already"}:
-                    context["applied"].append(item["id"])
-        verification = _verify_preflight(source)
-        if verification["role"]["state"] != "already" or verification["asset"]["state"] != "already" or verification.get("grapesjs", {"state": "already"})["state"] != "already":
-            raise PatchPlanError("patch_verification_failed")
-        context.update({"status": "success", "verification": verification, "phases": evidence})
-        _save(run, context)
-        return context
-    except Exception as exc:
-        rollback_ok, restored, rollback_reason = _preflight_restore(source, run, snapshot, allowed_after)
-        context.update({
-            "status": "error", "reason": str(exc), "phases": evidence,
-            "rollback_attempted": True, "rollback_succeeded": rollback_ok,
-            "restored": restored, "pre_patch_hashes": {item["path"]: item["sha256"] for item in snapshot["files"]},
-            "post_patch_hashes": {relative: (_sha(_inside(source, relative).read_bytes()) if _inside(source, relative).is_file() else None) for relative in (_ROLE_PATH, _BUNDLE_PATH, _ASSET_PATH, _GRAPESJS_SERVICES_PATH, _GRAPESJS_SUBSCRIBER_PATH)},
-            "restore_hashes": {item["path"]: item.get("sha256") for item in restored},
-            "hard_incident": not rollback_ok, "rollback_reason": rollback_reason,
-        })
-        if not rollback_ok:
-            context["reason"] = "hard_incident:patch_preflight_rollback_failed"
-        _save(run, context)
-        return context
+        if plan["schema"] == PLAN_V2_SCHEMA:
+            from mcd_agent import mautic_patch_plan_v2 as engine
+            if operation == "patch_preflight":
+                return engine.atomic_preflight(root_value, raw_plan)
+            if operation == "rollback":
+                return engine.rollback(root_value, raw_plan)
+            if plan["operation"] != operation or plan["phase"] != phase:
+                raise PatchPlanError("v2_invocation_argument_mismatch")
+            return engine.execute(root_value, raw_plan)
+        from mcd_agent import mautic_patch_plan_v3 as engine
+        if operation == "patch_preflight":
+            return engine.atomic_preflight(root_value, plan)
+        if plan["operation"] != operation:
+            raise PatchPlanError("v3_invocation_argument_mismatch")
+        return engine.execute(root_value, plan, phase=phase)
+    except RuntimeError as exc:
+        raise PatchPlanError(str(exc)) from exc
 
 
-def _verify_preflight(source: Path) -> dict[str, Any]:
-    return {"role": _gate(source, ROLE), "asset": _gate(source, ASSET), "grapesjs": _gate(source, GRAPESJS)}
+def atomic_preflight(root_value: str, raw_plan: str, run_id: str):
+    return _dispatch(root_value, raw_plan, run_id, "patch_preflight")
 
 
-def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply") -> dict[str, Any]:
-    if _uses_v2(raw_plan):
-        from mcd_agent.mautic_patch_plan_v2 import parse_plan as parse_v2, execute as execute_v2
-        plan_v2 = parse_v2(raw_plan)
-        if plan_v2["phase"] != phase or plan_v2["run_id"] != run_id or plan_v2["operation"] != operation:
-            raise PatchPlanError("v2_invocation_argument_mismatch")
-        return execute_v2(root_value, raw_plan)
-    plan = parse_plan(raw_plan)
-    if not _RUN.fullmatch(run_id): raise PatchPlanError("invalid_run_id")
-    root = Path(root_value).resolve(strict=True)
-    local_type = detect_install_type(str(root))
-    if local_type != plan["install_type"]: raise PatchPlanError("install_type_mismatch")
-    if _target_version(root) != plan["target_version"]: raise PatchPlanError("target_version_mismatch")
-    source = _source_root(root); selected = [item["id"] for item in plan["patches"] if phase in item["phases"]]
-    if operation not in {"verify", "apply"} or not selected: raise PatchPlanError("unsupported_operation_or_phase")
-    run = _inside(root, ".mcd/patch-runs/" + run_id)
-    context = {"operation": operation, "run_id": run_id, "phase": phase, "registry_revision": REGISTRY_REVISION,
-               "plan_sha256": _plan_sha(plan), "resolved_source_root": str(source)}
-    previous_path = _inside(run, "result.json")
-    if previous_path.is_file():
-        previous = json.loads(previous_path.read_text(encoding="utf-8"))
-        if previous.get("plan_sha256") != context["plan_sha256"]:
-            raise PatchPlanError("stale_run_plan")
-        if operation == "apply" and (
-            previous.get("status") != "success"
-            or previous.get("operation") == "rollback"
-        ) and not (
-            previous.get("operation") == "patch_preflight"
-            and previous.get("status") == "pending"
-        ):
-            raise PatchPlanError("incomplete_or_rolled_back_run")
-    gates = [_gate(source, ident) for ident in selected]
-    if any(item["state"] == "error" for item in gates):
-        return {**context, "status": "error", "reason": "ambiguous_or_unknown_gate", "patches": gates}
-    if operation == "verify": return {**context, "status": "success", "patches": gates}
-    applied = []
-    try:
-        for gate in gates:
-            if gate["id"] == ASSET and _gate(source, ROLE)["state"] != "already": raise PatchPlanError("dependency_unmet:" + ROLE)
-            if gate["id"] == GRAPESJS and _gate(source, ASSET)["state"] != "already": raise PatchPlanError("dependency_unmet:" + ASSET)
-            result = _apply(source, run, gate["id"], gate, context) if gate["state"] == "vulnerable" else {"id": gate["id"], "state": "already", "backups": []}
-            result.update({"phase": phase, "gate": gate})
-            applied.append(result)
-    except Exception as exc:
-        payload = {**context, "status": "error", "reason": str(exc), "gates": gates, "patches": applied, "rollback": "required"}; _save(run, payload); return payload
-    payload = {**context, "status": "success", "patches": applied}; _save(run, payload); return payload
+def rollback(root_value: str, raw_plan: str, run_id: str):
+    return _dispatch(root_value, raw_plan, run_id, "rollback")
+
+
+def execute(root_value: str, raw_plan: str, phase: str, run_id: str, operation: str = "apply"):
+    return _dispatch(root_value, raw_plan, run_id, operation, phase or None)

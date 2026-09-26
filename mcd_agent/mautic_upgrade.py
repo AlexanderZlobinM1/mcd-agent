@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -987,13 +988,58 @@ def _insert_migration_hacks_if_needed(root: str, to_ver: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+def _patch_lifecycle_phase(hook, root: str, phase: str) -> None:
+    callback = getattr(hook, "apply_phase", None)
+    if callback is not None:
+        callback(root, phase)
+
+
+def _prepare_patch_target_stage(config, root: str, current: str, target: str, mode: str, plan):
+    from mcd_agent.mautic_patch_stage import TargetStage, application_root
+    from mcd_agent.mautic_patch_plan import _target_version
+    package_identity = {}
+    def prepare(stage_root: Path) -> None:
+        if mode == "composer":
+            cjson = stage_root / "composer.json"
+            text = cjson.read_text(encoding="utf-8")
+            updated, _count = _replace_version_tokens(text, current, target)
+            updated, _count = _normalize_mautic7_composer_constraints(updated, target)
+            cjson.write_text(updated, encoding="utf-8")
+            composer = _resolve_composer_bin(config.php_bin)
+            _run([composer, *_composer_update_args(), "--no-scripts"], cwd=str(stage_root), as_www_data=False)
+            package_identity["sha256"] = hashlib.sha256((stage_root / "composer.lock").read_bytes()).hexdigest()
+        elif mode == "zip":
+            import zipfile
+            package = _resolve_update_package(config, target)
+            package_identity["sha256"] = hashlib.sha256(package.read_bytes()).hexdigest()
+            with zipfile.ZipFile(package) as archive:
+                for item in archive.infolist():
+                    parts = Path(item.filename).parts
+                    if not parts or item.filename.startswith("/") or any(part in {".", ".."} for part in parts) or "\\" in item.filename or ((item.external_attr >> 16) & 0o170000) == 0o120000:
+                        raise RuntimeError("Unsafe target update archive path")
+                    destination = stage_root.joinpath(*parts)
+                    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents if parent != stage_root.parent):
+                        raise RuntimeError("Target update archive symlink path")
+                archive.extractall(stage_root)
+        else:
+            raise RuntimeError("Unsupported target stage install type")
+    staged = TargetStage(root, plan, prepare, _target_version, application_root)
+    staged.target_package_sha256 = package_identity["sha256"]
+    return staged
+
+
 def _apply_zip(config: AgentConfig, root: str, console_path: str, php_bin: str, target: str, after_source_install=None) -> None:
     pkg = _resolve_update_package(config, target)
+    stage = getattr(after_source_install, "target_stage", None)
+    if stage is not None and hashlib.sha256(pkg.read_bytes()).hexdigest() != stage.target_package_sha256:
+        raise RuntimeError("Target update archive changed after staged preflight")
     dst = Path(root) / pkg.name
     shutil.copy2(pkg, dst)
     _run([php_bin, console_path, "mautic:update:apply", "--force", f"--update-package={dst.name}"], cwd=root, as_www_data=True)
     if after_source_install:
         after_source_install(root)
+    for phase in ("before_cache_warmup", "before_asset_generation", "preflight_frontend_assets", "before_doctrine_migrations"):
+        _patch_lifecycle_phase(after_source_install, root, phase)
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=root, as_www_data=True)
 
 
@@ -1012,6 +1058,28 @@ def _replace_version_tokens(text: str, current: str, target: str) -> tuple[str, 
 
 def _resolve_composer_project_root(root: str) -> str:
     p = Path(root)
+    # A recommended-project owns the lock above its application docroot.
+    # Do not mistake the application's core manifest for that project.
+    if p.name in {"docroot", "public"} and (p / "bin" / "console").is_file():
+        parent = p.parent
+        manifest_path = parent / "composer.json"
+        lock_path = parent / "composer.lock"
+        if manifest_path.is_file() and lock_path.is_file():
+            if p.is_symlink() or manifest_path.is_symlink() or lock_path.is_symlink():
+                raise RuntimeError("composer_project_root_symlink")
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                requirements = manifest.get("require", {})
+                packages = lock.get("packages", [])
+                if not isinstance(requirements, dict) or not isinstance(packages, list):
+                    raise ValueError("invalid Composer structure")
+                names = {item.get("name") for item in packages if isinstance(item, dict)}
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise RuntimeError("composer_project_root_metadata_invalid") from exc
+            core_names = {"mautic/core", "mautic/core-lib"}
+            if core_names.intersection(requirements) and core_names.intersection(names):
+                return str(parent)
     candidates = [p, p.parent]
     for c in candidates:
         if (c / "composer.json").exists() and (c / "bin" / "console").exists():
@@ -1277,32 +1345,8 @@ def _mautic_core_file_candidates(root: str, relpath: Path) -> list[Path]:
 
 
 def _apply_mautic7_twig_include_hotfix(root: str, target: str) -> bool:
-    if _parse_semver(target)[0] != 7:
-        return False
-    rel = Path("app") / "bundles" / "CoreBundle" / "Twig" / "Extension" / "OverrideIncludeExtension.php"
-    changed_any = False
-    for path in _mautic_core_file_candidates(root, rel):
-        if not path.exists() or not path.is_file():
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        if "function includeWithEvent(" not in text or "CoreExtension::include(" not in text:
-            continue
-        updated, count = re.subn(
-            r"return\s+(?!\(string\)\s*)CoreExtension::include\(",
-            "return (string) CoreExtension::include(",
-            text,
-        )
-        if count <= 0 or updated == text:
-            if "(string) CoreExtension::include(" in text:
-                print(f"Mautic 7 Twig include hotfix already present: {path}")
-            continue
-        backup = path.with_name(path.name + ".mcd-pre-twig-include-hotfix.bak")
-        if not backup.exists():
-            shutil.copy2(path, backup)
-        path.write_text(updated, encoding="utf-8")
-        print(f"Mautic 7 Twig include hotfix applied: {path}")
-        changed_any = True
-    return changed_any
+    """Historical compatibility name; applicability belongs to the catalog."""
+    return False
 
 
 def _apply_composer(root: str, console_path: str, php_bin: str, current: str, target: str, after_source_install=None) -> None:
@@ -1326,27 +1370,35 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     print(f"Composer preflight ok: {composer_version} ({composer_bin})")
     print(f"Node.js preflight ok: {node_version}")
     print(f"npm preflight ok: {npm_version}")
+    stage = getattr(after_source_install, "target_stage", None)
     text = cjson.read_text(encoding="utf-8")
     updated, changes = _replace_version_tokens(text, current, target)
     updated, constraint_changes = _normalize_mautic7_composer_constraints(updated, target)
     changes += constraint_changes
     if changes > 0 and updated != text:
         cjson.write_text(updated, encoding="utf-8")
+    if stage is not None:
+        if set(stage.composer_files) != {"composer.json", "composer.lock"}:
+            raise RuntimeError("Staged Composer target lacks exact dependency lock")
+        for name, content in stage.composer_files.items():
+            (Path(project_root) / name).write_bytes(content)
     _run([composer_bin, *_composer_update_args(dry_run=True), "--no-scripts"], cwd=project_root, as_www_data=True)
     print("Composer dependency dry-run ok")
     # Post-update scripts boot Mautic. They must never load the previous core's
     # compiled container after Composer has replaced its classes and services.
     deferred_events = ("post-autoload-dump", "post-update-cmd")
     _run(
-        ["env", "COMPOSER_SKIP_SCRIPTS=" + ",".join(deferred_events), composer_bin, *_composer_update_args()],
+        ["env", "COMPOSER_SKIP_SCRIPTS=" + ",".join(deferred_events), composer_bin, *(["install", "--no-interaction", "--no-scripts"] if stage is not None else _composer_update_args())],
         cwd=project_root,
         as_www_data=True,
     )
-    patched = _apply_mautic7_twig_include_hotfix(project_root, target)
+    patched = False
     _normalize_mautic7_loopback_redis_cache(project_root, target)
     _hard_clear_prod_cache(project_root)
     if after_source_install:
         after_source_install(project_root)
+    for phase in ("before_cache_warmup", "before_asset_generation", "preflight_frontend_assets"):
+        _patch_lifecycle_phase(after_source_install, project_root, phase)
     scripts = json.loads(cjson.read_text(encoding="utf-8")).get("scripts", {})
     for event in deferred_events:
         if event in scripts:
@@ -1354,6 +1406,7 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     _clear_prod_cache_with_fallback(project_root, console_path, php_bin)
     if patched:
         print("Mautic 7 Twig include hotfix cache refresh completed")
+    _patch_lifecycle_phase(after_source_install, project_root, "before_doctrine_migrations")
     _run([php_bin, console_path, "mautic:update:apply", "--finish"], cwd=project_root, as_www_data=True)
     migration_cmd = _doctrine_migrate_command(project_root, console_path, php_bin)
     _run_doctrine_migrate_with_reconcile(project_root, console_path, php_bin, migration_cmd)
@@ -1830,6 +1883,7 @@ def run_upgrade_apply(
     patch_run_id: str | None = None,
     repair_plan_json: str | None = None,
     repair_auth_context_file: str | None = None,
+    patch_backup_context_file: str | None = None,
     repair_auth_key_file: str = "/etc/mcd/mcc-operation-signing.key",
     mcc_preflighted_single_instance: bool = False,
 ) -> int:
@@ -1902,10 +1956,20 @@ def run_upgrade_apply(
             raise RuntimeError("Mautic upgrade preflight rejected")
 
     print(f"Upgrade plan: {current} -> {target} (mode={chosen_mode})")
+    if not mcc_preflighted_single_instance and not patch_plan_json and not patch_run_id and getattr(config, "mcc_url", ""):
+        from mcd_agent.mautic_patch_resolution import resolve_plan
+        selected = resolve_plan(config, inst, trigger="upgrade_lifecycle", phase="dependency_update_preflight",
+                                operation="apply", observed_version=current, observed_major=_parse_semver(current)[0],
+                                target_version=target, install_type=chosen_mode)
+        if selected["status"] == "blocked":
+            raise RuntimeError("Mautic catalog upgrade resolution blocked: " + str(selected.get("reason")))
+        if selected["status"] == "selected":
+            patch_plan_json = json.dumps(selected["plan"], ensure_ascii=True, separators=(",", ":"))
+            patch_run_id = selected["plan"]["run_id"]
     patch_hook = None
-    requires_patch_plan = _parse_semver(current) == (7, 1, 3) and _parse_semver(target) == (7, 2, 0)
+    target_stage = None
     has_patch_plan_input = bool(patch_plan_json or patch_run_id)
-    if requires_patch_plan or has_patch_plan_input:
+    if has_patch_plan_input:
         if not patch_plan_json or not patch_run_id:
             raise RuntimeError("Atomic Mautic patch stage requires --patch-plan-json and --patch-run-id")
         from mcd_agent.mautic_patch_plan import (
@@ -1916,7 +1980,19 @@ def run_upgrade_apply(
         )
 
         try:
-            validate_upgrade_plan(patch_plan_json, current, target, chosen_mode)
+            validated_patch_plan = validate_upgrade_plan(patch_plan_json, current, target, chosen_mode)
+            if validated_patch_plan.get("schema") == "mcd-mautic-patch-plan-v3":
+                if validated_patch_plan["trigger"] != "upgrade_lifecycle" or validated_patch_plan["operation"] != "apply" or validated_patch_plan["run_id"] != patch_run_id:
+                    raise PatchPlanError("upgrade_patch_context_mismatch")
+                from mcd_agent.mautic_patch_backup import required, load_and_validate
+                if required(validated_patch_plan):
+                    if not patch_backup_context_file:
+                        raise PatchPlanError("patch_backup_attestation_required")
+                    try:
+                        load_and_validate(patch_backup_context_file, key_path=repair_auth_key_file,
+                                          plan=validated_patch_plan, instance_uid=inst.instance_uid, root=install_root)
+                    except (OSError, RepairAuthorizationError) as exc:
+                        raise PatchPlanError(str(exc)) from exc
         except PatchPlanError as exc:
             evidence = rejected_preflight(patch_run_id, str(exc))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
@@ -1924,20 +2000,57 @@ def run_upgrade_apply(
 
         def patch_hook(source_root: str) -> None:
             try:
+                if target_stage is not None:
+                    from mcd_agent.mautic_patch_plan import _target_version
+                    from mcd_agent.mautic_patch_stage import application_root
+                    staged_evidence = target_stage.verify_live(source_root, validated_patch_plan, _target_version)
+                    print("MCD_PATCH_TARGET_EVIDENCE=" + json.dumps(staged_evidence, sort_keys=True))
+                    source_root = str(application_root(source_root))
                 evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id)
             except PatchPlanError as exc:
                 evidence = rejected_preflight(patch_run_id, str(exc))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
             if evidence.get("status") != "success":
                 raise RuntimeError(f"Mautic patch preflight rejected: {evidence.get('reason', 'unknown')}")
+            if validated_patch_plan.get("schema") == "mcd-mautic-patch-plan-v3":
+                apply_patch_phase(source_root, "post_source_install")
+
+        def apply_patch_phase(source_root: str, phase: str) -> None:
+            from mcd_agent.mautic_patch_plan import execute
+            from mcd_agent.mautic_patch_stage import application_root
+            source_root = str(application_root(source_root))
+            result = execute(source_root, patch_plan_json, phase, patch_run_id)
+            print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(result, sort_keys=True))
+            if result.get("status") != "success":
+                raise RuntimeError("Mautic patch phase rejected: " + phase)
+
+        if validated_patch_plan.get("schema") == "mcd-mautic-patch-plan-v3":
+            supported_phases = {"post_source_install", "before_cache_warmup", "before_asset_generation", "preflight_frontend_assets", "before_doctrine_migrations"}
+            if any(set(record["phases"]) - supported_phases for record in validated_patch_plan["patches"]):
+                raise RuntimeError("Selected upgrade plan contains a phase unavailable in this upgrade workflow")
+            target_stage = _prepare_patch_target_stage(config, _resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root,
+                                                       current, target, chosen_mode, validated_patch_plan)
+            patch_hook.target_stage = target_stage
+            patch_hook.apply_phase = apply_patch_phase
     if not yes:
         ans = input("Proceed? [y/N]: ").strip().lower()
         if ans not in {"y", "yes"}:
+            if target_stage is not None:
+                target_stage.close()
             print("Cancelled")
             return 0
 
-    guard = _enter_upgrade_maintenance(config)
     try:
+        guard = _enter_upgrade_maintenance(config)
+    except Exception:
+        if target_stage is not None:
+            target_stage.close()
+        raise
+    try:
+        if target_stage is not None:
+            from mcd_agent.mautic_patch_plan import _target_version
+            target_stage.verify_original(_resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root,
+                                         validated_patch_plan, _target_version)
         if mcc_preflighted_single_instance:
             # Maintenance admission may take time. Recheck before permissions
             # alignment or reverting a core patch, which also mutate source.
@@ -1951,7 +2064,7 @@ def run_upgrade_apply(
         # verified original before any version change so Composer/ZIP updates
         # never inherit a local patch into a new Mautic release.
         if _parse_semver(current)[0] == 7 and current != target:
-            restore = revert_mautic713_import_tag_patch(inst)
+            restore = {"status": "clean", "reason": "source_upgrade_uses_catalog_plan"}
             if str(restore.get("status", "")).strip().lower() == "error":
                 raise RuntimeError(
                     "Mautic import tag remediation rollback failed: "
@@ -2055,18 +2168,35 @@ def run_upgrade_apply(
         final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
         if _parse_semver(final_version) != _parse_semver(target):
             raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
-        import_patch = ensure_import_tag_patch(replace(inst, mautic_major=_parse_semver(final_version)[0]))
+        if target_stage is not None:
+            from mcd_agent.mautic_patch_stage import application_root
+            from mcd_agent.mautic_patch_plan_v3 import verify_applied
+            verification = verify_applied(str(application_root(install_root)), validated_patch_plan)
+            print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(verification, sort_keys=True))
+        import_patch = {"status": "already", "reason": "runtime_reconciliation_uses_catalog_plan"}
         if import_patch.get("status") == "error":
             raise RuntimeError("Import tag patch after upgrade failed: " + str(import_patch.get("reason")))
         cache_count = _write_upgrade_version_cache(install_root, final_version)
         print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
         print(f"Upgrade completed: {current} -> {final_version}")
     except Exception:
+        if target_stage is not None:
+            from mcd_agent.mautic_patch_plan_v3 import rollback as rollback_v3
+            try:
+                from mcd_agent.mautic_patch_stage import application_root
+                rollback_evidence = rollback_v3(str(application_root(_resolve_composer_project_root(install_root) if chosen_mode == "composer" else install_root)),
+                                                dict(validated_patch_plan, operation="rollback"))
+                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(rollback_evidence, sort_keys=True))
+            except RuntimeError as rollback_error:
+                print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps({"status": "error", "rollback_succeeded": False, "reason": str(rollback_error)}, sort_keys=True))
         try:
             _exit_upgrade_maintenance(config, guard)
         except Exception as cleanup_error:
             print(f"WARN maintenance cleanup failed after upgrade error: {cleanup_error}")
         raise
+    finally:
+        if target_stage is not None:
+            target_stage.close()
 
     _exit_upgrade_maintenance(config, guard)
     return 0

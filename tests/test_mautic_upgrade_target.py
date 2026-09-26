@@ -20,6 +20,7 @@ from mcd_agent.mautic_upgrade import (
     _normalize_mautic7_loopback_redis_cache,
     _latest_same_branch,
     _release_family_label,
+    _resolve_composer_project_root,
     _rewrite_nginx_php_fpm_references,
     _safe_mautic7_loopback_redis_dsn,
     _upgrade_target_relation,
@@ -27,6 +28,34 @@ from mcd_agent.mautic_upgrade import (
 
 
 class MauticUpgradeTargetTests(unittest.TestCase):
+    def test_composer_project_root_uses_parent_lock_without_parent_console(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            app = project / "docroot"
+            (app / "bin").mkdir(parents=True)
+            (app / "bin" / "console").write_text("console", encoding="utf-8")
+            (app / "composer.json").write_text('{"name":"mautic/core"}', encoding="utf-8")
+            (project / "composer.json").write_text(
+                '{"require":{"mautic/core-lib":"7.2.1"}}', encoding="utf-8"
+            )
+            (project / "composer.lock").write_text(
+                '{"packages":[{"name":"mautic/core-lib","version":"7.2.1"}]}', encoding="utf-8"
+            )
+            self.assertEqual(_resolve_composer_project_root(str(app)), str(project))
+
+    def test_composer_project_root_does_not_select_unrelated_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            app = project / "public"
+            (app / "bin").mkdir(parents=True)
+            (app / "bin" / "console").write_text("console", encoding="utf-8")
+            (app / "composer.json").write_text('{}', encoding="utf-8")
+            (project / "composer.json").write_text(
+                '{"require":{"other/package":"1.0"}}', encoding="utf-8"
+            )
+            (project / "composer.lock").write_text('{"packages":[]}', encoding="utf-8")
+            self.assertEqual(_resolve_composer_project_root(str(app)), str(app))
+
     def test_release_family_label_unifies_mautic_7_only(self) -> None:
         self.assertEqual(_release_family_label("7.0.2"), "7")
         self.assertEqual(_release_family_label("7.2.0"), "7")
@@ -395,11 +424,11 @@ final class OverrideIncludeExtension
                 encoding="utf-8",
             )
 
-            self.assertTrue(_apply_mautic7_twig_include_hotfix(str(root), "7.1.2"))
+            self.assertFalse(_apply_mautic7_twig_include_hotfix(str(root), "7.1.2"))
 
             updated = helper.read_text(encoding="utf-8")
-            self.assertIn("return (string) CoreExtension::include(", updated)
-            self.assertTrue(helper.with_name(helper.name + ".mcd-pre-twig-include-hotfix.bak").exists())
+            self.assertIn("return CoreExtension::include(", updated)
+            self.assertFalse(helper.with_name(helper.name + ".mcd-pre-twig-include-hotfix.bak").exists())
 
     def test_probe_domain_falls_back_to_mautic_site_url(self) -> None:
         with tempfile.TemporaryDirectory() as td:

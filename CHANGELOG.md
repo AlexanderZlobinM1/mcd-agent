@@ -3,7 +3,12 @@
 - Add the versioned MCC-resolved Mautic patch contract for generic runtime remediation.
 - Add authenticated resolved-plan/evidence transport with host, version, plan, and payload hash checks.
 - Enforce plan/record field allowlists, trigger/phase selection, and safe payload references before execution.
+- Preserve upgrade atomic preflight with one inline, revision-pinned v3 plan and later declared execution phases.
 - Add resolver regression coverage for auth, canonical hashes, payload integrity, and fail-closed schema guards.
+- Add generic v3 phase execution, read-only atomic simulation and plan-bound file rollback, including verified legacy backup import.
+- Bind major-upgrade backup evidence to immutable plans with a signed host-local attestation; same-major JSON preflight does not require external backup.
+- Publish exact gate field schemas and a data-only accepted record fixture for catalog owners.
+- Resolve recommended-project Composer ownership above docroot using its manifest and lock, independently of the application console location.
 
 # MCD Changelog
 

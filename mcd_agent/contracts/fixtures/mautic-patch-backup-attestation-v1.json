@@ -1,0 +1,81 @@
+{
+  "schema": "mcd-mautic-patch-backup-attestation-fixture-v1",
+  "fixture_only_key_hex": "666978747572652d6f6e6c792d7369676e696e672d6b65792d33322d627974657321",
+  "plan": {
+    "schema": "mcd-mautic-patch-plan-v3",
+    "registry_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_version": "6.0.9",
+    "target_version": "7.2.1",
+    "install_type": "composer",
+    "trigger": "upgrade_lifecycle",
+    "phase": "dependency_update_preflight",
+    "operation": "apply",
+    "run_id": "fixture-backup-001",
+    "patches": [
+      {
+        "id": "FIXTURE-GENERIC-PATCH",
+        "execution_kind": "git_patch_v1",
+        "triggers": [
+          "upgrade_lifecycle"
+        ],
+        "phase_order": 10,
+        "phases": [
+          "post_source_install"
+        ],
+        "source_paths": [
+          "docroot/app/fixture.txt"
+        ],
+        "payload_path": "fixtures/generic.patch",
+        "gate_logic": "vulnerable_exactly_one; fixed_exactly_one; mixed_or_unknown=error",
+        "gate": [
+          {
+            "group": "vulnerable",
+            "kind": "exact_count",
+            "path": "docroot/app/fixture.txt",
+            "needle": "before",
+            "expected_count": 1
+          },
+          {
+            "group": "fixed",
+            "kind": "exact_count",
+            "path": "docroot/app/fixture.txt",
+            "needle": "after",
+            "expected_count": 1
+          }
+        ]
+      }
+    ],
+    "payloads": [
+      {
+        "path": "fixtures/generic.patch",
+        "sha256": "c3dc0996c8d48cc7a0655d96af80a418edfe387ef8aa71ca3425216b15bc5984",
+        "content_base64": "ZGlmZiAtLWdpdCBhL2RvY3Jvb3QvYXBwL2ZpeHR1cmUudHh0IGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKLS0tIGEvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKKysrIGIvZG9jcm9vdC9hcHAvZml4dHVyZS50eHQKQEAgLTEgKzEgQEAKLWJlZm9yZQorYWZ0ZXIK"
+      }
+    ]
+  },
+  "manifest_bytes_base64": "eyJiYWNrdXBfaWQiOiJmaXh0dXJlLWluc3RhbmNlLTAwMTpmaXh0dXJlIiwiYnl0ZXNfd3JpdHRlbiI6MTIzLCJkdW1wZWRfaW5zdGFuY2VzIjpbeyJpbnN0YW5jZV91aWQiOiJmaXh0dXJlLWluc3RhbmNlLTAwMSIsInJvb3QiOiIvZml4dHVyZS9pbnN0YW5jZSJ9XSwic3RhdHVzIjoib2siLCJ0c191dGMiOiIyMDI3LTAxLTE1VDA3OjU5OjAwKzAwOjAwIn0K",
+  "attestation": {
+    "schema": "mcd-mautic-patch-backup-attestation-v1",
+    "instance_uid": "fixture-instance-001",
+    "root": "/fixture/instance",
+    "source_version": "6.0.9",
+    "target_version": "7.2.1",
+    "run_id": "fixture-backup-001",
+    "plan_sha256": "39319d9adda440d54ffb6414d5c66801a4e01c5a2fe9ecc81992d9ded3b634dc",
+    "backup_evidence": {
+      "backup_id": "fixture-instance-001:fixture",
+      "backup_path": "/fixture/backup",
+      "manifest_path": "/fixture/backup/.mcd-backup.json",
+      "sha256": "dc0587babb8e9a3b44b500a0f34e600f7f8bb3fc27b5a3425e25c9f56ec8d6a1",
+      "completed_at": "2027-01-15T07:59:00+00:00",
+      "bytes_written": 123
+    },
+    "issued_at": 1800000000,
+    "expires_at": 1800003600,
+    "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "signature": "e4ddb960e3cec030a75a1690a24e8f298ecc412e532708b68603c0a3001544cd"
+  },
+  "signature_canonicalization": "sorted compact ASCII JSON without signature, no LF",
+  "plan_canonicalization": "sorted compact ASCII JSON plus LF"
+}

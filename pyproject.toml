@@ -18,4 +18,4 @@ mcd-cli = "mcd_agent.cli:main"
 include = ["mcd_agent*"]
 
 [tool.setuptools.package-data]
-mcd_agent = ["templates/nginx/*.conf", "contracts/*.json"]
+mcd_agent = ["templates/nginx/*.conf", "contracts/*.json", "contracts/fixtures/*.json"]

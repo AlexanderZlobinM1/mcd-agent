@@ -1617,106 +1617,30 @@ def _run_plugin_cache_warmup(config: AgentConfig, install) -> None:
         raise RuntimeError(f"cache:warmup failed: {out}")
 
 
-def _run_plugin_install_reload(
-    config: AgentConfig,
-    install,
-    expected_bundles: set[str] | None = None,
-) -> None:
-    root = install.root
-
-    def _is_metadata_null_reload_error(out: str) -> bool:
-        text = str(out or "").lower()
-        return (
-            ("pluginupdateevent" in text or "pluginevent" in text)
-            and "metadata" in text
-            and "must be of type array" in text
-            and "null given" in text
-        )
-
-    def _is_inactive_transaction_reload_error(out: str) -> bool:
-        return "there is no active transaction" in str(out or "").lower()
-
-    def _repair_plugin_metadata_null_once() -> bool:
-        if not install.db:
-            return False
-        db = MauticDB(install.db)
-        try:
-            if not db.table_has_column("{prefix}plugins", "metadata"):
-                logging.info("[%s] plugin metadata repair skipped: plugins.metadata column not present", root)
-                return False
-        except Exception as e:
-            logging.warning("[%s] plugin metadata column check failed: %s", root, e)
-            return False
-        repaired_any = False
-        # Mautic bug workaround: malformed/null plugin metadata may break
-        # mautic:plugin:install|reload with PluginUpdateEvent metadata=null.
-        sql_fixes = [
-            "UPDATE {prefix}plugins SET metadata = '[]' WHERE metadata IS NULL OR metadata = ''",
-            "UPDATE {prefix}plugins SET metadata = '[]' WHERE metadata IS NOT NULL AND metadata <> '' AND JSON_VALID(metadata) = 0",
-        ]
-        for sql in sql_fixes:
-            try:
-                affected = db.execute_sql_template(sql)
-                repaired_any = repaired_any or (int(affected) > 0)
-                logging.info("[%s] plugin metadata repair affected=%s sql=%s", root, affected, sql)
-            except Exception as e:
-                # Keep going: some engines/schemas may reject JSON_VALID.
-                logging.warning("[%s] plugin metadata repair skipped for sql=%s: %s", root, sql, e)
-        return repaired_any
-
-    # Keep this preflight unconditional: many Mautic 5/6/7 installs fail reload
-    # before doing useful work if an older plugin row has NULL/broken metadata.
-    _repair_plugin_metadata_null_once()
-
+def _run_plugin_install_reload(config: AgentConfig, install, expected_bundles: set[str] | None = None) -> None:
+    from mcd_agent.mautic_patch_runtime import run as run_catalog
+    if getattr(config, "mcc_url", ""):
+        preflight = run_catalog(config, install, phase="before_plugin_reload", trigger="plugin_reload_failure")
+        if preflight.get("status") == "error":
+            raise RuntimeError("Catalog plugin reload preflight failed: " + str(preflight.get("reason")))
     rc, out = _run_plugin_template(config, install, "mautic:plugin:install")
     if rc == 0:
         return
-    if int(getattr(install, "mautic_major", 0) or 0) == 6 and _is_inactive_transaction_reload_error(out):
-        # Plugin DDL can implicitly commit on MySQL. Mautic 6 then attempts a
-        # rollback and reports failure even though the migration was applied.
-        # A single reload reconciles the now-current plugin schema.
-        logging.warning(
-            "[%s] retry mautic:plugin:install after Mautic 6 transaction state error",
-            root,
-        )
-        rc2, out2 = _run_plugin_template(config, install, "mautic:plugin:install")
-        if rc2 == 0:
+    if int(getattr(install, "mautic_major", 0) or 0) == 6 and "there is no active transaction" in str(out).lower():
+        rc, out = _run_plugin_template(config, install, "mautic:plugin:install")
+        if rc == 0:
             return
-        raise RuntimeError(
-            "mautic:plugin:install failed after Mautic 6 transaction retry: "
-            f"{out2}"
-        )
-    if _is_metadata_null_reload_error(out):
-        repaired = _repair_plugin_metadata_null_once()
-        if repaired:
-            logging.info("[%s] retry mautic:plugin:install after metadata repair", root)
-            rc2, out2 = _run_plugin_template(config, install, "mautic:plugin:install")
-            if rc2 == 0:
+        raise RuntimeError("mautic:plugin:install failed after Mautic 6 transaction retry: " + str(out))
+    signature = str(out).lower()
+    if "pluginupdateevent" in signature and "metadata" in signature and "must be of type array" in signature and "null given" in signature:
+        if int(getattr(install, "mautic_major", 0) or 0) == 6 and getattr(config, "mautic6_core_patch_policy", "required") != "required":
+            raise RuntimeError("Catalog runtime repair is disabled by local policy")
+        repair = run_catalog(config, install, phase="legacy_runtime_plugin_repair", trigger="plugin_reload_failure")
+        if repair.get("status") == "success" and repair.get("selected"):
+            rc, out = _run_plugin_template(config, install, "mautic:plugin:install")
+            if rc == 0:
                 return
-            out = out2
-        migration_rows = [
-            {"bundle": bundle, "install_bundle": bundle, "item": {}}
-            for bundle in sorted(expected_bundles or set())
-        ]
-        has_native_migration = bool(
-            _selected_metadataless_native_migration_bundles(install, migration_rows)
-        ) if migration_rows else False
-        if int(getattr(install, "mautic_major", 0) or 0) == 6 and has_native_migration:
-            logging.info("[%s] retry native migration reload with Mautic 6 metadata compatibility", root)
-            with _temporary_m6_native_migration_reload_compatibility(install, expected_bundles):
-                rc3, out3 = _run_plugin_template(config, install, "mautic:plugin:install")
-            if rc3 == 0:
-                return
-            raise RuntimeError(
-                "mautic:plugin:install failed after Mautic 6 native migration compatibility retry: "
-                f"{out3}"
-            )
-        if repaired:
-            raise RuntimeError(
-                "mautic:plugin:install failed after metadata repair: "
-                f"{out}"
-            )
-    raise RuntimeError(f"mautic:plugin:install failed: {out}")
+    raise RuntimeError("mautic:plugin:install failed: " + str(out))
 
 
 def _run_post_steps(config: AgentConfig, install, expected_bundles: set[str] | None = None) -> None:
@@ -1790,106 +1714,8 @@ def _cleanup_conflicting_plugin_rows(
 
 
 def _apply_hostnet_mautic4_tx_patch(install, selected_rows: list[dict[str, Any]]) -> bool:
-    if (install.mautic_major or 0) != 4:
-        return False
-
-    changed_any = False
-    engine_path = Path(install.root) / "app" / "bundles" / "IntegrationsBundle" / "Migration" / "Engine.php"
-    if not engine_path.exists():
-        logging.warning("[%s] m4 tx patch skipped: Engine.php not found", install.root)
-    else:
-        text = engine_path.read_text(encoding="utf-8", errors="ignore")
-        if "no active transaction" in text and "\\PDOException" in text:
-            text = ""
-        if text:
-            commit_re = re.compile(
-                r"^(?P<i>[ \t]*)\$conn = \$this->entityManager->getConnection\(\);\n"
-                r"(?P=i)if \(\(method_exists\(\$conn, 'isTransactionActive'\) && \$conn->isTransactionActive\(\)\) \|\| "
-                r"\(method_exists\(\$conn, 'getTransactionNestingLevel'\) && \$conn->getTransactionNestingLevel\(\) > 0\)\) \{\n"
-                r"(?P=i)[ \t]{4}\$this->entityManager->commit\(\);\n"
-                r"(?P=i)\}",
-                flags=re.MULTILINE,
-            )
-            rollback_re = re.compile(
-                r"^(?P<i>[ \t]*)\$conn = \$this->entityManager->getConnection\(\);\n"
-                r"(?P=i)if \(\(method_exists\(\$conn, 'isTransactionActive'\) && \$conn->isTransactionActive\(\)\) \|\| "
-                r"\(method_exists\(\$conn, 'getTransactionNestingLevel'\) && \$conn->getTransactionNestingLevel\(\) > 0\)\) \{\n"
-                r"(?P=i)[ \t]{4}\$this->entityManager->rollback\(\);\n"
-                r"(?P=i)\}",
-                flags=re.MULTILINE,
-            )
-            bare_commit_re = re.compile(r"^([ \t]*)\$this->entityManager->commit\(\);\s*$", flags=re.MULTILINE)
-            bare_rollback_re = re.compile(r"^([ \t]*)\$this->entityManager->rollback\(\);\s*$", flags=re.MULTILINE)
-
-            def _commit_guard(indent: str) -> str:
-                return (
-                    f"{indent}$conn = $this->entityManager->getConnection();\n"
-                    f"{indent}try {{\n"
-                    f"{indent}    if ((method_exists($conn, 'isTransactionActive') && $conn->isTransactionActive()) || "
-                    f"(method_exists($conn, 'getTransactionNestingLevel') && $conn->getTransactionNestingLevel() > 0)) {{\n"
-                    f"{indent}        $this->entityManager->commit();\n"
-                    f"{indent}    }}\n"
-                    f"{indent}}} catch (\\PDOException $e) {{\n"
-                    f"{indent}    if (false === stripos($e->getMessage(), 'no active transaction')) {{\n"
-                    f"{indent}        throw $e;\n"
-                    f"{indent}    }}\n"
-                    f"{indent}}}"
-                )
-
-            def _rollback_guard(indent: str) -> str:
-                return (
-                    f"{indent}$conn = $this->entityManager->getConnection();\n"
-                    f"{indent}try {{\n"
-                    f"{indent}    if ((method_exists($conn, 'isTransactionActive') && $conn->isTransactionActive()) || "
-                    f"(method_exists($conn, 'getTransactionNestingLevel') && $conn->getTransactionNestingLevel() > 0)) {{\n"
-                    f"{indent}        $this->entityManager->rollback();\n"
-                    f"{indent}    }}\n"
-                    f"{indent}}} catch (\\PDOException $e) {{\n"
-                    f"{indent}    if (false === stripos($e->getMessage(), 'no active transaction')) {{\n"
-                    f"{indent}        throw $e;\n"
-                    f"{indent}    }}\n"
-                    f"{indent}}}"
-                )
-
-            def _replace_guarded_commit(m: re.Match[str]) -> str:
-                return _commit_guard(m.group("i"))
-
-            def _replace_guarded_rollback(m: re.Match[str]) -> str:
-                return _rollback_guard(m.group("i"))
-
-            new_text, n_commit = commit_re.subn(_replace_guarded_commit, text, count=1)
-            new_text, n_rollback = rollback_re.subn(_replace_guarded_rollback, new_text, count=1)
-            if n_commit == 0:
-                new_text, n_commit = bare_commit_re.subn(lambda m: _commit_guard(m.group(1)), new_text, count=1)
-            if n_rollback == 0:
-                new_text, n_rollback = bare_rollback_re.subn(lambda m: _rollback_guard(m.group(1)), new_text, count=1)
-            if new_text != text:
-                engine_path.write_text(new_text, encoding="utf-8")
-                changed_any = True
-                logging.info("[%s] m4 tx patch (Engine.php) applied: commit=%s rollback=%s", install.root, n_commit, n_rollback)
-
-    hostnet_path = _resolve_plugins_dir(install.root, create=False) / "HostnetAuthBundle" / "HostnetAuthBundle.php"
-    if not hostnet_path.exists():
-        return changed_any
-    hostnet_text = hostnet_path.read_text(encoding="utf-8", errors="ignore")
-    if "$db->beginTransaction();" in hostnet_text:
-        block_re = re.compile(
-            r"if \(!empty\(\$queries\)\) \{\s*\$db->beginTransaction\(\);\s*try \{\s*foreach \(\$queries as \$q\) \{\s*\$db->query\(\$q\);\s*\}\s*.*?\s*\}\s*catch \(\\Exception \$e\) \{\s*.*?\s*throw \$e;\s*\}\s*\}",
-            flags=re.DOTALL,
-        )
-        repl = (
-            "if (!empty($queries)) {\n"
-            "            foreach ($queries as $q) {\n"
-            "                $db->query($q);\n"
-            "            }\n"
-            "        }"
-        )
-        hostnet_new, n_blocks = block_re.subn(repl, hostnet_text)
-        if n_blocks > 0:
-            hostnet_path.write_text(hostnet_new, encoding="utf-8")
-            changed_any = True
-            logging.info("[%s] m4 tx patch (HostnetAuthBundle.php) applied: blocks=%s", install.root, n_blocks)
-    return changed_any
+    """Disabled: compatibility payloads must be declared by the owner catalog."""
+    return False
 
 
 def _plugin_config_metadata_paths(plugins_dir: Path, selected_rows: list[dict[str, Any]]) -> list[tuple[str, Path]]:
@@ -1921,37 +1747,8 @@ def _plugin_config_metadata_paths(plugins_dir: Path, selected_rows: list[dict[st
 
 
 def _apply_plugin_config_metadata_patch(install, selected_rows: list[dict[str, Any]]) -> bool:
-    plugins_dir = _resolve_plugins_dir(install.root, create=False)
-    changed_any = False
-    for bundle, config_path in _plugin_config_metadata_paths(plugins_dir, selected_rows):
-        if not config_path.exists():
-            continue
-        text = config_path.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"['\"]metadata['\"]\s*=>", text):
-            continue
-
-        quote = '"' if re.search(r'^\s*"name"\s*=>', text, flags=re.MULTILINE) else "'"
-        metadata_line = f"    {quote}metadata{quote}    => [],"
-        new_text, count = re.subn(
-            r"(?m)^(?P<indent>\s*)(?P<key>['\"]author['\"]\s*=>\s*[^,\n]+,\s*)$",
-            lambda m: m.group(0) + "\n" + metadata_line,
-            text,
-            count=1,
-        )
-        if count == 0:
-            new_text, count = re.subn(
-                r"(?m)^(?P<indent>\s*)(?P<key>['\"]version['\"]\s*=>\s*[^,\n]+,\s*)$",
-                lambda m: m.group(0) + "\n" + metadata_line,
-                text,
-                count=1,
-            )
-        if count == 0:
-            logging.debug("[%s] plugin metadata config patch skipped for %s: insertion point not found", install.root, bundle)
-            continue
-        config_path.write_text(new_text, encoding="utf-8")
-        changed_any = True
-        logging.info("[%s] plugin metadata config patch applied: %s", install.root, bundle)
-    return changed_any
+    """Disabled: compatibility payloads must be declared by the owner catalog."""
+    return False
 
 
 def _plugin_has_doctrine_entity_metadata(plugin_dir: Path) -> bool:
@@ -2003,63 +1800,9 @@ def _m6_reload_helper_path(root: str) -> Path | None:
 
 
 @contextmanager
-def _temporary_m6_native_migration_reload_compatibility(
-    install,
-    expected_bundles: set[str],
-):
-    rows = [
-        {"bundle": bundle, "install_bundle": bundle, "item": {}}
-        for bundle in sorted({str(value or "").strip() for value in expected_bundles if str(value or "").strip()})
-    ]
-    migration_bundles = _selected_metadataless_native_migration_bundles(install, rows) if rows else set()
-    if not migration_bundles:
-        yield
-        return
-
-    helper_path = _m6_reload_helper_path(install.root)
-    if helper_path is None:
-        raise RuntimeError(
-            "Mautic 6 native plugin migration reload compatibility failed: ReloadHelper.php not found"
-        )
-
-    original = helper_path.read_text(encoding="utf-8")
-    patched = original
-    safe_pattern = re.compile(
-        r"\$metadata\s*=\s*\$pluginMetadata\[\$pluginConfig\['namespace'\]\]\s*\?\?\s*\[\];"
-    )
-    if not safe_pattern.search(original):
-        unsafe_pattern = re.compile(
-            r"\$metadata(?P<space>\s*)=(?P<rhs>\s*\$pluginMetadata\[\$pluginConfig\['namespace'\]\]\s*\?\?)\s*null;"
-        )
-        patched, replacements = unsafe_pattern.subn(
-            lambda match: f"$metadata{match.group('space')}={match.group('rhs')} [];",
-            original,
-            count=1,
-        )
-        if replacements != 1:
-            raise RuntimeError(
-                "Mautic 6 native plugin migration reload compatibility failed: unsupported ReloadHelper.php"
-            )
-        helper_path.write_text(patched, encoding="utf-8")
-        logging.info(
-            "[%s] temporary Mautic 6 native migration reload compatibility enabled for %s",
-            install.root,
-            ",".join(sorted(migration_bundles)),
-        )
-
-    try:
-        yield
-    finally:
-        if patched != original:
-            current = helper_path.read_text(encoding="utf-8")
-            if current == patched:
-                helper_path.write_text(original, encoding="utf-8")
-                logging.info("[%s] temporary Mautic 6 native migration reload compatibility restored", install.root)
-            else:
-                logging.warning(
-                    "[%s] Mautic ReloadHelper.php changed while temporary compatibility was active; refusing to overwrite it",
-                    install.root,
-                )
+def _temporary_m6_native_migration_reload_compatibility(install, expected_bundles: set[str]):
+    raise RuntimeError("Temporary core mutation is retired; use an immutable catalog plan")
+    yield
 
 
 def _prealign_metadataless_plugin_versions(install, selected_rows: list[dict[str, Any]]) -> bool:

@@ -9857,7 +9857,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
             _apply_instance_runtime_guard(installs, reason="plan-refresh")
             for inst in installs:
                 try:
-                    patch_res = ensure_grapesjs_ckeditor_gpl_patch(inst)
+                    patch_res = ensure_grapesjs_ckeditor_gpl_patch(inst, config)
                     patch_status = str(patch_res.get("status", "")).strip().lower()
                     if patch_status == "patched":
                         logging.info("[%s] Mautic 7 GrapesJS CKEditor GPL patch applied", inst.root)
@@ -9980,7 +9980,7 @@ def run_loop(config: AgentConfig, single_cycle: bool = False) -> None:
                                 "root": inst.root,
                             }
                         else:
-                            patch_res = ensure_m6_plugin_update_metadata_patch(inst)
+                            patch_res = ensure_m6_plugin_update_metadata_patch(inst, config)
                         p_status = str(patch_res.get("status", "")).strip().lower()
                         if p_status == "patched":
                             logging.info("[%s] mautic6 core patch applied: %s", inst.root, patch_res.get("path", "-"))

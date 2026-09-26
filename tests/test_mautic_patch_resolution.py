@@ -88,6 +88,21 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "payload_sha256_mismatch"):
             self._resolve(response)
 
+    def test_upgrade_preflight_anchor_allows_later_record_phases(self):
+        plan = json.loads(json.dumps(self.fixture["resolve_response"]["plan"]))
+        plan["trigger"] = "upgrade_lifecycle"
+        plan["phase"] = "dependency_update_preflight"
+        plan["source_version"] = "7.1.3"
+        plan["target_version"] = "7.2.0"
+        plan["patches"][0]["triggers"] = ["upgrade_lifecycle"]
+        plan["patches"][0]["phases"] = ["post_source_install"]
+        resolution._validate_plan_records(
+            plan,
+            resolution._contract(),
+            "upgrade_lifecycle",
+            "dependency_update_preflight",
+        )
+
     def test_requires_rollback_run_id(self):
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "rollback_run_id_required"):
             resolution.resolve_plan(

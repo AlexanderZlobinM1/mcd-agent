@@ -121,7 +121,7 @@ def _binary_record(payload, relative_path, *, old_sha256=None, new_sha256):
 
 def test_v2_contract_is_additive_and_advertises_literal_gate_capability():
     contract = v1.contract()
-    assert contract["schema"] == v1.PLAN_SCHEMA
+    assert contract["plan_schema"] == v1.PLAN_SCHEMA
     assert "mautic-patch-plan-v2" in contract["capabilities"]
     assert v2.EVIDENCE_SCHEMA in contract["capabilities"]
     capability = contract["patch_plan_v2"]

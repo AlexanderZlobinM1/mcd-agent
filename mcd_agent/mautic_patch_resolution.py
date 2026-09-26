@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
+from pathlib import Path
 import importlib.resources
 import json
 import base64
@@ -42,6 +45,7 @@ _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+_IMPLEMENTED_EXECUTION_KINDS = {"git_patch_v1"}
 
 
 class MauticPatchResolutionError(RuntimeError):
@@ -64,6 +68,38 @@ def _contract() -> dict[str, Any]:
 def canonical_json_sha256(value: Any) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def read_plan_file(path: str, expected_sha256: str) -> str:
+    """Read a bounded private host plan and verify its immutable canonical hash."""
+    if not _SHA64_RE.fullmatch(str(expected_sha256 or "")):
+        raise MauticPatchResolutionError("plan_file_sha256_required")
+    if not Path(path).is_absolute():
+        raise MauticPatchResolutionError("plan_file_absolute_path_required")
+    maximum = int(_contract()["max_plan_bytes"])
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.geteuid() or info.st_size > maximum:
+            raise MauticPatchResolutionError("plan_file_permissions_or_size_invalid")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(maximum + 1)
+        if len(raw) > maximum:
+            raise MauticPatchResolutionError("plan_file_too_large")
+    finally:
+        os.close(fd)
+    text = raw.decode("utf-8")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise MauticPatchResolutionError("plan_file_duplicate_key")
+            result[key] = value
+        return result
+    plan = json.loads(text, object_pairs_hook=unique)
+    if canonical_json_sha256(plan) != expected_sha256:
+        raise MauticPatchResolutionError("plan_file_sha256_mismatch")
+    return text
 
 
 def _version_tuple(value: str) -> tuple[int, int, int] | None:
@@ -134,7 +170,7 @@ def _resolved_host_id(value: Any) -> str:
 
 
 def _agent_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         key: contract[key]
         for key in (
             "schema",
@@ -152,6 +188,8 @@ def _agent_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
             "install_types",
         )
     }
+    result["execution_kinds"] = [kind for kind in contract["execution_kinds"] if kind in _IMPLEMENTED_EXECUTION_KINDS]
+    return result
 
 
 def _safe_relative_path(value: Any, *, suffix: str | None = None) -> bool:
@@ -190,6 +228,7 @@ def _validate_gates(record: dict[str, Any], source_paths: set[str]) -> None:
                 or not isinstance(count, int)
                 or count < 0
                 or (gate.get("allow_missing_path") is True and count != 0)
+                or ("allow_missing_path" in gate and not isinstance(gate["allow_missing_path"], bool))
                 or (group == "fixed" and count == 0)
             ):
                 raise MauticPatchResolutionError("patch_exact_count_gate_invalid")
@@ -204,6 +243,8 @@ def _validate_gates(record: dict[str, Any], source_paths: set[str]) -> None:
         groups.add(group)
     if groups != {"vulnerable", "fixed"}:
         raise MauticPatchResolutionError("patch_gate_groups_incomplete")
+    if record.get("gate_logic") == "vulnerable_exactly_one; fixed_exactly_one; mixed_or_unknown=error" and any(sum(gate["group"] == group for gate in gates) != 1 for group in groups):
+        raise MauticPatchResolutionError("patch_gate_exactly_one_cardinality_invalid")
 
 
 def _validate_legacy_state(value: Any) -> None:
@@ -291,7 +332,8 @@ def _validate_plan_records(plan: dict[str, Any], contract: dict[str, Any], trigg
             or not isinstance(phases, list)
             or not phases
             or any(value not in _PHASES for value in phases)
-            or phase not in phases
+            or (trigger != "upgrade_lifecycle" and phase not in phases)
+            or (trigger == "upgrade_lifecycle" and phase != "dependency_update_preflight")
             or isinstance(order, bool)
             or not isinstance(order, int)
             or not 0 <= order <= 10000
@@ -304,6 +346,8 @@ def _validate_plan_records(plan: dict[str, Any], contract: dict[str, Any], trigg
         _validate_legacy_state(record.get("legacy_state"))
         source_paths = record.get("source_paths", [])
         if kind == "git_patch_v1":
+            if "parameters" in record and record["parameters"] != {}:
+                raise MauticPatchResolutionError("git_patch_parameters_not_supported")
             if not isinstance(source_paths, list) or not source_paths or any(not isinstance(p, str) or not _safe_relative_path(p) for p in source_paths) or len(set(source_paths)) != len(source_paths):
                 raise MauticPatchResolutionError("patch_source_paths_invalid")
             if record.get("gate_logic") not in {

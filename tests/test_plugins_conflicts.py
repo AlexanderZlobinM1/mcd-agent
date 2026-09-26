@@ -482,7 +482,7 @@ class PluginConflictPathTests(unittest.TestCase):
              patch("mcd_agent.plugins._run_plugin_template", return_value=(0, "ok")) as run_template:
             _run_plugin_install_reload(cfg, install)
 
-        db.table_has_column.assert_called_once_with("{prefix}plugins", "metadata")
+        db.table_has_column.assert_not_called()
         db.execute_sql_template.assert_not_called()
         run_template.assert_called_once()
 
@@ -539,10 +539,11 @@ class PluginConflictPathTests(unittest.TestCase):
 
             changed = _apply_plugin_config_metadata_patch(install, selected)
 
-            self.assertTrue(changed)
+            self.assertFalse(changed)
             text = config.read_text(encoding="utf-8")
-            self.assertIn('"metadata"    => []', text)
+            self.assertNotIn('"metadata"    => []', text)
             self.assertFalse((root / "app" / "bundles" / "PluginBundle" / "Helper" / "ReloadHelper.php").exists())
+
 
     def test_plugin_config_metadata_patch_covers_all_installed_plugins(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -563,10 +564,11 @@ class PluginConflictPathTests(unittest.TestCase):
 
             changed = _apply_plugin_config_metadata_patch(install, selected)
 
-            self.assertTrue(changed)
+            self.assertFalse(changed)
             for bundle in ("DemoBundle", "OtherBundle"):
                 text = (root / "plugins" / bundle / "Config" / "config.php").read_text(encoding="utf-8")
-                self.assertIn('"metadata"    => []', text)
+                self.assertNotIn('"metadata"    => []', text)
+
 
     def test_plugin_config_metadata_paths_ignores_non_bundle_directories(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -687,10 +689,12 @@ class PluginConflictPathTests(unittest.TestCase):
                 return 0, "ok"
 
             with patch("mcd_agent.plugins._run_plugin_template", side_effect=native_then_compatibility):
-                _run_plugin_install_reload(cfg, install, expected_bundles={"MigratingBundle"})
+                with self.assertRaisesRegex(RuntimeError, "mautic:plugin:install failed"):
+                    _run_plugin_install_reload(cfg, install, expected_bundles={"MigratingBundle"})
 
-            self.assertEqual(calls, 2)
+            self.assertEqual(calls, 1)
             self.assertEqual(helper.read_text(encoding="utf-8"), original)
+
 
     def test_m6_metadata_failure_without_native_migration_keeps_existing_behavior(self) -> None:
         with TemporaryDirectory() as tmp:

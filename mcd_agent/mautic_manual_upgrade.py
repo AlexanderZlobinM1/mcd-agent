@@ -92,7 +92,7 @@ def validate_preflighted_single_instance(
     else:
         if not isinstance(run_id, str) or not _RUN.fullmatch(run_id):
             _reject(prefix, "invalid_patch_run_id", "a safe patch-run-id is required for a selected patch plan")
-        if not isinstance(raw_plan, str) or len(raw_plan.encode("utf-8")) > 16_384:
+        if not isinstance(raw_plan, str) or len(raw_plan.encode("utf-8")) > 33_554_432:
             _reject(prefix, "invalid_patch_plan", "selected patch plan must be bounded")
     try:
         canonical = Path(root).resolve(strict=True)

@@ -1,110 +1,122 @@
-# Mautic patch-plan boundary (MCD 1.2.19)
+# Mautic patch plans
 
-## Atomic preflight handoff
+The static v1 patch catalog is retired. MCD rejects v1 apply plans instead of
+using embedded payloads. The generic v2 adapter remains available for existing
+v2 plans and rollback. New catalog execution uses the immutable v3 interface in
+`mcd_agent/contracts/mautic-patch-resolution-v1.json` and its versioned fixtures.
 
-The managed 7.1.3 -> 7.2.0 flow uses `mcd-mautic-patch-preflight-v1`. MCD
-1.2.18 advertises that exact capability in host ZIP/Composer outbound
-`runtime_capabilities` and derived `runtime_profile.operations`, and its
-minimum version in `mcd-cli
-mautic-patch-plan contract --json`; MCC must fail closed when it is absent.
-Explicit host runtime descriptors require `filesystem` and `console`; they do
-not need the separate `host-managed-upgrade` policy token to advertise the
-atomic patch-stage executor. Docker/image-managed profiles never advertise it.
-Patch-plan SHA-256 uses compact, key-sorted JSON with ASCII escaping, matching
-the MCC job payload checksum independently of insignificant whitespace or key
-order.
-Before
-the first patch it snapshots the role migration, CoreBundle and AssetMapper
-files, applies all mandatory phases, verifies the complete fixed state and
-restores the exact snapshot on any failure. Partial patch application cannot
-continue to Mautic migrations.
+MCC selects applicability, dependencies, conflicts and ordering from operator
+Assets. MCD validates the selected plan and executes its declared file patches.
+Disabled or unverified catalog records never acquire an agent-side fallback.
+A missing catalog or unsupported predicate gives an explicit blocked result.
 
-`MCD_PATCH_PLAN_EVIDENCE=<JSON>` contains `snapshot_id`, `selected`, `applied`,
-`verification`, `rollback_attempted`, `rollback_succeeded`,
-`pre_patch_hashes`, `post_patch_hashes`, `restore_hashes` and
-`upgrade_started`. Failures always set `upgrade_started=false`; rollback
-failure sets `hard_incident=true` and reason
-`hard_incident:patch_preflight_rollback_failed`. MCC must preserve this object
-as the job result and keep the upgrade blocked when status is `error`.
-Every terminal result has the same contract fields, including early plan
-rejection before a snapshot exists. The plan is checked against the actual
-source version, requested target and detected install type before maintenance
-or source mutation. Supplying either plan argument requires both; an explicit
-strict plan enables the same atomic hook on its supported transition.
+## Root and gate contract
 
-The input remains `mcd-mautic-patch-plan-v1`, pinned to Mautic-Operations
-registry revision `8829d322409c66f8ec9e9abf57c9ac42a19022cc`. The exact sanitized
-MCC input is retained in `tests/fixtures/mautic_patch_plan/mcc-e74cdc2b-plan.json`.
-It contains no paths, commands or patch payloads. The two supported IDs are
-`M7-ROLE-PERMISSIONS-HYDRATED-ROW` and `M7-ASSET-MAPPER-WEBROOT`.
+Paths are relative to the Mautic application root containing `app/`, `plugins/`
+and `bin/console`. Composer's project/lock root is separate; the application may
+be `docroot/`. The workflow verifies a unique application root and rejects
+ambiguous or symlink layouts. Payload paths are not stripped or relocated.
 
-## Commands
+`source_paths` includes both diff paths and gate-only identity files. Only diff
+paths are mutated. Common identity SHA gates may appear in both groups:
+`vulnerable_all; fixed_all; mixed_or_unknown=error` matches complete groups,
+not individual gates. Vulnerable-only is candidate; fixed-only is already;
+both or neither is ambiguous. `path_state` uses `expected_state=absent|present`;
+`sha256` uses `expected_sha256` over exact bytes; `exact_count` uses a literal
+`needle` and integer `expected_count`. The exact JSON fields are in the contract.
+
+File apply is serialized per application root and atomic per phase. The ledger
+preserves original bytes, mode, uid/gid and exact before/after hashes. Rollback
+checks the immutable plan binding, unchanged identity gates and every recorded
+postimage before restoring files or removing created files. Drift is not
+repaired by overwriting it. Legacy snapshots are imported only through a
+catalog-declared descriptor after validating source gates, paths and hashes.
+
+## Large-plan transport
+
+Large binary plans are transferred by the authenticated MCC job to an existing
+private root-owned regular file. Use an absolute path, mode `0600`, and the
+original canonical plan digest/run ID:
 
 ```sh
-mcd-cli mautic-patch-plan contract --json
-mcd-cli mautic-patch-plan verify --root INSTANCE_ROOT --plan-json PLAN_JSON --phase post_source_install --run-id RUN_ID --json
-mcd-cli mautic-upgrade apply --root INSTANCE_ROOT --mode composer --target 7.2.0 --allow-minor --yes --patch-plan-json PLAN_JSON --patch-run-id RUN_ID
+mcd-cli mautic-upgrade apply --root /instance --mode composer --target VERSION \
+  --patch-plan-file /private/plan.json --patch-plan-sha256 CANONICAL_SHA \
+  --patch-run-id ORIGINAL_RUN --yes --allow-minor
 ```
 
-`zip` is also a supported install type. The monolithic command invokes role
-handling after source replacement, checks it again before migration finish,
-and invokes AssetMapper handling before deferred application scripts. The
-existing MCC release authorization remains mandatory.
+`mautic-patch-plan` and `mautic-patch-backup-authorize` use `--plan-file` and
+`--plan-sha256`. Inline JSON remains available for small plans. The file digest
+is SHA-256 of sorted compact ASCII-escaped JSON followed by one LF, as in the
+resolution contract; it is not a hash of arbitrary formatting. Wrong owner,
+permissions, symlink, duplicate JSON keys, oversize or digest mismatch is rejected.
+MCC removes its transferred plan file on the job's terminal path.
 
-Standalone `verify` emits JSON with `status`, `reason` on error, `run_id`,
-`phase`, `registry_revision`, `plan_sha256`, `resolved_source_root`, and
-`patches`. Each gate includes the stable ID, state, gate rule, target relative
-path, SHA and vulnerable/fixed occurrence counts. Exit code is 0 for success
-and 2 for a rejected gate. `apply` additionally returns backup before/after
-SHA and per-patch gate evidence. Upgrade output includes one
-`MCD_PATCH_PLAN_EVIDENCE=<JSON>` line per phase, including a failing phase
-before the command raises an error; it is not a single JSON document.
+## Upgrade staging and backup
 
-## Role gate correction
+A v3 upgrade prepares the exact target in an isolated source copy with
+application scripts disabled before maintenance, permissions or live source
+installation. It validates target version and all patch conditions there,
+records package/lock and selected source hashes, and rechecks the original
+source before mutation. Composer installs the staged lock; ZIP uses the same
+verified archive hash. Installed target version/layout/file hashes are checked
+again before patch application. Each supported phase has its own plan-bound
+ledger; terminal failure attempts reverse-phase patch rollback. The staging
+copy is removed on success, cancellation or failure.
 
-The disposable Composer source matched the official 7.2.0 migration byte for
-byte. Its SHA is
-`f970321517fa32eed01a031f5110f397e441bb049965efdbbeece7750df4d33c`.
-This is a vulnerable file, not an upstream-fixed signature. MCD 1.2.4 matched
-four spaces after the loop newline, whereas the real statement has twelve.
-Consequently it reported vulnerable/fixed counts 0/0.
+The supported upgrade record phases are `post_source_install`,
+`before_cache_warmup`, `before_asset_generation`, `preflight_frontend_assets`
+and `before_doctrine_migrations`; unsupported workflow phases fail before live
+mutation. Runtime phases are selected independently at their existing cadence.
 
-MCD 1.2.5 requires both that vulnerable SHA and exactly one complete executable
-block with the actual indentation. After canonical hydrated-row handling,
-the file must have SHA
-`b690b3cdd927a9b8257572cbb7bc42aba79f6c8b90d1ce39bac3154a928f2328`
-and one complete fixed block. Only that verified fixed state is `already`.
-Unknown, duplicate, mixed, partial, old-version and otherwise changed files
-are errors. Version discovery reads Mautic package or release metadata and
-does not accept an arbitrary `7.2.0` string elsewhere in a file. ZIP files
-may include composer.json without being classified as Composer installs.
+The signed schema-repair backup attestation applies to guarded M6-to-7 repair.
+Its JSON envelope binds instance/root/source/target/run/plan SHA and MCC-validated
+backup evidence; it is supplied after backup without changing the immutable
+plan. Signature bytes and fields are pinned in the contract. For 7-to-7 the
+repair attestation is not required. This does not waive the ordinary MCC backup
+policy or the agent's `--backup` request; regression covers that distinction.
 
-## Evidence and recovery
+## Legacy caller migration and disabled policy
 
-`ROOT/.mcd/patch-runs/RUN_ID/result.json` preserves phase history and original
-backup records through repeated successful checks. Pending-write intent is
-saved before source replacement. PHP lint runs on staged files; unchanged
-source hashes are rechecked before replacement. A pending or failed run
-requires explicit recovery, rather than silently treating it as completed.
+| Previous caller | Current route or safe policy |
+|---|---|
+| M6 metadata file remediation | Catalog `before_plugin_reload`, existing required/off policy and unknown-version opt-in; no embedded method replacement |
+| M7 import-tag daemon/operator actions | Catalog `before_background_imports`; operator rollback names its original `--run-id` |
+| GrapesJS/CKEditor periodic remediation | Catalog `before_asset_generation`; payload and version applicability come from Assets |
+| Generic upgrade/static v1 patch stage | Generic v3 staged target and exact phase execution; static v1 plans rejected |
+| Pre-upgrade import-tag revert and post-upgrade direct patch | Removed; source upgrade uses its immutable plan and daemon reconciliation uses the catalog |
+| Twig include hotfix | Historical function cannot mutate source; missing dependency predicate remains a readiness blocker |
+| M4 Hostnet composite compatibility | Disabled historical action, no source mutation |
+| Plugin config metadata insertion | Disabled; plugin source changes belong to its owner |
+| DB plugins.metadata NULL/empty/invalid-JSON rewrite | Removed and capability not advertised: upstream source does not establish that column as the event metadata source |
+| Temporary M6 native-migration core replacement | Removed; exact reload failure may invoke catalog runtime repair, otherwise stays failed without core mutation |
+| Retired patch automatic restore | No inferred backup/path/marker; explicit catalog legacy descriptor required |
 
-```sh
-mcd-cli mautic-patch-plan rollback --root INSTANCE_ROOT --plan-json PLAN_JSON --run-id RUN_ID --json
-```
+M6 policy `off` prevents automatic remediation, including plugin reload recovery.
+When the version is unknown, local opt-in, independently confirmed major,
+explicit catalog permission and source gates are all required. Local version
+window settings no longer supply catalog applicability decisions.
 
-Rollback verifies all known backup paths/checksums and current-file checksums
-before restoring files. It rejects files changed since the run. It restores
-patch source files only, not a database migration or a complete upgrade.
-After rollback, use a new run ID for a new attempt.
+Nonempty `git_patch_v1.parameters` is rejected until a typed capability exists.
+Role row count, configured-prefix migration-pending/namespace facts, dependency
+package predicates, method-scoped predicates and migration/DDL rollback barriers
+are not inferred from file signatures. Records needing those facts stay disabled
+and remain explicit upgrade-readiness blockers. Source-only consumer acceptance
+is not full upgrade readiness.
 
-## Acceptance scope
+The ROLE readiness policy is pending migration plus non-admin role count
+(`is_admin=0`) greater than zero, not total role count greater than one.
+One non-admin role requires remediation; one admin role alone does not.
+Missing schema, prefix, column or exact migration encoding blocks rather than
+producing a zero count. This typed capability is not advertised by 1.2.63.
 
-The regression fixtures are complete official source files with independently
-captured SHA values, plus the exact MCC payload. PHP execution tests demonstrate
-the original hydrated-array failure and corrected handling of array/direct
-Role results. Tests also cover both layouts, repeat phases, failure evidence,
-interruption recovery and checksum-protected rollback.
+## Consumer acceptance
 
-These fixtures validate patch behavior and the MCD command contract. A full
-disposable database upgrade remains the cross-component acceptance gate.
-Publication of 1.2.5 is an off-catalog, one-host candidate for
-`host-46-224-209-196`; global channel pointers must not move for this acceptance.
+MCD 1.2.63 executed the owner-published 4,126,599-byte Git binary payload with
+SHA-256 `fac7c6c72549cb3630dded1648c069d87d867bf9fb2050e2a4765b3c7944f321`
+from Operations ref `3681e699ba6bdd387f6e9d6741c2fc6f1b3bc3ec` in an isolated
+Composer project/docroot application fixture with exact fresh-package identity
+files. File CLI transport, complete-group gates, three exact postimages,
+identity-file immutability, idempotency, created-file rollback, partial/identity/
+postimage drift rejection and root/symlink containment passed. The source record
+remained disabled; no customer upgrade was performed. The immutable consumer
+source/package ref accompanies the release result.
