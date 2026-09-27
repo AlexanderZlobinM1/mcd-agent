@@ -1,0 +1,11 @@
+{
+  "schema": "mcd-target-patch-verification-contract-reference-v1",
+  "normative_contract": "control-plane/backend/docs/mautic-target-patch-verification-v1.json",
+  "normative_contract_sha256": "42f29b668117316870a698f144a1d8a066b4775d1f9c3449c5967adc830ce1e2",
+  "command": "mcd-cli mautic-target-patch-verify",
+  "purpose": "verify_target_excluded_patches",
+  "read_only": true,
+  "original_plan_database_facts_supported": false,
+  "unsupported_original_plan_outcome": "input_invalid_before_registry_admission_or_target_reads",
+  "dispatch_authority": false
+}

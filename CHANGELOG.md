@@ -1,3 +1,11 @@
+## 1.2.71 - 2026-09-27
+
+- Add root-only check-only verification of excluded target patches under dedicated online purpose admission.
+- Bind effective catalog bytes, original apply plan, prepared identity, source layout and complete fixed-source signatures without apply or rollback permission.
+- Read prepared registry metadata without writes or sidecars; recheck actual archives and staged bytes only after finite admission.
+- Publish bounded direct JSON results with independent gate validation and explicit private-file rejection.
+- Keep scenario dispatch disabled and preserve legacy context commands.
+
 ## 1.2.70 - 2026-09-27
 
 - Add root-only read-only local-context v2 CLI with independently discovered identity and Composer layout.

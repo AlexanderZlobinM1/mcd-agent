@@ -1882,6 +1882,17 @@ def _build_parser() -> argparse.ArgumentParser:
     local_context.add_argument("--root", required=True)
     local_context.add_argument("--json", action="store_true")
 
+    target_verify = sub.add_parser("mautic-target-patch-verify", help="Read-only admitted staged-target signatures")
+    target_verify.add_argument("--config", default=default_cfg)
+    target_verify.add_argument("--root", required=True)
+    target_verify.add_argument("--prepared-target-id", required=True)
+    for prefix in ("verification-plan", "authorization-context", "patch-plan"):
+        target_verify.add_argument("--" + prefix + "-file", required=True)
+        target_verify.add_argument("--" + prefix + "-sha256", required=True)
+    target_verify.add_argument("--catalog-file", required=True)
+    target_verify.add_argument("--catalog-sha256", required=True)
+    target_verify.add_argument("--json", action="store_true")
+
     up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
     up.add_argument("--config", default=default_cfg)
     up.add_argument("--root")
@@ -3208,6 +3219,16 @@ def main() -> int:
             return 2
         print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
         return 0
+
+    if args.cmd == "mautic-target-patch-verify":
+        from mcd_agent.mautic_target_patch_collector import verify_cli
+        result = verify_cli(config_path=args.config, root=args.root, prepared_target_id=args.prepared_target_id,
+            verification_plan_file=args.verification_plan_file, verification_plan_sha256=args.verification_plan_sha256,
+            authorization_context_file=args.authorization_context_file, authorization_context_sha256=args.authorization_context_sha256,
+            patch_plan_file=args.patch_plan_file, patch_plan_sha256=args.patch_plan_sha256,
+            catalog_file=args.catalog_file, catalog_sha256=args.catalog_sha256)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        return 0 if result["status"] == "verified" else 2
 
     if args.cmd == "mautic-upgrade":
         if args.patch_plan_file:
