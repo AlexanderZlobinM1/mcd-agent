@@ -1,3 +1,9 @@
+## 1.2.78 - 2026-09-27
+
+- Execute campaign/import consumer patch phases immediately after source installation under upgrade maintenance, before scripts or managed consumer resumption.
+- Preserve catalog phase names, target binding, source gates, idempotency, rollback and final postimage verification in ZIP and Composer workflows.
+- Cover ordinary six-record upgrade plans, asset-only patches, repeated phases, drift and early rejection through the upgrade entrypoint.
+
 ## 1.2.77 - 2026-09-27
 
 - Scope migration token ambiguity to the requested target; unrelated raw-distinct logical collisions no longer invalidate unique exact target presence.
