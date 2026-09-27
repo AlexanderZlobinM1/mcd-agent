@@ -181,9 +181,6 @@ def verify_assetmapper_upgrade(
     if webroot_source not in {"composer", "archive"}:
         result["reason"] = "webroot source is not explicit"
         return result
-    if not rollback_available:
-        result["reason"] = "rollback evidence is unavailable"
-        return result
     if not str(domain or "").strip():
         result["reason"] = "instance domain is unavailable for SNI/Host verification"
         return result

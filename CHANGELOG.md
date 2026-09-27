@@ -1,3 +1,9 @@
+## 1.2.80 - 2026-09-27
+
+- Execute and verify assets when baseline policy permits backup-off; keep actual rollback availability separate from execution success.
+- Preserve genuine asset command and HTTP failures without fabricated backup or rollback evidence.
+- Bind whole-plan patch rollback receipts to the original immutable apply plan and include the v3 evidence schema.
+
 ## 1.2.79 - 2026-09-27
 
 - Remove ordinary-upgrade conditional exclusion proof transport and global pre-Composer database admission.

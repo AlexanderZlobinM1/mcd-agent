@@ -716,7 +716,11 @@ def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str |
         for ledger_file, ledger in ledgers:
             restored.extend(_restore_ledger(root, ledger, allow_pre_state=ledger.get("status") == "rolled_back")["restored"])
             _save_ledger(ledger_file, ledger)
-        return {"status": "success", "operation": "rollback", "run_id": plan["run_id"], "restored": restored, "rollback_attempted": bool(restored), "rollback_succeeded": True}
+        return {"schema": "mcd-mautic-patch-preflight-v3", "status": "success",
+                "operation": "rollback", "run_id": plan["run_id"],
+                "plan_sha256": canonical_json_sha256(dict(plan, operation="apply")),
+                "restored": restored, "rollback_attempted": bool(restored),
+                "rollback_succeeded": True}
     path = _ledger_path(root, plan["run_id"] + ("." + selected_phase if plan["trigger"] == "upgrade_lifecycle" else ""))
     if not path.exists():
         snapshots = []
@@ -762,7 +766,7 @@ def _rollback(root_value: str, plan_value: dict[str, Any] | str, *, phase: str |
         "status": "success",
         "operation": "rollback",
         "run_id": plan["run_id"],
-        "plan_sha256": canonical_json_sha256(plan),
+        "plan_sha256": canonical_json_sha256(dict(plan, operation="apply")),
         "rollback_attempted": True,
         "rollback_succeeded": True,
         "restored": result["restored"],
