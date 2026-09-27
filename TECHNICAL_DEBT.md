@@ -1,5 +1,60 @@
 # MCD Technical Debt
 
+## MCD-TD-001
+
+- Status: open
+- Title: Composer dependency write-path admission misses nested parent ownership drift
+- Owner scope: MCD upgrade permissions and source-mutation admission; host recovery remains Operations-owned
+- Source task: `01a07d46-213b-7e62-b910-08c7a9dacde1`
+- Last updated: 2026-09-27
+
+Observed with published MCD 1.2.78 in failed operation
+`1d86050c-79ac-4349-b286-9ebd1f0648d6`. Composer ran as the runtime user and
+could not unlink a dependency file because its immediate directory was owned
+by root with mode 0755. The file itself and higher ancestors had runtime-user
+ownership. No immutable attribute or read-only filesystem explained the failure.
+
+`mautic_upgrade._pre_upgrade_permissions_check` delegates to configured
+`fs_permissions_guard_paths`. Defaults protect runtime/config/media paths,
+not Composer-managed plugin/vendor trees; deep checks cover only selected
+runtime paths and stop at depth four. A successful generic permissions check
+therefore did not establish actual dependency replacement capability.
+
+Composer replacement is not transactionally rolled back by the patch executor.
+Failure preceded the source-install callback: installed dependencies became
+partial, while patch rollback reported no applied source patches to restore.
+Do not interpret that result, extraction progress, or a target lock as a healthy
+completed installation. A complete source backup of the original version was
+not available in this incident.
+
+Operations performed the single controlled recovery: narrow parent ownership
+repair, completion from the unchanged existing lock under maintenance, the
+original immutable patch plan and fresh exclusion proof, all consumer hooks,
+normal finish/migration post-check, and asset/postimage/health verification.
+The target installation, manifest and 32 referenced assets passed real HTTP
+checks; managed consumers were restored only after verified success. The
+original failed operation remains historical ERROR. This customer recovery
+does not fix or close the generic admission defect.
+
+Operational reports, recovery scripts and source/frontend snapshots remain
+solely in the owning Operations project. Evidence locator: the operation ID
+above, `continuation-result.json`, `recovery-result-assetgate.json`, and the
+original immutable plan/proof in that project's canonical incident evidence.
+Do not copy host-local recovery implementation or sensitive snapshots here.
+
+Acceptance for a later MCD-owned change:
+
+- Establish create/unlink/rename capability for the actual Composer runtime identity and controlling directories before live dependency replacement, including nested ownership drift beyond depth four.
+- Bind checks and any normal repair to the selected canonical Composer/project/application layout and managed dependency paths; reject symlink escapes, immutable/read-only cases and unknown access evidence without blind recursive permission changes.
+- Preserve immutable catalog selection, typed facts, target staging, phase order, idempotency, drift rejection, data boundaries and complete postimage verification.
+- Cover nested parent-not-writable/file-writable, differing project/webroot layouts, already-correct paths and genuine pre-mutation failure through the upgrade entrypoint.
+- Publish and verify the fix through the normal source/public mirror, package regression, test-machine and approved release route. Report partial Composer failure and rollback limits honestly.
+
+Next action: implement and release the generic permission-admission correction
+in a later authorized work session. No 1.2.79 implementation or release was
+started; today's functional work stopped after verified recovery. Parent and
+subproject indexes both remain open.
+
 ## MCC-TD-001
 
 - Status: open
