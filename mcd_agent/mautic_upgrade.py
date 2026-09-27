@@ -1891,6 +1891,10 @@ def run_upgrade_apply(
     allow_release_transition: bool = False,
     mcc_release_authorization_context_file: str = "",
     mcc_release_authorization_context_sha256: str = "",
+    patch_exclusion_guard_plan_file: str = "",
+    patch_exclusion_guard_plan_sha256: str = "",
+    patch_exclusion_guard_receipt_file: str = "",
+    patch_exclusion_guard_receipt_sha256: str = "",
 ) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -2004,6 +2008,19 @@ def run_upgrade_apply(
         if selected["status"] == "selected":
             patch_plan_json = json.dumps(selected["plan"], ensure_ascii=True, separators=(",", ":"))
             patch_run_id = selected["plan"]["run_id"]
+    exclusion_recheck = None
+    exclusion_inputs = (patch_exclusion_guard_plan_file, patch_exclusion_guard_plan_sha256,
+                        patch_exclusion_guard_receipt_file, patch_exclusion_guard_receipt_sha256)
+    if any(exclusion_inputs):
+        if not all(exclusion_inputs) or not patch_plan_json or not patch_run_id:
+            raise RuntimeError("patch_exclusion_immutable_inputs_required")
+        from mcd_agent.mautic_patch_resolution import read_plan_file
+        from mcd_agent.mautic_patch_exclusion_guard import read_receipt, upgrade_guard
+        exclusion_recheck = upgrade_guard(config=config, root=install_root, current=current,
+            target=target, install_type=chosen_mode, run_id=patch_run_id,
+            apply_plan_json=patch_plan_json,
+            guard_plan_json=read_plan_file(patch_exclusion_guard_plan_file, patch_exclusion_guard_plan_sha256),
+            receipt=read_receipt(patch_exclusion_guard_receipt_file, patch_exclusion_guard_receipt_sha256))
     patch_hook = None
     target_stage = None
     patch_facts_provider = None
@@ -2086,6 +2103,8 @@ def run_upgrade_apply(
     try:
         if cross_line:
             require_live_release_authorization()
+        if exclusion_recheck is not None:
+            exclusion_recheck()
         guard = _enter_upgrade_maintenance(config)
     except Exception:
         if target_stage is not None:
@@ -2105,6 +2124,8 @@ def run_upgrade_apply(
                 _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
             )
         # Mandatory preflight: align permissions before any upgrade action.
+        if exclusion_recheck is not None:
+            exclusion_recheck()
         _pre_upgrade_permissions_check(config, install_root)
 
         # This hotfix changes a core file. Restore the exact

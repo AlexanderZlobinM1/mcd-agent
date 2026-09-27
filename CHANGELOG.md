@@ -1,3 +1,9 @@
+## 1.2.73 - 2026-09-27
+
+- Add fully bound read-only conditional exclusion proofs for ordinary upgrade plans.
+- Reobserve complete accepted facts before target preparation, maintenance admission; reject true, unknown, partial coverage or drift.
+- Advertise the conditional exclusion guard capability without enabling scenario execution.
+
 ## 1.2.72 - 2026-09-27
 
 - Advertise the exact read-only file-only target verification capability through a standalone nonroot JSON query.

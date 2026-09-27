@@ -1914,6 +1914,10 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--patch-plan-file", default="", help="Private host file containing a large immutable patch plan")
     up.add_argument("--patch-plan-sha256", default="", help="Expected canonical immutable plan SHA-256")
     up.add_argument("--patch-run-id", default="", help="Safe idempotency key for the atomic MCC patch-plan run")
+    up.add_argument("--patch-exclusion-guard-plan-file", default="")
+    up.add_argument("--patch-exclusion-guard-plan-sha256", default="")
+    up.add_argument("--patch-exclusion-guard-receipt-file", default="")
+    up.add_argument("--patch-exclusion-guard-receipt-sha256", default="")
     up.add_argument("--repair-plan-json", default="", help="Strict versioned JSON-schema repair plan")
     up.add_argument("--repair-auth-context-file", default="", help="Root-owned signed MCC authorization context file for JSON repair")
     up.add_argument("--patch-backup-context-file", default="", help="Signed host-local backup attestation bound to the immutable v3 patch plan")
@@ -2239,6 +2243,8 @@ def _build_parser() -> argparse.ArgumentParser:
     patch_plan.add_argument("--phase", default="")
     patch_plan.add_argument("--run-id", default="")
     patch_plan.add_argument("--json", action="store_true")
+    patch_plan.add_argument("--require-all-not-required", action="store_true")
+    patch_plan.add_argument("--config", default=default_cfg)
     patch_backup = sub.add_parser("mautic-patch-backup-authorize", help="Bind a verified backup to an immutable upgrade patch plan")
     patch_backup.add_argument("--root", required=True)
     patch_backup.add_argument("--instance-uid", required=True)
@@ -3308,6 +3314,10 @@ def main() -> int:
             patch_backup_context_file=str(args.patch_backup_context_file or "") or None,
             repair_auth_key_file=str(args.repair_auth_key_file or "/etc/mcd/mcc-operation-signing.key"),
             mcc_preflighted_single_instance=bool(args.mcc_preflighted_single_instance),
+            patch_exclusion_guard_plan_file=args.patch_exclusion_guard_plan_file,
+            patch_exclusion_guard_plan_sha256=args.patch_exclusion_guard_plan_sha256,
+            patch_exclusion_guard_receipt_file=args.patch_exclusion_guard_receipt_file,
+            patch_exclusion_guard_receipt_sha256=args.patch_exclusion_guard_receipt_sha256,
         )
         if rc == 0:
             _push_state_after_change(cfg, "mautic-upgrade-apply")
@@ -4459,7 +4469,16 @@ def main() -> int:
                 if args.op == "apply":
                     admission = execute(args.root or "", json.dumps(dict(plan, operation="verify")), args.phase, args.run_id, "verify", **options)
                     options["accepted_facts"] = admission["facts_receipt"]
-            result = rollback(args.root or "", args.plan_json, args.run_id, **options) if args.op == "rollback" else execute(args.root or "", args.plan_json, args.phase, args.run_id, args.op, **options)
+            if args.require_all_not_required:
+                if args.op != "verify" or plan.get("run_id") != args.run_id:
+                    raise PatchPlanError("patch_exclusion_verify_invocation_invalid")
+                from mcd_agent.mautic_patch_exclusion_guard import prove_not_required
+                try:
+                    result = prove_not_required(plan, options.get("facts_provider"), args.phase or plan["phase"])
+                except (ValueError, TypeError) as exc:
+                    raise PatchPlanError(str(exc)) from exc
+            else:
+                result = rollback(args.root or "", args.plan_json, args.run_id, **options) if args.op == "rollback" else execute(args.root or "", args.plan_json, args.phase, args.run_id, args.op, **options)
         except PatchPlanError as exc:
             result = {"status": "error", "reason": str(exc)}
         print(json.dumps(result, ensure_ascii=True, indent=2))
