@@ -209,7 +209,7 @@ def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
         raise PatchFactsError("fact_migration_target_encoding_unknown")
     if len(values) > 10000:
         raise PatchFactsError("fact_migration_storage_limit")
-    seen, logical_seen = set(), set()
+    seen = set()
     uninterpreted = []
     count = 0
     for value in values:
@@ -231,10 +231,8 @@ def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
         tokens = _migration_identity_tokens(value)
         if tokens is None:
             raise _migration_storage_error("fact_migration_encoding_unknown", values, value, migration)
-        logical_identity = tuple(token.casefold() for token in tokens)
-        if logical_identity in logical_seen:
-            raise _migration_storage_error("fact_migration_identity_ambiguous", values, value, migration)
-        logical_seen.add(logical_identity)
+        # Tokens identify target aliases above, not an unrelated stored-row
+        # identity. Raw-distinct history must not invalidate an exact target.
         if _NAMESPACE_LITERAL.fullmatch(value):
             # This is NOT a valid-FQCN/storage-codec assertion. A literal can
             # establish no execution identity, especially no pending target.

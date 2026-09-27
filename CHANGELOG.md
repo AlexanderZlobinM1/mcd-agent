@@ -1,3 +1,9 @@
+## 1.2.77 - 2026-09-27
+
+- Scope migration token ambiguity to the requested target; unrelated raw-distinct logical collisions no longer invalidate unique exact target presence.
+- Preserve raw duplicate, target alias, unsafe history and absent-target literal rejection without decoding, deduplication or receipt changes.
+- Add complete 120-row collision regression with unchanged raw history hashes.
+
 ## 1.2.76 - 2026-09-27
 
 - Scope migration execution facts to positive raw canonical target presence without decoding unsupported namespace-looking literal history.
