@@ -247,15 +247,19 @@ def issue_repair_authorization_context(
     marker_path = Path(backup_manifest_path)
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker_digest = hashlib.sha256(marker_path.read_bytes()).hexdigest()
         backup = {
             "backup_id": marker.get("backup_id"),
-            "sha256": hashlib.sha256(marker_path.read_bytes()).hexdigest(),
+            "sha256": marker_digest,
             "manifest_path": str(marker_path),
             "completed_at": marker.get("ts_utc"),
             "rollback_supported": True,
         }
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise RepairAuthorizationError("backup_manifest_unavailable") from exc
+    if marker_path.parent.parent.name == "authorization-manifests" and marker_path.name == ".mcd-backup.json":
+        if not hmac.compare_digest(marker_digest, marker_path.parent.name):
+            raise RepairAuthorizationError("backup_manifest_digest_mismatch")
     verified = verify_backup_evidence(backup, root=root, instance_uid=instance_uid)
     key = _read_signing_key(key_path)
     now = int(time.time())

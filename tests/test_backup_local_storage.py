@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import tempfile
+import hashlib
+import contextlib
+import io
+import json
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mcd_agent import backup
+from mcd_agent import cli
 from mcd_agent.models import DBConfig
+from mcd_agent.mautic_json_repair import RepairAuthorizationError, issue_repair_authorization_context, validate_authorization_context, verify_backup_evidence
+from mcd_agent.mautic_upgrade_contract import JSON_REPAIR_PLAN_CONTRACT, KNOWN_JSON_COLUMNS
 
 
 def _cfg(tmp: Path, target: Path) -> SimpleNamespace:
@@ -124,6 +132,75 @@ class BackupLocalStorageTests(unittest.TestCase):
             final = Path(result.backup_path)
             self.assertTrue(final.is_dir())
             self.assertFalse(any(p.name.startswith(".incomplete-") for p in final.parent.iterdir()))
+            self.assertEqual(Path(result.manifest_path), final / ".mcd-backup.json")
+            evidence = Path(result.authorization_manifest_path)
+            self.assertEqual(
+                evidence,
+                Path(result.state_path).parent / "authorization-manifests" / result.sha256 / ".mcd-backup.json",
+            )
+            self.assertEqual(evidence.read_bytes(), Path(result.manifest_path).read_bytes())
+            self.assertEqual(hashlib.sha256(evidence.read_bytes()).hexdigest(), result.sha256)
+            self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+            output = io.StringIO()
+            with patch.object(sys, "argv", [
+                "mcd-cli", "backup", "--config", str(tmp / "mcd.toml"), "instance-run",
+                "--root", str(source), "--json", "--remote-root-dir", "mcc/recovery",
+            ]), patch.object(cli, "load_config", return_value=cfg), patch.object(
+                cli, "maybe_notify_update", return_value=None,
+            ), patch.object(cli, "backup_instance_run", return_value=result), patch.object(
+                cli, "_push_state_after_change",
+            ), contextlib.redirect_stdout(output):
+                self.assertEqual(cli.main(), 0)
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["manifest_path"], result.manifest_path)
+            self.assertEqual(receipt["authorization_manifest_path"], str(evidence))
+            self.assertEqual(receipt["sha256"], result.sha256)
+
+            # Simulate a separate consumer after the transient storage mount
+            # disappears; the authorization must use only durable evidence.
+            offline = tmp / "offline-storage"
+            target.rename(offline)
+            plan = {
+                "schema": JSON_REPAIR_PLAN_CONTRACT,
+                "condition": "sqlstate_1253_json_collation_binary",
+                "source_major": 6,
+                "target_major": 7,
+                "table_prefix": "ss_",
+                "columns": [f"{row['table']}.{row['column']}" for row in KNOWN_JSON_COLUMNS],
+                "action": "normalize_declared_json_columns",
+            }
+            authorization = issue_repair_authorization_context(
+                root=str(source), instance_uid="uid-1", source_version="6.0.9", target_version="7.1.3",
+                repair_plan_json=plan, backup_manifest_path=str(evidence),
+                key_path=str(tmp / "signing.key"), output_path=str(tmp / "context.json"),
+            )
+            self.assertEqual(authorization["status"], "authorized")
+            self.assertEqual(authorization["backup_sha256"], result.sha256)
+            signed = json.loads(Path(authorization["context_path"]).read_text(encoding="utf-8"))
+            validate_authorization_context(
+                signed, plan=plan, instance_uid="uid-1", root=str(source),
+                source_version="6.0.9", target_version="7.1.3",
+                signing_key=(tmp / "signing.key").read_bytes().strip(),
+            )
+            self.assertEqual(signed["backup_evidence"]["manifest_path"], str(evidence))
+            verify_backup_evidence(
+                signed["backup_evidence"], root=str(source), instance_uid="uid-1",
+            )
+            evidence.write_bytes(evidence.read_bytes() + b" ")
+            with self.assertRaisesRegex(RepairAuthorizationError, "backup_manifest_digest_mismatch"):
+                issue_repair_authorization_context(
+                    root=str(source), instance_uid="uid-1", source_version="6.0.9", target_version="7.1.3",
+                    repair_plan_json=plan, backup_manifest_path=str(evidence),
+                    key_path=str(tmp / "signing.key"), output_path=str(tmp / "context.json"),
+                )
+            evidence.unlink()
+            with self.assertRaisesRegex(RepairAuthorizationError, "backup_manifest_unavailable"):
+                issue_repair_authorization_context(
+                    root=str(source), instance_uid="uid-1", source_version="6.0.9", target_version="7.1.3",
+                    repair_plan_json=plan, backup_manifest_path=str(evidence),
+                    key_path=str(tmp / "signing.key"), output_path=str(tmp / "context.json"),
+                )
+            offline.rename(target)
 
             loader = Mock()
             tar_run = Mock()

@@ -1,3 +1,9 @@
+## 1.2.83 - 2026-09-28
+
+- Preserve the remote instance-backup marker path and publish a separate durable, root-only exact-byte authorization marker before releasing transient backup storage.
+- Bind the authorization marker to the backup receipt digest so separate repair authorization and apply commands can verify it after unmount; fail honestly on missing or altered evidence.
+- Cover post-unmount authorization, marker integrity and legacy backup receipt behavior.
+
 ## 1.2.82 - 2026-09-27
 
 - Remove the introduced major-wide PHP readiness policy and restore native Composer readiness/bootstrap behavior without a replacement policy resolver.

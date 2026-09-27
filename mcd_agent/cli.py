@@ -4803,6 +4803,7 @@ def main() -> int:
                             "bytes_written": res.bytes_written,
                             "backup_id": res.backup_id,
                             "manifest_path": res.manifest_path,
+                            "authorization_manifest_path": res.authorization_manifest_path,
                             "sha256": res.sha256,
                             "completed_at": res.completed_at,
                         },

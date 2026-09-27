@@ -109,6 +109,7 @@ class BackupResult:
     bytes_written: int | None = None
     backup_id: str | None = None
     manifest_path: str | None = None
+    authorization_manifest_path: str | None = None
     sha256: str | None = None
     completed_at: str | None = None
 
@@ -5224,6 +5225,43 @@ def backup_instance_run(
             marker=marker,
             kind="mcc.instance_backup.mydumper",
         )
+        # The storage mount is released when this command returns. Keep the
+        # exact verified marker bytes available to a later authorization CLI.
+        evidence_dir = state_path.parent / "authorization-manifests" / marker_sha256
+        evidence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if evidence_dir.is_symlink():
+            raise RuntimeError("authorization manifest directory is a symlink")
+        os.chmod(evidence_dir, 0o700)
+        authorization_manifest_path = evidence_dir / ".mcd-backup.json"
+        marker_bytes = marker_path.read_bytes()
+        if hashlib.sha256(marker_bytes).hexdigest() != marker_sha256:
+            raise RuntimeError("backup marker changed before durable authorization handoff")
+        if authorization_manifest_path.is_symlink():
+            raise RuntimeError("authorization manifest is a symlink")
+        if authorization_manifest_path.exists():
+            if not authorization_manifest_path.is_file() or authorization_manifest_path.stat().st_mode & 0o077:
+                raise RuntimeError("existing authorization manifest permissions are unsafe")
+            if hashlib.sha256(authorization_manifest_path.read_bytes()).hexdigest() != marker_sha256:
+                raise RuntimeError("existing authorization manifest has different bytes")
+        else:
+            import tempfile
+
+            fd, temporary_path = tempfile.mkstemp(prefix=".mcd-backup-", dir=evidence_dir)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as evidence_file:
+                    evidence_file.write(marker_bytes)
+                    evidence_file.flush()
+                    os.fsync(evidence_file.fileno())
+                os.replace(temporary_path, authorization_manifest_path)
+                directory_fd = os.open(evidence_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
         duration = int(time.monotonic() - start_monotonic)
         history = state.get("history", [])
         if not isinstance(history, list):
@@ -5270,6 +5308,7 @@ def backup_instance_run(
             bytes_written=bytes_written,
             backup_id=str(marker["backup_id"]),
             manifest_path=str(marker_path),
+            authorization_manifest_path=str(authorization_manifest_path),
             sha256=marker_sha256,
             completed_at=str(marker["ts_utc"]),
         )
