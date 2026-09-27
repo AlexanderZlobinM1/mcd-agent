@@ -100,15 +100,38 @@ def validate_predicates(predicates: Any) -> None:
 
 
 def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
+    from datetime import datetime
+    if not isinstance(migration, str) or not _FQCN.fullmatch(migration):
+        raise PatchFactsError("fact_migration_target_encoding_unknown")
     if len(values) > 10000:
         raise PatchFactsError("fact_migration_storage_limit")
+    target_basename = migration.rsplit("\\", 1)[-1]
+    timestamp = re.fullmatch(r"Version([0-9]{14})", target_basename)
+    target_timestamp = timestamp.group(1) if timestamp else None
+    seen = set()
     count = 0
     for value in values:
-        if (not isinstance(value, str) or not _FQCN.fullmatch(value)
-                or len(value.encode("utf-8")) > 1024):
+        if not isinstance(value, str) or not value or len(value) > 1024:
             raise PatchFactsError("fact_migration_encoding_unknown")
+        if value in seen:
+            raise PatchFactsError("fact_migration_cardinality_unknown")
+        seen.add(value)
         if value != migration and value.casefold() == migration.casefold():
             raise PatchFactsError("fact_migration_case_ambiguous")
+        if value != migration and (value.rsplit("\\", 1)[-1].casefold() == target_basename.casefold()
+                or (target_timestamp is not None and value == target_timestamp)):
+            raise PatchFactsError("fact_migration_target_alias_ambiguous")
+        if re.fullmatch(r"[0-9]{14}", value):
+            try:
+                datetime(int(value[:4]), int(value[4:6]), int(value[6:8]),
+                         int(value[8:10]), int(value[10:12]), int(value[12:14]))
+            except ValueError as exc:
+                raise PatchFactsError("fact_migration_encoding_unknown") from exc
+            # A documented unrelated legacy timestamp is not a requested FQCN
+            # match. Keep the raw storage untouched for the observation hash.
+            continue
+        if not _FQCN.fullmatch(value) or len(value.encode("utf-8")) > 1024:
+            raise PatchFactsError("fact_migration_encoding_unknown")
         count += int(value.encode("utf-8") == migration.encode("utf-8"))
     if count > 1:
         raise PatchFactsError("fact_migration_cardinality_unknown")

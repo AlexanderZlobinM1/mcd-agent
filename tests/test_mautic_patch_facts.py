@@ -49,10 +49,50 @@ def test_migration_exact_cardinality_is_independent_of_database_collation():
         migration_state([MIGRATION, MIGRATION], MIGRATION)
 
 
-@pytest.mark.parametrize("value", [None, "20211209022550", 20211209022550, MIGRATION.encode(), ""])
+@pytest.mark.parametrize("value", [None, 20211209022550, MIGRATION.encode(), ""])
 def test_migration_unknown_encoding_never_means_pending(value):
     with pytest.raises(PatchFactsError, match="encoding_unknown"):
         migration_state([value], MIGRATION)
+
+
+@pytest.mark.parametrize("values,expected", [
+    (["20160101000000", MIGRATION, "Mautic\\Migrations\\Version20260915000000"], ("executed", 1)),
+    (["20160101000000", "Mautic\\Migrations\\Version20260915000000"], ("pending", 0)),
+    (["20240229010203", MIGRATION], ("executed", 1)),
+])
+def test_documented_mixed_storage_keeps_exact_target_and_raw_hash(values, expected):
+    before = copy.deepcopy(values); raw_hash = digest(values)
+    assert migration_state(values, MIGRATION) == expected
+    assert values == before and digest(values) == raw_hash
+
+
+@pytest.mark.parametrize("alias", ["20211209022550", "Version20211209022550",
+    "Other\\Migrations\\Version20211209022550", "Other\\Migrations\\version20211209022550"])
+@pytest.mark.parametrize("exact_present", [False, True])
+def test_target_alias_never_proves_pending_or_executed(alias, exact_present):
+    with pytest.raises(PatchFactsError, match="alias_ambiguous"):
+        migration_state(([MIGRATION] if exact_present else []) + [alias], MIGRATION)
+
+
+@pytest.mark.parametrize("value", ["20230229000000", "20241301000000", "20240101240000",
+    "00000101000000", "2016010100000", "201601010000000", " 20160101000000",
+    "Version20160101000000", "malformed", "\\udcff", "Mautic\\Bad-Name"])
+def test_unknown_unrelated_storage_still_rejects_exact_target(value):
+    with pytest.raises(PatchFactsError, match="encoding_unknown"):
+        migration_state([MIGRATION, value], MIGRATION)
+
+
+@pytest.mark.parametrize("duplicate", ["20160101000000", "Other\\Version20160101000000", MIGRATION])
+def test_duplicate_storage_is_not_silently_normalized(duplicate):
+    with pytest.raises(PatchFactsError, match="cardinality_unknown"):
+        migration_state([duplicate, duplicate], MIGRATION)
+
+
+def test_complete_capture_limit_and_target_encoding_are_still_required():
+    with pytest.raises(PatchFactsError, match="storage_limit"):
+        migration_state(["20160101000000"] * 10001, MIGRATION)
+    with pytest.raises(PatchFactsError, match="target_encoding_unknown"):
+        migration_state([], "20211209022550")
 
 
 def test_case_folded_near_match_blocks_instead_of_claiming_pending():

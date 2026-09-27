@@ -1,3 +1,9 @@
+## 1.2.74 - 2026-09-27
+
+- Recognize documented unrelated legacy migration timestamps without requiring all history to be FQCN-only.
+- Preserve exact target identity, raw storage hashes and typed receipt bindings; reject target aliases, duplicates and unknown formats.
+- Version collector storage semantics without changing catalog predicates or receipt wire fields.
+
 ## 1.2.73 - 2026-09-27
 
 - Add fully bound read-only conditional exclusion proofs for ordinary upgrade plans.
