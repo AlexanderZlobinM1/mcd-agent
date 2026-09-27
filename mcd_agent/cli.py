@@ -1893,6 +1893,9 @@ def _build_parser() -> argparse.ArgumentParser:
     target_verify.add_argument("--catalog-sha256", required=True)
     target_verify.add_argument("--json", action="store_true")
 
+    verification_capability = sub.add_parser("mautic-target-patch-verification-capability", help="Read-only collector capability")
+    verification_capability.add_argument("--json", action="store_true")
+
     up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
     up.add_argument("--config", default=default_cfg)
     up.add_argument("--root")
@@ -3229,6 +3232,11 @@ def main() -> int:
             catalog_file=args.catalog_file, catalog_sha256=args.catalog_sha256)
         print(json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False))
         return 0 if result["status"] == "verified" else 2
+
+    if args.cmd == "mautic-target-patch-verification-capability":
+        from mcd_agent.mautic_target_verification_capability import capability
+        print(json.dumps(capability(), sort_keys=True, separators=(",", ":"), allow_nan=False))
+        return 0
 
     if args.cmd == "mautic-upgrade":
         if args.patch_plan_file:

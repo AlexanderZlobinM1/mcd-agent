@@ -1,3 +1,9 @@
+## 1.2.72 - 2026-09-27
+
+- Advertise the exact read-only file-only target verification capability through a standalone nonroot JSON query.
+- Return actual agent version, pinned contract and explicit online-admission/database-fact limits without reading configuration or an instance.
+- Do not grant scenario dispatch, apply, rollback or lease-renewal authority.
+
 ## 1.2.71 - 2026-09-27
 
 - Add root-only check-only verification of excluded target patches under dedicated online purpose admission.

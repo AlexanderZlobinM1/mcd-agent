@@ -3,6 +3,8 @@
   "normative_contract": "control-plane/backend/docs/mautic-target-patch-verification-v1.json",
   "normative_contract_sha256": "42f29b668117316870a698f144a1d8a066b4775d1f9c3449c5967adc830ce1e2",
   "command": "mcd-cli mautic-target-patch-verify",
+  "capability_query": "mcd-cli mautic-target-patch-verification-capability --json",
+  "capability_schema": "mcd-mautic-target-patch-verification-capability-v1",
   "purpose": "verify_target_excluded_patches",
   "read_only": true,
   "original_plan_database_facts_supported": false,
