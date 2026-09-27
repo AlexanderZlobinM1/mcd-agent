@@ -1,3 +1,8 @@
+## 1.2.75 - 2026-09-27
+
+- Add bounded sanitized migration-storage error diagnostics from existing readonly capture.
+- Preserve stable error prefixes, fail-closed behavior, storage grammar and receipt fields; expose no raw values or connection data.
+
 ## 1.2.74 - 2026-09-27
 
 - Recognize documented unrelated legacy migration timestamps without requiring all history to be FQCN-only.

@@ -99,6 +99,65 @@ def validate_predicates(predicates: Any) -> None:
                     raise PatchFactsError("fact_filter_domain_required")
 
 
+def _migration_storage_format(value: Any) -> str:
+    from datetime import datetime
+    if value is None:
+        return "null"
+    if not isinstance(value, str):
+        return "non_string"
+    if not value:
+        return "empty"
+    if len(value) > 1024:
+        return "oversize"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "invalid_utf8"
+    if not value.isascii():
+        return "non_ascii"
+    if value.strip() != value:
+        return "whitespace"
+    if re.fullmatch(r"[0-9]{14}", value):
+        try:
+            datetime(int(value[:4]), int(value[4:6]), int(value[6:8]),
+                     int(value[8:10]), int(value[10:12]), int(value[12:14]))
+        except ValueError:
+            return "invalid_calendar"
+        return "legacy_timestamp"
+    if re.fullmatch(r"[0-9]+", value):
+        return "numeric_other"
+    if _FQCN.fullmatch(value):
+        return "fqcn"
+    if "\\\\" in value:
+        return "repeated_separator"
+    if value.startswith("\\"):
+        return "leading_namespace"
+    if value.endswith("\\"):
+        return "trailing_namespace"
+    if "/" in value:
+        return "slash_separator"
+    if _IDENT.fullmatch(value):
+        return "unqualified_identifier"
+    return "other"
+
+
+def _migration_storage_error(code: str, values: list[Any], offending: Any) -> PatchFactsError:
+    # Classify only the already captured bounded rows. Never expose a value,
+    # namespace, SQL, connection identity or target migration in the error.
+    categories = [_migration_storage_format(value) for value in values]
+    category = _migration_storage_format(offending)
+    value_type = ("null" if offending is None else "str" if isinstance(offending, str)
+                  else "bytes" if isinstance(offending, bytes) else "bool" if type(offending) is bool
+                  else "int" if type(offending) is int else "float" if type(offending) is float else "other")
+    diagnostic = {"v": 1, "category": category, "type": value_type,
+                  "length": min(len(offending), 1025) if isinstance(offending, (str, bytes)) else None,
+                  "rows": len(values), "same": categories.count(category),
+                  "fqcn": categories.count("fqcn"), "legacy": categories.count("legacy_timestamp"),
+                  "unknown": sum(item not in {"fqcn", "legacy_timestamp"} for item in categories)}
+    return PatchFactsError(code + ";diagnostic=" + json.dumps(diagnostic, sort_keys=True,
+                           ensure_ascii=True, separators=(",", ":")))
+
+
 def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
     from datetime import datetime
     if not isinstance(migration, str) or not _FQCN.fullmatch(migration):
@@ -112,26 +171,26 @@ def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
     count = 0
     for value in values:
         if not isinstance(value, str) or not value or len(value) > 1024:
-            raise PatchFactsError("fact_migration_encoding_unknown")
+            raise _migration_storage_error("fact_migration_encoding_unknown", values, value)
         if value in seen:
-            raise PatchFactsError("fact_migration_cardinality_unknown")
+            raise _migration_storage_error("fact_migration_cardinality_unknown", values, value)
         seen.add(value)
         if value != migration and value.casefold() == migration.casefold():
-            raise PatchFactsError("fact_migration_case_ambiguous")
+            raise _migration_storage_error("fact_migration_case_ambiguous", values, value)
         if value != migration and (value.rsplit("\\", 1)[-1].casefold() == target_basename.casefold()
                 or (target_timestamp is not None and value == target_timestamp)):
-            raise PatchFactsError("fact_migration_target_alias_ambiguous")
+            raise _migration_storage_error("fact_migration_target_alias_ambiguous", values, value)
         if re.fullmatch(r"[0-9]{14}", value):
             try:
                 datetime(int(value[:4]), int(value[4:6]), int(value[6:8]),
                          int(value[8:10]), int(value[10:12]), int(value[12:14]))
             except ValueError as exc:
-                raise PatchFactsError("fact_migration_encoding_unknown") from exc
+                raise _migration_storage_error("fact_migration_encoding_unknown", values, value) from exc
             # A documented unrelated legacy timestamp is not a requested FQCN
             # match. Keep the raw storage untouched for the observation hash.
             continue
         if not _FQCN.fullmatch(value) or len(value.encode("utf-8")) > 1024:
-            raise PatchFactsError("fact_migration_encoding_unknown")
+            raise _migration_storage_error("fact_migration_encoding_unknown", values, value)
         count += int(value.encode("utf-8") == migration.encode("utf-8"))
     if count > 1:
         raise PatchFactsError("fact_migration_cardinality_unknown")
