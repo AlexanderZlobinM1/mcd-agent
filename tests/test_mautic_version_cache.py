@@ -104,7 +104,6 @@ class MauticVersionCacheTest(unittest.TestCase):
             patch.object(mautic_upgrade, "_pick_install_record", return_value=install),
             patch.object(mautic_upgrade, "read_mautic_version_evidence_read_only", return_value={"version": "7.2.0", "source": "cache_fallback"}),
             patch.object(mautic_upgrade, "composer_readiness", return_value={"status": "missing", "php": {}}) as readiness,
-            patch.object(mautic_upgrade, "_php_target_readiness", return_value={"decision": "ready"}),
         ):
             self.assertEqual(
                 mautic_upgrade.run_upgrade_composer_prepare(

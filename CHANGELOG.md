@@ -1,3 +1,9 @@
+## 1.2.82 - 2026-09-27
+
+- Remove the introduced major-wide PHP readiness policy and restore native Composer readiness/bootstrap behavior without a replacement policy resolver.
+- Preserve authoritative static-version checks, Composer errors, repair/backup requirements and raw PHP observations without claiming target dependency compatibility.
+- Cover existing upgrade preparation, native failure propagation and cache-only bootstrap rejection across target versions.
+
 ## 1.2.81 - 2026-09-27
 
 - Retain the existing source-update lock in shared mode throughout Mautic upgrade execution, including staging, Composer gaps, verification and failure cleanup.

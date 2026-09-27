@@ -55,7 +55,6 @@ from mcd_agent.mautic_upgrade_contract import (
     composer_readiness,
     composer_readiness_from_observation,
     inspect_json_schema_repair,
-    php_target_readiness as _php_target_readiness,
     rebind_php_after_system_upgrade,
 )
 
@@ -1481,12 +1480,9 @@ def run_upgrade_preflight(
         plan = json_repair["repair_plan"].get("plan")
         if isinstance(plan, dict):
             json_repair["repair_plan"]["sha256"] = repair_plan_digest(plan)
-    php = _php_target_readiness(composer.get("php", {}), target, with_system_upgrade=with_system_upgrade)
-    composer["php"] = php
     composer_ok = composer.get("status") in {"not_required", "reused", "success"}
-    php_ok = php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"}
     json_ok = json_repair.get("status") in {"unsupported", "supported"}
-    status = "ready" if version_source == "static_metadata" and composer_ok and php_ok and json_ok else "needs_attention"
+    status = "ready" if version_source == "static_metadata" and composer_ok and json_ok else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1533,14 +1529,10 @@ def run_upgrade_composer_prepare(
     target = _clean_target_version(target_override)
     if mode != "composer":
         composer = {"status": "not_required", "compatible": True, "path": "", "version": ""}
-        php = {"available": True, "path": "", "version": ""}
     else:
-        composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=False)
-        php = _php_target_readiness(composer.get("php", {}), target, with_system_upgrade=with_system_upgrade)
-    if version_source == "static_metadata" and mode == "composer" and php.get("decision") in {"ready", "allow_with_system_upgrade"} and composer.get("status") not in {"reused", "success"}:
-        composer = composer_readiness(php_bin=config.php_bin, allow_bootstrap=True)
-    composer["php"] = php
-    status = "ready" if version_source == "static_metadata" and composer.get("status") in {"not_required", "reused", "success"} and php.get("decision") in {"ready", "allow_with_system_upgrade", "not_evaluated"} else "needs_attention"
+        composer = composer_readiness(php_bin=config.php_bin,
+                                      allow_bootstrap=version_source == "static_metadata")
+    status = "ready" if version_source == "static_metadata" and composer.get("status") in {"not_required", "reused", "success"} else "needs_attention"
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
