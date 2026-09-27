@@ -15,6 +15,7 @@ from typing import Any
 SCHEMA = "mcd-mautic-patch-facts-v1"
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _FQCN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)+\Z")
+_NAMESPACE_LITERAL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+\Z")
 _INT_TYPES = frozenset({"tinyint", "smallint", "mediumint", "int", "bigint"})
 _TEXT_TYPES = frozenset({"char", "varchar", "tinytext", "text", "mediumtext", "longtext"})
 
@@ -141,7 +142,51 @@ def _migration_storage_format(value: Any) -> str:
     return "other"
 
 
-def _migration_storage_error(code: str, values: list[Any], offending: Any) -> PatchFactsError:
+def _migration_identity_tokens(value: Any):
+    """Tokens for conservative ambiguity detection, never execution decoding."""
+    if not isinstance(value, str) or len(value) > 1024:
+        return None
+    if _FQCN.fullmatch(value):
+        return tuple(value.split("\\"))
+    if _NAMESPACE_LITERAL.fullmatch(value):
+        return tuple(value.split("\\\\"))
+    return None
+
+
+def _migration_target_alias(value: Any, target: str) -> bool:
+    if not isinstance(value, str) or value == target:
+        return False
+    basename = target.rsplit("\\", 1)[-1]
+    timestamp = re.fullmatch(r"Version([0-9]{14})", basename)
+    tokens = _migration_identity_tokens(value)
+    return (value.casefold() == target.casefold()
+            or value.casefold() == basename.casefold()
+            or (tokens is not None and tokens[-1].casefold() == basename.casefold())
+            or (timestamp is not None and value == timestamp.group(1)))
+
+
+def _migration_target_relevance(values, target):
+    raw_seen, logical_seen = set(), set()
+    counts = dict(exact=0, alias=0, literal=0, raw_dup=0, logical_dup=0, unsafe=0)
+    for value in values:
+        counts["exact"] += int(isinstance(value, str) and value == target)
+        counts["alias"] += int(_migration_target_alias(value, target))
+        literal = isinstance(value, str) and len(value) <= 1024 and bool(_NAMESPACE_LITERAL.fullmatch(value))
+        counts["literal"] += int(literal)
+        tokens = _migration_identity_tokens(value)
+        if tokens is not None:
+            identity = tuple(token.casefold() for token in tokens)
+            counts["logical_dup"] += int(identity in logical_seen)
+            logical_seen.add(identity)
+        elif _migration_storage_format(value) != "legacy_timestamp":
+            counts["unsafe"] += 1
+        if isinstance(value, str):
+            counts["raw_dup"] += int(value in raw_seen)
+            raw_seen.add(value)
+    return counts
+
+
+def _migration_storage_error(code: str, values: list[Any], offending: Any, target: str) -> PatchFactsError:
     # Classify only the already captured bounded rows. Never expose a value,
     # namespace, SQL, connection identity or target migration in the error.
     categories = [_migration_storage_format(value) for value in values]
@@ -149,51 +194,55 @@ def _migration_storage_error(code: str, values: list[Any], offending: Any) -> Pa
     value_type = ("null" if offending is None else "str" if isinstance(offending, str)
                   else "bytes" if isinstance(offending, bytes) else "bool" if type(offending) is bool
                   else "int" if type(offending) is int else "float" if type(offending) is float else "other")
-    diagnostic = {"v": 1, "category": category, "type": value_type,
+    diagnostic = {"v": 2, "category": category, "type": value_type,
                   "length": min(len(offending), 1025) if isinstance(offending, (str, bytes)) else None,
                   "rows": len(values), "same": categories.count(category),
                   "fqcn": categories.count("fqcn"), "legacy": categories.count("legacy_timestamp"),
                   "unknown": sum(item not in {"fqcn", "legacy_timestamp"} for item in categories)}
+    diagnostic.update(_migration_target_relevance(values, target))
     return PatchFactsError(code + ";diagnostic=" + json.dumps(diagnostic, sort_keys=True,
                            ensure_ascii=True, separators=(",", ":")))
 
 
 def migration_state(values: list[Any], migration: str) -> tuple[str, int]:
-    from datetime import datetime
     if not isinstance(migration, str) or not _FQCN.fullmatch(migration):
         raise PatchFactsError("fact_migration_target_encoding_unknown")
     if len(values) > 10000:
         raise PatchFactsError("fact_migration_storage_limit")
-    target_basename = migration.rsplit("\\", 1)[-1]
-    timestamp = re.fullmatch(r"Version([0-9]{14})", target_basename)
-    target_timestamp = timestamp.group(1) if timestamp else None
-    seen = set()
+    seen, logical_seen = set(), set()
+    uninterpreted = []
     count = 0
     for value in values:
         if not isinstance(value, str) or not value or len(value) > 1024:
-            raise _migration_storage_error("fact_migration_encoding_unknown", values, value)
+            raise _migration_storage_error("fact_migration_encoding_unknown", values, value, migration)
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _migration_storage_error("fact_migration_encoding_unknown", values, value, migration) from exc
         if value in seen:
-            raise _migration_storage_error("fact_migration_cardinality_unknown", values, value)
+            raise _migration_storage_error("fact_migration_cardinality_unknown", values, value, migration)
         seen.add(value)
         if value != migration and value.casefold() == migration.casefold():
-            raise _migration_storage_error("fact_migration_case_ambiguous", values, value)
-        if value != migration and (value.rsplit("\\", 1)[-1].casefold() == target_basename.casefold()
-                or (target_timestamp is not None and value == target_timestamp)):
-            raise _migration_storage_error("fact_migration_target_alias_ambiguous", values, value)
-        if re.fullmatch(r"[0-9]{14}", value):
-            try:
-                datetime(int(value[:4]), int(value[4:6]), int(value[6:8]),
-                         int(value[8:10]), int(value[10:12]), int(value[12:14]))
-            except ValueError as exc:
-                raise _migration_storage_error("fact_migration_encoding_unknown", values, value) from exc
-            # A documented unrelated legacy timestamp is not a requested FQCN
-            # match. Keep the raw storage untouched for the observation hash.
+            raise _migration_storage_error("fact_migration_case_ambiguous", values, value, migration)
+        if _migration_target_alias(value, migration):
+            raise _migration_storage_error("fact_migration_target_alias_ambiguous", values, value, migration)
+        if _migration_storage_format(value) == "legacy_timestamp":
             continue
-        if not _FQCN.fullmatch(value) or len(value.encode("utf-8")) > 1024:
-            raise _migration_storage_error("fact_migration_encoding_unknown", values, value)
+        tokens = _migration_identity_tokens(value)
+        if tokens is None:
+            raise _migration_storage_error("fact_migration_encoding_unknown", values, value, migration)
+        logical_identity = tuple(token.casefold() for token in tokens)
+        if logical_identity in logical_seen:
+            raise _migration_storage_error("fact_migration_identity_ambiguous", values, value, migration)
+        logical_seen.add(logical_identity)
+        if _NAMESPACE_LITERAL.fullmatch(value):
+            # This is NOT a valid-FQCN/storage-codec assertion. A literal can
+            # establish no execution identity, especially no pending target.
+            uninterpreted.append(value)
+            continue
         count += int(value.encode("utf-8") == migration.encode("utf-8"))
-    if count > 1:
-        raise PatchFactsError("fact_migration_cardinality_unknown")
+    if uninterpreted and count == 0:
+        raise _migration_storage_error("fact_migration_encoding_unknown", values, uninterpreted[0], migration)
     return ("executed" if count == 1 else "pending"), count
 
 

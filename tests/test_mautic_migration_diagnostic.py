@@ -16,16 +16,17 @@ TARGET = "Fixture\\Migrations\\Version20211209022550"
     ("PrivateIdentifier", "unqualified_identifier"), ("private-value", "other"),
 ])
 def test_unknown_storage_diagnostic_is_bounded_and_does_not_leak(value, category):
-    values = [TARGET, "20160101000000", value]
+    values = ["Other\\Migrations\\Version20150101000000", "20160101000000", value]
     with pytest.raises(PatchFactsError) as error:
         migration_state(values, TARGET)
     reason = str(error.value)
     assert reason.startswith("fact_migration_encoding_unknown;diagnostic=")
-    assert reason.isascii() and len(reason.encode()) <= 256
+    assert reason.isascii() and len(reason.encode()) <= 512
     diagnostic = json.loads(reason.split(";diagnostic=", 1)[1])
     assert diagnostic["category"] == category
     assert diagnostic["rows"] == 3 and diagnostic["fqcn"] == 1 and diagnostic["legacy"] == 1
     assert diagnostic["unknown"] == 1 and diagnostic["same"] == 1
+    assert diagnostic["v"] == 2 and diagnostic["exact"] == 0
     assert TARGET not in reason and "Secret" not in reason and "private" not in reason.lower()
 
 
@@ -35,7 +36,7 @@ def test_duplicate_diagnostic_is_not_permission_and_counts_full_capture():
         migration_state(values, TARGET)
     reason = str(error.value)
     assert reason.startswith("fact_migration_cardinality_unknown;diagnostic=")
-    assert len(reason.encode()) <= 256
+    assert len(reason.encode()) <= 512
     diagnostic = json.loads(reason.split(";diagnostic=", 1)[1])
     assert diagnostic["rows"] == diagnostic["same"] == diagnostic["fqcn"] == 10000
     assert diagnostic["unknown"] == diagnostic["legacy"] == 0

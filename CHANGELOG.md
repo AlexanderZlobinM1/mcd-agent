@@ -1,3 +1,9 @@
+## 1.2.76 - 2026-09-27
+
+- Scope migration execution facts to positive raw canonical target presence without decoding unsupported namespace-looking literal history.
+- Preserve ambiguity, duplicate, malformed and absent-target guards; retain complete raw hashes and receipt bindings.
+- Add bounded target-relevance diagnostics from existing readonly capture without new SQL.
+
 ## 1.2.75 - 2026-09-27
 
 - Add bounded sanitized migration-storage error diagnostics from existing readonly capture.
