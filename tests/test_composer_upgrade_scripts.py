@@ -24,6 +24,7 @@ class ComposerUpgradeScriptTests(unittest.TestCase):
             for name in ("_ensure_node20", "_ensure_www_data_composer_cache", "_apply_mautic7_twig_include_hotfix",
                          "_normalize_mautic7_loopback_redis_cache"):
                 stack.enter_context(patch("mcd_agent.mautic_upgrade." + name, return_value=False))
+            stack.enter_context(patch("mcd_agent.composer_permissions.prepare_composer_paths", return_value={}))
 
             def record(name):
                 def called(*args, **kwargs):

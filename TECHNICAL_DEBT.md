@@ -50,10 +50,12 @@ Acceptance for a later MCD-owned change:
 - Cover nested parent-not-writable/file-writable, differing project/webroot layouts, already-correct paths and genuine pre-mutation failure through the upgrade entrypoint.
 - Publish and verify the fix through the normal source/public mirror, package regression, test-machine and approved release route. Report partial Composer failure and rollback limits honestly.
 
-Next action: implement and release the generic permission-admission correction
-in a later authorized work session. No 1.2.79 implementation or release was
-started; today's functional work stopped after verified recovery. Parent and
-subproject indexes both remain open.
+Implementation checkpoint: 1.2.79 prepares Composer-managed directory ownership
+and owner write/search permissions during ordinary execution, without a new
+read-only admission gate. Nested directory, layout, idempotency, symlink escape
+and actual filesystem failure fixtures pass. Source regression is a checkpoint,
+not release acceptance; package/test-machine/approved verification remains open.
+Parent and subproject indexes both remain open until publication is verified.
 
 ## MCC-TD-001
 

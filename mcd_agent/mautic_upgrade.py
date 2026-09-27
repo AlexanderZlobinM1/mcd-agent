@@ -1025,7 +1025,8 @@ def _prepare_patch_target_stage(config, root: str, current: str, target: str, mo
                 archive.extractall(stage_root)
         else:
             raise RuntimeError("Unsupported target stage install type")
-    staged = TargetStage(root, plan, prepare, _target_version, application_root, facts_provider=facts_provider)
+    staged = TargetStage(root, plan, prepare, _target_version, application_root, facts_provider=facts_provider,
+                         defer_conditions=True)
     staged.target_package_sha256 = package_identity["sha256"]
     return staged
 
@@ -1373,6 +1374,11 @@ def _apply_composer(root: str, console_path: str, php_bin: str, current: str, ta
     print(f"Node.js preflight ok: {node_version}")
     print(f"npm preflight ok: {npm_version}")
     stage = getattr(after_source_install, "target_stage", None)
+    from mcd_agent.composer_permissions import prepare_composer_paths
+    staged_root = getattr(stage, "root", None)
+    permissions = prepare_composer_paths(project_root,
+        target_project_root=str(staged_root) if isinstance(staged_root, (str, Path)) else None)
+    print("Composer permissions prepared: " + json.dumps(permissions, sort_keys=True))
     text = cjson.read_text(encoding="utf-8")
     updated, changes = _replace_version_tokens(text, current, target)
     updated, constraint_changes = _normalize_mautic7_composer_constraints(updated, target)
@@ -1891,10 +1897,6 @@ def run_upgrade_apply(
     allow_release_transition: bool = False,
     mcc_release_authorization_context_file: str = "",
     mcc_release_authorization_context_sha256: str = "",
-    patch_exclusion_guard_plan_file: str = "",
-    patch_exclusion_guard_plan_sha256: str = "",
-    patch_exclusion_guard_receipt_file: str = "",
-    patch_exclusion_guard_receipt_sha256: str = "",
 ) -> int:
     inst = _pick_install_record(config, root)
     if str(getattr(inst, "runtime", "host") or "host").strip().lower() == "docker":
@@ -2008,19 +2010,6 @@ def run_upgrade_apply(
         if selected["status"] == "selected":
             patch_plan_json = json.dumps(selected["plan"], ensure_ascii=True, separators=(",", ":"))
             patch_run_id = selected["plan"]["run_id"]
-    exclusion_recheck = None
-    exclusion_inputs = (patch_exclusion_guard_plan_file, patch_exclusion_guard_plan_sha256,
-                        patch_exclusion_guard_receipt_file, patch_exclusion_guard_receipt_sha256)
-    if any(exclusion_inputs):
-        if not all(exclusion_inputs) or not patch_plan_json or not patch_run_id:
-            raise RuntimeError("patch_exclusion_immutable_inputs_required")
-        from mcd_agent.mautic_patch_resolution import read_plan_file
-        from mcd_agent.mautic_patch_exclusion_guard import read_receipt, upgrade_guard
-        exclusion_recheck = upgrade_guard(config=config, root=install_root, current=current,
-            target=target, install_type=chosen_mode, run_id=patch_run_id,
-            apply_plan_json=patch_plan_json,
-            guard_plan_json=read_plan_file(patch_exclusion_guard_plan_file, patch_exclusion_guard_plan_sha256),
-            receipt=read_receipt(patch_exclusion_guard_receipt_file, patch_exclusion_guard_receipt_sha256))
     patch_hook = None
     target_stage = None
     patch_facts_provider = None
@@ -2065,7 +2054,12 @@ def run_upgrade_apply(
                     staged_evidence = target_stage.verify_live(source_root, validated_patch_plan, _target_version)
                     print("MCD_PATCH_TARGET_EVIDENCE=" + json.dumps(staged_evidence, sort_keys=True))
                     source_root = str(application_root(source_root))
-                evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id, facts_provider=patch_facts_provider)
+                if validated_patch_plan.get("schema") == "mcd-mautic-patch-plan-v3":
+                    # Runtime execution evaluates each selected patch's own
+                    # condition; the executor has no global DB admission.
+                    evidence = staged_evidence
+                else:
+                    evidence = atomic_preflight(source_root, patch_plan_json, patch_run_id, facts_provider=patch_facts_provider)
             except PatchPlanError as exc:
                 evidence = rejected_preflight(patch_run_id, str(exc))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
@@ -2083,6 +2077,12 @@ def run_upgrade_apply(
             from mcd_agent.mautic_patch_plan import execute
             from mcd_agent.mautic_patch_stage import application_root
             source_root = str(application_root(source_root))
+            if patch_facts_provider is not None:
+                from mcd_agent.mautic_patch_plan_v3 import _observe_facts
+                # Admission belongs to runtime, after the standard updater
+                # installed the target. Execution still checks fresh drift.
+                target_stage.facts_receipt = _observe_facts(
+                    validated_patch_plan, patch_facts_provider, "apply", phase)
             result = execute(source_root, patch_plan_json, phase, patch_run_id, facts_provider=patch_facts_provider,
                              accepted_facts=getattr(target_stage, "facts_receipt", None))
             print("MCD_PATCH_PLAN_EVIDENCE=" + json.dumps(result, sort_keys=True))
@@ -2108,8 +2108,6 @@ def run_upgrade_apply(
     try:
         if cross_line:
             require_live_release_authorization()
-        if exclusion_recheck is not None:
-            exclusion_recheck()
         guard = _enter_upgrade_maintenance(config)
     except Exception:
         if target_stage is not None:
@@ -2129,8 +2127,6 @@ def run_upgrade_apply(
                 _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
             )
         # Mandatory preflight: align permissions before any upgrade action.
-        if exclusion_recheck is not None:
-            exclusion_recheck()
         _pre_upgrade_permissions_check(config, install_root)
 
         # This hotfix changes a core file. Restore the exact

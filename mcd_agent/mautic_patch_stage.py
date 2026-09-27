@@ -43,7 +43,8 @@ def application_root(value: str | Path) -> Path:
 
 class TargetStage:
     def __init__(self, source: str, plan: dict[str, Any], prepare: Callable[[Path], None],
-                 read_version: Callable[[Path], str | None], root_binding: Callable[[Path], Path] | None = None, facts_provider=None):
+                 read_version: Callable[[Path], str | None], root_binding: Callable[[Path], Path] | None = None, facts_provider=None,
+                 defer_conditions: bool = False):
         self.plan_sha256 = _validate_plan(plan)
         self.target_version = plan["target_version"]
         self.directory = Path(tempfile.mkdtemp(prefix="mcd-target-stage-"))
@@ -57,7 +58,8 @@ class TargetStage:
         self.facts_receipt = None
         try:
             from mcd_agent.mautic_patch_plan_v3 import _observe_facts
-            self.facts_receipt = _observe_facts(plan, facts_provider, "verify", plan["phase"])
+            if not defer_conditions:
+                self.facts_receipt = _observe_facts(plan, facts_provider, "verify", plan["phase"])
             original = _root(source)
             if read_version(original) != plan["source_version"]:
                 raise PatchPlanV3Error("target_stage_source_version_mismatch")
@@ -85,7 +87,11 @@ class TargetStage:
             for path in paths:
                 content, _st = _read(_file(staged_application, path))
                 self.hashes[path] = hashlib.sha256(content).hexdigest() if content is not None else None
-            preview, self.outcomes, _final = _simulate(staged_application, plan, facts=self.facts_receipt)
+            simulation_plan = plan
+            if defer_conditions:
+                simulation_plan = dict(plan, patches=[record for record in plan["patches"]
+                                                       if not record.get("preconditions")])
+            preview, self.outcomes, _final = _simulate(staged_application, simulation_plan, facts=self.facts_receipt)
             shutil.rmtree(preview, ignore_errors=True)
             for name in ("composer.json", "composer.lock"):
                 path = self.root / name

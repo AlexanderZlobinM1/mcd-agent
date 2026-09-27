@@ -20,7 +20,6 @@ def contract() -> dict[str, Any]:
     from mcd_agent.mautic_patch_plan_v2 import capability
     result = dict(_contract())
     result.update(capabilities=[PREFLIGHT_SCHEMA, "mautic-patch-plan-v2", capability()["evidence_schema"], "mautic-patch-plan-v3"], patch_plan_v2=capability())
-    result["features"] = dict(result.get("features", {}), conditional_exclusion_guard_v1=True)
     return result
 
 

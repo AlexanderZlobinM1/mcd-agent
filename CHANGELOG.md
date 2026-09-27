@@ -1,3 +1,9 @@
+## 1.2.79 - 2026-09-27
+
+- Remove ordinary-upgrade conditional exclusion proof transport and global pre-Composer database admission.
+- Evaluate selected conditional patches during runtime execution while preserving source bindings and typed drift guards.
+- Prepare Composer-managed directory ownership and owner write permissions during execution, including nested package assets, without changing unrelated file contents.
+
 ## 1.2.78 - 2026-09-27
 
 - Execute campaign/import consumer patch phases immediately after source installation under upgrade maintenance, before scripts or managed consumer resumption.
