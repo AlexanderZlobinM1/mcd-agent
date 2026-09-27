@@ -79,3 +79,35 @@ def test_cli_json_only_error_no_context(tmp_path, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["code"] == "patch_context_discovery_unavailable"
     assert "execution_context" not in output
+
+
+def test_split_composer_context_roundtrip_readonly(tmp_path, monkeypatch):
+    config, roots = fixture(tmp_path, monkeypatch)
+    root = roots[0]
+    docroot = root / "docroot"
+    docroot.mkdir()
+    (root / "app").rename(docroot / "app")
+    (root / "plugins").rename(docroot / "plugins")
+    (root / "config").mkdir()
+    (docroot / "app/config/local.php").rename(root / "config/local.php")
+    from mcd_agent.discovery import discover_mautic
+    from mcd_agent.mautic_patch_context import load_readonly_discovery_config
+    discovery_config = load_readonly_discovery_config(str(config))
+    installs = discover_mautic(discovery_config.discovery_roots,
+        discovery_config.exclude_path_contains, discovery_config.supported_mautic_majors,
+        discovery_config.custom_instances)
+    selected = [item for item in installs if Path(item.root) in (root, docroot)]
+    assert len(selected) == 1
+    uid = selected[0].instance_uid
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+              for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("external command"))
+    monkeypatch.setattr("mcd_agent.config.load_config", lambda *a, **kw: pytest.fail("mutating loader"))
+    monkeypatch.setattr("pymysql.connect", lambda **kw: pytest.fail("database query"))
+    for selected_root in (root, docroot):
+        output = preflight(str(config), str(selected_root), uid)
+        assert output["execution_context"] == dict(instance_uid=uid,
+            application_root=str(docroot), table_prefix="ss_")
+    after = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+             for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before

@@ -1,3 +1,9 @@
+## 1.2.69 - 2026-09-27
+
+- Resolve split Composer layouts with application files in docroot/public and console in the project root.
+- Preserve strict layout ambiguity, containment and symlink checks for project-root and application-root selection.
+- Bind read-only context preflight to the independently resolved application root without weakening instance UID checks.
+
 ## 1.2.68 - 2026-09-26
 
 - Accept the MCC authorization context's strict JSON integer policy revision without coercion.

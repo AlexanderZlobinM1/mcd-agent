@@ -17,14 +17,24 @@ from mcd_agent.mautic_patch_resolution import canonical_json_sha256
 
 def application_root(value: str | Path) -> Path:
     root = _root(str(value))
+    if (root.name in {"docroot", "public"}
+            and (root / "app").is_dir() and (root / "plugins").is_dir()
+            and not (root / "bin/console").exists()
+            and (root.parent / "bin/console").is_file()):
+        root = _root(str(root.parent))
     candidates = []
     for relative in ("", "docroot", "public"):
         candidate = root / relative
         if candidate.is_symlink():
             raise PatchPlanV3Error("application_root_symlink")
-        if (candidate / "app").is_dir() and (candidate / "plugins").is_dir() and (candidate / "bin/console").is_file():
-            for anchor in ("app", "plugins", "bin", "bin/console"):
+        console_root = candidate
+        if relative and not (candidate / "bin/console").exists():
+            console_root = root
+        if (candidate / "app").is_dir() and (candidate / "plugins").is_dir() and (console_root / "bin/console").is_file():
+            for anchor in ("app", "plugins"):
                 _file(candidate, anchor)
+            for anchor in ("bin", "bin/console"):
+                _file(console_root, anchor)
             candidates.append(candidate)
     if len(candidates) != 1:
         raise PatchPlanV3Error("application_root_missing_or_ambiguous")
