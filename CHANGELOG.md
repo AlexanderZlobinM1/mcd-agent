@@ -1,3 +1,10 @@
+## 1.2.70 - 2026-09-27
+
+- Add root-only read-only local-context v2 CLI with independently discovered identity and Composer layout.
+- Separate project root, application root and console location without changing legacy context v1.
+- Require real static version metadata and reject ambiguous consoles, symlinked anchors and unknown bindings.
+- Publish the bounded v2 context/root-mapping contract and a data-only split-layout fixture without enabling scenario dispatch.
+
 ## 1.2.69 - 2026-09-27
 
 - Resolve split Composer layouts with application files in docroot/public and console in the project root.

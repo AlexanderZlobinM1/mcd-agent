@@ -1,0 +1,20 @@
+{
+  "schema": "mcd-mautic-local-context-contract-v2",
+  "status": "implemented_readonly_producer",
+  "cli": "mcd-cli mautic-local-context --config <config> --root <project_root_or_application_root> --json",
+  "root_only": true,
+  "success_exit_code": 0,
+  "error_exit_code": 2,
+  "error_fields": ["schema", "status", "code"],
+  "error_codes": ["local_context_selection_invalid", "local_context_discovery_unavailable"],
+  "response_schema": "mcd-mautic-local-context-v2",
+  "response_fields": ["schema", "context", "layout", "source_version", "version_evidence_source"],
+  "context_fields": ["local_instance_uid", "application_root", "table_prefix"],
+  "layout_fields": ["project_root", "application_root_relative", "console_relative_path"],
+  "root_mapping_schema": "mcd-mautic-root-mapping-v1",
+  "root_mapping_fields": ["schema", "project_root", "application_root_relative", "console_relative_path"],
+  "application_root_relative_values": [".", "docroot", "public"],
+  "version_evidence_source": "static_metadata",
+  "requirements": ["independent_discovery", "canonical_roots", "no_symlink_anchors", "single_console", "no_database_queries", "no_application_bootstrap", "no_config_migrations"],
+  "dispatch_authority": false
+}

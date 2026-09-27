@@ -1,0 +1,15 @@
+{
+  "schema": "mcd-mautic-local-context-v2",
+  "context": {
+    "local_instance_uid": "fixture-local",
+    "application_root": "/var/www/fixture/docroot",
+    "table_prefix": "ss_"
+  },
+  "layout": {
+    "project_root": "/var/www/fixture",
+    "application_root_relative": "docroot",
+    "console_relative_path": "bin/console"
+  },
+  "source_version": "7.2.0",
+  "version_evidence_source": "static_metadata"
+}

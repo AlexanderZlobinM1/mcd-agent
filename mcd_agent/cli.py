@@ -1877,6 +1877,11 @@ def _build_parser() -> argparse.ArgumentParser:
         op_parser.add_argument("--prefix", default="")
         op_parser.add_argument("--json", action="store_true")
 
+    local_context = sub.add_parser("mautic-local-context", help="Read-only local identity and Composer layout")
+    local_context.add_argument("--config", default=default_cfg)
+    local_context.add_argument("--root", required=True)
+    local_context.add_argument("--json", action="store_true")
+
     up = sub.add_parser("mautic-upgrade", help="Check/apply Mautic version upgrade")
     up.add_argument("--config", default=default_cfg)
     up.add_argument("--root")
@@ -3185,6 +3190,24 @@ def main() -> int:
                     print(f"root={row.get('root')} status={row.get('status')}")
             _push_state_after_change(cfg, "cluster-assets-reload")
             return 0 if str(payload.get("status")) == "ok" else 1
+
+    if args.cmd == "mautic-local-context":
+        payload = dict(schema="mcd-mautic-local-context-v2", status="error",
+                       code="local_context_selection_invalid")
+        if os.geteuid() != 0:
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            return 2
+        try:
+            from mcd_agent.mautic_patch_context import load_readonly_discovery_config
+            from mcd_agent.mautic_local_context import read_local_context
+            payload = read_local_context(load_readonly_discovery_config(args.config), root=args.root)
+        except Exception:
+            payload = dict(schema="mcd-mautic-local-context-v2", status="error",
+                           code="local_context_discovery_unavailable")
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            return 2
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        return 0
 
     if args.cmd == "mautic-upgrade":
         if args.patch_plan_file:
