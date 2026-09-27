@@ -1314,6 +1314,31 @@ def maybe_cluster_auto_update(
 
 
 def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
+    # Use the existing source-update lock for the entire mutation path,
+    # including package-sync repairs and restart-only updates. Operations
+    # retain a shared lease even while no PHP console process is present.
+    if str(plan.get("status", "")).strip().lower() not in {"update", "update_available"} or not plan.get("target") or not plan.get("package_url"):
+        return _apply_update_locked(cfg, plan, None)
+    lock_f = _acquire_update_lock(cfg, blocking=False)
+    if lock_f is None:
+        message = "MCD update deferred: source operation or another update is active"
+        state = _read_state(cfg)
+        session_id = str(plan.get("session_id", "")).strip()
+        state.update(last_status="deferred_source_operation", last_result=message,
+                     last_target=str(plan["target"]), last_attempt_ts=int(time.time()),
+                     last_session_id=session_id)
+        _write_state(cfg, state)
+        if session_id:
+            release_session(cfg, session_id, result_status="deferred",
+                            result_message=message, new_version=installed_agent_version())
+        return False, message
+    try:
+        return _apply_update_locked(cfg, plan, lock_f)
+    finally:
+        _release_update_lock(lock_f)
+
+
+def _apply_update_locked(cfg: AgentConfig, plan: dict[str, Any], lock_f) -> tuple[bool, str]:
     status = str(plan.get("status", "")).strip().lower()
     if status == "update_available":
         # MCC may return update_available when the host should download/apply
@@ -1396,19 +1421,6 @@ def apply_update(cfg: AgentConfig, plan: dict[str, Any]) -> tuple[bool, str]:
     src_next_dir = updates_dir / f"src.next-{target}"
     backup_dir.mkdir(parents=True, exist_ok=True)
     updates_dir.mkdir(parents=True, exist_ok=True)
-
-    lock_f = _acquire_update_lock(cfg, blocking=False)
-    if lock_f is None:
-        session_id = str(plan.get("session_id", "")).strip()
-        if session_id:
-            release_session(
-                cfg,
-                session_id,
-                result_status="failed",
-                result_message="another update is already running",
-                new_version=installed_agent_version(),
-            )
-        return False, "another update is already running"
 
     archive_path = _update_archive_path(target)
     backup_path = backup_dir / f"mcd-src-preupdate-{now_s}.tgz"

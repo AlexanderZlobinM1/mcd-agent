@@ -150,6 +150,7 @@ def wire_upgrade(invocation, monkeypatch, kind="composer"):
     monkeypatch.setattr(upgrade, "_prepare_patch_target_stage", lambda *a, **kw: events.append("stage") or SimpleNamespace(close=lambda: None, verify_original=lambda *a: None))
     installed = [False]
     cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data",
+                          state_db_path=str(root / "state.db"),
                           mcc_url="https://mcc.example.test", mcc_token="test-shared-token")
     monkeypatch.setattr(upgrade, "_pick_install_record", lambda *a: Install(str(root)))
     monkeypatch.setattr(upgrade, "_read_current_version", lambda *a: invocation["target"] if installed[0] else "7.1.3")

@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -9,7 +11,10 @@ from mcd_agent import mautic_upgrade as upgrade
 
 class ReleaseApprovalTests(unittest.TestCase):
     def setUp(self):
-        self.config = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="test", php_bin="php", mautic_run_as_user="www-data")
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.config = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="test", php_bin="php", mautic_run_as_user="www-data",
+                                      state_db_path=str(Path(directory.name) / "state.db"))
 
     def test_exact_live_approval(self):
         response = MagicMock()

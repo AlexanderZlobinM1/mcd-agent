@@ -19,6 +19,7 @@ from urllib.parse import urlencode, urlparse, urlsplit, urlunsplit
 import urllib.request
 
 from mcd_agent.config import AgentConfig
+from mcd_agent.source_operation import stable_source_operation
 from mcd_agent.discovery import discover_mautic
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.maintenance_mode import (
@@ -1876,6 +1877,7 @@ def _ensure_mautic7_locale_fix(config: AgentConfig, root: str) -> None:
     print("Mautic 7 Locale Fix ready: published=1 gmail_image_proxy_open=1; other settings preserved")
 
 
+@stable_source_operation
 def run_upgrade_apply(
     *,
     config: AgentConfig,

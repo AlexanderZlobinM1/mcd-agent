@@ -48,7 +48,8 @@ def six_record_plan(root, mode):
 def wire(root, plan, monkeypatch, *, drift=False):
     events = []; installed = [False]
     inst = SimpleNamespace(root=str(root), console_path="bin/console", runtime="host", instance_uid="fixture")
-    cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data", mcc_url="")
+    cfg = SimpleNamespace(php_bin="php", mautic_run_as_user="www-data", mcc_url="",
+                          state_db_path=str(root / "state.db"))
     stage = SimpleNamespace(close=lambda: events.append("stage_close"),
         verify_original=lambda *a: events.append("original_bound"),
         verify_live=lambda *a: events.append("target_bound") or {"status": "success"})

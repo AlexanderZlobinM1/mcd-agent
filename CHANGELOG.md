@@ -1,3 +1,9 @@
+## 1.2.81 - 2026-09-27
+
+- Retain the existing source-update lock in shared mode throughout Mautic upgrade execution, including staging, Composer gaps, verification and failure cleanup.
+- Defer self-update while an operation owns that lease; preserve deferred session status and normal retry without terminating workers.
+- Cover source-package repair and restart-only paths with the updater's exclusive lock and test real cross-process races plus ZIP/Composer entrypoint boundaries.
+
 ## 1.2.80 - 2026-09-27
 
 - Execute and verify assets when baseline policy permits backup-off; keep actual rollback availability separate from execution success.
