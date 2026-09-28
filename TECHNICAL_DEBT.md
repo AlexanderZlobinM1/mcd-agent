@@ -22,6 +22,31 @@ artifacts, and test older compatible agents plus new package revisions without
 silently weakening actual capability floors. Do not backport this semantic
 change into the current incident fix.
 
+## MCD-TD-003
+
+- Status: open
+- Title: Generic desired per-instance PHP runtime selection
+- Owner scope: MCD runtime contract and agent executor; MCC mirrors only the published contract
+- Source task: `01a07d46-213b-7e62-b910-08c7a9dacde1`
+- Last updated: 2026-09-28
+
+`instance-runtime` currently observes the FastCGI version already present in a
+matching nginx vhost and normalizes generated pools for that same version. It
+does not accept a desired PHP version, install packages, choose an approved
+repository, or switch an existing instance between PHP-FPM versions.
+
+Define a v2 MCD contract after the current incident. It must represent desired
+and observed per-instance runtime state separately, provide a non-mutating
+plan/preflight, bind package repository/version/extension provenance, preserve
+multi-instance safety, snapshot affected FPM/nginx state, validate both
+services before reload, and provide a bounded rollback receipt. MCC may expose
+and mirror this state only after the MCD contract is published. Do not reuse a
+major-Mautic-transition PHP checkbox or add a host-specific recovery shortcut.
+
+The current `s.sales-snap.com` recovery remains Operations-owned through its
+external reversible runtime transaction; this debt does not authorize a MCD
+deployment or modify that incident.
+
 ## MCD-TD-001
 
 - Status: open
