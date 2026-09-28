@@ -1,3 +1,10 @@
+## 1.2.91 - 2026-09-28
+
+- Accept MCC's minimal blocked patch-resolution response without requiring a
+  request context echo when catalog admission stops before plan selection.
+- Preserve strict context, catalog, and immutable-plan validation for selected
+  and fully formed non-selected responses.
+
 ## 1.2.90 - 2026-09-28
 
 - Surface an MCC catalog-resolve HTTP 403 as `mcc_patch_http_403:<detail>` only when MCC supplies a bounded allowlisted detail token.

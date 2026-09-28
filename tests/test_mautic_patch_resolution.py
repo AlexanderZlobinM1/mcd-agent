@@ -119,6 +119,18 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(resolution.MauticPatchResolutionError, "plan_sha256_mismatch"):
             self._resolve(response)
 
+    def test_accepts_minimal_blocked_response_without_context_echo(self):
+        response = {
+            "schema": "mcc-mautic-patch-resolved-v1",
+            "status": "blocked",
+            "host_id": self.fixture["resolve_response"]["host_id"],
+            "instance_uid": "fixture-instance-001",
+            "reason": "agent_patch_contract_mismatch",
+        }
+        result, _urlopen = self._resolve(response)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "agent_patch_contract_mismatch")
+
     def test_typed_resolve_echoes_independent_context_and_rejects_drift(self):
         context = {"instance_uid": "fixture-instance-001", "application_root": "/fixture/app", "table_prefix": "ss_"}
         response = json.loads(json.dumps(self.fixture["resolve_response"]))

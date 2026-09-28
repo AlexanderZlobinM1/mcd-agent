@@ -468,6 +468,16 @@ def resolve_plan(
     if result.get("instance_uid") != instance_uid:
         raise MauticPatchResolutionError("mcc_patch_instance_mismatch")
     _resolved_host_id(result.get("host_id"))
+    status = result.get("status")
+    if status not in {"selected", "noop", "blocked"}:
+        raise MauticPatchResolutionError("mcc_patch_response_status_invalid")
+    # MCC may return a deliberately minimal blocked response when admission
+    # fails before catalog selection (for example, an unsupported execution
+    # kind). There is no selected plan to bind to the request in that case.
+    if status == "blocked" and "trigger" not in result and "phase" not in result:
+        if result.get("plan") is not None:
+            raise MauticPatchResolutionError("mcc_nonselected_response_has_plan")
+        return result
     if result.get("trigger") != trigger or result.get("phase") != phase:
         raise MauticPatchResolutionError("mcc_patch_response_context_mismatch")
     if not str(result.get("catalog_revision", "") or "").strip() or not _SHA64_RE.fullmatch(str(result.get("catalog_sha256", ""))):
@@ -476,9 +486,7 @@ def resolve_plan(
         raise MauticPatchResolutionError("mcc_registry_commit_invalid")
     if not _SHA64_RE.fullmatch(str(result.get("registry_sha256", ""))):
         raise MauticPatchResolutionError("mcc_registry_sha256_invalid")
-    if result.get("status") not in {"selected", "noop", "blocked"}:
-        raise MauticPatchResolutionError("mcc_patch_response_status_invalid")
-    if result["status"] != "selected":
+    if status != "selected":
         if result.get("plan") is not None:
             raise MauticPatchResolutionError("mcc_nonselected_response_has_plan")
         return result
