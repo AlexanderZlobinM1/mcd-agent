@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import time
 from typing import Any
 
@@ -20,6 +22,7 @@ SCHEMA = "mcd-mautic-patch-backup-attestation-v1"
 FIELDS = {"schema", "instance_uid", "root", "source_version", "target_version",
           "run_id", "plan_sha256", "backup_evidence", "issued_at", "expires_at", "nonce", "signature"}
 BACKUP_FIELDS = {"backup_id", "backup_path", "manifest_path", "sha256", "completed_at", "bytes_written"}
+DURABLE_FIELDS = BACKUP_FIELDS | {"state_path", "authorization_manifest_path"}
 
 
 def required(plan: dict[str, Any]) -> bool:
@@ -27,7 +30,7 @@ def required(plan: dict[str, Any]) -> bool:
 
 
 def _backup(value: Any, *, root: str, instance_uid: str, now: int) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != BACKUP_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (BACKUP_FIELDS, DURABLE_FIELDS):
         raise RepairAuthorizationError("patch_backup_fields_invalid")
     size = value.get("bytes_written")
     directory = Path(str(value.get("backup_path") or ""))
@@ -37,8 +40,33 @@ def _backup(value: Any, *, root: str, instance_uid: str, now: int) -> dict[str, 
             or directory.is_symlink() or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", "")))
             or isinstance(size, bool) or not isinstance(size, int) or size <= 0):
         raise RepairAuthorizationError("patch_backup_evidence_invalid")
-    verify_backup_evidence(value, root=root, instance_uid=instance_uid, now=now)
-    marker = json.loads(manifest.read_text(encoding="utf-8"))
+    evidence_manifest = manifest
+    if set(value) == DURABLE_FIELDS:
+        state_raw = str(value.get("state_path") or "")
+        durable_raw = str(value.get("authorization_manifest_path") or "")
+        state_path = Path(state_raw)
+        evidence_manifest = Path(durable_raw)
+        expected = state_path.parent / "authorization-manifests" / str(value["sha256"]) / ".mcd-backup.json"
+        if (not state_path.is_absolute() or str(state_path) != state_raw
+                or not evidence_manifest.is_absolute() or str(evidence_manifest) != durable_raw
+                or ".." in state_path.parts or ".." in evidence_manifest.parts
+                or evidence_manifest != expected or evidence_manifest.is_symlink()):
+            raise RepairAuthorizationError("patch_backup_authorization_path_invalid")
+        try:
+            info = evidence_manifest.stat()
+        except OSError as exc:
+            raise RepairAuthorizationError("backup_manifest_unavailable") from exc
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.geteuid()):
+            raise RepairAuthorizationError("patch_backup_authorization_file_unsafe")
+    try:
+        verify_backup_evidence(
+            {**value, "manifest_path": str(evidence_manifest)},
+            root=root, instance_uid=instance_uid, now=now,
+        )
+        marker = json.loads(evidence_manifest.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RepairAuthorizationError("backup_manifest_unavailable") from exc
     if marker.get("bytes_written") != size:
         raise RepairAuthorizationError("patch_backup_size_mismatch")
     return dict(value)

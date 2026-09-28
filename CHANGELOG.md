@@ -1,3 +1,9 @@
+## 1.2.85 - 2026-09-28
+
+- Authorize immutable patch-plan backups after transient storage unmount using the exact durable marker path and SHA from the instance-backup receipt.
+- Keep remote backup identity and legacy mounted-marker evidence intact; reject altered, misplaced, missing or unsafe durable evidence before issuing or consuming a signed attestation.
+- Cover post-unmount issue/validate, path and identity drift, marker tampering and legacy receipt compatibility.
+
 ## 1.2.84 - 2026-09-28
 
 - Satisfy a cross-line backup prerequisite with an existing signed JSON repair authorization only after revalidating its instance, versions, plan, signature, expiry and actual backup marker.

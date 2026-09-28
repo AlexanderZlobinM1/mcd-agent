@@ -6,7 +6,9 @@ import hmac
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 from mcd_agent import mautic_patch_backup as backup
 from mcd_agent import mautic_patch_plan_v3 as executor
@@ -62,6 +64,78 @@ class PatchBackupAttestationTests(unittest.TestCase):
         self.assertTrue(backup.required(self.plan))
         same_major = dict(self.plan, source_version="7.1.3")
         self.assertFalse(backup.required(same_major))
+
+    def _durable_receipt_after_unmount(self):
+        evidence = self.context["backup_evidence"]
+        remote = Path(evidence["manifest_path"])
+        state_path = self.root / "state" / "backup.json"
+        durable = state_path.parent / "authorization-manifests" / evidence["sha256"] / ".mcd-backup.json"
+        durable.parent.mkdir(parents=True)
+        durable.write_bytes(remote.read_bytes())
+        durable.chmod(0o600)
+        remote.unlink()
+        evidence.update(state_path=str(state_path), authorization_manifest_path=str(durable))
+        self._sign()
+        return durable
+
+    def test_durable_receipt_issue_and_validate_after_remote_unmount(self):
+        durable = self._durable_receipt_after_unmount()
+        self.assertEqual(self._validate()["backup_id"], self.uid + ":fixture")
+        key_path = self.root / "signing.key"
+        key_path.write_bytes(self.key)
+        key_path.chmod(0o600)
+        output_path = self.root / "attestation.json"
+        with patch.object(backup.time, "time", return_value=self.now):
+            result = backup.issue(
+                plan=self.plan, instance_uid=self.uid, root=str(self.root),
+                backup_evidence=self.context["backup_evidence"], key_path=str(key_path),
+                output_path=str(output_path),
+            )
+            self.assertEqual(result["status"], "success")
+            loaded = backup.load_and_validate(
+                str(output_path), key_path=str(key_path), plan=self.plan,
+                instance_uid=self.uid, root=str(self.root),
+            )
+        self.assertEqual(loaded["authorization_manifest_path"], str(durable))
+        self.assertEqual(loaded["manifest_path"], str(self.root / "backup" / ".mcd-backup.json"))
+
+    def test_durable_receipt_rejects_tamper_path_uid_and_root(self):
+        durable = self._durable_receipt_after_unmount()
+        evidence = self.context["backup_evidence"]
+        original = evidence["authorization_manifest_path"]
+        for wrong in (str(self.root / "other" / ".mcd-backup.json"),
+                      str(self.root / "state" / ".." / "other" / ".mcd-backup.json")):
+            evidence["authorization_manifest_path"] = wrong
+            self._sign()
+            with self.assertRaisesRegex(RepairAuthorizationError, "authorization_path_invalid"):
+                self._validate()
+        evidence["authorization_manifest_path"] = original
+        self._sign()
+        original_sha = evidence["sha256"]
+        evidence["sha256"] = "0" * 64
+        self._sign()
+        with self.assertRaisesRegex(RepairAuthorizationError, "authorization_path_invalid"):
+            self._validate()
+        evidence["sha256"] = original_sha
+        self._sign()
+        with self.assertRaisesRegex(RepairAuthorizationError, "binding_mismatch"):
+            backup.validate(self.context, plan=self.plan, instance_uid="wrong", root=str(self.root),
+                            signing_key=self.key, now=self.now)
+        with self.assertRaisesRegex(RepairAuthorizationError, "binding_mismatch"):
+            backup.validate(self.context, plan=self.plan, instance_uid=self.uid, root="/wrong",
+                            signing_key=self.key, now=self.now)
+        durable.write_bytes(durable.read_bytes() + b" ")
+        with self.assertRaisesRegex(RepairAuthorizationError, "digest_mismatch"):
+            self._validate()
+
+    def test_durable_receipt_rejects_missing_or_unsafe_file(self):
+        durable = self._durable_receipt_after_unmount()
+        durable.chmod(0o644)
+        with self.assertRaisesRegex(RepairAuthorizationError, "file_unsafe"):
+            self._validate()
+        durable.unlink()
+        with self.assertRaisesRegex(RepairAuthorizationError, "backup_manifest_unavailable"):
+            self._validate()
 
     def test_unsigned_tampering_is_rejected(self):
         self.context["backup_evidence"]["bytes_written"] = 999
