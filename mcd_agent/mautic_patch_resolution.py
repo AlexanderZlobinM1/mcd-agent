@@ -45,6 +45,7 @@ _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+_MCC_403_DETAIL_RE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _IMPLEMENTED_EXECUTION_KINDS = {"git_patch_v1"}
 
 
@@ -118,6 +119,21 @@ def _endpoint(config: AgentConfig, suffix: str) -> str:
     return base + "/api/v1" + suffix
 
 
+def _http_error_reason(exc: urllib.error.HTTPError) -> str:
+    prefix = f"mcc_patch_http_{int(exc.code)}"
+    if int(exc.code) != 403:
+        return prefix
+    try:
+        raw = exc.read(4096)
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return prefix
+    detail = value.get("detail") if isinstance(value, dict) else None
+    if isinstance(detail, str) and _MCC_403_DETAIL_RE.fullmatch(detail):
+        return f"{prefix}:{detail}"
+    return prefix
+
+
 def _post_json(config: AgentConfig, suffix: str, payload: dict[str, Any]) -> dict[str, Any]:
     token = str(getattr(config, "mcc_token", "") or "").strip()
     if not token:
@@ -137,7 +153,7 @@ def _post_json(config: AgentConfig, suffix: str, payload: dict[str, Any]) -> dic
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        raise MauticPatchResolutionError(f"mcc_patch_http_{int(exc.code)}") from exc
+        raise MauticPatchResolutionError(_http_error_reason(exc)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise MauticPatchResolutionError(f"mcc_patch_transport_failed: {exc}") from exc
     try:

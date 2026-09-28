@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from mcd_agent import mautic_patch_resolution as resolution
 from mcd_agent import __version__
@@ -89,6 +91,27 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         payload = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(payload["mcc_host_name"], "fixture.example")
         self.assertEqual(payload["hostname"], "fixture.example")
+
+    def test_403_exposes_only_allowlisted_mcc_detail(self):
+        error = HTTPError(
+            "https://mcc.example/api/v1/agent/mautic-patches/resolve", 403, "forbidden", {},
+            BytesIO(b'{"detail":"host_claim_ip_mismatch","token":"not-exposed"}'),
+        )
+        with patch.object(resolution.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                resolution.MauticPatchResolutionError,
+                r"^mcc_patch_http_403:host_claim_ip_mismatch$",
+            ):
+                resolution._post_json(self.config, "/agent/mautic-patches/resolve", {})
+
+    def test_403_does_not_expose_unstructured_mcc_body(self):
+        error = HTTPError(
+            "https://mcc.example/api/v1/agent/mautic-patches/resolve", 403, "forbidden", {},
+            BytesIO(b'{"detail":"host claim mismatch: 65.109.174.216","token":"not-exposed"}'),
+        )
+        with patch.object(resolution.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(resolution.MauticPatchResolutionError, r"^mcc_patch_http_403$"):
+                resolution._post_json(self.config, "/agent/mautic-patches/resolve", {})
 
     def test_rejects_plan_hash_mismatch(self):
         response = json.loads(json.dumps(self.fixture["resolve_response"]))

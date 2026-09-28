@@ -1,3 +1,8 @@
+## 1.2.90 - 2026-09-28
+
+- Surface an MCC catalog-resolve HTTP 403 as `mcc_patch_http_403:<detail>` only when MCC supplies a bounded allowlisted detail token.
+- Preserve the generic 403 reason for invalid, oversized or unstructured response bodies; never expose response text, credentials or tokens.
+
 ## 1.2.89 - 2026-09-28
 
 - Stop sending host-qualified `instance_uid@host` aliases in runtime-override polling; the canonical instance UID is now the only outbound key.
