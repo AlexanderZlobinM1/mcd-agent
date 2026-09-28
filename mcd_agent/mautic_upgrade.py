@@ -1929,6 +1929,7 @@ def run_upgrade_apply(
     cross_line = _branch_key(current) != _branch_key(target)
     release_context = None
     requirements = {}
+    external_backup_verified = False
     if cross_line:
         if not allow_release_transition or not yes or not root or root == "all":
             raise RuntimeError("Cross-line upgrade requires explicit single-instance release transition authorization")
@@ -1960,9 +1961,22 @@ def run_upgrade_apply(
         requirements = release_context["transition_requirements"]
         from mcd_agent import __version__
         minimum = requirements["minimum_agent_version"]
+        if requirements["requires_backup"] and not do_backup:
+            from mcd_agent.mautic_external_backup import release_backup_satisfied
+            external_backup_verified = release_backup_satisfied(
+                do_backup=False,
+                requires_json_repair=requirements["requires_json_repair"],
+                repair_plan_json=repair_plan_json,
+                repair_auth_context_file=repair_auth_context_file,
+                repair_auth_key_file=repair_auth_key_file,
+                instance_uid=inst.instance_uid,
+                root=install_root,
+                source_version=current,
+                target_version=target,
+            )
         if ((minimum and _parse_semver(__version__) < _parse_semver(minimum))
                 or actual_mode not in requirements["install_types"] or "upgrade" not in requirements["phases"]
-                or (requirements["requires_backup"] and not do_backup)
+                or (requirements["requires_backup"] and not (do_backup or external_backup_verified))
                 or (with_system_upgrade and not requirements["system_upgrade_supported"])
                 or (requirements["requires_json_repair"] and (not repair_plan_json or not repair_auth_context_file))):
             raise RuntimeError("Release transition prerequisites are not satisfied")
@@ -2208,7 +2222,7 @@ def run_upgrade_apply(
             inst,
             project_root=_resolve_composer_project_root(install_root),
             target=target,
-            rollback_available=do_backup,
+            rollback_available=do_backup or external_backup_verified,
         )
 
         # Restore transport dependencies for API senders after upgrade

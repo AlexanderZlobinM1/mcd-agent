@@ -1,3 +1,9 @@
+## 1.2.84 - 2026-09-28
+
+- Satisfy a cross-line backup prerequisite with an existing signed JSON repair authorization only after revalidating its instance, versions, plan, signature, expiry and actual backup marker.
+- Keep standalone and unproven transitions on the local backup requirement; do not create a duplicate backup for an externally verified MCC backup.
+- Preserve honest rollback availability from verified external backup evidence and cover missing, altered and expired proofs.
+
 ## 1.2.83 - 2026-09-28
 
 - Preserve the remote instance-backup marker path and publish a separate durable, root-only exact-byte authorization marker before releasing transient backup storage.
