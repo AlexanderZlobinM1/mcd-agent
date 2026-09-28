@@ -34,7 +34,7 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
         self.assertEqual(store.values["local_runtime"], {"segment_recurring_priority_v1": {}})
         push.assert_not_called()
 
-    def test_poll_includes_canonical_host_qualified_instance_uid(self) -> None:
+    def test_poll_uses_canonical_instance_uid_without_host_suffix(self) -> None:
         cfg = SimpleNamespace(mcc_url="https://mcc.example", mcc_token="token")
         identity = {
             "effective_hostname": "MauticFarm-02",
@@ -50,7 +50,7 @@ class RuntimeOverrideDirectionTests(unittest.TestCase):
         payload = post.call_args.args[1]
         self.assertEqual(
             payload["instance_uids"],
-            ["electronic.sales-snap.com", "electronic.sales-snap.com@MauticFarm-02"],
+            ["electronic.sales-snap.com"],
         )
 
     def test_local_runtime_push_targets_canonical_desired_state_when_requested(self) -> None:

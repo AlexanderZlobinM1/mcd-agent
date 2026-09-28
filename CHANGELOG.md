@@ -1,3 +1,8 @@
+## 1.2.89 - 2026-09-28
+
+- Stop sending host-qualified `instance_uid@host` aliases in runtime-override polling; the canonical instance UID is now the only outbound key.
+- Retain read-only matching of one unambiguous legacy host-qualified setting so existing desired state remains consumable during normalization.
+
 ## 1.2.88 - 2026-09-28
 
 - Keep an explicit MCC host name unchanged for catalog transport, but when it is blank send the already resolved effective hostname instead of rejecting the request locally.

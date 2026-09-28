@@ -69,17 +69,14 @@ def _matching_instance_entry(entries: dict[str, Any], keys: list[str]) -> str | 
     return canonical[0] if len(canonical) == 1 else None
 
 
-def _expanded_instance_uids(instance_uids: list[str], host_name: str) -> list[str]:
-    expanded: list[str] = []
-    host = str(host_name or "").strip()
+def _canonical_instance_uids(instance_uids: list[str]) -> list[str]:
+    canonical: list[str] = []
     for raw_uid in instance_uids:
         uid = str(raw_uid or "").strip()
         if not uid:
             continue
-        expanded.append(uid)
-        if host and "@" not in uid:
-            expanded.append(f"{uid}@{host}")
-    return list(dict.fromkeys(expanded))
+        canonical.append(uid)
+    return list(dict.fromkeys(canonical))
 
 
 def instance_desired_states(runtime: dict[str, Any], installs: list[object]) -> dict[str, dict[str, Any]]:
@@ -147,8 +144,7 @@ def fetch_runtime_overrides(cfg: AgentConfig, *, instance_uids: list[str] | None
     if not base:
         return {"status": "disabled", "reason": "mcc_url_not_set"}
     ident = resolve_agent_identity(cfg)
-    effective_host_name = str(ident.get("effective_mcc_host_name") or ident.get("effective_hostname") or "").strip()
-    expanded_instance_uids = _expanded_instance_uids(instance_uids or [], effective_host_name)
+    canonical_instance_uids = _canonical_instance_uids(instance_uids or [])
     payload = {
         "hostname": str(ident.get("effective_hostname") or ""),
         "mcc_host_name": str(ident.get("effective_mcc_host_name") or ""),
@@ -156,7 +152,7 @@ def fetch_runtime_overrides(cfg: AgentConfig, *, instance_uids: list[str] | None
         "configured_host_name": str(ident.get("configured_host_name") or ""),
         "agent_version": __version__,
         "desired_state_protocol": 1,
-        "instance_uids": expanded_instance_uids,
+        "instance_uids": canonical_instance_uids,
     }
     url = base + "/api/v1/agent/runtime-overrides"
     try:
