@@ -28,7 +28,7 @@ def invocation(tmp_path, monkeypatch):
     monkeypatch.setattr(manual.os, "geteuid", lambda: 0)
     return dict(root=str(root), install_root=str(root), current="7.1.3", target="7.1.4",
                 mode="composer", raw_plan=json.dumps(plan), run_id="manual-job-72",
-                yes=True, allow_minor=True, allow_major=False, with_system_upgrade=False)
+                yes=True, allow_minor=True, allow_major=False, do_backup=True, with_system_upgrade=False)
 
 
 def test_exact_manual_invocation_is_valid(invocation):
@@ -60,7 +60,7 @@ def test_run_id_without_selected_patch_plan_is_rejected(invocation):
     ("mode", "zip"), ("raw_plan", None), ("raw_plan", "{}"),
     ("raw_plan", " " * 16385), ("run_id", None), ("run_id", ""),
     ("run_id", "../other"), ("run_id", "x" * 97), ("yes", False),
-    ("allow_minor", False), ("allow_major", True), ("with_system_upgrade", True),
+    ("allow_minor", False), ("allow_major", True),
 ])
 def test_manual_input_mismatch_rejected(invocation, key, value):
     invocation[key] = value
@@ -72,6 +72,23 @@ def test_non_root_rejected(invocation, monkeypatch):
     monkeypatch.setattr(manual.os, "geteuid", lambda: 1000)
     with pytest.raises(RuntimeError, match="root execution"):
         manual.validate_preflighted_single_instance(**invocation)
+
+
+def test_manual_php84_requires_7x_backup_and_immutable_plan(invocation):
+    invocation["with_system_upgrade"] = True
+    manual.validate_preflighted_single_instance(**invocation)
+    with pytest.raises(RuntimeError, match="requires --backup"):
+        manual.validate_preflighted_single_instance(**{**invocation, "do_backup": False})
+    with pytest.raises(RuntimeError, match="immutable selected patch plan"):
+        manual.validate_preflighted_single_instance(**{**invocation, "raw_plan": None, "run_id": None})
+    with pytest.raises(RuntimeError, match="same-major Mautic 7"):
+        manual.validate_preflighted_single_instance(**{**invocation, "current": "6.0.9", "target": "6.0.10"})
+
+
+def test_manual_php84_capability_is_only_forward_7x():
+    assert manual.manual_system_upgrade_capability("7.1.3", "7.1.4")["supported"] is True
+    assert manual.manual_system_upgrade_capability("7.1.4", "7.1.3")["supported"] is False
+    assert manual.manual_system_upgrade_capability("6.0.9", "6.0.10")["supported"] is False
 
 
 def test_same_version_has_stable_no_mutation_reason(invocation):
@@ -203,6 +220,41 @@ def test_same_major_upgrade_keeps_requested_baseline_backup(invocation, monkeypa
     monkeypatch.setattr(upgrade, "_backup_install", lambda *a: events.append("baseline_backup") or "verified-backup")
     assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
     assert events.index("baseline_backup") < events.index("install")
+
+
+def test_manual_php84_runs_after_verified_mautic_update(invocation, monkeypatch, capsys):
+    args, events = wire_upgrade(invocation, monkeypatch)
+    args.update(do_backup=True, with_system_upgrade=True)
+    monkeypatch.setattr(upgrade, "_backup_install", lambda *a: events.append("baseline_backup") or "verified-backup")
+    monkeypatch.setattr(upgrade, "_assert_php84_host_safe", lambda *a: events.append("host_preflight"))
+    monkeypatch.setattr(upgrade, "_apply_system_upgrade", lambda *a, **kw: events.append("system"))
+    monkeypatch.setattr(upgrade, "rebind_php_after_system_upgrade", lambda value: value)
+    monkeypatch.setattr(upgrade, "replace", lambda config, **kw: config)
+    monkeypatch.setattr(upgrade, "_php84_runtime_observation", lambda: {"cli_version": "8.4.1", "fpm_version": "8.4", "nginx_socket": ["/run/php/php8.4-fpm.sock"]})
+    assert upgrade.run_upgrade_apply(**args, mcc_preflighted_single_instance=True) == 0
+    assert events == ["host_preflight", "stage", "maintenance", "permissions", "baseline_backup", "install", "system", "cleanup"]
+    evidence = [
+        json.loads(line.split("=", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("MCD_MANUAL_SYSTEM_UPGRADE_EVIDENCE=")
+    ]
+    assert evidence == [
+        {
+            "schema": "mcd-mautic-manual-system-upgrade-execution-v1",
+            "status": "success",
+            "requested": True,
+            "target_php": "8.4",
+            "binding": {
+                "instance_uid": "fixture-instance", "root": invocation["root"],
+                "source_version": "7.1.3", "target_version": "7.1.4",
+                "patch_run_id": "manual-job-72", "plan_sha256": evidence[0]["binding"]["plan_sha256"],
+                "backup_path": "verified-backup",
+            },
+            "host_compatibility": {"ok": True, "reason": "all discovered host instances are PHP 8.4 compatible"},
+            "observed": {"cli_version": "8.4.1", "fpm_version": "8.4", "nginx_socket": ["/run/php/php8.4-fpm.sock"]},
+            "rollback": {"attempted": False, "succeeded": False},
+        }
+    ]
 
 
 @pytest.mark.parametrize("kind", ["zip", "composer"])

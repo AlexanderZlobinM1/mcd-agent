@@ -1,3 +1,9 @@
+## 1.2.87 - 2026-09-28
+
+- Permit the existing guarded PHP 8.4 system stage for an MCC-preflighted, operator-acknowledged strictly forward manual Mautic 7.x upgrade only when it has an immutable patch plan/run ID and local backup.
+- Advertise the narrow manual runtime capability in read-only upgrade preflight; preserve the prohibition on a free per-instance PHP selector.
+- Keep the PHP stage in the same maintenance operation but execute it only after Mautic reaches the selected target, with bound execution evidence for backup, host compatibility, observed PHP/FPM/nginx state and rollback status.
+
 ## 1.2.86 - 2026-09-28
 
 - Emit bounded target-stage failure evidence with the allowlisted relative path and staged/live SHA-256 values when a prepared target differs from the installed target.

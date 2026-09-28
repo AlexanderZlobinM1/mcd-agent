@@ -13,6 +13,8 @@ from pathlib import Path
 from mcd_agent.install_type import detect_install_type
 from mcd_agent.mautic_patch_plan import _RUN, _target_version, parse_plan
 
+MANUAL_SYSTEM_UPGRADE_CAPABILITY = "mcc-mautic-manual-system-upgrade-v1"
+
 
 class ManualUpgradePreflightError(RuntimeError):
     def __init__(self, reason: str, message: str) -> None:
@@ -37,6 +39,31 @@ def _reject_number(value: str) -> None:
     raise ValueError("non-integer patch-plan number")
 
 
+def manual_system_upgrade_capability(current: str, target: str | None) -> dict[str, object]:
+    """Describe the narrow post-update PHP 8.4 stage without authorizing it."""
+    payload: dict[str, object] = {
+        "schema": MANUAL_SYSTEM_UPGRADE_CAPABILITY,
+        "supported": False,
+        "target_php": "8.4",
+        "execution_phase": "post_mautic_update",
+        "required": [
+            "mcc_preflighted_single_instance",
+            "operator_manual_upgrade_acknowledgement",
+            "immutable_patch_plan_and_run_id",
+            "backup",
+        ],
+        "reason": "manual PHP 8.4 is available only for a strictly forward same-major Mautic 7 upgrade",
+    }
+    try:
+        source = tuple(int(part) for part in current.split("."))
+        destination = tuple(int(part) for part in str(target).split("."))
+    except (AttributeError, TypeError, ValueError):
+        return payload
+    if len(source) == 3 and len(destination) == 3 and source[0] == destination[0] == 7 and destination > source:
+        payload.update(supported=True, reason="")
+    return payload
+
+
 def validate_preflighted_single_instance(
     *,
     root: str | None,
@@ -49,17 +76,18 @@ def validate_preflighted_single_instance(
     yes: bool,
     allow_minor: bool,
     allow_major: bool,
+    do_backup: bool,
     with_system_upgrade: bool,
 ) -> None:
     """Validate an explicitly acknowledged, single-instance manual upgrade."""
     prefix = "MCC preflighted single-instance upgrade rejected: "
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         _reject(prefix, "root_execution_required", "root execution is required")
-    if not yes or not allow_minor or allow_major or with_system_upgrade:
+    if not yes or not allow_minor or allow_major:
         _reject(
             prefix,
             "unsafe_upgrade_flags",
-            "require --yes/--allow-minor, without major/system upgrade",
+            "require --yes/--allow-minor, without major upgrade",
         )
     if current == target:
         _reject(prefix, "target_already_installed", f"target {target} is already installed")
@@ -81,6 +109,12 @@ def validate_preflighted_single_instance(
         _reject(prefix, "unsupported_transition", "manual major-version upgrades are not supported")
     if target_parts <= source_parts:
         _reject(prefix, "unsupported_transition", "manual target must be newer than the verified source")
+    if with_system_upgrade:
+        capability = manual_system_upgrade_capability(current, target)
+        if not capability["supported"]:
+            _reject(prefix, "system_upgrade_unsupported_transition", str(capability["reason"]))
+        if not do_backup:
+            _reject(prefix, "system_upgrade_backup_required", "manual PHP 8.4 requires --backup")
     if mode not in {"zip", "composer"}:
         _reject(prefix, "unsupported_install_type", "an explicit zip or composer mode is required")
     if not isinstance(root, str) or not root or not Path(root).is_absolute():
@@ -94,6 +128,12 @@ def validate_preflighted_single_instance(
             _reject(prefix, "invalid_patch_run_id", "a safe patch-run-id is required for a selected patch plan")
         if not isinstance(raw_plan, str) or len(raw_plan.encode("utf-8")) > 33_554_432:
             _reject(prefix, "invalid_patch_plan", "selected patch plan must be bounded")
+    if with_system_upgrade and raw_plan is None:
+        _reject(
+            prefix,
+            "system_upgrade_plan_required",
+            "manual PHP 8.4 requires an immutable selected patch plan and patch-run-id",
+        )
     try:
         canonical = Path(root).resolve(strict=True)
         if root != str(canonical) or not canonical.is_dir() or canonical == Path("/"):

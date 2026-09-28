@@ -890,7 +890,9 @@ def _apply_system_upgrade(
     config: AgentConfig | None = None,
     upgraded_root: str | None = None,
 ) -> None:
-    if _parse_semver(from_ver)[0] == 6 and _parse_semver(to_ver)[0] == 7:
+    source_major = _parse_semver(from_ver)[0]
+    target_major = _parse_semver(to_ver)[0]
+    if (source_major, target_major) in {(6, 7), (7, 7)}:
         if config is None or not upgraded_root:
             raise RuntimeError("PHP 8.4 system upgrade requires config and upgraded root")
         _apply_php84_system_upgrade(config, upgraded_root)
@@ -952,6 +954,19 @@ def _apply_system_upgrade(
             ],
             check=True,
         )
+
+
+def _php84_runtime_observation() -> dict[str, object]:
+    php84 = str(shutil.which("php8.4") or "/usr/bin/php8.4")
+    probe = subprocess.run([php84, "-r", "echo PHP_VERSION;"], capture_output=True, text=True, check=False)
+    service = subprocess.run(["systemctl", "is-active", "php8.4-fpm"], capture_output=True, text=True, check=False)
+    nginx = subprocess.run(["nginx", "-T"], capture_output=True, text=True, check=False)
+    sockets = sorted(set(re.findall(r"fastcgi_pass\\s+unix:([^;]*php8\\.4-fpm[^;]*);", nginx.stdout or "")))
+    return {
+        "cli_version": (probe.stdout or "").strip() if probe.returncode == 0 else "",
+        "fpm_version": "8.4" if service.returncode == 0 and (service.stdout or "").strip() == "active" else "",
+        "nginx_socket": sockets,
+    }
 
 
 def _insert_migration_hacks_if_needed(root: str, to_ver: str) -> None:
@@ -1483,6 +1498,11 @@ def run_upgrade_preflight(
     composer_ok = composer.get("status") in {"not_required", "reused", "success"}
     json_ok = json_repair.get("status") in {"unsupported", "supported"}
     status = "ready" if version_source == "static_metadata" and composer_ok and json_ok else "needs_attention"
+    from mcd_agent.mautic_manual_upgrade import (
+        MANUAL_SYSTEM_UPGRADE_CAPABILITY,
+        manual_system_upgrade_capability,
+    )
+    manual_system_upgrade = manual_system_upgrade_capability(current, target)
     payload = {
         "schema": "mcd-mautic-upgrade-preflight-v1",
         "contract_version": 1,
@@ -1503,6 +1523,8 @@ def run_upgrade_preflight(
         "composer": {"schema": "mcd-mautic-composer-readiness-v1", **composer},
         "json_schema_repair": json_repair,
         "backup_prerequisite": json_repair.get("backup_prerequisite", {}),
+        "runtime_capabilities": [MANUAL_SYSTEM_UPGRADE_CAPABILITY],
+        "manual_system_upgrade": manual_system_upgrade,
     }
     if version_source != "static_metadata":
         payload["reason"] = "authoritative on-disk Mautic version evidence is unavailable"
@@ -1910,7 +1932,7 @@ def run_upgrade_apply(
                     root=root, install_root=install_root, current=source_version,
                     target=target, mode=mode, raw_plan=patch_plan_json,
                     run_id=patch_run_id, yes=yes, allow_minor=allow_minor,
-                    allow_major=allow_major, with_system_upgrade=with_system_upgrade,
+                    allow_major=allow_major, do_backup=do_backup, with_system_upgrade=with_system_upgrade,
                 )
             except ManualUpgradePreflightError as exc:
                 evidence = rejected_preflight(patch_run_id, exc.reason)
@@ -1927,6 +1949,7 @@ def run_upgrade_apply(
         print(f"No upgrade target for current version {current}")
         return 0
     cross_line = _branch_key(current) != _branch_key(target)
+    manual_system_upgrade = bool(mcc_preflighted_single_instance and not cross_line and with_system_upgrade)
     release_context = None
     requirements = {}
     external_backup_verified = False
@@ -1989,6 +2012,8 @@ def run_upgrade_apply(
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = detect_install_type(install_root)
+    if manual_system_upgrade:
+        _assert_php84_host_safe(config, install_root)
     if requirements.get("database_compatibility") == "mautic7":
         database_ok, database_reason = mautic7_database_compatibility(_database_state())
         if not database_ok:
@@ -2198,10 +2223,6 @@ def run_upgrade_apply(
             if repair_evidence.get("status") != "success":
                 raise RuntimeError("Mautic JSON schema repair rejected or failed")
 
-        if with_system_upgrade:
-            _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
-            config = replace(config, php_bin=rebind_php_after_system_upgrade(config.php_bin))
-
         if chosen_mode == "zip":
             if cross_line:
                 require_live_release_authorization()
@@ -2245,7 +2266,6 @@ def run_upgrade_apply(
         if _parse_semver(current)[0] != 7 and _parse_semver(target)[0] == 7:
             _ensure_mautic7_locale_fix(config, install_root)
 
-        _post_upgrade_verify(config, inst)
         final_version = _read_current_version(install_root, console, config.php_bin, config.mautic_run_as_user)
         if _parse_semver(final_version) != _parse_semver(target):
             raise RuntimeError(f"Post-check failed: Mautic version is {final_version}, expected {target}")
@@ -2258,6 +2278,40 @@ def run_upgrade_apply(
         import_patch = {"status": "already", "reason": "runtime_reconciliation_uses_catalog_plan"}
         if import_patch.get("status") == "error":
             raise RuntimeError("Import tag patch after upgrade failed: " + str(import_patch.get("reason")))
+        if manual_system_upgrade:
+            from mcd_agent.mautic_patch_resolution import canonical_json_sha256
+            system_evidence = {
+                "schema": "mcd-mautic-manual-system-upgrade-execution-v1",
+                "status": "running",
+                "requested": True,
+                "target_php": "8.4",
+                "binding": {
+                    "instance_uid": inst.instance_uid,
+                    "root": install_root,
+                    "source_version": current,
+                    "target_version": target,
+                    "patch_run_id": patch_run_id or "",
+                    "plan_sha256": canonical_json_sha256(validated_patch_plan),
+                    "backup_path": str(b),
+                },
+                "host_compatibility": {"ok": True, "reason": "all discovered host instances are PHP 8.4 compatible"},
+                "observed": {"cli_version": "", "fpm_version": "", "nginx_socket": []},
+                "rollback": {"attempted": False, "succeeded": False},
+            }
+            try:
+                _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
+                config = replace(config, php_bin=rebind_php_after_system_upgrade(config.php_bin))
+                system_evidence["observed"] = _php84_runtime_observation()
+                system_evidence["status"] = "success"
+            except Exception as exc:
+                system_evidence.update(status="error", reason=str(exc), error_type=type(exc).__name__)
+                print("MCD_MANUAL_SYSTEM_UPGRADE_EVIDENCE=" + json.dumps(system_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+                raise
+            print("MCD_MANUAL_SYSTEM_UPGRADE_EVIDENCE=" + json.dumps(system_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        elif with_system_upgrade:
+            _apply_system_upgrade(current, target, config=config, upgraded_root=install_root)
+            config = replace(config, php_bin=rebind_php_after_system_upgrade(config.php_bin))
+        _post_upgrade_verify(config, inst)
         cache_count = _write_upgrade_version_cache(install_root, final_version)
         print(f"Mautic version cache refreshed: {final_version} ({cache_count} path(s))")
         print(f"Upgrade completed: {current} -> {final_version}")

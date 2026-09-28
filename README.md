@@ -651,7 +651,12 @@ Important:
     `composer.json` to the selected Mautic 7 target, runs Composer with
     dependencies, clears cache, finishes the Mautic updater, and reconciles
     known Doctrine migration metadata drift before the final migration check
-  - `--with-system-upgrade` on the 6 to 7 flow installs PHP 8.4 packages,
+  - `--with-system-upgrade` is available for a guarded 6-to-7 release transition
+    and for an MCC-preflighted, operator-acknowledged strictly forward manual
+    Mautic 7.x upgrade. The manual path requires `--backup` and the immutable
+    selected patch plan/run ID, stays in the same maintenance session, and runs
+    only after Mautic reaches the selected target.
+  - The PHP 8.4 stage installs PHP 8.4 packages,
     migrates custom PHP ini files such as `60-custom.ini` and
     `90-redis-sessions.ini`, rewrites nginx PHP-FPM socket references from
     8.3 to 8.4, validates nginx, restarts services, and purges PHP 8.3 only
