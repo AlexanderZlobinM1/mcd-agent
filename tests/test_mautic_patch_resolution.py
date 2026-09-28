@@ -71,6 +71,25 @@ class MauticPatchResolutionTransportTests(unittest.TestCase):
         self.assertNotIn("execution_context", payload)
         self.assertTrue(payload["agent_patch_contract"]["features"]["typed_execution_context_v1"])
 
+    def test_blank_mcc_host_name_uses_effective_hostname_for_transport(self):
+        with (
+            patch.object(
+                resolution,
+                "resolve_agent_identity",
+                return_value={"effective_mcc_host_name": "", "effective_hostname": "fixture.example"},
+            ),
+            patch.object(resolution.urllib.request, "urlopen", return_value=_Response(self.fixture["resolve_response"])) as urlopen,
+        ):
+            result = resolution.resolve_plan(
+                self.config, self.install, trigger="daemon_reconcile", phase="before_plugin_reload",
+                operation="apply", observed_version="7.2.0", observed_major=7,
+                install_type="composer", run_id="fixture-runtime-001",
+            )
+        self.assertEqual(result["status"], "selected")
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(payload["mcc_host_name"], "fixture.example")
+        self.assertEqual(payload["hostname"], "fixture.example")
+
     def test_rejects_plan_hash_mismatch(self):
         response = json.loads(json.dumps(self.fixture["resolve_response"]))
         response["plan_sha256"] = "0" * 64

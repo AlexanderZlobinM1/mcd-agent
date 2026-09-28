@@ -1,3 +1,8 @@
+## 1.2.88 - 2026-09-28
+
+- Keep an explicit MCC host name unchanged for catalog transport, but when it is blank send the already resolved effective hostname instead of rejecting the request locally.
+- Preserve failure on an unavailable effective hostname and cover the blank-name transport payload without changing host/plugin execution.
+
 ## 1.2.87 - 2026-09-28
 
 - Permit the existing guarded PHP 8.4 system stage for an MCC-preflighted, operator-acknowledged strictly forward manual Mautic 7.x upgrade only when it has an immutable patch plan/run ID and local backup.

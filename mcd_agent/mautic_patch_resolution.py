@@ -151,9 +151,9 @@ def _post_json(config: AgentConfig, suffix: str, payload: dict[str, Any]) -> dic
 
 def _host_identity(config: AgentConfig) -> tuple[str, str]:
     identity = resolve_agent_identity(config)
-    host_name = str(identity.get("effective_mcc_host_name") or "").strip()
     hostname = str(identity.get("effective_hostname") or "").strip()
-    if not host_name or not hostname:
+    host_name = str(identity.get("effective_mcc_host_name") or "").strip() or hostname
+    if not hostname:
         raise MauticPatchResolutionError("mcc_host_identity_unavailable")
     return host_name, hostname
 
