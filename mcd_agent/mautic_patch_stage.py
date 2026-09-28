@@ -132,6 +132,17 @@ class TargetStage:
             content, _st = _read(_file(live_application, path))
             actual = hashlib.sha256(content).hexdigest() if content is not None else None
             if actual != digest:
+                print("MCD_PATCH_TARGET_EVIDENCE=" + json.dumps({
+                    "schema": "mcd-mautic-target-stage-evidence-v1",
+                    "status": "failed",
+                    "reason": "target_live_source_hash_mismatch",
+                    "plan_sha256": self.plan_sha256,
+                    "target_version": self.target_version,
+                    "application_root_relative": self.application_root_relative,
+                    "source_path": path,
+                    "expected_sha256": digest,
+                    "actual_sha256": actual,
+                }, ensure_ascii=True, sort_keys=True, separators=(",", ":")), flush=True)
                 raise PatchPlanV3Error("target_live_source_hash_mismatch")
         return {"schema": "mcd-mautic-target-stage-evidence-v1", "status": "success",
                 "plan_sha256": self.plan_sha256, "target_version": self.target_version,

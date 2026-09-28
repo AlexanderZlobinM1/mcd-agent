@@ -1,5 +1,27 @@
 # MCD Technical Debt
 
+## MCD-TD-002
+
+- Status: open
+- Title: Decouple package identity from patch-resolution minimum admission in a future v2 contract
+- Owner scope: MCD patch-resolution contract, package version validation and MCC consumer compatibility
+- Source task: `01a07d46-213b-7e62-b910-08c7a9dacde1`
+- Last updated: 2026-09-28
+
+The v1 patch-resolution contract uses top-level `minimum_agent_version` as an
+exact package identity stamp: `_contract()` rejects it unless it equals
+`mcd_agent.__version__`. Consequently even a diagnostic-only MCD release must
+update this field, or patch resolution fails with
+`resolution_contract_version_mismatch`. This exact binding is retained in
+1.2.86 for compatibility; its version change is not a new target-policy gate.
+
+Future v2 work must separate immutable package/contract identity from the
+minimum agent capability admitted by a consumer. Coordinate the field and
+fallback semantics with MCC, preserve fail-closed rejection of mismatched
+artifacts, and test older compatible agents plus new package revisions without
+silently weakening actual capability floors. Do not backport this semantic
+change into the current incident fix.
+
 ## MCD-TD-001
 
 - Status: open

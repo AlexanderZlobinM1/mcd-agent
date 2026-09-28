@@ -23,7 +23,7 @@ def scenario(tmp_path):
     return root, path, plan, prepare, version
 
 
-def test_exact_target_is_validated_before_any_live_mutation_and_rechecked(tmp_path):
+def test_exact_target_is_validated_before_any_live_mutation_and_rechecked(tmp_path, capsys):
     root, path, plan, prepare, version = scenario(tmp_path)
     stage = TargetStage(str(root), plan, prepare, version)
     try:
@@ -38,6 +38,21 @@ def test_exact_target_is_validated_before_any_live_mutation_and_rechecked(tmp_pa
         path.write_bytes(b'operator drift\n')
         with pytest.raises(PatchPlanV3Error, match='target_live_source_hash_mismatch'):
             stage.verify_live(str(root), plan, version)
+        lines = [line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith('MCD_PATCH_TARGET_EVIDENCE=')]
+        assert len(lines) == 1
+        failure = json.loads(lines[0].split('=', 1)[1])
+        assert failure == {
+            'schema': 'mcd-mautic-target-stage-evidence-v1',
+            'status': 'failed',
+            'reason': 'target_live_source_hash_mismatch',
+            'plan_sha256': stage.plan_sha256,
+            'target_version': '7.2.0',
+            'application_root_relative': '.',
+            'source_path': 'docroot/app/fixture.txt',
+            'expected_sha256': stage.hashes['docroot/app/fixture.txt'],
+            'actual_sha256': __import__('hashlib').sha256(b'operator drift\n').hexdigest(),
+        }
         assert path.read_bytes() == b'operator drift\n'
     finally:
         directory = stage.directory

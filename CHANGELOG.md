@@ -1,3 +1,10 @@
+## 1.2.86 - 2026-09-28
+
+- Emit bounded target-stage failure evidence with the allowlisted relative path and staged/live SHA-256 values when a prepared target differs from the installed target.
+- Preserve the strict target-source rejection and patch rollback behavior; do not expose file contents or weaken source binding.
+- Cover exact failure evidence and unchanged success behavior in the target-stage regression.
+- Update the v1 patch-resolution package identity stamp to 1.2.86 as required by the existing equality check; this does not add a target-policy gate.
+
 ## 1.2.85 - 2026-09-28
 
 - Authorize immutable patch-plan backups after transient storage unmount using the exact durable marker path and SHA from the instance-backup receipt.
