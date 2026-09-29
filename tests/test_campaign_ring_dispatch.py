@@ -859,6 +859,48 @@ class CampaignRingDispatchTests(unittest.TestCase):
         self.assertFalse(executor.is_active("/var/www/site", "segment", 23))
         self.assertGreater(executor.last_finished("/var/www/site", "segment", 23), 0)
 
+    def test_priority_campaign_lanes_share_campaign_total_capacity(self) -> None:
+        executor = _PriorityTaskExecutor()
+        release = threading.Event()
+        started = threading.Event()
+
+        def _run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            started.set()
+            release.wait(timeout=2)
+            return SimpleNamespace(pid=1234, wait=lambda timeout=None: 0)
+
+        cfg = SimpleNamespace(command_timeout_sec=0, campaign_total_parallel=1)
+        with patch.object(daemon_mod, "_spawn_command", side_effect=_run):
+            self.assertTrue(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="campaign_trigger",
+                    entity_id=23,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                    capacity_lane="campaign_trigger_realtime",
+                )
+            )
+            self.assertTrue(started.wait(timeout=1))
+            self.assertFalse(
+                executor.launch(
+                    cfg,
+                    root="/var/www/site",
+                    task_type="campaign_rebuild",
+                    entity_id=24,
+                    args=["php", "bin/console"],
+                    interval_sec=60,
+                    max_parallel=1,
+                    capacity_lane="campaign_rebuild_liveness",
+                )
+            )
+            release.set()
+            deadline = time.time() + 2
+            while executor.is_active("/var/www/site", "campaign_trigger", 23) and time.time() < deadline:
+                time.sleep(0.01)
+
     def test_realtime_capacity_is_independent_from_normal_priority_capacity(self) -> None:
         executor = _PriorityTaskExecutor()
         release = threading.Event()

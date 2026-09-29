@@ -6183,6 +6183,31 @@ def _campaign_dispatch_end(root: str, task_type: str) -> None:
             _CAMPAIGN_DISPATCHING_ROOTS.pop(root, None)
 
 
+def _campaign_priority_capacity(config: AgentConfig) -> int | None:
+    """Return the shared per-instance cap for priority campaign work.
+
+    The ordinary ring scheduler already applies ``campaign_total_parallel``.
+    Priority/liveness work is admitted by a separate executor, so it must
+    derive the same cap locally or trigger and rebuild lanes can bypass it.
+    ``None`` preserves compatibility for configurations that predate the
+    campaign lane settings.
+    """
+    explicit = max(0, int(getattr(config, "campaign_total_parallel", 0) or 0))
+    if explicit > 0:
+        return explicit
+    configured = max(
+        max(0, int(getattr(config, "campaign_priority_parallel", 0) or 0))
+        + max(0, int(getattr(config, "campaign_regular_parallel", 0) or 0)),
+        max(0, int(getattr(config, "campaign_trigger_priority_parallel", 0) or 0))
+        + max(0, int(getattr(config, "campaign_trigger_regular_parallel", 0) or 0)),
+        max(0, int(getattr(config, "campaign_rebuild_priority_parallel", 0) or 0))
+        + max(0, int(getattr(config, "campaign_rebuild_regular_parallel", 0) or 0)),
+        max(0, int(getattr(config, "campaign_update_priority_parallel", 0) or 0))
+        + max(0, int(getattr(config, "campaign_update_regular_parallel", 0) or 0)),
+    )
+    return configured or None
+
+
 def _campaign_fallback_try_begin(
     root: str,
     *,
@@ -6323,6 +6348,16 @@ class _PriorityTaskExecutor:
                     for active_root, _active_type, active_lane in self._active.values()
                     if active_root == root and active_lane == lane
                 )
+                campaign_capacity = (
+                    _campaign_priority_capacity(config)
+                    if task_type in _CAMPAIGN_EXACT_TASK_TYPES
+                    else None
+                )
+                active_campaign_total = sum(
+                    1
+                    for active_root, active_type, _active_lane in self._active.values()
+                    if active_root == root and active_type in _CAMPAIGN_EXACT_TASK_TYPES
+                )
                 admitted = (
                     key not in self._active
                     and _launch_allowed(
@@ -6335,6 +6370,10 @@ class _PriorityTaskExecutor:
                     )
                     and not (previous > 0 and now - previous < interval)
                     and active_for_lane < max(1, int(max_parallel or 1))
+                    and (
+                        campaign_capacity is None
+                        or active_campaign_total < campaign_capacity
+                    )
                 )
                 if admitted:
                     self._active[key] = (root, task_type, lane)

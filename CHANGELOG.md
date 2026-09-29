@@ -1,3 +1,11 @@
+## 1.2.92 - 2026-09-29
+
+- Enforce the shared per-instance campaign capacity for priority/liveness
+  trigger and rebuild lanes instead of allowing separate lanes to bypass
+  `campaign_total_parallel`.
+- Keep excess campaign work queued without killing running processes or
+  changing host web/PHP-FPM configuration.
+
 ## 1.2.91 - 2026-09-28
 
 - Accept MCC's minimal blocked patch-resolution response without requiring a
